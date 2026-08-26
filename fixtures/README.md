@@ -16,7 +16,14 @@ than at something that merely has the right name.
 
 **With `RPF_CORPUS` unset, or the named archive absent, a test skips and says
 what it skipped.** It does not fail, and — the part that matters — it does not
-pass quietly. A green suite that tested nothing is the most expensive outcome
+pass quietly. `cargo test` hides a passing test's output, so the message alone
+is not enough: set **`RPF_REQUIRE_CORPUS=1`** and a skip becomes a failure. Use
+it whenever the corpus is supposed to be present, so that "green" and "it ran"
+are the same claim:
+
+```
+RPF_CORPUS=/path/to/corpus RPF_REQUIRE_CORPUS=1 cargo test --all
+``` A green suite that tested nothing is the most expensive outcome
 available here, so the skip is reported rather than swallowed. `docs/backlog.md`
 R0.2 and R8.4.
 
@@ -25,6 +32,25 @@ R0.2 and R8.4.
 | Fixture | Archive | Verified against |
 |---|---|---|
 | `rmrp_bp16_meringls63amg24.json` | `rmrp_bp16_meringls63amg24/dlc.rpf`, a FiveM vehicle add-on, unencrypted | Independently walked in Python before this fixture existed. The two readings agree on every field of all 27 file entries and all 6 directory entries — zero disagreements |
+
+## Interoperation
+
+On 2026-08-26 the sample was rebuilt by `rpf-core` — tight-packed, 65,160,704
+bytes against the original's 144,504,832 — and the **reference implementation
+read the result**: 3 archives, 25 leaf files, every checksum identical to the
+row above. Neither implementation was written against the other's output.
+
+That is the strongest evidence available without a game to load the archive.
+It says the writer produces something a different reader understands. It does
+not say the runtime will accept it, and R0.5 remains the only thing that would.
+
+Reproduce it with:
+
+```
+RPF_CORPUS=/path/to/corpus RPF_REQUIRE_CORPUS=1 RPF_REBUILD_OUT=/tmp/rebuilt.rpf \
+    cargo test --test roundtrip
+cd tools/oracle && cargo run --release -- /tmp/rebuilt.rpf
+```
 
 That agreement is the reason this fixture is worth committing. A fixture can be
 wrong in the same way its oracle is wrong (DR-005); two independent readings

@@ -1,3 +1,10 @@
 # Lint *levels* live in the workspace manifest. Only parameterised tool
 # configuration belongs here. docs/conventions.md §15.
 too-many-arguments-threshold = 6
+
+# A panic in a test is the reporting mechanism, not a crash. docs/conventions.md
+# §15 states this exception; these are what implement it.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

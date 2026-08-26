@@ -8,4 +8,18 @@
 //! it comes from. A fact is encoded here exactly once (§3), so that changing it
 //! is one edit rather than a search.
 
+pub mod archive;
+pub mod build;
+pub mod entry;
+pub mod error;
 pub mod format;
+pub mod manifest;
+
+pub use archive::Archive;
+pub use build::{
+    FileKind, FileSpec, Report, Storage, build, directories_of, rebuild, replace_at, replace_many,
+    specs_of,
+};
+pub use entry::{Entry, EntryKind};
+pub use error::{Category, Error, Result};
+pub use manifest::{MANIFEST_NAME, Manifest};

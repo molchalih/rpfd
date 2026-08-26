@@ -4,6 +4,11 @@
 assets/
 fixtures/corpus/
 
+# Design notes, decision records and the backlog. Present in the working tree
+# and deliberately untracked: they are how the work is thought through, not what
+# the work ships.
+docs/
+
 # Extracted key material. Derived from a local game install; never redistributed.
 keys/
 *.keys
