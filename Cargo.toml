@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/rpf-core", "crates/rpf"]
+# DR-007: the oracle generator links the reference implementation. It must not
+# appear in a default build, in continuous integration, or in anything shipped.
+# It is built deliberately, run once per corpus change, and what gets committed
+# is its output. tools/oracle/README.md says how to run it.
+exclude = ["tools/oracle"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.dependencies]
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+thiserror = "2.0"
+
+# One place decides the lint levels; every member opts in with
+# `lints.workspace = true`. docs/conventions.md §15 states what each row buys.
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+# §6 — an archive is third-party data, and some of it is malformed on purpose.
+# Every lint below turns a class of reachable panic into a compile error.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_lossless = "deny"

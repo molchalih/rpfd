@@ -1,0 +1,41 @@
+# Licence and advisory gate. DR-007 permits porting from MIT-licensed reference
+# implementations with attribution; this is what keeps that permission from
+# quietly becoming a licence problem. docs/conventions.md §15.
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+# Permissive only. A copyleft dependency would contradict the distribution shape
+# in DR-001 — a single static binary handed to whoever wants it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+# The list above is a policy about what may be depended on, not an inventory of
+# what currently is. An entry nothing matches yet is not a finding.
+unused-allowed-license = "allow"
+
+# This project's own crates are `publish = false` and carry no license field,
+# because the project has not chosen one — R8.5 in docs/backlog.md. That is a
+# decision to make, not a dependency to audit, so it is not this tool's job.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# `rpf` depends on `rpf-core` by path with no version, which is a wildcard by
+# the letter of the rule and unavoidable between unpublished workspace members.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

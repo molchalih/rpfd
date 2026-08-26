@@ -1,0 +1,6 @@
+# Pinned so that `-D warnings` means the same thing for everyone. Lint levels
+# move between compiler releases; a floating toolchain turns continuous
+# integration into a lottery. docs/conventions.md §15.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

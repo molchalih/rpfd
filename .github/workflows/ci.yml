@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is pinned in rust-toolchain.toml so that `-D warnings`
+      # means the same here as it does locally. docs/conventions.md §15.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # No corpus is present here, and none ever will be: DR-006 keeps game
+      # data out of tracked content. The suite must pass anyway, skipping what
+      # it cannot reach and saying what it skipped. docs/backlog.md R8.4.
+      - run: cargo test --all
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

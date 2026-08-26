@@ -1,0 +1,15 @@
+# Deliberately outside the workspace. See the exclude note in the root manifest
+# and DR-007. This crate exists to be run by hand and to leave fixtures behind.
+[package]
+name = "oracle"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+rpf-archive = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"

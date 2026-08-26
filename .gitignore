@@ -1,0 +1,20 @@
+# Third-party game archives and extracted assets. Never tracked: redistribution
+# is not ours to grant, and 195 MB of binaries poisons clone time for a repo
+# whose tracked content is text.
+assets/
+fixtures/corpus/
+
+# Extracted key material. Derived from a local game install; never redistributed.
+keys/
+*.keys
+
+# Rust
+target/
+**/*.rs.bk
+
+# Node (editor client)
+node_modules/
+dist/
+*.vsix
+
+.DS_Store

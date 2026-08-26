@@ -1,0 +1,437 @@
+{
+  "generator": {
+    "tool": "tools/oracle",
+    "reference_implementation": "rpf-archive 0.7.1",
+    "extraction_semantics": "binary entries: inflated contents. resource entries: 16-byte RSC7 header followed by the still-deflated body, which is the file as it exists outside the archive. Nested archives are descended into, not emitted."
+  },
+  "source": {
+    "name": "dlc.rpf",
+    "len": 144504832,
+    "sha256": "bdbc7553b0cada5667b77dd702bf8bee0b2b2642e15ed16d52f1e2ebd8041fff"
+  },
+  "archives": [
+    {
+      "path": "dlc.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 11,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 4,
+          "entries_index": 1
+        },
+        {
+          "name": "content.xml",
+          "kind": "binary",
+          "file_offset": 1,
+          "file_size": 488,
+          "is_encrypted": 0,
+          "uncompressed_size": 2199
+        },
+        {
+          "name": "data",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 5
+        },
+        {
+          "name": "setup2.xml",
+          "kind": "binary",
+          "file_offset": 8,
+          "file_size": 297,
+          "is_encrypted": 0,
+          "uncompressed_size": 559
+        },
+        {
+          "name": "x64",
+          "kind": "directory",
+          "entries_count": 2,
+          "entries_index": 8
+        },
+        {
+          "name": "carvariations.meta",
+          "kind": "binary",
+          "file_offset": 2,
+          "file_size": 393,
+          "is_encrypted": 0,
+          "uncompressed_size": 1445
+        },
+        {
+          "name": "dlctext.meta",
+          "kind": "binary",
+          "file_offset": 3,
+          "file_size": 131,
+          "is_encrypted": 0,
+          "uncompressed_size": 191
+        },
+        {
+          "name": "vehicles.meta",
+          "kind": "binary",
+          "file_offset": 4,
+          "file_size": 1631,
+          "is_encrypted": 0,
+          "uncompressed_size": 5100
+        },
+        {
+          "name": "vehiclemods",
+          "kind": "directory",
+          "entries_count": 1,
+          "entries_index": 10
+        },
+        {
+          "name": "vehicles.rpf",
+          "kind": "binary",
+          "file_offset": 159947,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 62611968
+        },
+        {
+          "name": "meringls63amg24_mods.rpf",
+          "kind": "binary",
+          "file_offset": 9,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 2544128
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/vehicles.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 4,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 1
+        },
+        {
+          "name": "meringls63amg24.yft",
+          "kind": "resource",
+          "file_offset": 100476,
+          "file_size": 11168053,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2701394630
+        },
+        {
+          "name": "meringls63amg24.ytd",
+          "kind": "resource",
+          "file_offset": 98908,
+          "file_size": 802444,
+          "graphics_flags": 3506569224,
+          "is_encrypted": 0,
+          "system_flags": 131072
+        },
+        {
+          "name": "meringls63amg24_hi.yft",
+          "kind": "resource",
+          "file_offset": 36782,
+          "file_size": 11168055,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2701394630
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/meringls63amg24_mods.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 18,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 17,
+          "entries_index": 1
+        },
+        {
+          "name": "meringls63amg24_brabus_diffuser_1.yft",
+          "kind": "resource",
+          "file_offset": 4686,
+          "file_size": 144727,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354577
+        },
+        {
+          "name": "meringls63amg24_brabus_exhaust_1.yft",
+          "kind": "resource",
+          "file_offset": 285,
+          "file_size": 167813,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354705
+        },
+        {
+          "name": "meringls63amg24_brabus_fender_1.yft",
+          "kind": "resource",
+          "file_offset": 614,
+          "file_size": 103150,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354577
+        },
+        {
+          "name": "meringls63amg24_brabus_fender_2.yft",
+          "kind": "resource",
+          "file_offset": 3579,
+          "file_size": 143817,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354577
+        },
+        {
+          "name": "meringls63amg24_brabus_grill_1.yft",
+          "kind": "resource",
+          "file_offset": 4240,
+          "file_size": 127621,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354640
+        },
+        {
+          "name": "meringls63amg24_brabus_splitter_1.yft",
+          "kind": "resource",
+          "file_offset": 1343,
+          "file_size": 117012,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354577
+        },
+        {
+          "name": "meringls63amg24_brabus_spoiler_1.yft",
+          "kind": "resource",
+          "file_offset": 1572,
+          "file_size": 38495,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354592
+        },
+        {
+          "name": "meringls63amg24_mansory_bumper_f_1.yft",
+          "kind": "resource",
+          "file_offset": 4111,
+          "file_size": 37148,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684485664
+        },
+        {
+          "name": "meringls63amg24_mansory_bumper_r_1.yft",
+          "kind": "resource",
+          "file_offset": 1721,
+          "file_size": 13752,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354688
+        },
+        {
+          "name": "meringls63amg24_mansory_diffuser_1.yft",
+          "kind": "resource",
+          "file_offset": 1748,
+          "file_size": 179668,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2701393937
+        },
+        {
+          "name": "meringls63amg24_mansory_door_dside_r_1.yft",
+          "kind": "resource",
+          "file_offset": 4184,
+          "file_size": 28183,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684356736
+        },
+        {
+          "name": "meringls63amg24_mansory_door_pside_r_1.yft",
+          "kind": "resource",
+          "file_offset": 2154,
+          "file_size": 28292,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684356736
+        },
+        {
+          "name": "meringls63amg24_mansory_exhaust_1.yft",
+          "kind": "resource",
+          "file_offset": 2210,
+          "file_size": 49556,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354720
+        },
+        {
+          "name": "meringls63amg24_mansory_fender_1.yft",
+          "kind": "resource",
+          "file_offset": 2307,
+          "file_size": 264636,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354626
+        },
+        {
+          "name": "meringls63amg24_mansory_grill_1.yft",
+          "kind": "resource",
+          "file_offset": 4490,
+          "file_size": 100174,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354577
+        },
+        {
+          "name": "meringls63amg24_mansory_splitter_1.yft",
+          "kind": "resource",
+          "file_offset": 3020,
+          "file_size": 253501,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354578
+        },
+        {
+          "name": "meringls63amg24_mansory_spoiler_1.yft",
+          "kind": "resource",
+          "file_offset": 3516,
+          "file_size": 32170,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354592
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "carvariations.meta",
+      "len": 1445,
+      "sha256": "cbaba504c9ae3c8a8f70ddd5efd40b8f9998e71eaf638b158df1f92a8bc004d1"
+    },
+    {
+      "path": "content.xml",
+      "len": 2199,
+      "sha256": "3a06119565c1ef191052c2287774761a6d4a82f3ee31c51b4afcc88c2dfbf359"
+    },
+    {
+      "path": "dlctext.meta",
+      "len": 191,
+      "sha256": "1cb8688fbc64687933f29117bcc20d307a15baa1876bed02f1d65575f5fb9a86"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_diffuser_1.yft",
+      "len": 144727,
+      "sha256": "3f48a4901008a35016f76aabe3ce1136c1c2e52b0110ac478a67651501ed3479"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_exhaust_1.yft",
+      "len": 167813,
+      "sha256": "3dcec7298cef6db055a16fc6c487370d3f2723d394f1f8ac3cad3451a223e8f9"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_fender_1.yft",
+      "len": 103150,
+      "sha256": "59ad44d3cc2c7c9ff155b7d077852da8f49058beab8b0edae6287d12627b4d47"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_fender_2.yft",
+      "len": 143817,
+      "sha256": "fc2a3ffa7f625182b333589a9be9ad3dc6d27b2e013ff29518dd34b68f1b1375"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_grill_1.yft",
+      "len": 127621,
+      "sha256": "9e0976c3e9e0c0fbbe95539d60c9492997bbda619bfa1aa64bdaba01415a1529"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_splitter_1.yft",
+      "len": 117012,
+      "sha256": "7f16d941bad7c70e366c6cc695ae724bd64dc8c0724011ffccf867deab41d98a"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_brabus_spoiler_1.yft",
+      "len": 38495,
+      "sha256": "93384fb44e073186e0e2b605f8e1b47b30e760448404d73a4ca7e1fbaf607745"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_bumper_f_1.yft",
+      "len": 37148,
+      "sha256": "fbb95fb2cb16c4661795a7d715be50dac43583bb0e7c601557ffca6faa3208fa"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_bumper_r_1.yft",
+      "len": 13752,
+      "sha256": "8b802903b910b7ebbc179a094055b0ccacb0beae5ca0da667cf369d71f0e1f64"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_diffuser_1.yft",
+      "len": 179668,
+      "sha256": "2dfe29ed2582c180b81d360ff75f19c87b4bb810ee0fa91bfc043a47505de840"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_door_dside_r_1.yft",
+      "len": 28183,
+      "sha256": "9ee4171ea726af4324ea4cfeaf54715c42d6ca8a7556ff2ae068fd77b8fc7512"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_door_pside_r_1.yft",
+      "len": 28292,
+      "sha256": "0b525acbc547eab325bb3071c33c1a1b4e8f4798da0b996c76623b8fe5792cc8"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_exhaust_1.yft",
+      "len": 49556,
+      "sha256": "cc6b92bb8928290aa2a4f8fcd4ecdd2e4e9a95e67713dd37c1ff7022d6b69075"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_fender_1.yft",
+      "len": 264636,
+      "sha256": "ebc4873f2d87acb8f36c162d4daae1774910c360cae0c19bd5b7ee65ec5b62b7"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_grill_1.yft",
+      "len": 100174,
+      "sha256": "0a23413e2310ee86683412f496b311cf4b99f6b89bf75991f1d0270eb86a6af4"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_splitter_1.yft",
+      "len": 253501,
+      "sha256": "9f2b0f4e7d06be9628340373614494b3a267dc88bb86bcf687943235f4952254"
+    },
+    {
+      "path": "meringls63amg24_mods.rpf/meringls63amg24_mansory_spoiler_1.yft",
+      "len": 32170,
+      "sha256": "e7f90019426273de885780d816621b99866292fb39bc8f408b71d0e433089a99"
+    },
+    {
+      "path": "setup2.xml",
+      "len": 559,
+      "sha256": "dc0cbe2dfc84b76abd5d86c222f4f0b7109ca7af7ecfc1a33a8e25192c16568d"
+    },
+    {
+      "path": "vehicles.meta",
+      "len": 5100,
+      "sha256": "f55727ad1917dceaffe307e7f94b7d36eaa07d6b7daf515b34b259b68a80c8a8"
+    },
+    {
+      "path": "vehicles.rpf/meringls63amg24.yft",
+      "len": 11168053,
+      "sha256": "aea773377b5c9687fad408635eebc681c2dee419bd7ce39324f66cf332f97fc9"
+    },
+    {
+      "path": "vehicles.rpf/meringls63amg24.ytd",
+      "len": 802444,
+      "sha256": "f201ecf8e140a8fc49ef3cbe863be3af6cdf292567309e3ee96c875658265055"
+    },
+    {
+      "path": "vehicles.rpf/meringls63amg24_hi.yft",
+      "len": 11168055,
+      "sha256": "9d0c1f423d7360900fd37a6a404b7af2981ac30d36c4932e6f276339321a1659"
+    }
+  ]
+}
