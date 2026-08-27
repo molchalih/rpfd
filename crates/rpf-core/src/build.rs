@@ -18,13 +18,14 @@ use std::{
 use flate2::{Compression, write::DeflateEncoder};
 
 use crate::{
-    archive::Archive,
-    entry::EntryKind,
+    archive::{Archive, MAX_DEPTH},
+    entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
         BLOCK_LEN, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7, MAGIC_RSC7, RESOURCE_FLAG,
-        RESOURCE_HEADER_LEN,
+        RESOURCE_HEADER_LEN, folded, payload_floor, u32_at,
     },
+    watch::{Flow, Step, Watch},
 };
 
 /// Largest value a 24-bit size field holds.
@@ -87,11 +88,72 @@ struct Dir {
     /// name order — measured on all 6 directories of the sample. Whether the
     /// runtime *requires* it is Q1, still open.
     children: BTreeMap<String, Child>,
+    /// Each child's name folded the way readers compare it, mapping to the one
+    /// spelling that took it. See [`crate::format::folded`], which is the same
+    /// rule `Archive::child_named` resolves by: two children of one directory
+    /// differing only in case are one name at runtime, and the second is
+    /// unreachable by any spelling of its own path — including its own.
+    folded: HashMap<String, String>,
 }
 
+#[derive(Clone, Copy)]
 enum Child {
     Dir(usize),
     File(usize),
+}
+
+/// The child of `dir` that `name` would resolve to, or `None` if the name is
+/// free.
+///
+/// Fails when a child is already there under a different spelling of the same
+/// folded name: the two are indistinguishable to a reader, so writing both
+/// loses one of them.
+fn taken(dir: &Dir, path: &str, name: &str) -> Result<Option<Child>> {
+    let Some(exact) = dir.folded.get(&folded(name)) else {
+        return Ok(None);
+    };
+    if exact != name {
+        return Err(Error::BadPath {
+            path: path.to_owned(),
+            reason: "two children of one directory differ only in case",
+        });
+    }
+    Ok(dir.children.get(exact).copied())
+}
+
+/// Records `name` as taken within the directory at `parent`.
+fn claim(arena: &mut [Dir], parent: usize, path: &str, name: &str, child: Child) -> Result<()> {
+    let dir = arena.get_mut(parent).ok_or(Error::BadPath {
+        path: path.to_owned(),
+        reason: "unreachable parent",
+    })?;
+    dir.children.insert(name.to_owned(), child);
+    dir.folded.insert(folded(name), name.to_owned());
+    Ok(())
+}
+
+/// Resolves one path component to the directory it names, creating it if the
+/// name is free.
+fn descend(arena: &mut Vec<Dir>, parent: usize, path: &str, segment: &str) -> Result<usize> {
+    let dir = arena.get(parent).ok_or(Error::BadPath {
+        path: path.to_owned(),
+        reason: "unreachable parent",
+    })?;
+    match taken(dir, path, segment)? {
+        Some(Child::Dir(id)) => Ok(id),
+        // Silently replacing the file would drop it from the tree, and its
+        // contents would never be fetched or written.
+        Some(Child::File(_)) => Err(Error::BadPath {
+            path: path.to_owned(),
+            reason: "a file and a directory share one name",
+        }),
+        None => {
+            arena.push(Dir::default());
+            let created = arena.len().saturating_sub(1);
+            claim(arena, parent, path, segment, Child::Dir(created))?;
+            Ok(created)
+        }
+    }
 }
 
 /// An entry with its position decided but its payload not yet written.
@@ -124,32 +186,41 @@ fn align_up(value: u64) -> Option<u64> {
     value.checked_add(BLOCK_LEN.checked_sub(over)?)
 }
 
+/// Refuses a path that would put an entry deeper than a reader will walk.
+///
+/// §8: every write path has a read path that verifies it, and `Archive::parse`
+/// refuses a tree deeper than [`MAX_DEPTH`]. Without this, `pack` would write
+/// an archive that this crate's own reader declines to open — the stated top
+/// risk with the failure moved one step later.
+///
+/// `segments` counts the path's own components, which is the depth of the entry
+/// it becomes: a file in the root is depth 1, and so is a directory named
+/// there.
+fn check_path_depth(segments: usize) -> Result<()> {
+    let depth = u32::try_from(segments).unwrap_or(u32::MAX);
+    if depth > MAX_DEPTH {
+        return Err(Error::TooDeep {
+            what: "directory tree",
+            depth,
+            limit: MAX_DEPTH,
+        });
+    }
+    Ok(())
+}
+
 /// Builds the directory tree, returning the arena and the root's id.
 fn plan_tree(files: &[FileSpec], directories: &[String]) -> Result<Vec<Dir>> {
     let mut arena: Vec<Dir> = vec![Dir::default()];
-    let mut lookup: HashMap<(usize, String), usize> = HashMap::new();
 
     // Directories named outright, so that one holding no files still survives a
     // round trip. Files create their own parents below; this adds only what
     // nothing else would.
     for directory in directories {
+        let segments: Vec<&str> = directory.split('/').filter(|s| !s.is_empty()).collect();
+        check_path_depth(segments.len())?;
         let mut current = 0_usize;
-        for segment in directory.split('/').filter(|s| !s.is_empty()) {
-            let key = (current, segment.to_owned());
-            current = if let Some(&existing) = lookup.get(&key) {
-                existing
-            } else {
-                arena.push(Dir::default());
-                let created = arena.len().saturating_sub(1);
-                lookup.insert(key, created);
-                let slot = arena.get_mut(current).ok_or(Error::BadPath {
-                    path: directory.clone(),
-                    reason: "unreachable parent",
-                })?;
-                slot.children
-                    .insert(segment.to_owned(), Child::Dir(created));
-                created
-            };
+        for segment in segments {
+            current = descend(&mut arena, current, directory, segment)?;
         }
     }
 
@@ -167,40 +238,24 @@ fn plan_tree(files: &[FileSpec], directories: &[String]) -> Result<Vec<Dir>> {
                 reason: "empty component",
             });
         }
+        check_path_depth(segments.len())?;
 
         let mut current = 0_usize;
         for segment in parents {
-            let key = (current, (*segment).to_owned());
-            current = if let Some(&existing) = lookup.get(&key) {
-                existing
-            } else {
-                arena.push(Dir::default());
-                let created = arena.len().saturating_sub(1);
-                lookup.insert(key, created);
-                let slot = arena.get_mut(current).ok_or(Error::BadPath {
-                    path: spec.path.clone(),
-                    reason: "unreachable parent",
-                })?;
-                slot.children
-                    .insert((*segment).to_owned(), Child::Dir(created));
-                created
-            };
+            current = descend(&mut arena, current, &spec.path, segment)?;
         }
 
-        let slot = arena.get_mut(current).ok_or(Error::BadPath {
+        let dir = arena.get(current).ok_or(Error::BadPath {
             path: spec.path.clone(),
             reason: "unreachable parent",
         })?;
-        if slot
-            .children
-            .insert((*name).to_owned(), Child::File(index))
-            .is_some()
-        {
+        if taken(dir, &spec.path, name)?.is_some() {
             return Err(Error::BadPath {
                 path: spec.path.clone(),
                 reason: "duplicate",
             });
         }
+        claim(&mut arena, current, &spec.path, name, Child::File(index))?;
     }
     Ok(arena)
 }
@@ -289,16 +344,64 @@ fn plan_names(planned: &[Planned]) -> Result<(Vec<u8>, Vec<u32>)> {
 }
 
 /// The payload of one file, ready to write, and the fields describing it.
-struct Prepared {
-    bytes: Vec<u8>,
-    compressed_len: u32,
-    word_at_8: u32,
-    word_at_12: u32,
-    resource: bool,
+///
+/// `compressed_len` is left wide on purpose. Narrowing it to the entry's 24-bit
+/// field is [`file_row`]'s job and nobody else's, so a value that will not fit
+/// arrives there to be refused rather than being quietly cut down on the way.
+pub(crate) struct Prepared {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) compressed_len: u64,
+    pub(crate) word_at_8: u32,
+    pub(crate) word_at_12: u32,
+    pub(crate) resource: bool,
 }
 
-/// Applies the storage rule to one file's contents.
-fn prepare(path: &str, kind: FileKind, contents: Vec<u8>) -> Result<Prepared> {
+/// The storage rule an existing entry carries, as the [`FileKind`] that spells
+/// it for a write.
+///
+/// One spelling of one question (§4): a rebuild asks it through [`specs_of`],
+/// and an in-place patch asks it to apply the same rule to a new payload.
+/// Deriving it separately in each is how they came to disagree.
+///
+/// # Errors
+///
+/// [`Error::WrongKind`] for a directory, which has no payload to store.
+pub(crate) fn kind_of(index: u32, entry: &Entry) -> Result<FileKind> {
+    match entry.kind {
+        EntryKind::Directory { .. } => Err(Error::WrongKind {
+            entry: index,
+            found: "directory",
+            wanted: "file",
+        }),
+        EntryKind::Resource { .. } => Ok(FileKind::Resource),
+        EntryKind::Binary {
+            compressed_len,
+            encryption,
+            ..
+        } => Ok(FileKind::Binary {
+            storage: if compressed_len == 0 {
+                Storage::Stored
+            } else {
+                Storage::Deflate
+            },
+            encryption,
+        }),
+    }
+}
+
+/// Applies a storage rule to one file's contents.
+///
+/// The one implementation of it. A rebuild reaches it with the rule the caller
+/// asked for and a patch with the rule the entry already carries, but the rule
+/// is applied here in both cases — the two used to apply it separately, and a
+/// resource over the 24-bit size field was refused by one and truncated by the
+/// other.
+///
+/// # Errors
+///
+/// [`Error::NotAResource`] for a resource whose payload is not one, and
+/// [`Error::FieldOverflow`] for contents too long for the entry's fields.
+pub(crate) fn prepare(path: &str, kind: FileKind, contents: Vec<u8>) -> Result<Prepared> {
     let plain_len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
 
     match kind {
@@ -317,15 +420,15 @@ fn prepare(path: &str, kind: FileKind, contents: Vec<u8>) -> Result<Prepared> {
                     path: path.to_owned(),
                 });
             }
-            check(path, "resource size", plain_len, MAX_SIZE_24)?;
             // The flags are the payload's own, at offsets 8 and 12 of its
-            // RSC7 header, and they are what the entry duplicates.
-            let word_at_8 = word(&contents, 8);
-            let word_at_12 = word(&contents, 12);
-            let compressed_len = u32::try_from(plain_len).unwrap_or(u32::MAX);
+            // RSC7 header, and they are what the entry duplicates. Both are
+            // inside the sixteen bytes checked just above, so the default is
+            // unreachable rather than a guess at a truncated header.
+            let word_at_8 = u32_at(&contents, 8).unwrap_or_default();
+            let word_at_12 = u32_at(&contents, 12).unwrap_or_default();
             Ok(Prepared {
                 bytes: contents,
-                compressed_len,
+                compressed_len: plain_len,
                 word_at_8,
                 word_at_12,
                 resource: true,
@@ -357,10 +460,9 @@ fn prepare(path: &str, kind: FileKind, contents: Vec<u8>) -> Result<Prepared> {
                 // Deflating has to pay for itself, and it has to fit the field.
                 // Falling back to stored is R4.4, not a workaround.
                 if deflated_len < plain_len && deflated_len <= MAX_SIZE_24 {
-                    let compressed_len = u32::try_from(deflated_len).unwrap_or(u32::MAX);
                     return Ok(Prepared {
                         bytes: deflated,
-                        compressed_len,
+                        compressed_len: deflated_len,
                         word_at_8: uncompressed,
                         word_at_12: encryption,
                         resource: false,
@@ -381,15 +483,6 @@ fn prepare(path: &str, kind: FileKind, contents: Vec<u8>) -> Result<Prepared> {
     }
 }
 
-/// Reads a little-endian word, zero if it does not fit.
-fn word(bytes: &[u8], at: usize) -> u32 {
-    let raw: [u8; 4] = bytes
-        .get(at..at.saturating_add(4))
-        .and_then(|s| s.try_into().ok())
-        .unwrap_or_default();
-    u32::from_le_bytes(raw)
-}
-
 /// Fails when a value will not fit its field.
 fn check(path: &str, what: &'static str, len: u64, limit: u64) -> Result<()> {
     if len > limit {
@@ -403,23 +496,62 @@ fn check(path: &str, what: &'static str, len: u64, limit: u64) -> Result<()> {
     Ok(())
 }
 
-/// Writes every payload at its aligned position, returning the entry rows.
+/// The tree as it will be written: the files as specified, the entries they
+/// became, and the name offset of each.
+///
+/// Grouped because they are one thing — three parallel slices that only mean
+/// anything together, and passing them singly put `write_payloads` over the
+/// argument limit `clippy.toml` sets.
+struct Layout<'a> {
+    files: &'a [FileSpec],
+    planned: &'a [Planned],
+    name_offsets: &'a [u32],
+}
+
+/// Writes every payload at its aligned position, returning the entry rows and
+/// the offset one past the **last byte actually written** — zero when nothing
+/// was, which includes an archive whose every payload is empty.
 ///
 /// `cursor` enters at the first payload's offset and leaves at the archive's
 /// end. One file is resident at a time; the archive never is.
+///
+/// That second value is where padding may begin, and it is deliberately neither
+/// `cursor`, which is rounded up to the next block, nor the position the last
+/// payload was written *at*. Both readings have been wrong here:
+///
+/// - `cursor` is one block too far when a payload ends on a boundary, and a
+///   byte written at `cursor - 1` to stretch the file to that length lands on
+///   the payload's own last byte;
+/// - the last payload's start is too far when that payload is **empty**. A
+///   `write_all` of no bytes extends no file, so the highest byte written is
+///   still the previous payload's, and padding forward from the empty
+///   payload's own start pads nothing. The archive is then short of the length
+///   its entries describe, and its last entry addresses past the end of it.
+///
+/// So it is the high-water mark of the writes themselves, and only a write with
+/// bytes in it moves it.
+///
+/// `watch` is stepped once per file written, and can stop the write. DR-008.
 fn write_payloads<W, F>(
     out: &mut W,
-    files: &[FileSpec],
-    planned: &[Planned],
-    name_offsets: &[u32],
+    layout: &Layout<'_>,
     cursor: &mut u64,
     fetch: &mut F,
-) -> Result<Vec<[u8; 16]>>
+    watch: &mut impl Watch,
+) -> Result<(Vec<[u8; 16]>, u64)>
 where
     W: Write + Seek,
     F: FnMut(&str) -> Result<Vec<u8>>,
 {
+    let Layout {
+        files,
+        planned,
+        name_offsets,
+    } = *layout;
     let mut rows = Vec::with_capacity(planned.len());
+    let total = u32::try_from(files.len()).unwrap_or(u32::MAX);
+    let mut done = 0_u32;
+    let mut end = 0_u64;
 
     for (index, entry) in planned.iter().enumerate() {
         let name_offset = name_offsets.get(index).copied().unwrap_or_default();
@@ -444,13 +576,9 @@ where
 
         let at = *cursor;
         let block = at / BLOCK_LEN;
-        check(&spec.path, "block offset", block, MAX_BLOCK)?;
-        check(
-            &spec.path,
-            "file name offset",
-            u64::from(name_offset),
-            MAX_FILE_NAME_OFFSET,
-        )?;
+        // The row is built before the payload goes out, so a value the entry
+        // cannot describe is refused with nothing written for it.
+        let row = file_row(&spec.path, name_offset, block, &prepared)?;
 
         out.seek(SeekFrom::Start(at))
             .map_err(|source| Error::Io { offset: at, source })?;
@@ -458,6 +586,13 @@ where
             .map_err(|source| Error::Io { offset: at, source })?;
 
         let written = u64::try_from(prepared.bytes.len()).unwrap_or(u64::MAX);
+        // Only a write that put bytes somewhere moves the high-water mark. An
+        // empty payload leaves the sink exactly as long as it was, so claiming
+        // its start as the end of what was written loses everything between
+        // there and the previous payload's last byte.
+        if written > 0 {
+            end = at.saturating_add(written);
+        }
         *cursor = align_up(at.saturating_add(written)).ok_or(Error::FieldOverflow {
             path: spec.path.clone(),
             what: "archive length",
@@ -465,16 +600,21 @@ where
             limit: u64::MAX,
         })?;
 
-        rows.push(file_row(
-            name_offset,
-            prepared.compressed_len,
-            u32::try_from(block).unwrap_or(u32::MAX),
-            prepared.resource,
-            prepared.word_at_8,
-            prepared.word_at_12,
-        ));
+        rows.push(row);
+
+        // After the write, not before: a step reports what has happened.
+        done = done.saturating_add(1);
+        let flow = watch.step(Step {
+            path: &spec.path,
+            done,
+            total,
+            bytes: *cursor,
+        });
+        if flow == Flow::Stop {
+            return Err(Error::Cancelled { done, total });
+        }
     }
-    Ok(rows)
+    Ok((rows, end))
 }
 
 /// Writes an archive containing `files`, taking each one's contents from
@@ -495,6 +635,7 @@ pub fn build<W, F>(
     files: &[FileSpec],
     directories: &[String],
     mut fetch: F,
+    watch: &mut impl Watch,
 ) -> Result<Report>
 where
     W: Write + Seek,
@@ -513,18 +654,23 @@ where
     let names_len = u32::try_from(names_blob.len()).unwrap_or(u32::MAX);
 
     let table_len = u64::from(entry_count).saturating_mul(ENTRY_LEN);
-    let header_region = HEADER_LEN
-        .saturating_add(table_len)
-        .saturating_add(u64::from(names_len));
-    let mut cursor = align_up(header_region).ok_or(Error::FieldOverflow {
+    // The same sum `Archive` checks every payload offset against, so an archive
+    // laid out here cannot have its first payload refused by the reader.
+    let floor = payload_floor(u64::from(entry_count), u64::from(names_len));
+    let mut cursor = align_up(floor).ok_or(Error::FieldOverflow {
         path: String::new(),
         what: "archive length",
-        len: header_region,
+        len: floor,
         limit: u64::MAX,
     })?;
 
     // Payloads first, at their aligned positions, one file resident at a time.
-    let rows = write_payloads(out, files, &planned, &name_offsets, &mut cursor, &mut fetch)?;
+    let layout = Layout {
+        files,
+        planned: &planned,
+        name_offsets: &name_offsets,
+    };
+    let (rows, payload_end) = write_payloads(out, &layout, &mut cursor, &mut fetch, watch)?;
 
     // Then the header, the table and the names, now that every offset is known.
     out.seek(SeekFrom::Start(0))
@@ -548,17 +694,36 @@ where
     })?;
 
     // Pad to the last block so the archive's length matches what the entries
-    // describe. Slack is zero here by construction; real archives carry stale
-    // bytes in it, which is a thing to tolerate on read, not to reproduce.
-    out.seek(SeekFrom::Start(cursor.saturating_sub(1)))
-        .map_err(|source| Error::Io {
-            offset: cursor,
-            source,
-        })?;
-    out.write_all(&[0]).map_err(|source| Error::Io {
-        offset: cursor,
-        source,
-    })?;
+    // describe. It is written from the end of what was written, never backwards
+    // from `cursor`: when the last payload ends exactly on a block boundary
+    // there is nothing to pad, and a byte written at `cursor - 1` to stretch
+    // the file is that payload's own last byte. Nothing catches it afterwards —
+    // the archive parses, the row is right, and a stored entry has no checksum
+    // and no deflate stream to disagree with.
+    //
+    // Slack is written zero rather than left as a hole: real archives carry
+    // stale bytes there, which is a thing to tolerate on read and not to
+    // reproduce (§8).
+    //
+    // Where padding begins: past the last byte any payload wrote, or past the
+    // names blob when no payload wrote one — which covers both an archive with
+    // no files and an archive whose payloads are all empty.
+    let written_to = payload_end.max(floor);
+    // Under one block by construction — `cursor` is `written_to` rounded up to
+    // the next boundary — so the conversion cannot lose anything.
+    let pad = usize::try_from(cursor.saturating_sub(written_to)).unwrap_or_default();
+    if pad > 0 {
+        out.seek(SeekFrom::Start(written_to))
+            .map_err(|source| Error::Io {
+                offset: written_to,
+                source,
+            })?;
+        out.write_all(&vec![0_u8; pad])
+            .map_err(|source| Error::Io {
+                offset: written_to,
+                source,
+            })?;
+    }
     out.flush().map_err(|source| Error::Io {
         offset: cursor,
         source,
@@ -583,27 +748,51 @@ fn directory_row(name_offset: u32, first_child: u32, child_count: u32) -> [u8; 1
 
 /// One file row: a 16-bit name offset, a 24-bit size and a 24-bit block, then
 /// two words whose meaning depends on the resource bit.
-fn file_row(
+///
+/// Every narrow field is checked **here**, where the narrowing happens, rather
+/// than by whoever calls it. A row is sixteen bytes of truncation waiting to
+/// happen — the compressed size is written as the low three bytes of a wider
+/// value, and dropping the top byte produces an entry that describes a
+/// fraction of its own payload and reads back without complaint. The two
+/// callers used to check different subsets of these, so one of them wrote that
+/// row. A value that will not fit the format cannot now become a row at all.
+///
+/// # Errors
+///
+/// [`Error::FieldOverflow`] for a value the row cannot represent.
+pub(crate) fn file_row(
+    path: &str,
     name_offset: u32,
-    compressed_len: u32,
-    block: u32,
-    resource: bool,
-    word_at_8: u32,
-    word_at_12: u32,
-) -> [u8; 16] {
-    let mut row = [0_u8; 16];
-    let name = u16::try_from(name_offset).unwrap_or(u16::MAX);
-    row[0..2].copy_from_slice(&name.to_le_bytes());
-    row[2..5].copy_from_slice(&compressed_len.to_le_bytes()[..3]);
-    let offset_field = if resource {
-        block | RESOURCE_FLAG
+    block: u64,
+    prepared: &Prepared,
+) -> Result<[u8; 16]> {
+    check(
+        path,
+        "file name offset",
+        u64::from(name_offset),
+        MAX_FILE_NAME_OFFSET,
+    )?;
+    check(
+        path,
+        "compressed size",
+        prepared.compressed_len,
+        MAX_SIZE_24,
+    )?;
+    check(path, "block offset", block, MAX_BLOCK)?;
+
+    let offset_field = if prepared.resource {
+        block | u64::from(RESOURCE_FLAG)
     } else {
         block
     };
+
+    let mut row = [0_u8; 16];
+    row[0..2].copy_from_slice(&name_offset.to_le_bytes()[..2]);
+    row[2..5].copy_from_slice(&prepared.compressed_len.to_le_bytes()[..3]);
     row[5..8].copy_from_slice(&offset_field.to_le_bytes()[..3]);
-    row[8..12].copy_from_slice(&word_at_8.to_le_bytes());
-    row[12..16].copy_from_slice(&word_at_12.to_le_bytes());
-    row
+    row[8..12].copy_from_slice(&prepared.word_at_8.to_le_bytes());
+    row[12..16].copy_from_slice(&prepared.word_at_12.to_le_bytes());
+    Ok(row)
 }
 
 /// The specification that would rebuild an archive as it stands, paired with
@@ -622,22 +811,10 @@ pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
     let mut out = Vec::new();
     for index in 0..count {
         let entry = archive.entry(index)?;
-        let kind = match entry.kind {
-            EntryKind::Directory { .. } => continue,
-            EntryKind::Resource { .. } => FileKind::Resource,
-            EntryKind::Binary {
-                compressed_len,
-                encryption,
-                ..
-            } => FileKind::Binary {
-                storage: if compressed_len == 0 {
-                    Storage::Stored
-                } else {
-                    Storage::Deflate
-                },
-                encryption,
-            },
-        };
+        if entry.is_directory() {
+            continue;
+        }
+        let kind = kind_of(index, entry)?;
         out.push((
             FileSpec {
                 path: archive.path(index)?,
@@ -684,6 +861,7 @@ pub fn rebuild<R, W>(
     archive: &Archive,
     out: &mut W,
     overrides: &BTreeMap<u32, Vec<u8>>,
+    watch: &mut impl Watch,
 ) -> Result<Report>
 where
     R: std::io::Read + Seek,
@@ -697,16 +875,22 @@ where
     let files: Vec<FileSpec> = specs.iter().map(|(spec, _)| spec.clone()).collect();
     let directories = directories_of(archive)?;
 
-    build(out, &files, &directories, |wanted| {
-        let index = *by_path.get(wanted).ok_or(Error::BadPath {
-            path: wanted.to_owned(),
-            reason: "not an entry of this archive",
-        })?;
-        match overrides.get(&index) {
-            Some(bytes) => Ok(bytes.clone()),
-            None => archive.extract(src, index),
-        }
-    })
+    build(
+        out,
+        &files,
+        &directories,
+        |wanted| {
+            let index = *by_path.get(wanted).ok_or(Error::BadPath {
+                path: wanted.to_owned(),
+                reason: "not an entry of this archive",
+            })?;
+            match overrides.get(&index) {
+                Some(bytes) => Ok(bytes.clone()),
+                None => archive.extract(src, index),
+            }
+        },
+        watch,
+    )
 }
 
 /// Resolves the first component of `segments` that names a file, returning its
@@ -750,6 +934,7 @@ pub fn replace_at<R, W>(
     path: &str,
     contents: Vec<u8>,
     out: &mut W,
+    watch: &mut impl Watch,
 ) -> Result<Report>
 where
     R: std::io::Read + Seek,
@@ -757,7 +942,7 @@ where
 {
     let mut edits = BTreeMap::new();
     edits.insert(path.to_owned(), contents);
-    replace_many(src, archive, &edits, out)
+    replace_many(src, archive, &edits, out, watch)
 }
 
 /// Rebuilds `archive` into `out` with any number of entries replaced,
@@ -775,42 +960,98 @@ where
 /// Intermediates are rebuilt in memory one level at a time, so peak cost is the
 /// largest single ancestor. `docs/backlog.md` R4.13.
 ///
+/// Two edits that resolve to one entry are refused, whether they spell it the
+/// same way or not: `x/y`, `x//y` and `X/Y` are one file, and a whole nested
+/// archive and a file inside it are the same bytes twice. [`crate::patch::plan`]
+/// refuses exactly these, and the two write paths have to agree — a caller that
+/// falls back from one to the other would otherwise get a different archive
+/// depending on which ran.
+///
 /// # Errors
 ///
 /// [`Error::NotFound`] for a path that does not resolve,
-/// [`Error::NotAnArchive`] for a component that is not one, and as [`build`].
+/// [`Error::NotAnArchive`] for a component that is not one,
+/// [`Error::Overlapping`] for two edits that resolve to one entry, and as
+/// [`build`].
 pub fn replace_many<R, W>(
     src: &mut R,
     archive: &Archive,
     edits: &BTreeMap<String, Vec<u8>>,
     out: &mut W,
+    watch: &mut impl Watch,
 ) -> Result<Report>
 where
     R: std::io::Read + Seek,
     W: Write + Seek,
 {
     let mut direct: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-    let mut deeper: BTreeMap<u32, BTreeMap<String, Vec<u8>>> = BTreeMap::new();
+    // Which edit replaced each entry outright, so a second one naming the same
+    // entry is refused rather than quietly winning. Keying the edits by path
+    // string and then by index collapsed them: last write won, and the losers
+    // vanished with an Ok.
+    let mut claimed: BTreeMap<u32, String> = BTreeMap::new();
+    let mut deeper: BTreeMap<u32, Nested> = BTreeMap::new();
 
     for (path, contents) in edits {
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let (index, rest) = split_at_file(archive, &segments)?;
+
+        if let Some(other) = claimed.get(&index) {
+            return Err(Error::Overlapping {
+                path: path.clone(),
+                other: other.clone(),
+            });
+        }
+
         if rest.is_empty() {
+            if let Some(nested) = deeper.get(&index) {
+                return Err(Error::Overlapping {
+                    path: path.clone(),
+                    other: nested.first.clone(),
+                });
+            }
+            claimed.insert(index, path.clone());
             direct.insert(index, contents.clone());
         } else {
-            deeper
-                .entry(index)
-                .or_default()
-                .insert(rest.join("/"), contents.clone());
+            let nested = deeper.entry(index).or_insert_with(|| Nested {
+                first: path.clone(),
+                edits: BTreeMap::new(),
+            });
+            if let Some((other, _)) = nested
+                .edits
+                .insert(rest.join("/"), (path.clone(), contents.clone()))
+            {
+                return Err(Error::Overlapping {
+                    path: path.clone(),
+                    other,
+                });
+            }
         }
     }
 
-    for (index, inner) in deeper {
-        let nested = archive.open_nested(src, index)?;
+    for (index, nested) in deeper {
+        let inner: BTreeMap<String, Vec<u8>> = nested
+            .edits
+            .into_iter()
+            .map(|(within, (_, bytes))| (within, bytes))
+            .collect();
+        let holder = archive.open_nested(src, index)?;
         let mut buffer = Cursor::new(Vec::new());
-        replace_many(src, &nested, &inner, &mut buffer)?;
+        replace_many(src, &holder, &inner, &mut buffer, watch)?;
         direct.insert(index, buffer.into_inner());
     }
 
-    rebuild(src, archive, out, &direct)
+    rebuild(src, archive, out, &direct, watch)
+}
+
+/// The edits landing inside one nested archive.
+struct Nested {
+    /// The first edit that addressed through this archive. It is what an edit
+    /// replacing the archive wholesale is reported as colliding with.
+    first: String,
+    /// Path within the nested archive, to the edit that named it and its new
+    /// contents. Two spellings reaching one path within are two entries in the
+    /// map only until the recursive call resolves them, which is where the
+    /// refusal comes from; two reaching the *same* string are caught here.
+    edits: BTreeMap<String, (String, Vec<u8>)>,
 }

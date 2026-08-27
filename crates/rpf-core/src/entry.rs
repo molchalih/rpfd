@@ -5,30 +5,7 @@
 //! struct with an `uncompressed_len` that is secretly two flag words is a bug
 //! waiting for its first resource.
 
-use crate::format::{DIRECTORY_MARKER, ENTRY_LEN, RESOURCE_FLAG};
-
-/// Reads a little-endian `u16` at `off`, or `None` if it does not fit.
-fn u16_at(bytes: &[u8], off: usize) -> Option<u16> {
-    let end = off.checked_add(2)?;
-    let raw: [u8; 2] = bytes.get(off..end)?.try_into().ok()?;
-    Some(u16::from_le_bytes(raw))
-}
-
-/// Reads a little-endian `u32` at `off`, or `None` if it does not fit.
-fn u32_at(bytes: &[u8], off: usize) -> Option<u32> {
-    let end = off.checked_add(4)?;
-    let raw: [u8; 4] = bytes.get(off..end)?.try_into().ok()?;
-    Some(u32::from_le_bytes(raw))
-}
-
-/// Reads a little-endian 24-bit field at `off`, widened, or `None` if it does
-/// not fit.
-fn u24_at(bytes: &[u8], off: usize) -> Option<u32> {
-    let end = off.checked_add(3)?;
-    let raw = bytes.get(off..end)?;
-    let (low, mid, high) = (*raw.first()?, *raw.get(1)?, *raw.get(2)?);
-    Some(u32::from(low) | (u32::from(mid) << 8) | (u32::from(high) << 16))
-}
+use crate::format::{DIRECTORY_MARKER, ENTRY_LEN, RESOURCE_FLAG, u16_at, u24_at, u32_at};
 
 /// What an entry is, and the fields that only that kind has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

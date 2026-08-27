@@ -17,9 +17,11 @@
 )]
 //!
 //! No game data is tracked. Archives are located through `RPF_CORPUS`. With it
-//! unset, or the archive absent, these tests **skip and say so**. They never
-//! pass quietly, because a green suite that tested nothing is the most
-//! expensive outcome available here. R0.2, R8.4.
+//! unset every test here is `#[ignore]`d by `build.rs`, so the harness names
+//! each one as skipped; with it set and the archive absent they skip at run
+//! time and say which test and which file. They never pass quietly, because a
+//! green suite that tested nothing is the most expensive outcome available
+//! here. R0.2, R8.4.
 
 use std::{
     collections::BTreeMap,
@@ -28,7 +30,7 @@ use std::{
     path::PathBuf,
 };
 
-use rpf_core::{Archive, EntryKind, format::resource_len};
+use rpf_core::{Archive, EntryKind, Summary, Unwatched, Verified, format::resource_len};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -53,33 +55,36 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Reports a skip, and refuses to be quiet about it when the caller has said
-/// the corpus must be there.
+/// Reports a skip, naming the test that is skipping and what it would have
+/// read, and refuses to be quiet about it when the caller has said the corpus
+/// must be there.
 ///
-/// `cargo test` swallows a passing test's output, so an unconditional skip
-/// reads as a pass — the outcome `docs/conventions.md` §12 calls the most
-/// expensive one available. `RPF_REQUIRE_CORPUS` is the mechanical answer: set
-/// it and a skip becomes a failure, so "the suite was green" and "the suite ran"
-/// stop being different claims.
-fn skip<T>(reason: &str) -> Option<T> {
+/// The ordinary case — no `RPF_CORPUS` at all — never reaches here: `build.rs`
+/// turns that into `#[ignore]`, which the harness reports by name whether or
+/// not output is captured. What is left is a corpus that was pointed at and
+/// does not hold this archive, and the one thing a reader needs then is which
+/// test went unrun. `RPF_REQUIRE_CORPUS` turns it into a failure, so "the suite
+/// was green" and "the suite ran" stop being different claims.
+fn skip<T>(test: &str, reason: &str) -> Option<T> {
     assert!(
         env::var_os("RPF_REQUIRE_CORPUS").is_none(),
-        "RPF_REQUIRE_CORPUS is set, but this test would have skipped: {reason}",
+        "RPF_REQUIRE_CORPUS is set, but {test} would have skipped: {reason}",
     );
-    eprintln!("SKIP: {reason}");
+    eprintln!("SKIP {test}: {reason}");
     None
 }
 
 /// The archive this fixture describes, or `None` with a reason on stderr.
-fn corpus_archive() -> Option<(PathBuf, Value)> {
+fn corpus_archive(test: &str) -> Option<(PathBuf, Value)> {
     let Some(root) = env::var_os("RPF_CORPUS") else {
-        return skip(&format!(
-            "RPF_CORPUS is not set, so {RELATIVE_ARCHIVE} cannot be located"
-        ));
+        return skip(
+            test,
+            &format!("RPF_CORPUS is not set, so {RELATIVE_ARCHIVE} cannot be located"),
+        );
     };
     let path = PathBuf::from(root).join(RELATIVE_ARCHIVE);
     if !path.is_file() {
-        return skip(&format!("{} is not a file", path.display()));
+        return skip(test, &format!("{} is not a file", path.display()));
     }
     let fixture: Value =
         serde_json::from_str(&fs::read_to_string(FIXTURE).expect("fixture readable"))
@@ -188,8 +193,9 @@ fn collect<R: Read + Seek>(
 }
 
 #[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn reader_agrees_with_the_oracle() {
-    let Some((path, fixture)) = corpus_archive() else {
+    let Some((path, fixture)) = corpus_archive("reader_agrees_with_the_oracle") else {
         return;
     };
 
@@ -262,8 +268,9 @@ fn reader_agrees_with_the_oracle() {
 }
 
 #[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn paths_carry_their_directories() {
-    let Some((path, _)) = corpus_archive() else {
+    let Some((path, _)) = corpus_archive("paths_carry_their_directories") else {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
@@ -287,10 +294,11 @@ fn paths_carry_their_directories() {
 }
 
 #[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn the_resource_bit_agrees_with_the_payload_magic() {
     // Q7, against every entry we can reach. One producer's archive does not
     // settle it, but a mismatch here would settle it the other way at once.
-    let Some((path, _)) = corpus_archive() else {
+    let Some((path, _)) = corpus_archive("the_resource_bit_agrees_with_the_payload_magic") else {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
@@ -322,8 +330,9 @@ fn the_resource_bit_agrees_with_the_payload_magic() {
 /// negative control found exactly that hole: setting `RESOURCE_HEADER_LEN` to
 /// zero left the differential test green.
 #[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn contents_inflate_to_the_declared_lengths() {
-    let Some((path, _)) = corpus_archive() else {
+    let Some((path, _)) = corpus_archive("contents_inflate_to_the_declared_lengths") else {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
@@ -386,8 +395,10 @@ fn read_all<R: Read + Seek>(
 
 /// R3.5a: one string addresses through the nesting.
 #[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn a_single_path_addresses_through_nested_archives() {
-    let Some((path, fixture)) = corpus_archive() else {
+    let Some((path, fixture)) = corpus_archive("a_single_path_addresses_through_nested_archives")
+    else {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
@@ -435,4 +446,48 @@ fn a_single_path_addresses_through_nested_archives() {
         archive.locate(&mut file, "content.xml/whatever"),
         Err(rpf_core::Error::NotAnArchive { .. })
     ));
+}
+
+#[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
+fn the_summary_reproduces_the_measured_slack() {
+    // `docs/rpf-format.md`, Slack, `verified`: subtracting the header, the
+    // entry table, the names blob and every payload from `dlc.rpf`'s own length
+    // leaves 79,345,460 bytes. The summary counted only the header and the
+    // payloads, so it reported 320 more than the row it derives from — the
+    // entry table's 176 bytes and the names blob's 144.
+    let Some((path, _)) = corpus_archive("the_summary_reproduces_the_measured_slack") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("archive opens");
+    let archive = Archive::open(&mut file).expect("archive parses");
+    let summary = Summary::of(&mut file, &archive).expect("summarises");
+
+    assert_eq!(summary.len, 144_504_832);
+    assert_eq!(summary.entries, 11);
+    assert_eq!(summary.directories, 4);
+    assert_eq!(summary.nested_archives, 2);
+    assert_eq!(summary.unreferenced_bytes, 79_345_460);
+}
+
+#[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
+fn every_entry_of_the_sample_reads_back() {
+    // 27 files over the 3 archives, and each one addressed by the path that
+    // reaches it — which is what a caller acts on when one of them fails.
+    let Some((path, _)) = corpus_archive("every_entry_of_the_sample_reads_back") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("archive opens");
+    let archive = Archive::open(&mut file).expect("archive parses");
+    let verified = Verified::of(&mut file, &archive, &mut Unwatched).expect("reads back");
+
+    let named: Vec<&str> = verified
+        .problems
+        .iter()
+        .map(|problem| problem.path.as_str())
+        .collect();
+    assert!(named.is_empty(), "entries did not read back: {named:?}");
+    assert_eq!(verified.checked, 27);
+    assert!(verified.outcome().is_ok());
 }

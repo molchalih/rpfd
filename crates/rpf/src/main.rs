@@ -58,9 +58,9 @@ enum Command {
         path: String,
         /// The file to put there.
         from: PathBuf,
-        /// Write even into a detected game installation.
-        #[arg(long)]
-        force: bool,
+        /// How the write is allowed to happen.
+        #[command(flatten)]
+        options: commands::WriteOptions,
     },
     /// Write every entry to a tree, with a manifest beside it.
     Extract {
@@ -111,8 +111,8 @@ fn main() -> ExitCode {
             ref archive,
             ref path,
             ref from,
-            force,
-        } => commands::put(archive, path, from, force),
+            options,
+        } => commands::put(archive, path, from, options, cli.json),
         Command::Extract {
             ref archive,
             ref into,

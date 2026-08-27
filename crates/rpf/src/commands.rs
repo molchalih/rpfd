@@ -5,18 +5,52 @@
 //! same thing. `docs/conventions.md` §1.
 
 use std::{
+    collections::BTreeMap,
     fs,
-    io::{Read, Seek, Write},
+    io::{IsTerminal, Read, Seek, Write},
     path::Path,
 };
 
-use rpf_core::{Archive, EntryKind};
+use rpf_core::{Archive, EntryKind, Flow, Step, Watch};
 use serde_json::{Value, json};
 
 use crate::{
     exit::{Failure, Result},
     install,
 };
+
+/// Progress on standard error, for a person watching a long rebuild.
+///
+/// Only when standard error is a terminal. Piped output belongs to whatever is
+/// consuming it, and `--json` on standard output should not have to be read
+/// past noise on standard error. R6.8.
+struct OnStderr {
+    silent: bool,
+}
+
+impl OnStderr {
+    /// Reports if there is someone there to read it.
+    fn new() -> Self {
+        Self {
+            silent: !std::io::stderr().is_terminal(),
+        }
+    }
+}
+
+impl Watch for OnStderr {
+    fn step(&mut self, step: Step<'_>) -> Flow {
+        if !self.silent {
+            // Carriage return and erase-to-end-of-line, so one line is reused
+            // rather than one printed per entry. Safe because this only runs
+            // when standard error is a terminal.
+            eprint!("\r\u{1b}[2K{}/{} {}", step.done, step.total, step.path);
+            if step.done == step.total {
+                eprintln!();
+            }
+        }
+        Flow::Continue
+    }
+}
 
 /// Opens an archive file and parses its table of contents.
 pub fn open(path: &Path) -> Result<(fs::File, Archive)> {
@@ -31,61 +65,32 @@ pub fn open(path: &Path) -> Result<(fs::File, Archive)> {
 /// `info` — the header, and what the entries add up to.
 pub fn info(path: &Path, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
-    let len = archive.len_bytes();
-
-    let mut directories = 0_u32;
-    let mut binaries = 0_u32;
-    let mut resources = 0_u32;
-    let mut referenced = rpf_core::format::HEADER_LEN;
-    for index in 0..count(&archive) {
-        match archive.entry(index)?.kind {
-            EntryKind::Directory { .. } => directories = directories.saturating_add(1),
-            EntryKind::Binary {
-                compressed_len,
-                uncompressed_len,
-                ..
-            } => {
-                binaries = binaries.saturating_add(1);
-                referenced = referenced.saturating_add(u64::from(if compressed_len == 0 {
-                    uncompressed_len
-                } else {
-                    compressed_len
-                }));
-            }
-            EntryKind::Resource { compressed_len, .. } => {
-                resources = resources.saturating_add(1);
-                referenced = referenced.saturating_add(u64::from(compressed_len));
-            }
-        }
-    }
-    let nested = count_nested(&mut file, &archive)?;
-    let slack = len.saturating_sub(referenced);
+    let summary = rpf_core::Summary::of(&mut file, &archive)?;
 
     if json_out {
         emit(&json!({
             "path": path.display().to_string(),
-            "len": len,
-            "encryption": encryption_name(archive.encryption()),
-            "entries": count(&archive),
-            "directories": directories,
-            "binary_files": binaries,
-            "resource_files": resources,
-            "nested_archives": nested,
-            "unreferenced_bytes": slack,
+            "len": summary.len,
+            "encryption": encryption_name(summary.encryption),
+            "entries": summary.entries,
+            "directories": summary.directories,
+            "binary_files": summary.binary_files,
+            "resource_files": summary.resource_files,
+            "nested_archives": summary.nested_archives,
+            "unreferenced_bytes": summary.unreferenced_bytes,
         }));
-        Ok(())
     } else {
         println!("path         {}", path.display());
-        println!("length       {len}");
-        println!("encryption   {}", encryption_name(archive.encryption()));
-        println!("entries      {}", count(&archive));
-        println!("  directories {directories}");
-        println!("  binary      {binaries}");
-        println!("  resource    {resources}");
-        println!("nested       {nested}");
-        println!("unreferenced {slack}");
-        Ok(())
+        println!("length       {}", summary.len);
+        println!("encryption   {}", encryption_name(summary.encryption));
+        println!("entries      {}", summary.entries);
+        println!("  directories {}", summary.directories);
+        println!("  binary      {}", summary.binary_files);
+        println!("  resource    {}", summary.resource_files);
+        println!("nested       {}", summary.nested_archives);
+        println!("unreferenced {}", summary.unreferenced_bytes);
     }
+    Ok(())
 }
 
 /// `ls` — what is at a path.
@@ -132,18 +137,112 @@ pub fn cat(path: &Path, inside: &str) -> Result<()> {
         })
 }
 
-/// `put` — replace one entry and rebuild, cascading through nesting.
+/// How a write is allowed to happen.
 ///
-/// Writes to a temporary file beside the archive and renames it into place, so
-/// an interrupted rebuild cannot leave a corrupt archive where a good one was.
-/// R4.2.
-pub fn put(path: &Path, inside: &str, from: &Path, force: bool) -> Result<()> {
-    refuse_game_install(path, force)?;
+/// Grouped rather than passed as three more parameters: `put` was already at
+/// the argument and boolean limits `clippy.toml` sets, and a call site reading
+/// `put(a, b, c, false, false, true)` says nothing about which `false` is which.
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub struct WriteOptions {
+    /// Write even into a detected game installation.
+    #[arg(long)]
+    pub force: bool,
+    /// Rebuild the whole archive rather than patching in place. Slower, and
+    /// atomic: an interrupted rebuild leaves the original untouched.
+    #[arg(long)]
+    pub rebuild: bool,
+    /// Report what would be written, and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// `put` — replace one entry.
+///
+/// Prefers patching in place: if the new payload fits where the old one sits,
+/// only that payload and its entry row are written, and an archive of any size
+/// costs the same as the file being put. `docs/approach.md`. When it does not
+/// fit, or `rebuild` is asked for, the archive is rebuilt to a temporary file
+/// and renamed into place.
+///
+/// The two are not equivalent in durability, and the report says which ran. A
+/// rebuild is atomic. A patch is not: it writes into the live archive, and an
+/// interruption between the payload and its entry row leaves the archive
+/// describing bytes that are no longer there.
+///
+/// `dry_run` reports that decision and stops before acting on it. R6.7. It is
+/// the same decision, taken the same way, so what it reports is what would
+/// happen — including a refusal, which is why the game-install guard runs
+/// first here too.
+pub fn put(
+    path: &Path,
+    inside: &str,
+    from: &Path,
+    options: WriteOptions,
+    json_out: bool,
+) -> Result<()> {
+    refuse_game_install(path, options.force)?;
 
     let contents = fs::read(from).map_err(|source| Failure::Io {
         path: from.display().to_string(),
         source,
     })?;
+
+    if !options.rebuild {
+        // A dry run only reads: needing write permission to answer "what would
+        // this write do" would make it useless on the archives worth asking
+        // about.
+        let mut file = if options.dry_run {
+            fs::File::open(path)
+        } else {
+            fs::OpenOptions::new().read(true).write(true).open(path)
+        }
+        .map_err(|source| Failure::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let archive = rpf_core::Archive::open(&mut file)?;
+
+        let edits = BTreeMap::from([(inside.to_owned(), contents.clone())]);
+        match rpf_core::plan(&mut file, &archive, &edits)? {
+            rpf_core::Plan::Fits(patches) => {
+                if !options.dry_run {
+                    patches.apply(&mut file)?;
+                }
+                for entry in patches.planned() {
+                    report_patch(inside, entry, options.dry_run, json_out);
+                }
+                return Ok(());
+            }
+            rpf_core::Plan::DoesNotFit(rejected) => {
+                if options.dry_run {
+                    for entry in &rejected {
+                        report_would_rebuild(inside, entry, json_out);
+                    }
+                    return Ok(());
+                }
+                if !json_out {
+                    for entry in &rejected {
+                        eprintln!(
+                            "rpf: {} bytes will not fit the {} available; rebuilding",
+                            entry.needed, entry.allocation,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if options.dry_run {
+        // Reached only with --rebuild --dry-run: the rebuild was asked for
+        // rather than forced by a payload that would not fit, so there is no
+        // allocation to report against.
+        if json_out {
+            emit(&json!({ "method": "rebuild", "path": inside, "dry_run": true }));
+        } else {
+            println!("would rebuild the archive");
+        }
+        return Ok(());
+    }
 
     let (mut file, archive) = open(path)?;
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -152,8 +251,72 @@ pub fn put(path: &Path, inside: &str, from: &Path, force: bool) -> Result<()> {
         source,
     })?;
 
-    rpf_core::replace_at(&mut file, &archive, inside, contents, scratch.as_file_mut())?;
-    persist(scratch, path)
+    let report = rpf_core::replace_at(
+        &mut file,
+        &archive,
+        inside,
+        contents,
+        scratch.as_file_mut(),
+        &mut OnStderr::new(),
+    )?;
+    persist(scratch, path)?;
+
+    if json_out {
+        emit(&json!({
+            "method": "rebuild",
+            "path": inside,
+            "entries": report.entry_count,
+            "len": report.len,
+        }));
+    } else {
+        println!(
+            "rebuilt: {} entries, {} bytes",
+            report.entry_count, report.len
+        );
+    }
+    Ok(())
+}
+
+/// Reports one patch, made or merely planned.
+fn report_patch(inside: &str, entry: &rpf_core::Planned, dry_run: bool, json_out: bool) {
+    if json_out {
+        emit(&json!({
+            "method": "patch",
+            "path": inside,
+            "at": entry.at,
+            "len": entry.len,
+            "allocation": entry.allocation,
+            "dry_run": dry_run,
+        }));
+    } else if dry_run {
+        println!(
+            "would patch {} bytes in place at {} (room for {})",
+            entry.len, entry.at, entry.allocation,
+        );
+    } else {
+        println!(
+            "patched {} bytes in place at {} (room for {})",
+            entry.len, entry.at, entry.allocation,
+        );
+    }
+}
+
+/// Reports that an edit would force a rebuild, and why.
+fn report_would_rebuild(inside: &str, entry: &rpf_core::TooLarge, json_out: bool) {
+    if json_out {
+        emit(&json!({
+            "method": "rebuild",
+            "path": inside,
+            "needed": entry.needed,
+            "allocation": entry.allocation,
+            "dry_run": true,
+        }));
+    } else {
+        println!(
+            "would rebuild: {} bytes will not fit the {} available",
+            entry.needed, entry.allocation,
+        );
+    }
 }
 
 /// `extract` — write every entry to a tree, with the manifest beside it.
@@ -240,6 +403,7 @@ pub fn pack(from: &Path, archive_path: &Path, force: bool, json_out: bool) -> Re
                 }
             }
         },
+        &mut OnStderr::new(),
     );
     if let Some((path, source)) = missing {
         return Err(Failure::Io {
@@ -320,44 +484,33 @@ pub fn persist(scratch: tempfile::NamedTempFile, path: &Path) -> Result<()> {
 /// `verify` — read every entry back and check it against what the archive says.
 pub fn verify(path: &Path, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
-    let mut checked = 0_u32;
-    let mut problems = Vec::new();
-    verify_into(&mut file, &archive, "", &mut checked, &mut problems)?;
+    let verified = rpf_core::Verified::of(&mut file, &archive, &mut OnStderr::new())?;
+    let problems: Vec<String> = verified
+        .problems
+        .iter()
+        .map(|problem| format!("{}: {}", problem.path, problem.error))
+        .collect();
 
     if json_out {
         emit(&json!({
             "path": path.display().to_string(),
-            "entries_checked": checked,
+            "entries_checked": verified.checked,
             "problems": problems,
         }));
     } else if problems.is_empty() {
-        println!("{checked} entries verified");
+        println!("{} entries verified", verified.checked);
     } else {
         for problem in &problems {
             println!("{problem}");
         }
-        println!("{} of {checked} entries failed", problems.len());
+        println!("{} of {} entries failed", problems.len(), verified.checked);
     }
 
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(Failure::Container(rpf_core::Error::LengthMismatch {
-            entry: 0,
-            expected: u64::from(checked),
-            actual: u64::from(checked)
-                .saturating_sub(u64::try_from(problems.len()).unwrap_or(u64::MAX)),
-        }))
-    }
-}
-
-/// Entries in an archive, as a `u32`.
-fn count(archive: &Archive) -> u32 {
-    u32::try_from(archive.entries().len()).unwrap_or(u32::MAX)
+    Ok(verified.outcome()?)
 }
 
 /// A readable name for an encryption tag.
-fn encryption_name(tag: u32) -> String {
+pub fn encryption_name(tag: u32) -> String {
     if tag == rpf_core::format::ENCRYPTION_OPEN {
         "OPEN".to_owned()
     } else {
@@ -369,20 +522,6 @@ fn encryption_name(tag: u32) -> String {
 fn emit(value: &Value) {
     let text = serde_json::to_string_pretty(value).unwrap_or_default();
     println!("{text}");
-}
-
-/// Counts archives nested directly inside this one.
-fn count_nested<R: Read + Seek>(src: &mut R, archive: &Archive) -> Result<u32> {
-    let mut nested = 0_u32;
-    for index in 0..count(archive) {
-        if archive.entry(index)?.is_directory() {
-            continue;
-        }
-        if archive.open_nested(src, index).is_ok() {
-            nested = nested.saturating_add(1);
-        }
-    }
-    Ok(nested)
 }
 
 /// Collects the rows `ls` prints.
@@ -398,7 +537,7 @@ pub fn list_into<R: Read + Seek>(
     // inside it — a nested archive is a directory as far as a path is
     // concerned. Anything else is a single entry.
     let Ok(children) = archive.children(at) else {
-        if let Ok(nested) = archive.open_nested(src, at) {
+        if let Some(nested) = archive.nested_at(src, at)? {
             return list_into(src, &nested, 0, prefix, recursive, rows);
         }
         rows.push(describe(archive, at, prefix)?);
@@ -419,7 +558,7 @@ pub fn list_into<R: Read + Seek>(
         }
         if archive.entry(index)?.is_directory() {
             list_into(src, archive, index, &path, true, rows)?;
-        } else if let Ok(nested) = archive.open_nested(src, index) {
+        } else if let Some(nested) = archive.nested_at(src, index)? {
             list_into(src, &nested, 0, &path, true, rows)?;
         }
     }
@@ -446,38 +585,4 @@ fn describe(archive: &Archive, index: u32, path: &str) -> Result<Value> {
         ),
     };
     Ok(json!({ "path": path, "kind": kind, "len": len }))
-}
-
-/// Reads every entry, recording the ones that do not come back as promised.
-fn verify_into<R: Read + Seek>(
-    src: &mut R,
-    archive: &Archive,
-    prefix: &str,
-    checked: &mut u32,
-    problems: &mut Vec<String>,
-) -> Result<()> {
-    for index in 0..count(archive) {
-        let entry = archive.entry(index)?;
-        if entry.is_directory() {
-            continue;
-        }
-        let name = archive.name(index)?;
-        let path = if prefix.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{prefix}/{name}")
-        };
-
-        match archive.read(src, index) {
-            Ok(_) => *checked = checked.saturating_add(1),
-            Err(error) => {
-                problems.push(format!("{path}: {error}"));
-                continue;
-            }
-        }
-        if let Ok(nested) = archive.open_nested(src, index) {
-            verify_into(src, &nested, &path, checked, problems)?;
-        }
-    }
-    Ok(())
 }

@@ -2,6 +2,10 @@
 //!
 //! Nothing here does I/O. These are the measured facts of the format and the
 //! pure functions over them, so that they can be tested without an archive.
+//! A rule that both the reader and the writer have to apply the same way —
+//! where a payload may begin, how a field is decoded, when two names are one
+//! name — belongs here for that reason: two encodings of it are two chances to
+//! drift, and the drift is invisible until an archive does not load (§3).
 //!
 //! Each item names the row of `docs/rpf-format.md` that established it. A row
 //! marked `verified` there was measured against a real archive; do not add a
@@ -70,6 +74,94 @@ pub const RESOURCE_FLAG: u32 = 0x0080_0000;
 ///
 /// `docs/rpf-format.md`, Compression, `verified` — 20 of 20 entries.
 pub const RESOURCE_HEADER_LEN: u64 = 16;
+
+/// The little-endian `u16` at `at`, or `None` if `bytes` is too short to hold
+/// one there.
+///
+/// Every fixed-width field in this format is little-endian, so every reader of
+/// one comes through here or its two siblings. They return an `Option` rather
+/// than defaulting, because the caller is the only one that knows whether a
+/// short buffer is impossible or is the malformed input §6 is about.
+#[must_use]
+pub fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    let raw: [u8; 2] = bytes.get(at..end)?.try_into().ok()?;
+    Some(u16::from_le_bytes(raw))
+}
+
+/// The little-endian 24-bit field at `at`, widened, or `None` if `bytes` is too
+/// short to hold one there.
+///
+/// Three bytes, not four: an entry's compressed size and its block offset are
+/// both this width. `docs/rpf-format.md`, Entry table, `verified`.
+#[must_use]
+pub fn u24_at(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(3)?;
+    let raw = bytes.get(at..end)?;
+    let (low, mid, high) = (*raw.first()?, *raw.get(1)?, *raw.get(2)?);
+    Some(u32::from(low) | (u32::from(mid) << 8) | (u32::from(high) << 16))
+}
+
+/// The little-endian `u32` at `at`, or `None` if `bytes` is too short to hold
+/// one there.
+#[must_use]
+pub fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let raw: [u8; 4] = bytes.get(at..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(raw))
+}
+
+/// The lowest offset, relative to an archive's base, that a payload may occupy:
+/// past the header, the entry table and the names blob, and nothing else.
+///
+/// One sum, two readers. `Archive` checks an entry's payload offset against it
+/// so that no payload addresses the archive's own structure, and `build` aligns
+/// the first payload up from it. Written twice, the reader and the writer would
+/// be free to disagree about where an archive's contents begin.
+///
+/// Saturating rather than checked, and both callers are why: `Archive::parse`
+/// has already fitted all three regions inside the archive's length before it
+/// asks, and `build` has already refused an entry count that does not fit a
+/// `u32`. There is no second failure left to report.
+///
+/// `docs/rpf-format.md`, Layout, `verified`.
+#[must_use]
+pub fn payload_floor(entry_count: u64, names_len: u64) -> u64 {
+    HEADER_LEN
+        .saturating_add(entry_count.saturating_mul(ENTRY_LEN))
+        .saturating_add(names_len)
+}
+
+/// Whether two names address the same entry.
+///
+/// Path components resolve case-insensitively here — `Archive::child_named`
+/// folds, and `find`, `locate` and `split_at_file` all go through it — so two
+/// children of one directory differing only in case are one name, and the
+/// second is unreachable by any spelling of its own path.
+///
+/// That archives *are* stored in ascending name order is `verified`
+/// (`docs/rpf-format.md`, Entry ordering); that the runtime *requires*
+/// case-folded resolution is `docs/backlog.md` Q1 and is not measured. What is
+/// settled is that this crate resolves that way, which is the whole reason
+/// `build` has to refuse a collision it could not address afterwards.
+#[must_use]
+pub fn same_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// The key a name is unique under among its siblings.
+///
+/// Exactly the equivalence [`same_name`] tests — `folded(a) == folded(b)` if
+/// and only if `same_name(a, b)`, and a test below says so — as a value that
+/// can go in a map, which is what a writer needs to catch a collision before it
+/// writes one. Two spellings of one rule in one place, rather than one spelling
+/// in the reader and another in the writer: they were in two places, and the
+/// writer packed `X64` and `x64` as separate directories that no reader could
+/// tell apart.
+#[must_use]
+pub fn folded(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
 
 /// Number of pages described by one of a resource's two flag words.
 ///
@@ -209,6 +301,52 @@ mod tests {
         for &(system, graphics, _) in MEASURED {
             let expected = if graphics == 0x2000_0000 { 162 } else { 13 };
             assert_eq!(resource_version(system, graphics), expected);
+        }
+    }
+
+    #[test]
+    fn a_field_read_past_the_end_is_none_rather_than_a_panic() {
+        // §6: the buffer is an archive's bytes, and an entry table can end
+        // mid-row. Every one of these is a slice index in disguise.
+        let row = [0x01_u8, 0x02, 0x03];
+        assert_eq!(u16_at(&row, 0), Some(0x0201));
+        assert_eq!(u24_at(&row, 0), Some(0x0003_0201));
+        assert_eq!(u32_at(&row, 0), None);
+        assert_eq!(u16_at(&row, 2), None);
+        assert_eq!(u24_at(&row, 1), None);
+        assert_eq!(u16_at(&row, usize::MAX), None);
+    }
+
+    #[test]
+    fn the_payload_floor_is_the_three_regions_before_it() {
+        // The sample: 11 entries and a 144-byte names blob.
+        assert_eq!(payload_floor(11, 144), 16 + 11 * 16 + 144);
+        assert_eq!(payload_floor(0, 0), HEADER_LEN);
+    }
+
+    #[test]
+    fn folding_a_name_and_comparing_two_are_the_same_rule() {
+        // The two spellings exist because one has to go in a map and the other
+        // is on the path of every lookup. They must not be able to disagree.
+        const NAMES: &[&str] = &[
+            "x64",
+            "X64",
+            "x64/",
+            "vehicles.rpf",
+            "VEHICLES.RPF",
+            "Vehicles.Rpf",
+            "",
+            "ä",
+            "Ä",
+        ];
+        for &a in NAMES {
+            for &b in NAMES {
+                assert_eq!(
+                    same_name(a, b),
+                    folded(a) == folded(b),
+                    "{a:?} against {b:?}"
+                );
+            }
         }
     }
 

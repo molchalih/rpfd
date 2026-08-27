@@ -16,9 +16,29 @@ use crate::{
     error::{Error, Result},
     format::{
         BLOCK_LEN, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7, MAGIC_RSC7,
-        RESOURCE_HEADER_LEN, resource_len,
+        RESOURCE_HEADER_LEN, payload_floor, resource_len, same_name, u32_at,
     },
 };
+
+/// How deep anything in this container is walked before it is refused.
+///
+/// It bounds two structures, because it is one fact about one thing: every
+/// recursive walk over an archive — `child_named` down a path, `ls -R`,
+/// `verify`, the daemon's recursive list — descends a directory tree, an
+/// archive nested inside an archive, or both, and both depths are chosen by
+/// the bytes rather than by us.
+///
+/// The bound belongs here and not at each walker (§5). A walker that carried
+/// its own counter would be one walker away from a walker that forgot, and the
+/// symptom of forgetting is a stack overflow rather than a wrong answer:
+/// measured before this existed, 5,000 stacked directory rows — 80,384 bytes —
+/// and 16,000 stacked archive headers — 8,192,000 bytes — each aborted
+/// `rpf ls -R` with exit 134, and took the daemon's session with them.
+///
+/// 32 rather than a rounder number because it is two orders of magnitude above
+/// anything real and still far below what a stack holds: the deepest tree in
+/// the sample is `x64/vehiclemods/<file>`, 3, and the deepest nesting is 1.
+pub const MAX_DEPTH: u32 = 32;
 
 /// Seeks and fills `buf`, reporting where it was when it failed.
 fn read_exact_at<R: Read + Seek>(src: &mut R, offset: u64, buf: &mut [u8]) -> Result<()> {
@@ -78,10 +98,32 @@ pub struct Archive {
     base: u64,
     len: u64,
     encryption: u32,
+    /// How many archives this one sits inside. Zero for a file opened on its
+    /// own, and one more than its holder's for every nested archive, which is
+    /// what [`MAX_DEPTH`] is counted against.
+    depth: u32,
     entries: Vec<Entry>,
-    names: Vec<String>,
+    names: Vec<NameSpan>,
     parents: Vec<Option<u32>>,
     names_blob: Vec<u8>,
+}
+
+/// Where one entry's name lies in the names blob.
+///
+/// A span rather than an owned `String`, because nothing stops an archive
+/// pointing every entry at one long name: materialising each copy makes the
+/// cost of *opening* the archive `entry_count × names_len`. Measured before
+/// this was a span — 40,000 entries over a 40,000-byte blob, a 680,016-byte
+/// file — 1,980,317,696 bytes of resident memory in 4.2 seconds, and ~7 MB of
+/// input would have asked for ~200 GB. `Archive::open` is on the path of every
+/// command and every daemon session, so that is a small file away from every
+/// caller.
+#[derive(Debug, Clone, Copy)]
+struct NameSpan {
+    /// Offset into the names blob.
+    at: u32,
+    /// Length in bytes, up to but not including the terminator.
+    len: u32,
 }
 
 impl Archive {
@@ -97,52 +139,31 @@ impl Archive {
     /// is encrypted, and the bounds variants if the header describes regions
     /// that do not fit.
     pub fn parse<R: Read + Seek>(src: &mut R, base: u64, len: u64) -> Result<Self> {
-        // Read as much of the header as there is. A file too short to hold one
-        // is not an archive, which is a better answer than "i/o failure" —
-        // nothing failed, the bytes simply are not there.
-        src.seek(SeekFrom::Start(base))
-            .map_err(|source| Error::Io {
-                offset: base,
-                source,
-            })?;
-        let mut header = [0u8; 16];
-        let mut filled = 0_usize;
-        while filled < header.len() {
-            let rest = header.get_mut(filled..).unwrap_or_default();
-            let read = src.read(rest).map_err(|source| Error::Io {
-                offset: base,
-                source,
-            })?;
-            if read == 0 {
-                break;
-            }
-            filled = filled.saturating_add(read);
-        }
-        if filled < header.len() {
-            let found: [u8; 4] = header
-                .get(0..4)
-                .and_then(|s| s.try_into().ok())
-                .unwrap_or_default();
-            return Err(Error::NotAnArchive { base, found });
+        // An archive parsed by name rather than through a holder is the
+        // outermost one there is, so it is nested inside nothing.
+        Self::parse_nested(src, base, len, 0)
+    }
+
+    /// [`Archive::parse`], told how many archives it already sits inside.
+    ///
+    /// The depth is the caller's to supply because it is not in the bytes: an
+    /// archive cannot tell where it is being read from. [`Archive::open_nested`]
+    /// is the only caller that supplies anything but zero, which is what keeps
+    /// the count honest.
+    fn parse_nested<R: Read + Seek>(src: &mut R, base: u64, len: u64, depth: u32) -> Result<Self> {
+        if depth > MAX_DEPTH {
+            return Err(Error::TooDeep {
+                what: "archive nesting",
+                depth,
+                limit: MAX_DEPTH,
+            });
         }
 
-        let magic: [u8; 4] = header
-            .get(0..4)
-            .and_then(|s| s.try_into().ok())
-            .unwrap_or_default();
-        if magic != MAGIC_RPF7 {
-            return Err(Error::NotAnArchive { base, found: magic });
-        }
-
-        let entry_count = word(&header, 4);
-        let names_len = word(&header, 8);
-        let encryption = word(&header, 12);
-
-        // Every encrypted path is R2. Refusing here, with a distinct variant,
-        // keeps "cannot open this" separate from "this is broken". R6.3.
-        if encryption != ENCRYPTION_OPEN {
-            return Err(Error::NeedsKey { tag: encryption });
-        }
+        let Header {
+            entry_count,
+            names_len,
+            encryption,
+        } = read_header(src, base)?;
 
         let table_len =
             u64::from(entry_count)
@@ -161,6 +182,17 @@ impl Archive {
                 len: table_len,
                 archive_len: len,
             })?;
+        // Checked before the names blob, so that a header claiming more
+        // entries than the file can hold names the entry table rather than the
+        // blob that never got a chance to start (§10).
+        if names_at > len {
+            return Err(Error::OutOfBounds {
+                region: "entry table",
+                offset: HEADER_LEN,
+                len: table_len,
+                archive_len: len,
+            });
+        }
         let names_end = names_at
             .checked_add(u64::from(names_len))
             .ok_or(Error::OutOfBounds {
@@ -187,14 +219,10 @@ impl Archive {
             u64::from(names_len),
         )?;
 
-        // Names are resolved once, here, so that `name` cannot fail later (§5).
-        // The bound is `names_len`, never the blob's backing buffer: the bytes
-        // after the blob can be stale names from a previous pack.
-        let names = entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| resolve_name(&names_blob, entry.name_offset, index, names_len))
-            .collect::<Result<Vec<_>>>()?;
+        // Names are located once, here, so that `name` has nothing left to
+        // find (§5). What it costs is one pass over the blob, not one scan and
+        // one allocation per entry — see [`NameSpan`].
+        let names = resolve_names(&names_blob, &entries)?;
 
         let parents = parse_parents(&entries)?;
 
@@ -202,6 +230,7 @@ impl Archive {
             base,
             len,
             encryption,
+            depth,
             entries,
             names,
             parents,
@@ -271,19 +300,41 @@ impl Archive {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSuchEntry`] if the index is past the end.
+    /// [`Error::NoSuchEntry`] if the index is past the end, and
+    /// [`Error::BadName`] if the bytes at the entry's name offset are not
+    /// UTF-8. Every name in the sample is ASCII; refusing the rest is §6's
+    /// answer for third-party bytes, and it is a name the caller can be shown
+    /// rather than a repair it cannot check.
     pub fn name(&self, index: u32) -> Result<&str> {
-        let at = usize::try_from(index).ok().and_then(|i| self.names.get(i));
-        at.map(String::as_str).ok_or(Error::NoSuchEntry {
-            index,
-            entry_count: count_of(&self.entries),
-        })
+        let span = usize::try_from(index)
+            .ok()
+            .and_then(|i| self.names.get(i))
+            .copied()
+            .ok_or(Error::NoSuchEntry {
+                index,
+                entry_count: count_of(&self.entries),
+            })?;
+
+        let bad = || Error::BadName {
+            entry: index,
+            name_offset: span.at,
+            names_len: u32::try_from(self.names_blob.len()).unwrap_or(u32::MAX),
+        };
+        let start = usize::try_from(span.at).unwrap_or(usize::MAX);
+        let end = start.saturating_add(usize::try_from(span.len).unwrap_or(usize::MAX));
+        let raw = self.names_blob.get(start..end).ok_or_else(bad)?;
+        std::str::from_utf8(raw).map_err(|_| bad())
     }
 
     /// The full path of an entry, addressed from the archive root.
     ///
     /// The root itself is the empty string; everything else is
     /// slash-separated with no leading slash.
+    ///
+    /// The walk up the parent map is unguarded because it does not need a
+    /// guard: [`parse_parents`] refuses any archive in which a child's index is
+    /// not greater than its parent's, so every step of this loop moves to a
+    /// smaller index and it ends (§5).
     ///
     /// # Errors
     ///
@@ -365,6 +416,14 @@ impl Archive {
                 };
                 (block, u64::from(len))
             }
+            // No stored sentinel here, and the asymmetry with the arm above is
+            // the format's rather than an oversight: a binary entry that
+            // declares zero has its real length at offset 8, and a resource
+            // does not — both of its trailing words are page flags.
+            // `docs/rpf-format.md` records no measurement of a stored
+            // resource, so nothing here invents a rule for recovering one; a
+            // resource declaring zero is refused by `read` and `extract` for
+            // being smaller than its own `RSC7` header.
             EntryKind::Resource {
                 block,
                 compressed_len,
@@ -380,6 +439,24 @@ impl Archive {
                 len: on_disk,
                 archive_len: self.len,
             })?;
+        // A payload lies after the names blob — `docs/rpf-format.md`, Layout.
+        // The upper bound alone leaves the archive's own header, entry table
+        // and names blob addressable as file contents: an entry at block 0
+        // reads back the table of contents, which is a plausible-but-wrong
+        // value rather than a failure, and `allocation` then offers those same
+        // bytes to a patch as room to write into.
+        let floor = payload_floor(
+            u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
+            u64::try_from(self.names_blob.len()).unwrap_or(u64::MAX),
+        );
+        if relative < floor {
+            return Err(Error::PayloadUnderflow {
+                entry: index,
+                offset: relative,
+                floor,
+            });
+        }
+
         let end = relative.checked_add(on_disk).ok_or(Error::OutOfBounds {
             region: "payload",
             offset: relative,
@@ -402,6 +479,95 @@ impl Archive {
             archive_len: self.len,
         })?;
         Ok((absolute, on_disk))
+    }
+
+    /// The payload extent of every file entry, relative to this archive's base.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::entry`], and the bounds variants for a payload that does
+    /// not fit.
+    pub fn payload_extents(&self) -> Result<Vec<(u32, u64, u64)>> {
+        let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        let mut out = Vec::new();
+        for index in 0..count {
+            if self.entry(index)?.is_directory() {
+                continue;
+            }
+            let (absolute, len) = self.payload_span(index)?;
+            out.push((index, absolute.saturating_sub(self.base), len));
+        }
+        Ok(out)
+    }
+
+    /// How many bytes an entry's payload may occupy without moving.
+    ///
+    /// This is room a caller may **write into**, so it stops at the first byte
+    /// any other payload claims from this one's start onwards — not at the
+    /// next payload to begin strictly later. Two entries sharing a block, and
+    /// an entry whose payload runs through this one's start, are both invisible
+    /// to the second reading, and both mean these bytes are already spoken
+    /// for: the answer is then zero, not the distance to whatever comes next.
+    ///
+    /// [`crate::patch::plan`] rests on that. It treats an allocation as the
+    /// bytes an edit claims and refuses two edits that overlap, which only
+    /// tells it what it needs if an allocation really does end where the next
+    /// payload begins.
+    ///
+    /// Real archives leave a great deal of room here — 82.7% of the sample is
+    /// unreferenced — which is what makes patching in place worth doing at all.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::payload_extents`], and [`Error::NoSuchEntry`] or
+    /// [`Error::WrongKind`] for an index that is not a file in this archive.
+    pub fn allocation(&self, index: u32) -> Result<u64> {
+        // Resolved before the extents are searched: an index that is not an
+        // entry at all must say so, rather than being reported as the wrong
+        // kind of entry because the search for it came up empty (§10).
+        let (absolute, _) = self.payload_span(index)?;
+        let start = absolute.saturating_sub(self.base);
+
+        let end = self
+            .payload_extents()?
+            .iter()
+            .filter(|(at, _, _)| *at != index)
+            .filter_map(|(_, other, len)| {
+                let other_end = other.saturating_add(*len);
+                (other_end > start).then_some((*other).max(start))
+            })
+            .min()
+            .unwrap_or(self.len);
+        Ok(end.saturating_sub(start))
+    }
+
+    /// Where an entry's payload begins, absolutely, and how long it is now.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::payload_extents`].
+    pub fn payload_at(&self, index: u32) -> Result<(u64, u64)> {
+        self.payload_span(index)
+    }
+
+    /// Where this entry's row begins in the source.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSuchEntry`] if the index is past the end.
+    pub fn row_at(&self, index: u32) -> Result<u64> {
+        let _ = self.entry(index)?;
+        let offset = u64::from(index)
+            .checked_mul(ENTRY_LEN)
+            .and_then(|by| HEADER_LEN.checked_add(by))
+            .and_then(|by| self.base.checked_add(by))
+            .ok_or(Error::OutOfBounds {
+                region: "entry table",
+                offset: HEADER_LEN,
+                len: ENTRY_LEN,
+                archive_len: self.len,
+            })?;
+        Ok(offset)
     }
 
     /// Reads an entry's **contents**: what the file means, with no container
@@ -511,9 +677,9 @@ impl Archive {
     /// Finds an entry by path **within this archive**, not descending into any
     /// archive nested in it.
     ///
-    /// Matching is ASCII case-insensitive, which is how the runtime addresses
-    /// these paths. Every name in the sample is lower-case, so this repository
-    /// cannot yet tell case-folded order from byte order — `docs/backlog.md` Q1.
+    /// Matching is [`same_name`], which is how the runtime addresses these
+    /// paths. Every name in the sample is lower-case, so this repository cannot
+    /// yet tell case-folded order from byte order — `docs/backlog.md` Q1.
     ///
     /// The empty path is the root directory.
     ///
@@ -539,7 +705,7 @@ impl Archive {
     pub(crate) fn child_named(&self, parent: u32, name: &str) -> Option<u32> {
         self.children(parent)
             .ok()?
-            .find(|&index| self.name(index).is_ok_and(|n| n.eq_ignore_ascii_case(name)))
+            .find(|&index| self.name(index).is_ok_and(|n| same_name(n, name)))
     }
 
     /// Finds an entry by a path that may address **through** nested archives,
@@ -592,22 +758,108 @@ impl Archive {
     /// Nesting is not a special case: the payload is another archive, and its
     /// offsets are relative to its own base. `docs/rpf-format.md`.
     ///
+    /// This is the only way an archive's nesting depth grows, and it is
+    /// bounded: a payload whose own payload is another archive, repeated, is
+    /// recursion an archive chooses for its readers. [`MAX_DEPTH`].
+    ///
     /// # Errors
     ///
-    /// As [`Archive::parse`], plus [`Error::WrongKind`] for a directory.
+    /// As [`Archive::parse`], plus [`Error::WrongKind`] for a directory and
+    /// [`Error::TooDeep`] past [`MAX_DEPTH`] levels of nesting.
     pub fn open_nested<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Self> {
         let (offset, on_disk) = self.payload_span(index)?;
-        Self::parse(src, offset, on_disk)
+        let depth = self.depth.checked_add(1).ok_or(Error::TooDeep {
+            what: "archive nesting",
+            depth: u32::MAX,
+            limit: MAX_DEPTH,
+        })?;
+        Self::parse_nested(src, offset, on_disk, depth)
+    }
+
+    /// The archive nested in an entry's payload, or `None` when the payload is
+    /// not one.
+    ///
+    /// Every walk over an archive sniffs each payload for a nested one, so
+    /// "this is not an archive" is the ordinary answer and cannot be a failure
+    /// — a listing that stopped at the first `.txt` would be useless. A refusal
+    /// on depth is not ordinary: it says the walk stopped short of what the
+    /// archive describes, and swallowing it would report a truncated listing as
+    /// a complete one, which is the plausible-but-wrong value §6 rules out
+    /// alongside the panic it replaced.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooDeep`] past [`MAX_DEPTH`] levels of nesting, and nothing
+    /// else: every other reason a payload is not an archive is `None`.
+    pub fn nested_at<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Option<Self>> {
+        match self.open_nested(src, index) {
+            Ok(nested) => Ok(Some(nested)),
+            Err(error @ Error::TooDeep { .. }) => Err(error),
+            Err(_) => Ok(None),
+        }
     }
 }
 
-/// Reads a little-endian word from the header.
-fn word(header: &[u8; 16], off: usize) -> u32 {
-    let raw: [u8; 4] = header
-        .get(off..off.saturating_add(4))
+/// The three fields of an RPF7 header that say anything about the archive.
+///
+/// `docs/rpf-format.md`, RPF7 header, `verified`. The magic is not carried
+/// because a [`Header`] cannot exist without it having matched, and the length
+/// is not in the header at all.
+struct Header {
+    entry_count: u32,
+    names_len: u32,
+    encryption: u32,
+}
+
+/// Reads the header at `base`, or says why those bytes are not one.
+///
+/// Leaves the source positioned wherever the read ended; every read after this
+/// one seeks for itself.
+fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
+    // Read as much of the header as there is. A file too short to hold one is
+    // not an archive, which is a better answer than "i/o failure" — nothing
+    // failed, the bytes simply are not there.
+    src.seek(SeekFrom::Start(base))
+        .map_err(|source| Error::Io {
+            offset: base,
+            source,
+        })?;
+    let mut header = [0u8; 16];
+    let mut filled = 0_usize;
+    while filled < header.len() {
+        let rest = header.get_mut(filled..).unwrap_or_default();
+        let read = src.read(rest).map_err(|source| Error::Io {
+            offset: base,
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        filled = filled.saturating_add(read);
+    }
+
+    let magic: [u8; 4] = header
+        .get(0..4)
         .and_then(|s| s.try_into().ok())
         .unwrap_or_default();
-    u32::from_le_bytes(raw)
+    if filled < header.len() || magic != MAGIC_RPF7 {
+        return Err(Error::NotAnArchive { base, found: magic });
+    }
+
+    // Every field below is inside the sixteen bytes just filled, so the default
+    // is unreachable rather than a decision about a short header.
+    let encryption = u32_at(&header, 12).unwrap_or_default();
+    // Every encrypted path is R2. Refusing here, with a distinct variant, keeps
+    // "cannot open this" separate from "this is broken". R6.3.
+    if encryption != ENCRYPTION_OPEN {
+        return Err(Error::NeedsKey { tag: encryption });
+    }
+
+    Ok(Header {
+        entry_count: u32_at(&header, 4).unwrap_or_default(),
+        names_len: u32_at(&header, 8).unwrap_or_default(),
+        encryption,
+    })
 }
 
 /// How many entries, saturating rather than truncating.
@@ -652,35 +904,96 @@ fn parse_entries(table: &[u8], entry_count: u32) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// Resolves one name, refusing anything that runs past `names_len`.
-fn resolve_name(blob: &[u8], name_offset: u32, index: usize, names_len: u32) -> Result<String> {
-    let entry = u32::try_from(index).unwrap_or(u32::MAX);
-    let bad = Error::BadName {
-        entry,
+/// Locates every entry's name in the names blob, refusing anything that is not
+/// a terminated string inside it.
+///
+/// The blob is `namesLength` bytes and no more, never the backing buffer: the
+/// bytes after it can be stale names from a previous pack. `docs/rpf-format.md`,
+/// Slack.
+///
+/// Distinct name offsets are visited in ascending order and share one cursor,
+/// so finding every terminator costs one pass over the blob rather than one
+/// scan per entry. That is the same reason the result is a span and not a
+/// `String`: both readings are `entry_count × names_len` when an archive points
+/// every entry at one long name, and an archive may.
+fn resolve_names(blob: &[u8], entries: &[Entry]) -> Result<Vec<NameSpan>> {
+    let names_len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+    // The entry index is what a caller needs to act on, and the offset is
+    // shared, so the first entry carrying it is the one reported.
+    let bad = |name_offset: u32| Error::BadName {
+        entry: entries
+            .iter()
+            .position(|entry| entry.name_offset == name_offset)
+            .and_then(|index| u32::try_from(index).ok())
+            .unwrap_or(u32::MAX),
         name_offset,
         names_len,
     };
 
-    let start = usize::try_from(name_offset).map_err(|_| Error::BadName {
-        entry,
-        name_offset,
-        names_len,
-    })?;
-    let tail = blob.get(start..).ok_or(Error::BadName {
-        entry,
-        name_offset,
-        names_len,
-    })?;
-    let end = tail.iter().position(|&b| b == 0).ok_or(bad)?;
-    let raw = tail.get(..end).ok_or(Error::BadName {
-        entry,
-        name_offset,
-        names_len,
-    })?;
-    Ok(String::from_utf8_lossy(raw).into_owned())
+    let mut offsets: Vec<u32> = entries.iter().map(|entry| entry.name_offset).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let mut located: Vec<NameSpan> = Vec::with_capacity(offsets.len());
+    let mut cursor = 0_usize;
+    for &at in &offsets {
+        let start = usize::try_from(at).map_err(|_| bad(at))?;
+        if start >= blob.len() {
+            return Err(bad(at));
+        }
+        if cursor < start {
+            cursor = start;
+        }
+        while blob.get(cursor).is_some_and(|&byte| byte != 0) {
+            cursor = cursor.saturating_add(1);
+        }
+        if cursor >= blob.len() {
+            return Err(bad(at));
+        }
+        let len = u32::try_from(cursor.saturating_sub(start)).map_err(|_| bad(at))?;
+        located.push(NameSpan { at, len });
+    }
+
+    entries
+        .iter()
+        .map(|entry| {
+            offsets
+                .binary_search(&entry.name_offset)
+                .ok()
+                .and_then(|index| located.get(index))
+                .copied()
+                .ok_or_else(|| bad(entry.name_offset))
+        })
+        .collect()
 }
 
-/// Builds the child-to-parent map, validating every child range on the way.
+/// Builds the child-to-parent map, and with it establishes that the entries are
+/// a forest at all.
+///
+/// A child range inside the entry table is not enough. Three things are checked
+/// here, and each of them is a crash somewhere downstream if it is not:
+///
+/// - the range fits the entry table, or an index in it names no entry;
+/// - **every child comes after the directory that claims it.** The entry table
+///   is laid out breadth-first, each directory's children in one run after it
+///   (`docs/rpf-format.md`, Table order), so this holds of any archive a packer
+///   wrote — and it is what makes the parent map well founded, since a walk up
+///   it then strictly decreases and must end. `Archive::path` walks it in an
+///   unguarded loop;
+/// - **no entry is claimed twice.** Otherwise the children relation is a
+///   lattice rather than a forest while the parent map, which holds one parent
+///   per entry, looks perfectly ordinary — and it is the children relation that
+///   `ls -R` recurses over.
+///
+/// The last two are what a single-valued, last-writer-wins parent map cannot
+/// see. A directory whose range includes itself stays in the children relation
+/// while being erased from the parent map the moment a later entry re-claims
+/// the same child, and a check over the parent map alone then passes: measured,
+/// three directory rows in 512 bytes left `info`, `cat` and `verify` all
+/// reporting success and `ls -R` aborting with a stack overflow.
+///
+/// Refused here rather than guarded against at each walk (§5): a caller cannot
+/// act on a value it never gets back.
 fn parse_parents(entries: &[Entry]) -> Result<Vec<Option<u32>>> {
     let total = count_of(entries);
     let mut parents = vec![None; entries.len()];
@@ -694,27 +1007,68 @@ fn parse_parents(entries: &[Entry]) -> Result<Vec<Option<u32>>> {
             continue;
         };
         let index = u32::try_from(index).unwrap_or(u32::MAX);
-        let end = first_child
-            .checked_add(child_count)
-            .ok_or(Error::BadChildRange {
-                entry: index,
-                first: first_child,
-                count: child_count,
-                entry_count: total,
-            })?;
+        let bad_range = || Error::BadChildRange {
+            entry: index,
+            first: first_child,
+            count: child_count,
+            entry_count: total,
+        };
+        let end = first_child.checked_add(child_count).ok_or_else(bad_range)?;
         if end > total {
-            return Err(Error::BadChildRange {
-                entry: index,
-                first: first_child,
-                count: child_count,
-                entry_count: total,
-            });
+            return Err(bad_range());
         }
+
         for child in first_child..end {
-            if let Some(slot) = usize::try_from(child).ok().and_then(|c| parents.get_mut(c)) {
-                *slot = Some(index);
+            if child <= index {
+                return Err(Error::CyclicTree {
+                    entry: index,
+                    child,
+                });
             }
+            let Some(slot) = usize::try_from(child).ok().and_then(|c| parents.get_mut(c)) else {
+                return Err(bad_range());
+            };
+            if let Some(first) = *slot {
+                return Err(Error::ClaimedTwice {
+                    child,
+                    first,
+                    second: index,
+                });
+            }
+            *slot = Some(index);
         }
     }
+
+    check_depth(&parents)?;
     Ok(parents)
+}
+
+/// Refuses a tree deeper than [`MAX_DEPTH`].
+///
+/// One forward pass, and it is only that cheap because of the rule above: every
+/// entry's parent has a smaller index, so by the time an entry is reached its
+/// parent's depth is already known. An entry no directory claims is a root of
+/// its own and counts as depth zero, which is what entry 0 is.
+fn check_depth(parents: &[Option<u32>]) -> Result<()> {
+    let mut depth: Vec<u32> = Vec::with_capacity(parents.len());
+    for parent in parents {
+        let here = match *parent {
+            None => 0,
+            Some(parent) => usize::try_from(parent)
+                .ok()
+                .and_then(|p| depth.get(p))
+                .copied()
+                .unwrap_or(MAX_DEPTH)
+                .saturating_add(1),
+        };
+        if here > MAX_DEPTH {
+            return Err(Error::TooDeep {
+                what: "directory tree",
+                depth: here,
+                limit: MAX_DEPTH,
+            });
+        }
+        depth.push(here);
+    }
+    Ok(())
 }

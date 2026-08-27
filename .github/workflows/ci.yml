@@ -26,7 +26,24 @@ jobs:
       # No corpus is present here, and none ever will be: DR-006 keeps game
       # data out of tracked content. The suite must pass anyway, skipping what
       # it cannot reach and saying what it skipped. docs/backlog.md R8.4.
-      - run: cargo test --all
+      #
+      # And that claim is checked rather than asserted. `cargo test` prints `ok`
+      # for a passing test and swallows its output, so a corpus test that
+      # returned early would be indistinguishable in this log from one that ran
+      # — the green suite that tested nothing, docs/conventions.md §12. The
+      # count is written down so that adding a corpus test without a gate, or
+      # gating one that should have run, fails here rather than going unnoticed.
+      #
+      # `pipefail` because the default shell is `bash -e` without it, and a
+      # `tee` that succeeds would otherwise hide a suite that did not.
+      - name: the suite, and the tests it could not reach
+        run: |
+          set -o pipefail
+          cargo test --all 2>&1 | tee suite.log
+          skipped=$(grep -c 'ignored, no RPF_CORPUS' suite.log || true)
+          grep 'ignored, no RPF_CORPUS' suite.log || true
+          test "$skipped" -eq 10 \
+            || { echo "expected 10 corpus tests to report themselves skipped, got $skipped"; exit 1; }
 
   deny:
     runs-on: ubuntu-latest

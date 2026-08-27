@@ -13,13 +13,19 @@ pub mod build;
 pub mod entry;
 pub mod error;
 pub mod format;
+pub mod inspect;
 pub mod manifest;
+pub mod patch;
+pub mod watch;
 
-pub use archive::Archive;
+pub use archive::{Archive, MAX_DEPTH};
 pub use build::{
     FileKind, FileSpec, Report, Storage, build, directories_of, rebuild, replace_at, replace_many,
     specs_of,
 };
 pub use entry::{Entry, EntryKind};
 pub use error::{Category, Error, Result};
+pub use inspect::{Problem, Summary, Verified};
 pub use manifest::{MANIFEST_NAME, Manifest};
+pub use patch::{Patches, Plan, Planned, TooLarge, plan};
+pub use watch::{Flow, Step, Unwatched, Watch};

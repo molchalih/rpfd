@@ -83,6 +83,79 @@ pub enum Error {
         entry_count: u32,
     },
 
+    /// A directory claims a child that does not come after it in the entry
+    /// table — itself, or an entry above it — so the entries do not form a
+    /// tree.
+    ///
+    /// The entry table is laid out breadth-first, each directory's children in
+    /// one run after it (`docs/rpf-format.md`, Table order), so a child index
+    /// greater than its parent's is what makes the parent map well founded: a
+    /// walk up it strictly decreases and therefore ends. A claim that goes the
+    /// other way is what a cycle is made of.
+    ///
+    /// Distinct from [`Error::BadChildRange`], and worse: every index involved
+    /// is inside the entry table, so walking the parent map does not run off
+    /// the end — it runs for ever. Refused at parse, because a caller cannot
+    /// act on a value it never gets back.
+    #[error("entry {entry}: child {child} does not come after it in the entry table")]
+    CyclicTree {
+        /// Index of the directory that claimed the child.
+        entry: u32,
+        /// The child it claimed.
+        child: u32,
+    },
+
+    /// Two directories claim the same entry as a child, so the entries are not
+    /// a forest.
+    ///
+    /// Nothing here is out of range and nothing is a cycle, which is why it
+    /// needs saying separately: the children relation can still be a lattice,
+    /// and the number of root-to-leaf paths through one doubles per row. A
+    /// 512-byte archive of 26 such rows made `ls -R` produce 33,554,431 rows.
+    #[error("entry {child} is claimed as a child by both entry {first} and entry {second}")]
+    ClaimedTwice {
+        /// The entry claimed more than once.
+        child: u32,
+        /// The first directory to claim it.
+        first: u32,
+        /// The second.
+        second: u32,
+    },
+
+    /// A recursive structure is deeper than this container will walk.
+    ///
+    /// Both directory trees and archives nested inside archives are walked
+    /// recursively, by this crate and by everything built on it, and both
+    /// depths are the archive's to choose. Nothing about a deep one is
+    /// self-contradictory — which is exactly why it is refused at a stated
+    /// depth rather than discovered as a stack overflow (§6).
+    #[error("{what} is {depth} deep, over the limit of {limit}")]
+    TooDeep {
+        /// Which structure: `"directory tree"` or `"archive nesting"`.
+        what: &'static str,
+        /// The depth reached.
+        depth: u32,
+        /// The deepest that is accepted.
+        limit: u32,
+    },
+
+    /// An entry's payload begins inside the archive's own header, entry table
+    /// or names blob rather than after them.
+    ///
+    /// Distinct from [`Error::OutOfBounds`]: the region fits inside the
+    /// archive, and that is what makes it dangerous. Reading it hands back the
+    /// archive's own structure as file contents, and the room reported for
+    /// patching it in place covers the header.
+    #[error("entry {entry}: payload begins at {offset}, before the first payload offset {floor}")]
+    PayloadUnderflow {
+        /// Index of the offending entry.
+        entry: u32,
+        /// Where the payload claims to begin, relative to the archive's base.
+        offset: u64,
+        /// The lowest offset a payload may occupy in this archive.
+        floor: u64,
+    },
+
     /// A resource entry's compressed size cannot hold its own `RSC7` header.
     #[error("entry {entry}: resource of {compressed_len} bytes is smaller than its 16-byte header")]
     ResourceTooSmall {
@@ -93,6 +166,9 @@ pub enum Error {
     },
 
     /// The payload did not inflate.
+    ///
+    /// A fact about the archive's bytes, not about the source they came from:
+    /// every byte asked for arrived, and then did not decode. DR-010.
     #[error("entry {entry}: payload did not inflate")]
     Inflate {
         /// Index of the offending entry.
@@ -170,6 +246,48 @@ pub enum Error {
         reason: &'static str,
     },
 
+    /// Two edits in one plan claim the same bytes.
+    ///
+    /// A nested archive and a file inside it, or two spellings of one path.
+    /// Nothing about the archive is wrong, so this is a refusal rather than a
+    /// corrupt archive: the caller has to drop one of the two or rebuild.
+    #[error("{path:?} and {other:?} cannot be patched together: they claim the same bytes")]
+    Overlapping {
+        /// The edit that collided.
+        path: String,
+        /// The edit already planned over those bytes.
+        other: String,
+    },
+
+    /// A watcher stopped the write. DR-008.
+    ///
+    /// Not a failure of the archive or of the caller's input — the caller asked
+    /// for this — which is why it carries how far it got rather than a reason.
+    #[error("cancelled after {done} of {total} entries")]
+    Cancelled {
+        /// How many entries had been written when it stopped.
+        done: u32,
+        /// How many there would have been.
+        total: u32,
+    },
+
+    /// Entries did not read back as the archive describes them.
+    ///
+    /// What a failing `verify` returns. It is one failure about a set of
+    /// entries rather than about any one of them, so it carries the two counts
+    /// a caller acts on — how many were read, and how many of those did not
+    /// come back as promised — and leaves the per-entry detail to the report
+    /// beside it. R6.9. Borrowing [`Error::LengthMismatch`] for this rendered
+    /// "entry 0: inflated to 25 bytes, archive declares 26", a sentence about
+    /// inflation with nothing to do with what happened.
+    #[error("{failed} of {checked} entries did not read back as the archive describes them")]
+    VerifyFailed {
+        /// How many file entries were read, the failing ones included.
+        checked: u32,
+        /// How many of them did not come back as the archive promised.
+        failed: u32,
+    },
+
     /// The entry exists but is not the kind the operation needs.
     #[error("entry {entry} is a {found}, expected a {wanted}")]
     WrongKind {
@@ -188,6 +306,8 @@ pub enum Error {
 /// rather than in the binary: the variant set is the public contract (§10), and
 /// a new variant that forgets to classify itself would otherwise become an
 /// exit code silently.
+/// A category names what the caller has to do about the failure rather than
+/// what the code was doing when it noticed. DR-010.
 /// Deliberately **not** `#[non_exhaustive]`, unlike [`Error`]: a new category
 /// must break every mapping of it at compile time, which is the whole point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +318,13 @@ pub enum Category {
     Corrupt,
     /// The archive is intact but needs key material we do not have.
     NeedsKey,
-    /// The source or sink failed.
+    /// The container declines to carry out the request. Either it is not well
+    /// formed, or it is and the container will not do it. DR-010.
+    Refused,
+    /// The caller stopped it part-way.
+    Cancelled,
+    /// The source or sink failed. Nobody's input is in question: this is the
+    /// disk, the pipe or the handle. DR-010.
     Io,
 }
 
@@ -207,22 +333,239 @@ impl Error {
     #[must_use]
     pub const fn category(&self) -> Category {
         match *self {
-            Self::Io { .. } | Self::Inflate { .. } => Category::Io,
+            Self::Io { .. } => Category::Io,
             Self::NeedsKey { .. } => Category::NeedsKey,
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
+            Self::Overlapping { .. }
+            | Self::FieldOverflow { .. }
+            | Self::NotAResource { .. }
+            | Self::BadPath { .. }
+            | Self::WrongKind { .. } => Category::Refused,
+            Self::Cancelled { .. } => Category::Cancelled,
             Self::NotAnArchive { .. }
             | Self::OutOfBounds { .. }
             | Self::BadName { .. }
             | Self::BadChildRange { .. }
+            | Self::CyclicTree { .. }
+            | Self::ClaimedTwice { .. }
+            | Self::TooDeep { .. }
+            | Self::PayloadUnderflow { .. }
             | Self::ResourceTooSmall { .. }
+            | Self::Inflate { .. }
             | Self::LengthMismatch { .. }
-            | Self::FieldOverflow { .. }
-            | Self::NotAResource { .. }
-            | Self::BadPath { .. }
-            | Self::WrongKind { .. } => Category::Corrupt,
+            | Self::VerifyFailed { .. } => Category::Corrupt,
         }
     }
 }
 
 /// Result of a container operation.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{Category, Error};
+
+    /// How many variants [`Error`] has, which is what the match below counts.
+    ///
+    /// The match is exhaustive, so a variant added later stops this module
+    /// compiling until it is named there — and then this number and the tables
+    /// below have to be brought up to date, which is the point.
+    const VARIANTS: usize = 22;
+
+    /// The variant's own name, for a test that has to say which one it means.
+    fn name(error: &Error) -> &'static str {
+        match *error {
+            Error::Io { .. } => "Io",
+            Error::NotAnArchive { .. } => "NotAnArchive",
+            Error::NeedsKey { .. } => "NeedsKey",
+            Error::OutOfBounds { .. } => "OutOfBounds",
+            Error::BadName { .. } => "BadName",
+            Error::BadChildRange { .. } => "BadChildRange",
+            Error::CyclicTree { .. } => "CyclicTree",
+            Error::ClaimedTwice { .. } => "ClaimedTwice",
+            Error::TooDeep { .. } => "TooDeep",
+            Error::PayloadUnderflow { .. } => "PayloadUnderflow",
+            Error::ResourceTooSmall { .. } => "ResourceTooSmall",
+            Error::Inflate { .. } => "Inflate",
+            Error::LengthMismatch { .. } => "LengthMismatch",
+            Error::VerifyFailed { .. } => "VerifyFailed",
+            Error::NoSuchEntry { .. } => "NoSuchEntry",
+            Error::NotFound { .. } => "NotFound",
+            Error::FieldOverflow { .. } => "FieldOverflow",
+            Error::NotAResource { .. } => "NotAResource",
+            Error::BadPath { .. } => "BadPath",
+            Error::Overlapping { .. } => "Overlapping",
+            Error::Cancelled { .. } => "Cancelled",
+            Error::WrongKind { .. } => "WrongKind",
+        }
+    }
+
+    /// A stand-in for whatever the source or the decompressor reported.
+    fn io() -> std::io::Error {
+        std::io::Error::other("something below us failed")
+    }
+
+    /// Every failure that means the archive's own bytes are wrong.
+    ///
+    /// `Inflate` belongs here and was `Io`: every byte asked for arrived and
+    /// then failed to decode. DR-010.
+    fn corrupt() -> Vec<Error> {
+        vec![
+            Error::NotAnArchive {
+                base: 0,
+                found: [0; 4],
+            },
+            Error::OutOfBounds {
+                region: "payload",
+                offset: 0,
+                len: 1,
+                archive_len: 0,
+            },
+            Error::BadName {
+                entry: 0,
+                name_offset: 0,
+                names_len: 0,
+            },
+            Error::BadChildRange {
+                entry: 0,
+                first: 0,
+                count: 0,
+                entry_count: 0,
+            },
+            Error::CyclicTree { entry: 0, child: 0 },
+            Error::ClaimedTwice {
+                child: 2,
+                first: 0,
+                second: 1,
+            },
+            Error::TooDeep {
+                what: "directory tree",
+                depth: 33,
+                limit: 32,
+            },
+            Error::PayloadUnderflow {
+                entry: 0,
+                offset: 0,
+                floor: 16,
+            },
+            Error::ResourceTooSmall {
+                entry: 0,
+                compressed_len: 4,
+            },
+            Error::Inflate {
+                entry: 0,
+                source: io(),
+            },
+            Error::LengthMismatch {
+                entry: 0,
+                expected: 26,
+                actual: 25,
+            },
+            Error::VerifyFailed {
+                checked: 27,
+                failed: 1,
+            },
+        ]
+    }
+
+    /// Every failure that means the request, or the input it carried, was
+    /// wrong. All but `Overlapping` were `Corrupt`, and so blamed the archive
+    /// for what the caller passed. DR-010.
+    fn refused() -> Vec<Error> {
+        vec![
+            Error::FieldOverflow {
+                path: "big.bin".to_owned(),
+                what: "compressed size",
+                len: 1 << 24,
+                limit: (1 << 24) - 1,
+            },
+            Error::NotAResource {
+                path: "x.ytd".to_owned(),
+            },
+            Error::BadPath {
+                path: "../escape".to_owned(),
+                reason: "leaves the archive",
+            },
+            Error::Overlapping {
+                path: "a".to_owned(),
+                other: "b".to_owned(),
+            },
+            Error::WrongKind {
+                entry: 0,
+                found: "directory",
+                wanted: "file",
+            },
+        ]
+    }
+
+    /// One failure for each of the categories with no group of their own.
+    fn the_rest() -> Vec<(Error, Category)> {
+        vec![
+            (
+                Error::Io {
+                    offset: 0,
+                    source: io(),
+                },
+                Category::Io,
+            ),
+            (Error::NeedsKey { tag: 0x0FFF_FFF9 }, Category::NeedsKey),
+            (
+                Error::NoSuchEntry {
+                    index: 9,
+                    entry_count: 4,
+                },
+                Category::NotFound,
+            ),
+            (
+                Error::NotFound {
+                    path: "x64/nope".to_owned(),
+                    segment: "nope".to_owned(),
+                },
+                Category::NotFound,
+            ),
+            (Error::Cancelled { done: 1, total: 24 }, Category::Cancelled),
+        ]
+    }
+
+    /// A failure of each variant, with the category it is contracted to carry.
+    fn taxonomy() -> Vec<(Error, Category)> {
+        corrupt()
+            .into_iter()
+            .map(|error| (error, Category::Corrupt))
+            .chain(
+                refused()
+                    .into_iter()
+                    .map(|error| (error, Category::Refused)),
+            )
+            .chain(the_rest())
+            .collect()
+    }
+
+    #[test]
+    fn every_variant_carries_the_category_it_is_contracted_to() {
+        // §10 makes the variant set the public contract and R6.3 derives the
+        // exit code from it, so a category that moves is a contract that moved.
+        for (error, expected) in taxonomy() {
+            assert_eq!(
+                error.category(),
+                expected,
+                "{} is classified {:?}",
+                name(&error),
+                error.category()
+            );
+        }
+    }
+
+    #[test]
+    fn the_taxonomy_covers_every_variant_exactly_once() {
+        let named: BTreeSet<&str> = taxonomy().iter().map(|(error, _)| name(error)).collect();
+        assert_eq!(
+            named.len(),
+            VARIANTS,
+            "the tables name {} of {VARIANTS} variants",
+            named.len()
+        );
+    }
+}
