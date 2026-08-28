@@ -26,7 +26,7 @@ pub use build::{
 };
 pub use entry::{Entry, EntryKind};
 pub use error::{Category, Error, Result};
-pub use inspect::{Problem, Summary, Verified};
+pub use inspect::{Listed, ListedKind, Problem, Summary, Verified};
 pub use manifest::{MANIFEST_NAME, Manifest};
 pub use patch::{Patches, Plan, Planned, TooLarge, plan};
 pub use watch::{Flow, Step, Unwatched, Watch};

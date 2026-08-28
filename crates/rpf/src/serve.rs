@@ -189,10 +189,13 @@ impl State {
     /// for one archive, the path catches a new file at a name a session holds.
     /// Derived from the open sessions rather than kept beside them, so a claim
     /// is released exactly one way — the session going away (§3).
-    fn holder_of(&self, path: &Path, id: FileId) -> Option<(u64, &Path)> {
+    /// `id` is absent when the file is not there to be statted, which is the
+    /// ordinary case for an archive `pack` is about to create. The path is
+    /// still asked, and it is the half that catches a name a session holds.
+    fn holder_of(&self, path: &Path, id: Option<FileId>) -> Option<(u64, &Path)> {
         self.sessions
             .iter()
-            .find(|(_, session)| session.path == path || session.id.is(id))
+            .find(|(_, session)| session.path == path || id.is_some_and(|id| session.id.is(id)))
             .map(|(handle, session)| (*handle, session.path.as_path()))
     }
 }
@@ -225,7 +228,10 @@ struct Job {
     request: Value,
     /// What an answer echoes back. [`NAME_ECHO`].
     name: Value,
-    handle: u64,
+    /// The session it runs against, or `None` for the one operation that has
+    /// none: `pack` builds an archive from a tree and is named by its output
+    /// path rather than by a handle. DR-014.
+    handle: Option<u64>,
     /// What the client is told is running: `"commit"` while it is still being
     /// decided, then `"patch"` or `"rebuild"`.
     method: &'static str,
@@ -272,7 +278,13 @@ impl Cancellation {
     }
 
     /// Registers the operation a `cancel` may now name.
-    fn begin(&self, request: &Value, handle: u64, method: &'static str, stoppable: Stoppable) {
+    fn begin(
+        &self,
+        request: &Value,
+        handle: Option<u64>,
+        method: &'static str,
+        stoppable: Stoppable,
+    ) {
         *self.job() = Some(Job {
             request: request.clone(),
             name: name_of(request),
@@ -304,7 +316,7 @@ impl Cancellation {
             return json!({ "cancelling": false, "running": Value::Null });
         };
         let named = request.is_none_or(|named| *named == job.request)
-            && handle.is_none_or(|named| named == job.handle);
+            && handle.is_none_or(|named| job.handle == Some(named));
         let reason = match (named, &job.stoppable) {
             (true, &Stoppable::Yes) => {
                 job.cancelled = true;
@@ -536,7 +548,8 @@ fn write_line(out: &mut impl Write, text: &str, backlog: &Backlog) -> bool {
 /// when there is nobody left to report to.
 struct Notifying<'a> {
     wire: &'a Wire,
-    handle: u64,
+    /// The session being reported on, or `None` for a `pack`, which has none.
+    handle: Option<u64>,
     /// What the notification echoes of the request that started the write.
     /// [`NAME_ECHO`].
     name: &'a Value,
@@ -966,6 +979,8 @@ fn dispatch(
         "discard" => discard(state, params),
         "info" => info(state, params),
         "verify" => verify(state, params, wire, request),
+        "extract" => extract(state, params, wire, request),
+        "pack" => pack(state, params, wire, request),
         "commit" => commit(state, params, wire, request),
         other => Err(Rejected::Protocol {
             code: METHOD_NOT_FOUND,
@@ -1036,11 +1051,13 @@ fn session<'a>(state: &'a mut State, params: &Value) -> Answer<&'a mut Session> 
 /// Two names for one *file* do not resolve alike, which is what [`FileId`] is
 /// for. A path that cannot be resolved has not been opened either, so it is an
 /// ordinary open failure. DR-009.
+///
+/// With one exception, which is the command line's too: a path that runs past a
+/// file is an in-archive path spelled as a filesystem one, and that is a
+/// request rather than a disk. `commands::opening` decides it for both
+/// frontends, so the two cannot answer one mistake with two numbers. DR-010.
 fn resolve(path: &Path) -> crate::exit::Result<PathBuf> {
-    fs::canonicalize(path).map_err(|source| Failure::Io {
-        path: path.display().to_string(),
-        source,
-    })
+    fs::canonicalize(path).map_err(|source| commands::opening(path, source))
 }
 
 /// `open` — claim an archive, parse it, and keep it warm.
@@ -1052,7 +1069,7 @@ fn open(state: &mut State, params: &Value) -> Answered {
     let path = resolve(&asked)?;
     let (file, archive) = commands::open(&path)?;
     let id = FileId::of(&file, &path)?;
-    if let Some((holder, held)) = state.holder_of(&path, id) {
+    if let Some((holder, held)) = state.holder_of(&path, Some(id)) {
         return Err(already_open(&path, held, holder).into());
     }
 
@@ -1082,12 +1099,13 @@ fn open(state: &mut State, params: &Value) -> Answered {
     }))
 }
 
-/// Why one archive cannot be opened twice, and which handle has it.
+/// That an archive is held, and by which handle.
 ///
 /// The path asked for and the path the holder claimed can differ — two names
-/// for one file — so both are named.
-fn already_open(path: &Path, held: &Path, holder: u64) -> Failure {
-    let names = if held == path {
+/// for one file — so both are named. One sentence for both of the refusals that
+/// need it, so a client is told the same thing however it ran into the claim.
+fn names_held(path: &Path, held: &Path, holder: u64) -> String {
+    if held == path {
         format!("{} is already open on handle {holder}", path.display())
     } else {
         format!(
@@ -1095,12 +1113,17 @@ fn already_open(path: &Path, held: &Path, holder: u64) -> Failure {
             path.display(),
             held.display()
         )
-    };
+    }
+}
+
+/// Why one archive cannot be opened twice, and which handle has it.
+fn already_open(path: &Path, held: &Path, holder: u64) -> Failure {
     Failure::Refused {
         reason: format!(
-            "{names}. An archive is open in one session at a time: every offset a session holds \
+            "{}. An archive is open in one session at a time: every offset a session holds \
              is true only of the bytes it parsed, and a second session committing moves them. \
-             Close handle {holder} first, or work on a copy"
+             Close handle {holder} first, or work on a copy",
+            names_held(path, held, holder),
         ),
     }
 }
@@ -1119,27 +1142,25 @@ fn close(state: &mut State, params: &Value) -> Answered {
     Ok(json!({ "closed": true, "discarded": closed.pending.len() }))
 }
 
-/// `list` — the entries at a path, optionally recursively.
-fn list(state: &mut State, params: &Value) -> Answered {
-    let inside = params
+/// An optional path inside the archive a handle holds, empty for its root.
+fn inside_of(params: &Value) -> String {
+    params
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or("")
-        .to_owned();
+        .to_owned()
+}
+
+/// `list` — the entries at a path, optionally recursively.
+fn list(state: &mut State, params: &Value) -> Answered {
+    let inside = inside_of(params);
     let recursive = flag(params, "recursive")?;
     let session = session(state, params)?;
 
-    let (holder, at) = session.archive.locate(&mut session.file, &inside)?;
-    let mut rows = Vec::new();
-    commands::list_into(
-        &mut session.file,
-        &holder,
-        at,
-        &inside,
-        recursive,
-        &mut rows,
-    )?;
-    Ok(Value::Array(rows))
+    let rows = rpf_core::Listed::at(&mut session.file, &session.archive, &inside, recursive)?;
+    Ok(Value::Array(
+        rows.iter().map(commands::listing_row).collect(),
+    ))
 }
 
 /// `read` — one entry's bytes, as base64.
@@ -1209,11 +1230,17 @@ fn write(state: &mut State, params: &Value) -> Answered {
 }
 
 /// `info` — the header, and what the entries add up to.
+///
+/// `path` means what it means to `list`: a path inside the archive the handle
+/// holds. Empty, or absent, is the archive itself; anything else names a nested
+/// archive. R6.11.
 fn info(state: &mut State, params: &Value) -> Answered {
+    let inside = inside_of(params);
     let session = session(state, params)?;
-    let summary = rpf_core::Summary::of(&mut session.file, &session.archive)?;
+    let summary = rpf_core::Summary::of(&mut session.file, &session.archive, &inside)?;
     Ok(json!({
         "path": session.path.display().to_string(),
+        "inside": inside,
         "len": summary.len,
         "encryption": commands::encryption_name(summary.encryption),
         "entries": summary.entries,
@@ -1242,13 +1269,14 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 
     let mut watch = Notifying {
         wire,
-        handle,
+        handle: Some(handle),
         name: &name,
         wanted,
         skipped: 0,
         stopped: None,
     };
-    wire.cancel.begin(request, handle, "verify", Stoppable::Yes);
+    wire.cancel
+        .begin(request, Some(handle), "verify", Stoppable::Yes);
     let outcome = rpf_core::Verified::of(&mut session.file, &session.archive, &mut watch);
     wire.cancel.finish();
     let verified = outcome.map_err(|error| watch.explain(Failure::from(error)))?;
@@ -1263,6 +1291,134 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
         "entries_checked": verified.checked,
         "problems": problems,
     }))
+}
+
+/// `extract` — write every entry of an open archive to a tree.
+///
+/// `into` is a directory on the **daemon's own** filesystem, which is the one
+/// thing a path on this wire has ever meant: `open` takes one, and a client
+/// that cannot name a file the daemon can reach could not open an archive
+/// either. DR-014.
+///
+/// Unbounded work, so it reports progress and takes a `cancel` on the same seam
+/// a rebuild does. A cancelled extraction leaves the files it had already
+/// written where they are — a tree is not replaced by rename the way an archive
+/// is, and DR-014 says so rather than leaving it to be discovered.
+fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
+    let handle = handle_of(params)?;
+    let into = PathBuf::from(string(params, "into")?);
+    let wanted = wants_progress(params)?;
+    let name = name_of(request);
+    let session = session(state, params)?;
+
+    let mut watch = Notifying {
+        wire,
+        handle: Some(handle),
+        name: &name,
+        wanted,
+        skipped: 0,
+        stopped: None,
+    };
+    wire.cancel
+        .begin(request, Some(handle), "extract", Stoppable::Yes);
+    let outcome = commands::extract_into(&mut session.file, &session.archive, &into, &mut watch);
+    wire.cancel.finish();
+    let extracted = outcome.map_err(|failure| watch.explain(failure))?;
+
+    Ok(json!({
+        "archive": session.path.display().to_string(),
+        "into": into.display().to_string(),
+        "files": extracted.files,
+        "directories": extracted.directories,
+        "manifest": extracted.manifest.display().to_string(),
+    }))
+}
+
+/// `pack` — build an archive from a tree and its manifest.
+///
+/// The one method with no handle: it makes an archive rather than working on
+/// one that is open, so both of its paths are on the daemon's filesystem and
+/// its output is named by path. DR-014.
+///
+/// That is a second way into DR-009's corruption, so it is refused the same
+/// way: an archive an open session holds cannot be packed over, because every
+/// offset that session holds is true only of the bytes it parsed.
+fn pack(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
+    let from = PathBuf::from(string(params, "from")?);
+    let archive = PathBuf::from(string(params, "archive")?);
+    let force = flag(params, "force")?;
+    let wanted = wants_progress(params)?;
+    let name = name_of(request);
+
+    let target = target_of(&archive)?;
+    if let Some((holder, held)) = state.holder_of(&target, identity_of(&target)) {
+        return Err(packing_over_held(&target, held, holder).into());
+    }
+
+    let mut watch = Notifying {
+        wire,
+        handle: None,
+        name: &name,
+        wanted,
+        skipped: 0,
+        stopped: None,
+    };
+    wire.cancel.begin(request, None, "pack", Stoppable::Yes);
+    let outcome = commands::pack_from(&from, &archive, force, &mut watch);
+    wire.cancel.finish();
+    let report = outcome.map_err(|failure| watch.explain(failure))?;
+
+    Ok(json!({
+        "archive": archive.display().to_string(),
+        "entries": report.entry_count,
+        "len": report.len,
+    }))
+}
+
+/// The path a write will land on, resolved as far as it exists.
+///
+/// [`resolve`] needs the file to be there and `pack` usually writes one that is
+/// not, so the directory is resolved and the name joined back on. That is the
+/// path a session would have claimed had it opened the file, which is what
+/// makes the two comparable.
+///
+/// # Errors
+///
+/// [`Failure::Io`] when the directory does not resolve, and
+/// [`Failure::Refused`] for a path that names no file at all.
+fn target_of(path: &Path) -> crate::exit::Result<PathBuf> {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return Ok(resolved);
+    }
+    let name = path.file_name().ok_or_else(|| Failure::Refused {
+        reason: format!("{} does not name an archive to write", path.display()),
+    })?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(resolve(directory)?.join(name))
+}
+
+/// What the operating system calls the file at a path, when there is one.
+///
+/// `None` covers both "nothing is there" and "it could not be statted": either
+/// way there is no identity to match a session's against, and the path is asked
+/// on its own. DR-009.
+fn identity_of(path: &Path) -> Option<FileId> {
+    let file = fs::File::open(path).ok()?;
+    FileId::of(&file, path).ok()
+}
+
+/// Why an archive cannot be packed over, and which handle has it.
+fn packing_over_held(path: &Path, held: &Path, holder: u64) -> Failure {
+    Failure::Refused {
+        reason: format!(
+            "{}. Packing over it would move every offset that session holds. Close handle \
+             {holder} first, or pack somewhere else",
+            names_held(path, held, holder),
+        ),
+    }
 }
 
 /// `pending` — what has been written but not committed.
@@ -1315,7 +1471,7 @@ impl Decision {
 
 /// What one commit was asked for, past the flags that decide nothing.
 struct Asked<'a> {
-    /// The session it runs against.
+    /// The session it runs against. A commit always has one.
     handle: u64,
     /// The `id` of the request, which is the name a cancel uses.
     request: &'a Value,
@@ -1390,7 +1546,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     // compresses every buffered edit, and forgotten whatever the outcome.
     wire.cancel.begin(
         asked.request,
-        asked.handle,
+        Some(asked.handle),
         "commit",
         Stoppable::No(DECIDING),
     );
@@ -1429,8 +1585,12 @@ fn commit_now(
 ) -> crate::exit::Result<&'static str> {
     let decision = decide(session, asked.rebuild)?;
     let method = decision.method();
-    wire.cancel
-        .begin(asked.request, asked.handle, method, decision.stoppable());
+    wire.cancel.begin(
+        asked.request,
+        Some(asked.handle),
+        method,
+        decision.stoppable(),
+    );
     match decision {
         Decision::Patch { patches, mut file } => patches.apply(&mut file)?,
         Decision::Rebuild => rebuild(session, wire, asked)?,
@@ -1505,7 +1665,7 @@ fn rebuild(session: &mut Session, wire: &Wire, asked: &Asked<'_>) -> crate::exit
 
     let mut watch = Notifying {
         wire,
-        handle: asked.handle,
+        handle: Some(asked.handle),
         name: asked.name,
         wanted: asked.progress,
         skipped: 0,
@@ -1638,11 +1798,32 @@ mod tests {
     }
 
     #[test]
+    fn a_pack_is_cancellable_and_is_named_by_nothing_but_its_request() {
+        // `pack` is the one operation with no session, so a cancel that names a
+        // handle names something else by construction. Naming nothing still
+        // means "whatever is running", which is what DR-008 says it means, and
+        // the answer reports no handle rather than inventing one. DR-014.
+        let cancel = Cancellation::default();
+        cancel.begin(&json!(7), None, "pack", Stoppable::Yes);
+
+        let aimed = cancel.ask(None, Some(1));
+        assert_eq!(aimed["cancelling"], json!(false), "{aimed}");
+        assert_eq!(aimed["handle"], json!(null), "{aimed}");
+        assert!(!cancel.stopped(), "a cancel aimed at a handle stopped it");
+
+        let answer = cancel.ask(Some(&json!(7)), None);
+        assert_eq!(answer["cancelling"], json!(true), "{answer}");
+        assert_eq!(answer["running"], json!("pack"), "{answer}");
+        assert_eq!(answer["handle"], json!(null), "{answer}");
+        assert!(cancel.stopped());
+    }
+
+    #[test]
     fn a_patch_answers_a_cancel_with_what_it_actually_does() {
         // DR-008: a cancelled patch is not possible, and the client is told so
         // rather than told a commit is stopping when it is not.
         let cancel = Cancellation::default();
-        cancel.begin(&json!(7), 1, "patch", Stoppable::No(PATCHING));
+        cancel.begin(&json!(7), Some(1), "patch", Stoppable::No(PATCHING));
 
         let answer = cancel.ask(None, None);
         assert_eq!(answer["cancelling"], json!(false), "{answer}");
@@ -1656,7 +1837,7 @@ mod tests {
         // Deciding reads and compresses every buffered edit, so neither
         // "nothing is running" nor "cancelling" is the right answer during it.
         let cancel = Cancellation::default();
-        cancel.begin(&json!(7), 1, "commit", Stoppable::No(DECIDING));
+        cancel.begin(&json!(7), Some(1), "commit", Stoppable::No(DECIDING));
 
         let answer = cancel.ask(None, None);
         assert_eq!(answer["cancelling"], json!(false), "{answer}");
@@ -1667,7 +1848,7 @@ mod tests {
     #[test]
     fn a_cancel_only_stops_the_operation_it_names() {
         let cancel = Cancellation::default();
-        cancel.begin(&json!(7), 3, "rebuild", Stoppable::Yes);
+        cancel.begin(&json!(7), Some(3), "rebuild", Stoppable::Yes);
 
         for aimed_elsewhere in [
             cancel.ask(Some(&json!(6)), None),
@@ -1697,7 +1878,7 @@ mod tests {
         assert_eq!(answer["cancelling"], json!(false), "{answer}");
         assert_eq!(answer["running"], json!(null), "{answer}");
 
-        cancel.begin(&json!(1), 1, "rebuild", Stoppable::Yes);
+        cancel.begin(&json!(1), Some(1), "rebuild", Stoppable::Yes);
         assert!(!cancel.stopped(), "a cancel was stored for the next commit");
         cancel.finish();
         assert!(!cancel.stopped());
@@ -1739,7 +1920,7 @@ mod tests {
     #[test]
     fn an_ill_typed_cancel_is_refused_rather_than_acted_on() {
         let cancel = Cancellation::default();
-        cancel.begin(&json!(3), 1, "rebuild", Stoppable::Yes);
+        cancel.begin(&json!(3), Some(1), "rebuild", Stoppable::Yes);
 
         let Seen::Cancel(answer) = answer_cancel(
             r#"{"jsonrpc":"2.0","id":9,"method":"cancel","params":{"handle":"2"}}"#,
@@ -1773,7 +1954,7 @@ mod tests {
         // grow the daemon 5.67 GB.
         let cancel = Cancellation::default();
         let huge = json!("i".repeat(256 * 1024));
-        cancel.begin(&huge, 1, "rebuild", Stoppable::Yes);
+        cancel.begin(&huge, Some(1), "rebuild", Stoppable::Yes);
 
         for answer in [cancel.ask(None, Some(2)), cancel.ask(None, None)] {
             assert!(

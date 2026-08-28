@@ -28,10 +28,13 @@ struct Cli {
 /// `x64/vehicles.rpf/meringls63amg24.ytd`.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Summarise an archive.
+    /// Summarise an archive, or one nested inside it.
     Info {
         /// The archive.
         archive: PathBuf,
+        /// A nested archive inside it. Defaults to the archive itself.
+        #[arg(default_value = "")]
+        path: String,
     },
     /// List what is at a path inside an archive.
     Ls {
@@ -98,7 +101,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let outcome = match cli.command {
-        Command::Info { ref archive } => commands::info(archive, cli.json),
+        Command::Info {
+            ref archive,
+            ref path,
+        } => commands::info(archive, path, cli.json),
         Command::Ls {
             ref archive,
             ref path,

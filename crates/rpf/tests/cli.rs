@@ -299,15 +299,14 @@ fn put_keeps_the_archives_permissions() {
     assert_eq!(mode, 0o644, "permissions changed to {mode:o}");
 }
 
-#[test]
-fn ls_of_a_nested_archive_lists_what_is_inside_it() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let inner_path = dir.path().join("inner.rpf");
+/// An archive holding an archive at `x64/inner.rpf`, stored rather than
+/// deflated, returning the outer path and the inner one it was built from.
+fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let inner_path = dir.join("inner.rpf");
     make_archive(&inner_path);
     let inner = fs::read(&inner_path).expect("readable");
 
-    // An archive holding an archive, stored rather than deflated.
-    let outer_path = dir.path().join("outer.rpf");
+    let outer_path = dir.join("outer.rpf");
     let files = vec![FileSpec {
         path: "x64/inner.rpf".to_owned(),
         kind: FileKind::Binary {
@@ -318,6 +317,13 @@ fn ls_of_a_nested_archive_lists_what_is_inside_it() {
     let mut out = fs::File::create(&outer_path).expect("creatable");
     rpf_core::build(&mut out, &files, &[], |_| Ok(inner.clone()), &mut Unwatched)
         .expect("outer builds");
+    (outer_path, inner_path)
+}
+
+#[test]
+fn ls_of_a_nested_archive_lists_what_is_inside_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, _) = make_nested(dir.path());
     let outer = outer_path.display().to_string();
 
     let (code, listing) = run(&["ls", &outer, "x64/inner.rpf"]);
@@ -1239,4 +1245,99 @@ fn a_not_found_holding_no_backslash_is_reported_as_it_was() {
         !stderr.contains("separates with"),
         "there is nothing to say about a separator here: {stderr}"
     );
+}
+
+#[test]
+fn info_summarises_a_nested_archive() {
+    // R6.11. `ls`, `cat`, `put` and `verify` all take an in-archive path and
+    // descend through nesting; `info` took the archive alone, so the entry
+    // count, size and slack of `x64/vehicles.rpf` could not be asked for at
+    // all. R6's exit criterion is an agent working inside a nested archive
+    // using only documented output, and this was the one reporting command
+    // that could not address one.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, inner_path) = make_nested(dir.path());
+    let outer = outer_path.display().to_string();
+
+    // What the inner archive says about itself, read as a file of its own, is
+    // what `info` through the nesting has to say about it.
+    let (code, alone) = run(&["--json", "info", &inner_path.display().to_string()]);
+    assert_eq!(code, 0);
+    let alone: serde_json::Value = serde_json::from_slice(&alone).expect("json");
+
+    let (code, nested) = run(&["--json", "info", &outer, "x64/inner.rpf"]);
+    assert_eq!(code, 0);
+    let nested: serde_json::Value = serde_json::from_slice(&nested).expect("json");
+
+    for field in [
+        "entries",
+        "directories",
+        "binary_files",
+        "resource_files",
+        "len",
+    ] {
+        assert_eq!(nested[field], alone[field], "{field}: {nested}");
+    }
+    assert_eq!(
+        nested["path"],
+        serde_json::json!(outer),
+        "the file that was opened"
+    );
+    assert_eq!(
+        nested["inside"],
+        serde_json::json!("x64/inner.rpf"),
+        "the archive within it"
+    );
+
+    // And the archive itself is still the default.
+    let (code, whole) = run(&["--json", "info", &outer]);
+    assert_eq!(code, 0);
+    let whole: serde_json::Value = serde_json::from_slice(&whole).expect("json");
+    assert_eq!(whole["inside"], serde_json::json!(""), "{whole}");
+    assert_ne!(whole["len"], nested["len"], "the outer is not the inner");
+}
+
+#[test]
+fn info_of_something_that_is_not_an_archive_is_refused_rather_than_summarised() {
+    // A directory inside the archive is a well-formed request for something
+    // `info` cannot answer: it summarises an archive, and a directory is not
+    // one. The caller has to change what it asked for, which DR-010 puts under
+    // exit 6.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("test.rpf");
+    make_archive(&path);
+    let archive = path.display().to_string();
+
+    let (code, message) = run_err(&["info", &archive, "data"]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains("directory"), "{message}");
+}
+
+#[test]
+fn a_path_that_continues_past_the_archive_is_refused_rather_than_blamed_on_the_disk() {
+    // R6.11. `rpf info outer.rpf/x64/inner.rpf` is an in-archive path spelled
+    // as a filesystem one. The open failed with "Not a directory (os error
+    // 20)" and exit 7 — an i/o failure, which tells an agent consumer that the
+    // disk misbehaved and retrying is reasonable. Nothing on the disk failed;
+    // the request named something the tool does not accept, and DR-010 puts
+    // that under exit 6.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, _) = make_nested(dir.path());
+    let through = outer_path.join("x64").join("inner.rpf");
+
+    let (code, message) = run_err(&["info", &through.display().to_string()]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains(&outer_path.display().to_string()),
+        "the refusal names the archive the path runs past: {message}"
+    );
+
+    // Every command that opens an archive says the same thing about it.
+    let (code, message) = run_err(&["ls", &through.display().to_string()]);
+    assert_eq!(code, 6, "{message}");
+
+    // And a path that simply is not there is still an ordinary i/o failure.
+    let absent = dir.path().join("absent.rpf").display().to_string();
+    let (code, message) = run_err(&["info", &absent]);
+    assert_eq!(code, 7, "{message}");
 }

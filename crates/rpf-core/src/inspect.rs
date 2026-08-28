@@ -1,15 +1,16 @@
-//! What an archive adds up to, and whether it reads back as it describes
-//! itself.
+//! What an archive holds, what it adds up to, and whether it reads back as it
+//! describes itself.
 //!
-//! `info` and `verify` ask about a whole archive rather than about one entry,
+//! `ls`, `info` and `verify` ask about an archive rather than about one entry,
 //! and both frontends ask them. They live here because anything one frontend
 //! can do the other must be able to do (§1): with this logic in the binary,
-//! `serve --stdio` could not answer either question at all, and the editor
-//! client reaches the container only through the daemon.
+//! `serve --stdio` could not answer any of them at all, and the editor client
+//! reaches the container only through the daemon.
 //!
-//! Neither renders anything. A [`Summary`] is numbers and a [`Verified`] is a
-//! list of failures with the entry each belongs to, so the command line,
-//! `--json` and the editor client each say it their own way (§10).
+//! None of them renders anything. A [`Listed`] is a path and what is at it, a
+//! [`Summary`] is numbers, and a [`Verified`] is a list of failures with the
+//! entry each belongs to, so the command line, `--json` and the editor client
+//! each say it their own way (§10).
 
 use std::io::{Read, Seek};
 
@@ -17,9 +18,134 @@ use crate::{
     archive::Archive,
     entry::EntryKind,
     error::{Error, Result},
-    format::payload_floor,
+    format::{payload_floor, resource_len},
     watch::{Flow, Step, Watch},
 };
+
+/// One entry, as a listing reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// Where it is, addressed from the path that was listed.
+    pub path: String,
+    /// What it is, and the one number that belongs with it.
+    pub kind: ListedKind,
+}
+
+/// What a listed entry is, and the number that means something for that kind.
+///
+/// Three variants rather than one struct with a nullable field, because the
+/// number is a child count for one of them and a byte count for the others
+/// (§5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListedKind {
+    /// A directory, and how many children it holds.
+    Directory {
+        /// Entries directly inside it.
+        children: u32,
+    },
+    /// Plain bytes, and how many of them the file is.
+    Binary {
+        /// The contents' length, which is what the file is outside the
+        /// archive. Either storage choice changes what sits on disk, not what
+        /// the file is.
+        len: u64,
+    },
+    /// A resource, and the length its page flags describe.
+    Resource {
+        /// From [`resource_len`], which is where that fact is decoded.
+        len: u64,
+    },
+}
+
+impl Listed {
+    /// Every entry at a path, and everything below it when `recursive`.
+    ///
+    /// The empty path is the archive's root. A path naming a nested archive
+    /// lists what is inside it, because a nested archive is a directory as far
+    /// as a path is concerned; a path naming an ordinary file is that one
+    /// entry.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::locate`] for a path that does not resolve,
+    /// [`Error::TooDeep`] past [`crate::MAX_DEPTH`], and as [`Archive::entry`]
+    /// for an entry table that contradicts itself.
+    pub fn at<R: Read + Seek>(
+        src: &mut R,
+        archive: &Archive,
+        path: &str,
+        recursive: bool,
+    ) -> Result<Vec<Self>> {
+        let (holder, at) = archive.locate(src, path)?;
+        let mut rows = Vec::new();
+        list_into(src, &holder, at, path, recursive, &mut rows)?;
+        Ok(rows)
+    }
+
+    /// One row: what an entry is, and where it is from the path that was
+    /// listed.
+    fn of(archive: &Archive, index: u32, path: &str) -> Result<Self> {
+        let kind = match archive.entry(index)?.kind {
+            EntryKind::Directory { child_count, .. } => ListedKind::Directory {
+                children: child_count,
+            },
+            EntryKind::Binary {
+                uncompressed_len, ..
+            } => ListedKind::Binary {
+                len: u64::from(uncompressed_len),
+            },
+            // A resource entry carries no uncompressed size; its length is the
+            // two flag words decoded. `docs/rpf-format.md`, Resource page
+            // flags, `verified`.
+            EntryKind::Resource {
+                system_flags,
+                graphics_flags,
+                ..
+            } => ListedKind::Resource {
+                len: resource_len(system_flags, graphics_flags),
+            },
+        };
+        Ok(Self {
+            path: path.to_owned(),
+            kind,
+        })
+    }
+}
+
+/// Collects the rows at one index, descending where asked to.
+fn list_into<R: Read + Seek>(
+    src: &mut R,
+    archive: &Archive,
+    at: u32,
+    prefix: &str,
+    recursive: bool,
+    rows: &mut Vec<Listed>,
+) -> Result<()> {
+    // Not a directory? If it is an archive, listing it means listing what is
+    // inside it. Anything else is a single entry.
+    let Ok(children) = archive.children(at) else {
+        if let Some(nested) = archive.nested_at(src, at)? {
+            return list_into(src, &nested, 0, prefix, recursive, rows);
+        }
+        rows.push(Listed::of(archive, at, prefix)?);
+        return Ok(());
+    };
+
+    for index in children {
+        let path = joined(prefix, archive.name(index)?);
+        rows.push(Listed::of(archive, index, &path)?);
+
+        if !recursive {
+            continue;
+        }
+        if archive.entry(index)?.is_directory() {
+            list_into(src, archive, index, &path, true, rows)?;
+        } else if let Some(nested) = archive.nested_at(src, index)? {
+            list_into(src, &nested, 0, &path, true, rows)?;
+        }
+    }
+    Ok(())
+}
 
 /// What one archive contains, and how much of it nothing refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,13 +169,23 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// Summarises an archive, sniffing each payload for a nested one.
+    /// Summarises the archive at `path`, sniffing each payload for a nested
+    /// one.
+    ///
+    /// The empty path is `archive` itself; any other path names an archive
+    /// nested inside it, addressed the way every other command addresses one —
+    /// `x64/vehicles.rpf`, through as much nesting as it takes. R6.11.
     ///
     /// # Errors
     ///
-    /// [`Error::TooDeep`] when a payload nests past [`crate::MAX_DEPTH`], and
-    /// as [`Archive::entry`] for an entry table that contradicts itself.
-    pub fn of<R: Read + Seek>(src: &mut R, archive: &Archive) -> Result<Self> {
+    /// [`Error::TooDeep`] when a payload nests past [`crate::MAX_DEPTH`], as
+    /// [`Archive::locate`] for a path that does not resolve, as
+    /// [`Archive::open_nested`] for one that resolves to something that is not
+    /// an archive, and as [`Archive::entry`] for an entry table that
+    /// contradicts itself.
+    pub fn of<R: Read + Seek>(src: &mut R, archive: &Archive, path: &str) -> Result<Self> {
+        let holder = archive_at(src, archive, path)?;
+        let archive = &holder;
         let entries = count(archive);
         // The header, the entry table and the names blob are referenced too.
         // `payload_floor` is the one place that sum lives, so this cannot drift
@@ -241,6 +377,25 @@ impl Verified {
     }
 }
 
+/// The archive a path names, from the archive it is addressed within.
+///
+/// The empty path is `archive` itself, which is what makes one call answer both
+/// "summarise this archive" and "summarise the archive at `x64/vehicles.rpf`"
+/// (§4). Anything else has to be an archive, so a component that resolves to a
+/// directory or to an ordinary file is an error rather than a summary of
+/// something that is not one.
+///
+/// # Errors
+///
+/// As [`Archive::locate`] and [`Archive::open_nested`].
+fn archive_at<R: Read + Seek>(src: &mut R, archive: &Archive, path: &str) -> Result<Archive> {
+    if path.split('/').all(str::is_empty) {
+        return Ok(archive.clone());
+    }
+    let (holder, index) = archive.locate(src, path)?;
+    holder.open_nested(src, index)
+}
+
 /// Entries in an archive, saturating rather than truncating.
 fn count(archive: &Archive) -> u32 {
     u32::try_from(archive.entries().len()).unwrap_or(u32::MAX)
@@ -263,5 +418,111 @@ fn joined(prefix: &str, name: &str) -> String {
         name.to_owned()
     } else {
         format!("{prefix}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Write as _};
+
+    use super::{Listed, ListedKind};
+    use crate::{
+        archive::Archive,
+        build::{FileKind, FileSpec, Storage, build},
+        watch::Unwatched,
+    };
+
+    /// A resource whose page flags describe one 512-byte system page and no
+    /// graphics pages, followed by a deflate stream of exactly that.
+    ///
+    /// `docs/rpf-format.md`, Resource page flags, `verified`: the top nibbles
+    /// are the header's version field, and the rest decodes to the length.
+    fn resource() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RSC7");
+        bytes.extend_from_slice(&162_u32.to_le_bytes());
+        bytes.extend_from_slice(&0xA800_0000_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x2000_0000_u32.to_le_bytes());
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&vec![0_u8; 512]).expect("deflates");
+        bytes.extend_from_slice(&encoder.finish().expect("finishes"));
+        bytes
+    }
+
+    /// An archive holding one directory, one stored file and one resource.
+    fn archive() -> Vec<u8> {
+        let files = vec![
+            FileSpec {
+                path: "data/greeting.txt".to_owned(),
+                kind: FileKind::Binary {
+                    storage: Storage::Stored,
+                    encryption: 0,
+                },
+            },
+            FileSpec {
+                path: "art.yft".to_owned(),
+                kind: FileKind::Resource,
+            },
+        ];
+        let mut out = Vec::new();
+        build(
+            &mut Cursor::new(&mut out),
+            &files,
+            &[],
+            |wanted| {
+                Ok(if wanted == "art.yft" {
+                    resource()
+                } else {
+                    b"hello there".to_vec()
+                })
+            },
+            &mut Unwatched,
+        )
+        .expect("builds");
+        out
+    }
+
+    #[test]
+    fn a_listing_names_each_kind_with_the_number_that_belongs_to_it() {
+        let bytes = archive();
+        let mut src = Cursor::new(bytes);
+        let parsed = Archive::open(&mut src).expect("parses");
+
+        let rows = Listed::at(&mut src, &parsed, "", true).expect("lists");
+        let named = |path: &str| {
+            rows.iter()
+                .find(|row| row.path == path)
+                .unwrap_or_else(|| panic!("{path} is not in {rows:?}"))
+                .kind
+        };
+
+        // A directory's number is how many children it holds, and a file's is
+        // its length: two different facts under one field, which is why they
+        // are two variants rather than one nullable number.
+        assert_eq!(named("data"), ListedKind::Directory { children: 1 });
+        assert_eq!(named("data/greeting.txt"), ListedKind::Binary { len: 11 });
+
+        // The one that cannot be read off the entry row: a resource carries no
+        // uncompressed size, so its length is the two flag words decoded.
+        // `docs/rpf-format.md`, Resource page flags, `verified`.
+        assert_eq!(named("art.yft"), ListedKind::Resource { len: 512 });
+    }
+
+    #[test]
+    fn a_listing_stops_at_the_directory_it_was_asked_for_unless_told_otherwise() {
+        let bytes = archive();
+        let mut src = Cursor::new(bytes);
+        let parsed = Archive::open(&mut src).expect("parses");
+
+        let shallow = Listed::at(&mut src, &parsed, "", false).expect("lists");
+        let paths: Vec<&str> = shallow.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(paths, ["art.yft", "data"], "the root, and no deeper");
+
+        // And a path names what is under it, addressed from the archive's root
+        // rather than from the directory that was asked for.
+        let inside = Listed::at(&mut src, &parsed, "data", false).expect("lists");
+        let paths: Vec<&str> = inside.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(paths, ["data/greeting.txt"]);
     }
 }

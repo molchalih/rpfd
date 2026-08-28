@@ -1174,7 +1174,7 @@ fn a_nested_archive_of_another_version_is_named_by_locate_and_invisible_to_info(
 
     // Through the sniff, it is not there at all. This is the limit, pinned so
     // that changing it is a decision rather than a surprise.
-    let summary = rpf_core::Summary::of(&mut source, &archive).expect("info summarises");
+    let summary = rpf_core::Summary::of(&mut source, &archive, "").expect("info summarises");
     assert_eq!(summary.nested_archives, 0, "the sniff swallows the version");
     let verified =
         rpf_core::Verified::of(&mut source, &archive, &mut rpf_core::Unwatched).expect("verify");

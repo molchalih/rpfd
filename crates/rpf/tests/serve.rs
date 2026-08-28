@@ -2558,3 +2558,288 @@ fn the_daemon_respells_a_backslashed_path_exactly_as_the_command_line_does() {
         "there is nothing to say about a separator here: {plain}"
     );
 }
+
+/// An archive holding an archive at `x64/inner.rpf`, stored rather than
+/// deflated, returning the outer path and the inner one it was built from.
+fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let inner_path = dir.join("inner.rpf");
+    make_archive(&inner_path);
+    let inner = fs::read(&inner_path).expect("readable");
+
+    let outer_path = dir.join("outer.rpf");
+    let files = vec![FileSpec {
+        path: "x64/inner.rpf".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = fs::File::create(&outer_path).expect("creatable");
+    rpf_core::build(&mut out, &files, &[], |_| Ok(inner.clone()), &mut Unwatched)
+        .expect("outer builds");
+    (outer_path, inner_path)
+}
+
+#[test]
+fn info_addresses_a_nested_archive_as_the_command_line_does() {
+    // R6.11, and §1's own test with it: `info` grew an in-archive path, and
+    // the daemon has to be able to ask the same question. The daemon names the
+    // archive by handle, so `path` here means the same thing it means to
+    // `list` — a path inside the archive the handle holds.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, _) = make_nested(dir.path());
+    let outer = outer_path.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": outer}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"info","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"info","params":{
+            "handle":1,"path":"x64/inner.rpf"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"info","params":{"handle":1,"path":"x64"}}),
+    ]);
+
+    let whole = &answer(&responses, 2)["result"];
+    assert_eq!(whole["inside"], json!(""), "{whole}");
+
+    let nested = &answer(&responses, 3)["result"];
+    let from_cli = cli_json(&["info", &outer, "x64/inner.rpf"]);
+    for field in [
+        "inside",
+        "len",
+        "encryption",
+        "entries",
+        "directories",
+        "binary_files",
+        "resource_files",
+        "nested_archives",
+        "unreferenced_bytes",
+    ] {
+        assert_eq!(
+            nested[field], from_cli[field],
+            "info disagrees about {field}"
+        );
+    }
+    // The resolved path the session claimed, which is what `open` reported.
+    assert_eq!(nested["path"], answer(&responses, 1)["result"]["path"]);
+    assert_ne!(nested["len"], whole["len"], "the outer is not the inner");
+
+    // A directory is not an archive, and saying so is a refusal rather than a
+    // malformed archive. DR-010.
+    let refusal = answer(&responses, 4);
+    assert_eq!(refusal["error"]["code"], json!(6), "{refusal}");
+}
+
+#[test]
+fn opening_a_path_that_continues_past_an_archive_is_refused() {
+    // The same complaint the command line makes, with the same number: an
+    // in-archive path spelled as a filesystem one is a request the daemon does
+    // not accept, not the disk misbehaving. DR-010.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, _) = make_nested(dir.path());
+    let through = outer_path.join("x64").join("inner.rpf");
+
+    let responses = talk(&[json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+        "path": through.display().to_string()}})]);
+    let refusal = answer(&responses, 1);
+    assert_eq!(refusal["error"]["code"], json!(6), "{refusal}");
+    let message = refusal["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains(&outer_path.display().to_string()),
+        "the refusal names the archive the path runs past: {message}"
+    );
+}
+
+#[test]
+fn list_and_ls_report_the_same_rows_through_the_same_nesting() {
+    // §1's own test, made mechanical for the one command whose rows were built
+    // in the binary until now: both frontends read them out of `rpf-core`, so a
+    // row that differs between them means the walk has been written twice.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, _) = make_nested(dir.path());
+    let outer = outer_path.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": outer}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"list","params":{"handle":1,"recursive":true}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"list","params":{
+            "handle":1,"path":"x64/inner.rpf"}}),
+    ]);
+
+    assert_eq!(
+        answer(&responses, 2)["result"],
+        cli_json(&["ls", "-R", &outer]),
+        "a recursive listing of the whole archive"
+    );
+    assert_eq!(
+        answer(&responses, 3)["result"],
+        cli_json(&["ls", &outer, "x64/inner.rpf"]),
+        "and one addressed through the nesting"
+    );
+
+    // The rows really do reach inside the nested archive, so the two are not
+    // agreeing only because both are empty.
+    let rows = answer(&responses, 2)["result"]
+        .as_array()
+        .expect("an array")
+        .clone();
+    assert!(
+        rows.iter()
+            .any(|row| row["path"] == json!("x64/inner.rpf/art.yft")
+                && row["kind"] == json!("resource")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn the_daemon_extracts_and_packs_as_the_command_line_does() {
+    // §1's own test, and the last place it failed: `extract` and `pack` lived
+    // in the binary, so an editor client — which reaches the container only
+    // through the daemon — could do neither. A tree is a path on the daemon's
+    // own filesystem, the same thing `open`'s path already is. DR-014.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let from_cli = dir.path().join("cli-tree").display().to_string();
+    let cli_extract = cli_json(&["extract", &archive_str, &from_cli]);
+    let cli_packed = dir.path().join("cli.rpf").display().to_string();
+    let cli_pack = cli_json(&["pack", &from_cli, &cli_packed]);
+
+    let from_daemon = dir.path().join("daemon-tree").display().to_string();
+    let daemon_packed = dir.path().join("daemon.rpf").display().to_string();
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+            "handle":1,"into": from_daemon, "progress": false}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+            "from": from_daemon, "archive": daemon_packed, "progress": false}}),
+    ]);
+
+    let extracted = &answer(&responses, 2)["result"];
+    for field in ["files", "directories"] {
+        assert_eq!(
+            extracted[field], cli_extract[field],
+            "extract disagrees about {field}: {extracted}"
+        );
+    }
+    assert_eq!(
+        extracted["manifest"],
+        json!(
+            Path::new(&from_daemon)
+                .join(".rpf-manifest.json")
+                .display()
+                .to_string()
+        ),
+        "{extracted}"
+    );
+
+    let packed = &answer(&responses, 3)["result"];
+    for field in ["entries", "len"] {
+        assert_eq!(
+            packed[field], cli_pack[field],
+            "pack disagrees about {field}: {packed}"
+        );
+    }
+
+    // The strongest form of the claim: the two frontends produced the same
+    // archive out of their own trees, byte for byte.
+    assert_eq!(
+        fs::read(&daemon_packed).expect("readable"),
+        fs::read(&cli_packed).expect("readable"),
+        "the two frontends packed different archives"
+    );
+}
+
+#[test]
+fn packing_over_an_archive_a_session_holds_is_refused() {
+    // DR-009 arriving through a new door. `pack` is the one method that names
+    // its output by path rather than by handle, and writing over an archive a
+    // session holds moves every offset that session is still working from —
+    // which is exactly the corruption DR-009 exists to make unreachable.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+    let before = fs::read(&archive).expect("readable");
+
+    let tree = dir.path().join("tree").display().to_string();
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+            "handle":1,"into": tree, "progress": false}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+            "from": tree, "archive": archive_str, "progress": false}}),
+        // Released, and then the same pack is allowed.
+        json!({"jsonrpc":"2.0","id":4,"method":"close","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"pack","params":{
+            "from": tree, "archive": archive_str, "progress": false}}),
+    ]);
+
+    let refusal = answer(&responses, 3);
+    assert_eq!(refusal["error"]["code"], json!(6), "{refusal}");
+    let message = refusal["error"]["message"].as_str().expect("a message");
+    assert!(message.contains("handle 1"), "{message}");
+    assert_eq!(
+        fs::read(&archive).expect("readable"),
+        before,
+        "a refused pack must leave the archive it was aimed at alone"
+    );
+
+    assert!(
+        answer(&responses, 5)["result"]["entries"]
+            .as_u64()
+            .is_some(),
+        "closing the handle releases the claim: {:?}",
+        answer(&responses, 5)
+    );
+}
+
+#[test]
+fn extract_and_pack_report_progress_as_notifications() {
+    // Writing every entry of a 2.7 GB archive out to a tree, and reading one
+    // back in, is unbounded work in the same way a rebuild is — so both take
+    // DR-008's seam rather than running silently. A `pack` has no handle to be
+    // named by, so its notifications carry none.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let tree = dir.path().join("tree").display().to_string();
+    let packed = dir.path().join("packed.rpf").display().to_string();
+    let (_, notifications) = narrated(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+            "handle":1,"into": tree}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+            "from": tree, "archive": packed}}),
+    ]);
+
+    let steps = |request: u64| -> Vec<Value> {
+        notifications
+            .iter()
+            .filter(|n| n["params"]["request"] == json!(request))
+            .cloned()
+            .collect()
+    };
+
+    let extracting = steps(2);
+    assert!(!extracting.is_empty(), "extract reported nothing");
+    for step in &extracting {
+        assert_eq!(step["method"], json!("progress"), "{step}");
+        assert_eq!(step["params"]["handle"], json!(1), "{step}");
+        assert_eq!(step["params"]["total"], json!(2), "{step}");
+    }
+
+    let packing = steps(3);
+    assert!(!packing.is_empty(), "pack reported nothing");
+    for step in &packing {
+        assert_eq!(step["method"], json!("progress"), "{step}");
+        assert_eq!(
+            step["params"]["handle"],
+            json!(null),
+            "a pack is not a session: {step}"
+        );
+    }
+}

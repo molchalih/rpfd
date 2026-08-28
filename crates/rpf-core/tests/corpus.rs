@@ -461,7 +461,7 @@ fn the_summary_reproduces_the_measured_slack() {
     };
     let mut file = fs::File::open(&path).expect("archive opens");
     let archive = Archive::open(&mut file).expect("archive parses");
-    let summary = Summary::of(&mut file, &archive).expect("summarises");
+    let summary = Summary::of(&mut file, &archive, "").expect("summarises");
 
     assert_eq!(summary.len, 144_504_832);
     assert_eq!(summary.entries, 11);

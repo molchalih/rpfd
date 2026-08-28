@@ -7,11 +7,11 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{IsTerminal, Read, Seek, Write},
+    io::{IsTerminal, Write},
     path::Path,
 };
 
-use rpf_core::{Archive, EntryKind, Flow, Step, Watch};
+use rpf_core::{Archive, Flow, ListedKind, Step, Watch};
 use serde_json::{Value, json};
 
 use crate::{
@@ -71,22 +71,52 @@ fn padding(written: usize, now: usize) -> String {
 
 /// Opens an archive file and parses its table of contents.
 pub fn open(path: &Path) -> Result<(fs::File, Archive)> {
-    let mut file = fs::File::open(path).map_err(|source| Failure::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let mut file = fs::File::open(path).map_err(|source| opening(path, source))?;
     let archive = Archive::open(&mut file)?;
     Ok((file, archive))
 }
 
+/// Why an archive would not open, classified by who has to act on it.
+///
+/// A filesystem path that runs *past* a file is an in-archive path spelled as a
+/// filesystem one — `rpf info outer.rpf/x64/inner.rpf`. The operating system
+/// answers "Not a directory", which as [`Failure::Io`] tells an agent consumer
+/// that the disk misbehaved and retrying is reasonable. Nothing on the disk
+/// failed: the request named something the tool does not accept, which DR-010
+/// puts under [`Failure::Refused`]. R6.11.
+///
+/// Asked of the path rather than of the error, because which `io::ErrorKind` a
+/// platform produces for it varies and the shape of the path does not.
+pub fn opening(path: &Path, source: std::io::Error) -> Failure {
+    if let Some(archive) = path.ancestors().skip(1).find(|above| above.is_file()) {
+        return Failure::Refused {
+            reason: format!(
+                "{} continues past {}, which is a file; a path inside an archive is given \
+                 separately from the archive that holds it",
+                path.display(),
+                archive.display(),
+            ),
+        };
+    }
+    Failure::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
 /// `info` — the header, and what the entries add up to.
-pub fn info(path: &Path, json_out: bool) -> Result<()> {
+///
+/// `inside` is empty for the archive itself, and names a nested archive
+/// otherwise: every other reporting command addresses through nesting, and
+/// R6.11 is this one catching up.
+pub fn info(path: &Path, inside: &str, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
-    let summary = rpf_core::Summary::of(&mut file, &archive)?;
+    let summary = rpf_core::Summary::of(&mut file, &archive, inside)?;
 
     if json_out {
         emit(&json!({
             "path": path.display().to_string(),
+            "inside": inside,
             "len": summary.len,
             "encryption": encryption_name(summary.encryption),
             "entries": summary.entries,
@@ -98,6 +128,9 @@ pub fn info(path: &Path, json_out: bool) -> Result<()> {
         }));
     } else {
         println!("path         {}", path.display());
+        if !inside.is_empty() {
+            println!("inside       {inside}");
+        }
         println!("length       {}", summary.len);
         println!("encryption   {}", encryption_name(summary.encryption));
         println!("entries      {}", summary.entries);
@@ -113,22 +146,38 @@ pub fn info(path: &Path, json_out: bool) -> Result<()> {
 /// `ls` — what is at a path.
 pub fn ls(path: &Path, inside: &str, recursive: bool, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
-    let (holder, at) = archive.locate(&mut file, inside)?;
-
-    let mut rows = Vec::new();
-    list_into(&mut file, &holder, at, inside, recursive, &mut rows)?;
+    let rows = rpf_core::Listed::at(&mut file, &archive, inside, recursive)?;
 
     if json_out {
-        emit(&Value::Array(rows));
-        Ok(())
+        emit(&Value::Array(rows.iter().map(listing_row).collect()));
     } else {
         for row in &rows {
-            let kind = row["kind"].as_str().unwrap_or("?");
-            let len = row["len"].as_u64().unwrap_or_default();
-            let name = row["path"].as_str().unwrap_or("?");
-            println!("{kind:<9} {len:>12}  {name}");
+            let (kind, len) = named(row);
+            println!("{kind:<9} {len:>12}  {}", row.path);
         }
-        Ok(())
+    }
+    Ok(())
+}
+
+/// One `ls` row as JSON, for whichever frontend is reporting it.
+///
+/// Presentation, and one place for it: `--json ls` and the daemon's `list` are
+/// the same rows under the same names, and a second spelling of them is how two
+/// frontends drift apart (§1).
+pub fn listing_row(listed: &rpf_core::Listed) -> Value {
+    let (kind, len) = named(listed);
+    json!({ "path": listed.path, "kind": kind, "len": len })
+}
+
+/// What a listed entry is called, and the one number reported beside it.
+///
+/// A directory's number is how many children it holds and a file's is its
+/// length; the two share a column because a listing is one table.
+fn named(listed: &rpf_core::Listed) -> (&'static str, u64) {
+    match listed.kind {
+        ListedKind::Directory { children } => ("directory", u64::from(children)),
+        ListedKind::Binary { len } => ("binary", len),
+        ListedKind::Resource { len } => ("resource", len),
     }
 }
 
@@ -360,54 +409,141 @@ fn report_would_rebuild(inside: &str, entry: &rpf_core::TooLarge, json_out: bool
     }
 }
 
+/// What an extraction put on the filesystem.
+#[derive(Debug, Clone)]
+pub struct Extracted {
+    /// How many entries came out as files.
+    pub files: usize,
+    /// How many directories were created to hold them.
+    pub directories: usize,
+    /// Where the sidecar manifest was written.
+    pub manifest: std::path::PathBuf,
+}
+
 /// `extract` — write every entry to a tree, with the manifest beside it.
-///
-/// Nested archives come out as the `.rpf` files they are, byte for byte, rather
-/// than being unpacked in place. Packing puts them back untouched, which is
-/// what passthrough means. Editing inside one is `put`'s job, and it cascades.
 pub fn extract(path: &Path, into: &Path, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
-    let manifest = rpf_core::Manifest::of(&archive)?;
-
-    create_dir(into)?;
-    for directory in &manifest.directories {
-        create_dir(&into.join(directory))?;
-    }
-
-    let specs = rpf_core::specs_of(&archive)?;
-    for (spec, index) in &specs {
-        let target = into.join(&spec.path);
-        if let Some(parent) = target.parent() {
-            create_dir(parent)?;
-        }
-        let bytes = archive.extract(&mut file, *index)?;
-        write_file(&target, &bytes)?;
-    }
-
-    let manifest_path = into.join(rpf_core::MANIFEST_NAME);
-    write_file(&manifest_path, manifest.to_json()?.as_bytes())?;
+    let extracted = extract_into(&mut file, &archive, into, &mut OnStderr::new())?;
 
     if json_out {
         emit(&json!({
             "archive": path.display().to_string(),
             "into": into.display().to_string(),
-            "files": specs.len(),
-            "directories": manifest.directories.len(),
-            "manifest": manifest_path.display().to_string(),
+            "files": extracted.files,
+            "directories": extracted.directories,
+            "manifest": extracted.manifest.display().to_string(),
         }));
     } else {
         println!(
             "{} files and {} directories into {}",
-            specs.len(),
-            manifest.directories.len(),
+            extracted.files,
+            extracted.directories,
             into.display(),
         );
     }
     Ok(())
 }
 
+/// Writes every entry of an open archive to a tree, with the manifest beside
+/// it.
+///
+/// Nested archives come out as the `.rpf` files they are, byte for byte, rather
+/// than being unpacked in place. Packing puts them back untouched, which is
+/// what passthrough means. Editing inside one is `put`'s job, and it cascades.
+///
+/// One [`Step`] per file written, and it stops when the watcher says to. A
+/// stopped extraction leaves the files it had already written where they are —
+/// unlike a rebuild, which goes to a temporary file and is renamed only on
+/// success. DR-014.
+///
+/// # Errors
+///
+/// [`Failure::Io`] for a file or directory that could not be written,
+/// `Error::Cancelled` when the watcher stops it, and as
+/// `rpf_core::Manifest::of` for an archive whose names no host can hold.
+pub fn extract_into<R: std::io::Read + std::io::Seek>(
+    src: &mut R,
+    archive: &Archive,
+    into: &Path,
+    watch: &mut impl Watch,
+) -> Result<Extracted> {
+    let manifest = rpf_core::Manifest::of(archive)?;
+
+    create_dir(into)?;
+    for directory in &manifest.directories {
+        create_dir(&into.join(directory))?;
+    }
+
+    let specs = rpf_core::specs_of(archive)?;
+    let total = u32::try_from(specs.len()).unwrap_or(u32::MAX);
+    let mut done = 0_u32;
+    let mut bytes = 0_u64;
+    for (spec, index) in &specs {
+        let target = into.join(&spec.path);
+        if let Some(parent) = target.parent() {
+            create_dir(parent)?;
+        }
+        let contents = archive.extract(src, *index)?;
+        write_file(&target, &contents)?;
+
+        done = done.saturating_add(1);
+        bytes = bytes.saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+        if watch.step(Step {
+            path: &spec.path,
+            done,
+            total,
+            bytes,
+        }) == Flow::Stop
+        {
+            return Err(Failure::Container(rpf_core::Error::Cancelled {
+                done,
+                total,
+            }));
+        }
+    }
+
+    let manifest_path = into.join(rpf_core::MANIFEST_NAME);
+    write_file(&manifest_path, manifest.to_json()?.as_bytes())?;
+
+    Ok(Extracted {
+        files: specs.len(),
+        directories: manifest.directories.len(),
+        manifest: manifest_path,
+    })
+}
+
 /// `pack` — build an archive from a tree and its manifest.
 pub fn pack(from: &Path, archive_path: &Path, force: bool, json_out: bool) -> Result<()> {
+    let report = pack_from(from, archive_path, force, &mut OnStderr::new())?;
+
+    if json_out {
+        emit(&json!({
+            "archive": archive_path.display().to_string(),
+            "entries": report.entry_count,
+            "len": report.len,
+        }));
+    } else {
+        println!("{} entries, {} bytes", report.entry_count, report.len);
+    }
+    Ok(())
+}
+
+/// Builds an archive from a tree and its manifest, replacing whatever is at
+/// `archive_path`.
+///
+/// Written to a temporary file in the same directory and renamed into place, so
+/// a `pack` that is stopped part-way leaves the destination as it was (§8).
+///
+/// # Errors
+///
+/// [`Failure::GameInstall`] unless `force`, [`Failure::Io`] for a file in the
+/// manifest that is not in the tree, and as `rpf_core::build`.
+pub fn pack_from(
+    from: &Path,
+    archive_path: &Path,
+    force: bool,
+    watch: &mut impl Watch,
+) -> Result<rpf_core::Report> {
     refuse_game_install(archive_path, force)?;
 
     let manifest_path = from.join(rpf_core::MANIFEST_NAME);
@@ -444,7 +580,7 @@ pub fn pack(from: &Path, archive_path: &Path, force: bool, json_out: bool) -> Re
                 }
             }
         },
-        &mut OnStderr::new(),
+        watch,
     );
     if let Some((path, source)) = missing {
         return Err(Failure::Io {
@@ -455,17 +591,7 @@ pub fn pack(from: &Path, archive_path: &Path, force: bool, json_out: bool) -> Re
     let report = report?;
 
     persist(scratch, archive_path)?;
-
-    if json_out {
-        emit(&json!({
-            "archive": archive_path.display().to_string(),
-            "entries": report.entry_count,
-            "len": report.len,
-        }));
-    } else {
-        println!("{} entries, {} bytes", report.entry_count, report.len);
-    }
-    Ok(())
+    Ok(report)
 }
 
 /// Creates a directory and everything above it.
@@ -563,69 +689,6 @@ pub fn encryption_name(tag: u32) -> String {
 fn emit(value: &Value) {
     let text = serde_json::to_string_pretty(value).unwrap_or_default();
     println!("{text}");
-}
-
-/// Collects the rows `ls` prints.
-pub fn list_into<R: Read + Seek>(
-    src: &mut R,
-    archive: &Archive,
-    at: u32,
-    prefix: &str,
-    recursive: bool,
-    rows: &mut Vec<Value>,
-) -> Result<()> {
-    // Not a directory? If it is an archive, listing it means listing what is
-    // inside it — a nested archive is a directory as far as a path is
-    // concerned. Anything else is a single entry.
-    let Ok(children) = archive.children(at) else {
-        if let Some(nested) = archive.nested_at(src, at)? {
-            return list_into(src, &nested, 0, prefix, recursive, rows);
-        }
-        rows.push(describe(archive, at, prefix)?);
-        return Ok(());
-    };
-
-    for index in children {
-        let name = archive.name(index)?;
-        let path = if prefix.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        rows.push(describe(archive, index, &path)?);
-
-        if !recursive {
-            continue;
-        }
-        if archive.entry(index)?.is_directory() {
-            list_into(src, archive, index, &path, true, rows)?;
-        } else if let Some(nested) = archive.nested_at(src, index)? {
-            list_into(src, &nested, 0, &path, true, rows)?;
-        }
-    }
-    Ok(())
-}
-
-/// One `ls` row.
-fn describe(archive: &Archive, index: u32, path: &str) -> Result<Value> {
-    let entry = archive.entry(index)?;
-    let (kind, len) = match entry.kind {
-        EntryKind::Directory { child_count, .. } => ("directory", u64::from(child_count)),
-        // Either way the content is `uncompressed_len` bytes: the storage
-        // choice changes what sits on disk, not what the file is.
-        EntryKind::Binary {
-            uncompressed_len, ..
-        } => ("binary", u64::from(uncompressed_len)),
-        EntryKind::Resource {
-            system_flags,
-            graphics_flags,
-            ..
-        } => (
-            "resource",
-            rpf_core::format::resource_len(system_flags, graphics_flags),
-        ),
-    };
-    Ok(json!({ "path": path, "kind": kind, "len": len }))
 }
 
 #[cfg(test)]

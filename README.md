@@ -9,7 +9,7 @@ rebuilt from the command line, including through nested archives. Metadata
 conversion, encryption and the editor client are not built yet; see the backlog.
 
 ```
-rpf info    dlc.rpf
+rpf info    dlc.rpf x64/vehicles.rpf   # or the archive alone
 rpf ls -R   dlc.rpf x64
 rpf cat     dlc.rpf data/vehicles.meta
 rpf put     dlc.rpf x64/vehicles.rpf/meringls63amg24.ytd new.ytd   # patches in place
@@ -64,10 +64,11 @@ written and how much room its entry has, or which edits will not fit and force
 the rebuild. It needs no write permission, and a refusal is reported as a
 refusal, so what it says is what the real call would do.
 
-The daemon answers every question the binary does: `info` and `verify` are
-methods on an open handle, so an editor client — which reaches the container
-only through the daemon — is not limited to a subset of what the command line
-can do.
+The daemon answers everything the binary does. `info` and `verify` are methods
+on an open handle; `extract` and `pack` are too, with a tree named by a path on
+the daemon's own filesystem — the same thing `open`'s path already is, and
+DR-014 says why. An editor client, which reaches the container only through the
+daemon, is not limited to a subset of what the command line can do.
 
 A rebuild reports progress as it goes: on the command line to standard error
 when there is a terminal to read it, and over the daemon as JSON-RPC
