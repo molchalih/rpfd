@@ -62,7 +62,20 @@ fn run(args: &[&str]) -> (i32, Vec<u8>) {
 
 /// Runs the binary, returning its exit code and standard error.
 fn run_err(args: &[&str]) -> (i32, String) {
-    let output = Command::new(RPF).args(args).output().expect("binary runs");
+    run_err_in(Path::new("."), args)
+}
+
+/// Runs the binary from inside `directory`, returning its exit code and
+/// standard error.
+///
+/// A child process rather than `set_current_dir`, which is process-global and
+/// would race every other test in this binary.
+fn run_err_in(directory: &Path, args: &[&str]) -> (i32, String) {
+    let output = Command::new(RPF)
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .expect("binary runs");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -139,6 +152,22 @@ fn exit_codes_distinguish_the_failures() {
     let empty = dir.path().join("empty.rpf");
     fs::write(&empty, b"").expect("writable");
     assert_eq!(run(&["info", &empty.display().to_string()]).0, 4, "empty");
+
+    // An RPF of a version with no codec here is not the same failure as either
+    // of those: nothing is malformed and the caller's request was fine. It used
+    // to report `not an RPF7 archive` and exit 4. R11.1, DR-010's amendment.
+    let other_version = dir.path().join("rpf2.rpf");
+    let mut header = b"RPF2".to_vec();
+    header.extend_from_slice(&1_u32.to_le_bytes());
+    header.extend_from_slice(&0_u32.to_le_bytes());
+    header.extend_from_slice(&rpf_core::format::ENCRYPTION_OPEN.to_le_bytes());
+    fs::write(&other_version, &header).expect("writable");
+    let (code, stderr) = run_err(&["info", &other_version.display().to_string()]);
+    assert_eq!(code, 9, "another container version: {stderr}");
+    assert!(
+        stderr.contains("RPF2"),
+        "the version must be named: {stderr}"
+    );
 
     let missing = dir.path().join("absent.rpf").display().to_string();
     assert_eq!(run(&["info", &missing]).0, 7, "i/o");
@@ -793,4 +822,421 @@ fn info_subtracts_the_entry_table_and_the_names_blob_from_the_slack() {
     // And the regions really are there to subtract, so the test would fail if
     // the two agreed only because both were zero.
     assert!(entries > 0 && names > 0, "{entries} entries, {names} names");
+}
+
+/// Builds an archive of `names`, then rewrites `placeholder` in its names blob
+/// to `actual`.
+///
+/// `build` refuses the names these tests need — that refusal is the write half
+/// of the same rules — so the archive is made with a legal name of equal length
+/// and edited afterwards. The two must be the same length so that nothing in
+/// the archive moves, and the substitution asserts the placeholder occurs
+/// exactly once, so what is edited is the name and nothing else.
+fn archive_named(at: &Path, names: &[&str], placeholder: &str, actual: &str) {
+    assert_eq!(
+        placeholder.len(),
+        actual.len(),
+        "substituting a different length would move the payloads"
+    );
+    let files: Vec<FileSpec> = names
+        .iter()
+        .map(|name| FileSpec {
+            path: (*name).to_owned(),
+            kind: FileKind::Binary {
+                storage: Storage::Stored,
+                encryption: 0,
+            },
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    rpf_core::build(
+        &mut std::io::Cursor::new(&mut out),
+        &files,
+        &[],
+        |_| Ok(b"payload".to_vec()),
+        &mut Unwatched,
+    )
+    .expect("legal names build");
+
+    let occurrences = out
+        .windows(placeholder.len())
+        .filter(|window| *window == placeholder.as_bytes())
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "the name must appear only in the names blob"
+    );
+    let at_offset = out
+        .windows(placeholder.len())
+        .position(|window| window == placeholder.as_bytes())
+        .expect("the placeholder is in the blob");
+    out.get_mut(at_offset..at_offset.saturating_add(placeholder.len()))
+        .expect("the placeholder is in the blob")
+        .copy_from_slice(actual.as_bytes());
+
+    fs::write(at, &out).expect("archive is writable");
+}
+
+#[test]
+fn extract_refuses_a_name_that_climbs_out_of_the_target() {
+    // Reproduced before this was refused: the file landed one level above the
+    // target and the command reported `1 files and 1 directories into <target>`
+    // with exit 0. R10.3.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    archive_named(
+        &archive,
+        &["xx_escaped.txt"],
+        "xx_escaped.txt",
+        "../escaped.txt",
+    );
+    let target = dir.path().join("tree");
+
+    let (code, stderr) = run_err(&[
+        "extract",
+        &archive.display().to_string(),
+        &target.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "a hostile name is a refusal: {stderr}");
+    assert!(
+        stderr.contains("../escaped.txt"),
+        "the refusal must name the path it is about: {stderr}"
+    );
+    assert!(
+        !dir.path().join("escaped.txt").exists(),
+        "nothing may be written above the target"
+    );
+
+    // Only extraction is refused. The archive is not malformed and listing it
+    // is how a caller finds out what is wrong with it.
+    assert_eq!(run(&["ls", &archive.display().to_string()]).0, 0);
+}
+
+#[test]
+fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree() {
+    // Reproduced before this was refused: `pack` read a file from above the
+    // tree it was given and exited 0. R10.3.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tree = dir.path().join("tree");
+    fs::create_dir(&tree).expect("tree");
+    fs::write(dir.path().join("escaped.txt"), b"above the tree").expect("writable");
+
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "encryption": rpf_core::format::ENCRYPTION_OPEN,
+        "directories": [],
+        "entries": [{
+            "path": "../escaped.txt",
+            "class": "binary",
+            "storage": "stored",
+            "encryption": 0,
+        }],
+    });
+    fs::write(
+        tree.join(rpf_core::MANIFEST_NAME),
+        serde_json::to_vec_pretty(&manifest).expect("json"),
+    )
+    .expect("writable");
+
+    let archive = dir.path().join("packed.rpf");
+    let (code, stderr) = run_err(&[
+        "pack",
+        &tree.display().to_string(),
+        &archive.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "a hostile name is a refusal: {stderr}");
+    assert!(
+        stderr.contains("../escaped.txt"),
+        "the refusal must name the path it is about: {stderr}"
+    );
+    assert!(
+        !archive.exists(),
+        "nothing may be produced from a manifest that reaches outside its tree"
+    );
+}
+
+#[test]
+fn an_entry_named_like_the_sidecar_manifest_is_refused_both_ways() {
+    // Reproduced: `extract` writes every entry and then writes the manifest
+    // over the top of it, so the file on disk held the manifest rather than the
+    // entry's bytes and the report said "2 files", exit 0. `pack` read the same
+    // name as the manifest *and* as an entry payload, also exit 0.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let name = rpf_core::MANIFEST_NAME;
+    assert_eq!(name.len(), "zzzzzzzzzzzzzzzzzz".len());
+    archive_named(
+        &archive,
+        &["b.txt", "zzzzzzzzzzzzzzzzzz"],
+        "zzzzzzzzzzzzzzzzzz",
+        name,
+    );
+
+    let target = dir.path().join("tree");
+    let (code, stderr) = run_err(&[
+        "extract",
+        &archive.display().to_string(),
+        &target.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "the manifest's own name is a refusal: {stderr}");
+    assert!(
+        stderr.contains(name),
+        "the refusal must name the path it is about: {stderr}"
+    );
+    assert!(!target.exists(), "nothing may be written");
+
+    // And the other direction: a manifest that names itself as an entry.
+    let tree = dir.path().join("packable");
+    fs::create_dir(&tree).expect("tree");
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "encryption": rpf_core::format::ENCRYPTION_OPEN,
+        "directories": [],
+        "entries": [{
+            "path": name,
+            "class": "binary",
+            "storage": "stored",
+            "encryption": 0,
+        }],
+    });
+    fs::write(
+        tree.join(name),
+        serde_json::to_vec_pretty(&manifest).expect("json"),
+    )
+    .expect("writable");
+
+    let packed = dir.path().join("packed.rpf");
+    let (code, stderr) = run_err(&[
+        "pack",
+        &tree.display().to_string(),
+        &packed.display().to_string(),
+    ]);
+    assert_eq!(
+        code, 6,
+        "one file read as two things is a refusal: {stderr}"
+    );
+    assert!(!packed.exists(), "nothing may be produced from it");
+}
+
+#[test]
+fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree_with_a_backslash() {
+    // R10.3's refusal split on the separator: `name::check` divided on `/`
+    // only, so `..\escaped.txt` was one legal component and `pack` exited 0.
+    // On Windows `Path::join` reads it as two and the tree is escaped at
+    // whatever depth the name asks for.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tree = dir.path().join("tree");
+    fs::create_dir(&tree).expect("tree");
+    fs::write(dir.path().join("escaped.txt"), b"above the tree").expect("writable");
+
+    let manifest = serde_json::json!({
+        "schema": 1,
+        "encryption": rpf_core::format::ENCRYPTION_OPEN,
+        "directories": [],
+        "entries": [{
+            "path": "..\\escaped.txt",
+            "class": "binary",
+            "storage": "stored",
+            "encryption": 0,
+        }],
+    });
+    fs::write(
+        tree.join(rpf_core::MANIFEST_NAME),
+        serde_json::to_vec_pretty(&manifest).expect("json"),
+    )
+    .expect("writable");
+
+    let archive = dir.path().join("packed.rpf");
+    let (code, stderr) = run_err(&[
+        "pack",
+        &tree.display().to_string(),
+        &archive.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "a hostile name is a refusal: {stderr}");
+    assert!(
+        stderr.contains("escaped.txt"),
+        "the refusal must name the path it is about: {stderr}"
+    );
+    assert!(!archive.exists(), "nothing may be produced from it");
+}
+
+#[test]
+fn an_archive_a_host_cannot_hold_is_still_repairable() {
+    // The cost DR-013 recorded, and its second amendment removes: an archive
+    // holding `aux.ytd` could be read and could not be rebuilt, so `put` on any
+    // other entry in it printed `rebuilding` and then refused. The host rules
+    // are `extract`'s and `pack`'s; the tree rules are everyone's.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    archive_named(&archive, &["b.txt", "zzz.ytd"], "zzz.ytd", "aux.ytd");
+
+    let replacement = dir.path().join("replacement.bin");
+    fs::write(&replacement, vec![9_u8; 4_000]).expect("writable");
+    let (code, stderr) = run_err(&[
+        "put",
+        &archive.display().to_string(),
+        "b.txt",
+        &replacement.display().to_string(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "a rebuild must not be refused a host name: {stderr}"
+    );
+
+    let mut file = fs::File::open(&archive).expect("archive opens");
+    let rebuilt = rpf_core::Archive::open(&mut file).expect("the rebuild parses");
+    let index = rebuilt
+        .find("aux.ytd")
+        .expect("the name survived the rebuild");
+    assert_eq!(
+        rebuilt.extract(&mut file, index).expect("payload"),
+        b"payload",
+        "the entry no host can hold came through untouched"
+    );
+
+    // And it is still not extractable, which is the half that stands.
+    let target = dir.path().join("tree");
+    let (code, stderr) = run_err(&[
+        "extract",
+        &archive.display().to_string(),
+        &target.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "a device name is a refusal: {stderr}");
+    assert!(
+        stderr.contains("aux.ytd"),
+        "the refusal must name the path it is about: {stderr}"
+    );
+    assert!(!target.exists(), "nothing may be written");
+}
+
+#[test]
+fn extract_refuses_two_siblings_it_cannot_tell_apart() {
+    // Measured on macOS before this was refused: `extract` reported "2 files",
+    // wrote one — holding the second entry's bytes — and `pack` of that tree
+    // then failed one command later. On Linux the same archive round-tripped,
+    // so one archive was two trees. R10.4.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    archive_named(&archive, &["A.txt", "b.txt"], "b.txt", "a.txt");
+    let target = dir.path().join("tree");
+
+    let (code, stderr) = run_err(&[
+        "extract",
+        &archive.display().to_string(),
+        &target.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "one name for two entries is a refusal: {stderr}");
+    for named in ["a.txt", "A.txt"] {
+        assert!(
+            stderr.contains(named),
+            "the refusal must name both: {stderr}"
+        );
+    }
+    assert!(!target.exists(), "nothing may be written");
+
+    // Only turning it into a tree is refused. The archive is not malformed and
+    // listing it is how a caller finds out which two names collided.
+    assert_eq!(run(&["ls", &archive.display().to_string()]).0, 0, "ls");
+}
+
+#[test]
+fn put_refuses_a_name_two_entries_answer_to() {
+    // Reproduced before this was refused: `rpf put … a.txt` against an archive
+    // holding `A.txt` beside `a.txt` reported `patched 8 bytes in place`, exit
+    // 0, and `A.txt` is what changed. `Archive::check_names` is reached only by
+    // whoever turns the archive into a tree; the patch-in-place path resolves
+    // through `locate`, which folded case and took the first match.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    archive_named(&archive, &["A.txt", "b.txt"], "b.txt", "a.txt");
+    let before = fs::read(&archive).expect("readable");
+
+    let replacement = dir.path().join("replacement.txt");
+    fs::write(&replacement, b"changed").expect("writable");
+
+    let (code, stderr) = run_err(&[
+        "put",
+        &archive.display().to_string(),
+        "a.txt",
+        &replacement.display().to_string(),
+    ]);
+    assert_eq!(code, 6, "a name with two answers is a refusal: {stderr}");
+    for named in ["a.txt", "A.txt"] {
+        assert!(
+            stderr.contains(named),
+            "the refusal must name both: {stderr}"
+        );
+    }
+    assert_eq!(
+        fs::read(&archive).expect("readable"),
+        before,
+        "a refused put must leave every entry as it was"
+    );
+
+    // Only the resolution is refused. Listing is still how a caller finds out
+    // which two names collided.
+    assert_eq!(run(&["ls", &archive.display().to_string()]).0, 0, "ls");
+}
+
+#[test]
+fn a_bare_archive_name_inside_an_installation_is_still_refused() {
+    // `Path::new("dlc.rpf").parent()` is the empty path, so the guard ascended
+    // exactly once and stopped: it never saw the installation it was standing
+    // in, and it fails open. R10.10.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().join("Grand Theft Auto V");
+    let deep = root.join("mods/update/x64/dlcpacks");
+    fs::create_dir_all(&deep).expect("directories");
+    fs::write(root.join("GTA5.exe"), b"not really").expect("writable");
+    make_archive(&deep.join("dlc.rpf"));
+
+    let replacement = dir.path().join("replacement.txt");
+    fs::write(&replacement, b"replaced").expect("writable");
+    let replacement = replacement.display().to_string();
+
+    let (code, stderr) = run_err_in(
+        &deep,
+        &["put", "dlc.rpf", "data/greeting.txt", &replacement],
+    );
+    assert_eq!(code, 6, "a bare name is the same archive: {stderr}");
+    assert!(
+        stderr.contains("Grand Theft Auto V"),
+        "the refusal must name the installation: {stderr}"
+    );
+}
+
+#[test]
+fn a_path_spelled_with_backslashes_is_not_found_and_the_message_respells_it() {
+    // DR-016: `\` is an ordinary character in an entry name, so this addresses
+    // an entry the archive does not hold rather than `data/greeting.txt`. The
+    // not-found is where a caller who spells paths the Windows way finds out.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let (code, stderr) = run_err(&["cat", &archive, "data\\greeting.txt"]);
+    assert_eq!(code, 3, "not an entry of this archive: {stderr}");
+    assert!(
+        stderr.contains("data/greeting.txt"),
+        "the message must respell the path with the separator: {stderr}"
+    );
+
+    // And the spelling it points at is the one that resolves.
+    assert_eq!(run(&["cat", &archive, "data/greeting.txt"]).0, 0);
+}
+
+#[test]
+fn a_not_found_holding_no_backslash_is_reported_as_it_was() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+
+    let (code, stderr) = run_err(&["cat", &archive.display().to_string(), "data/absent.txt"]);
+    assert_eq!(code, 3, "{stderr}");
+    assert!(
+        !stderr.contains("separates with"),
+        "there is nothing to say about a separator here: {stderr}"
+    );
 }

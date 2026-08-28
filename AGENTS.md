@@ -23,7 +23,7 @@ can answer.
 |---|---|---|
 | 1 | Bytes in a real archive | A probe against `assets/` settles layout questions in seconds. Prefer it to every other row |
 | 2 | Behaviour of the game or of FiveM loading the output | The only test of whether a rebuilt archive is correct |
-| 3 | Reference implementations — `CodeWalker.Core`, the `rpf-archive` / `rage-rpf` crates | Read as specification, port with attribution. Never linked, never shipped: DR-007, superseding DR-005 |
+| 3 | Reference implementations — `CodeWalker.Core`, and the crate published as `rpf-archive` / `rage-rpf` / `rpf-rs` | Read as specification, port with attribution. Never linked, never shipped: DR-007, superseding DR-005. **Those three names are one repository by one author, not three sources** — citing them severally triple-counts a single derivative work whose own test suite is self-roundtrip. Two implementations agreeing matters only when they are two. DR-012 |
 | 4 | Community wikis | Frequently describe RPF2 where the reader assumes RPF7. Corroborate before use |
 | 5 | These documents | Correct only as far as their stated verification status |
 
@@ -46,6 +46,8 @@ length. A ten-line probe produced the real layout. Everything in
 | How code is written — boundaries, responsibility, error handling, naming, tests | `docs/conventions.md` | Amend in place. A convention whose reason has expired is deleted, not kept |
 | How is the byte format laid out; what is compression, crypto, alignment, ordering | `docs/rpf-format.md` | A new row in the relevant table, with a Status marker and, when `verified`, the probe that established it |
 | What work is outstanding, in what order, and what is still unknown | `docs/backlog.md` | A new item under the owning track, or a new row in Open questions |
+| What archives exist to test against, what each one is, and what it does and does not exercise | `docs/corpus.md` | A new row per archive, with its size, version, encryption tag and entry count, and a note on what class it covers |
+| How a rebuilt archive is shown to load, and what a pass does and does not prove | `docs/acceptance.md` | Amend the procedure in place. A new observation is a step naming the command, the value it must show, and whether it has been executed here or only written |
 | Why was an option chosen over its alternative | `docs/decisions/DR-NNN-<slug>.md` | Next free number. Never renumber, reword or delete — supersede |
 
 A fact that fits no row above does not yet have a home; add the row before

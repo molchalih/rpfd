@@ -26,6 +26,8 @@ use crate::{
 /// past noise on standard error. R6.8.
 struct OnStderr {
     silent: bool,
+    /// How wide the line last written was, so the next one can cover it.
+    written: usize,
 }
 
 impl OnStderr {
@@ -33,6 +35,7 @@ impl OnStderr {
     fn new() -> Self {
         Self {
             silent: !std::io::stderr().is_terminal(),
+            written: 0,
         }
     }
 }
@@ -40,16 +43,30 @@ impl OnStderr {
 impl Watch for OnStderr {
     fn step(&mut self, step: Step<'_>) -> Flow {
         if !self.silent {
-            // Carriage return and erase-to-end-of-line, so one line is reused
-            // rather than one printed per entry. Safe because this only runs
-            // when standard error is a terminal.
-            eprint!("\r\u{1b}[2K{}/{} {}", step.done, step.total, step.path);
+            let line = format!("{}/{} {}", step.done, step.total, step.path);
+            eprint!("\r{line}{}", padding(self.written, line.chars().count()));
+            self.written = line.chars().count();
             if step.done == step.total {
                 eprintln!();
+                self.written = 0;
             }
         }
         Flow::Continue
     }
+}
+
+/// Spaces enough to cover what a shorter line leaves behind.
+///
+/// One line is reused rather than one printed per entry, and the reuse used to
+/// be a carriage return followed by the ANSI erase-to-end-of-line. That
+/// sequence needs virtual-terminal processing, which neither the standard
+/// library nor this module enables on Windows and which `is_terminal()` cannot
+/// report — so on a plain console the escape was printed rather than obeyed,
+/// once per entry. A carriage return is handled by every console there is, and
+/// spaces cover the tail of the previous line without asking anything of the
+/// terminal at all. R10.9.
+fn padding(written: usize, now: usize) -> String {
+    " ".repeat(written.saturating_sub(now))
 }
 
 /// Opens an archive file and parses its table of contents.
@@ -129,12 +146,26 @@ pub fn cat(path: &Path, inside: &str) -> Result<()> {
     // entry the two are identical; for a resource `extract` keeps the RSC7
     // header, which is what the file is outside the archive.
     let bytes = holder.extract(&mut file, index)?;
-    std::io::stdout()
-        .write_all(&bytes)
-        .map_err(|source| Failure::Io {
-            path: "<stdout>".to_owned(),
-            source,
-        })
+    let out = std::io::stdout();
+    // Refused at this tool's own boundary rather than at the platform's. On
+    // Windows the standard library's console writer declines bytes that are not
+    // UTF-8 — so `cat` of a resource inside a terminal failed with a sentence
+    // about UTF-8, exit 7, while the same command redirected worked, and the
+    // same command on macOS filled the terminal with a resource. One rule
+    // instead, the same on all three: a terminal takes text, and anything else
+    // goes to a file or a pipe. R10.7.
+    if !goes_to(&bytes, out.is_terminal()) {
+        return Err(Failure::Refused {
+            reason: format!(
+                "{inside} is not text and standard output is a terminal; \
+                 redirect it to a file or a pipe"
+            ),
+        });
+    }
+    out.lock().write_all(&bytes).map_err(|source| Failure::Io {
+        path: "<stdout>".to_owned(),
+        source,
+    })
 }
 
 /// How a write is allowed to happen.
@@ -275,6 +306,16 @@ pub fn put(
         );
     }
     Ok(())
+}
+
+/// Whether these bytes may go to standard output as it stands.
+///
+/// A terminal takes text; anything else goes to a file or a pipe. Separated
+/// from [`cat`] so that the rule can be tested: whether standard output is a
+/// terminal is not something a test can arrange without a pseudo-terminal, and
+/// which bytes are text is the half that decides.
+fn goes_to(bytes: &[u8], terminal: bool) -> bool {
+    !terminal || std::str::from_utf8(bytes).is_ok()
 }
 
 /// Reports one patch, made or merely planned.
@@ -585,4 +626,40 @@ fn describe(archive: &Archive, index: u32, path: &str) -> Result<Value> {
         ),
     };
     Ok(json!({ "path": path, "kind": kind, "len": len }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{goes_to, padding};
+
+    #[test]
+    fn a_shorter_progress_line_covers_the_one_before_it() {
+        // The reuse is a carriage return and spaces rather than the ANSI
+        // erase-to-end-of-line, which a plain Windows console prints instead of
+        // obeying. What the escape did, this has to do by hand. R10.9.
+        assert_eq!(padding(20, 8).len(), 12, "the tail of the longer line");
+        assert_eq!(padding(8, 20), "", "a longer line covers itself");
+        assert_eq!(padding(8, 8), "", "the same width needs nothing");
+        assert_eq!(padding(0, 40), "", "the first line has nothing to cover");
+    }
+
+    #[test]
+    fn a_terminal_takes_text_and_nothing_else() {
+        // Windows' console writer refuses bytes that are not UTF-8 and macOS'
+        // terminal accepts them and is ruined by them. One rule for all three,
+        // decided here rather than by whichever platform is running. R10.7.
+        assert!(goes_to("hello".as_bytes(), true));
+        assert!(goes_to("ä".as_bytes(), true), "text is text past ASCII");
+        assert!(!goes_to(b"RSC7\xff\xfe", true));
+        assert!(!goes_to(&[0x80], true), "a lone continuation byte");
+    }
+
+    #[test]
+    fn a_pipe_or_a_file_takes_anything() {
+        // `rpf cat … > f && rpf put … f` is the round trip the command exists
+        // for, and every resource in it is bytes rather than text.
+        assert!(goes_to(b"RSC7\xff\xfe", false));
+        assert!(goes_to(&[0x80], false));
+        assert!(goes_to(&[], false));
+    }
 }

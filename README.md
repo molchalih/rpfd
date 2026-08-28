@@ -39,6 +39,7 @@ not what the tool was doing when it noticed. DR-010.
 | 6 | The request or its input was wrong, and the tool declined to act |
 | 7 | Reading or writing failed — the source or the sink, and nobody's input |
 | 8 | The caller stopped the operation part-way |
+| 9 | The archive is an RPF version this build does not read |
 
 The daemon reports the same numbers as a JSON-RPC `error.code`. A negative code
 there is JSON-RPC's own — `-32601` for an unknown method, `-32602` for a bad
@@ -50,6 +51,12 @@ set before writing any of it. Two small edits to a 145 MB archive cost 92 bytes
 of writes rather than 145 MB. A set that does not all fit is rebuilt instead,
 and the report says which of the two ran — they are not equivalent in
 durability, since a rebuild is atomic and a patch is not.
+
+"Atomic" here means the archive is never left half-written under its own name:
+the rebuild goes to a scratch file in the same directory and replaces the
+original in one step. It is not a claim about surviving power loss — the replace
+is not followed by a sync — and it is measured on macOS and Linux, not yet on
+Windows.
 
 `--dry-run` on `put`, and `"dry_run": true` on the daemon's `commit`, take that
 same decision and stop before acting on it — reporting where each edit would be
@@ -72,6 +79,10 @@ read on its own thread, so it arrives while there is still something to cancel. 
 rebuild only replaces the archive once it has finished.
 
 ## Building and testing
+
+A tagged release publishes a static binary per platform — macOS on both
+architectures, Linux `x86_64` against musl, and Windows `x86_64` — with both
+licence files beside it. Nothing has to be installed first.
 
 ```
 cargo build --release          # target/release/rpf
@@ -101,7 +112,16 @@ they are worth.
 | `docs/conventions.md` | how code is written; read before changing source |
 | `docs/rpf-format.md` | format facts, each marked verified or not |
 | `docs/backlog.md` | research and delivery backlog |
+| `docs/corpus.md` | what archives exist to test against, and what they do not cover |
 | `docs/decisions/` | decision records |
+
+## Licence
+
+`MIT OR Apache-2.0`, at your option: `LICENSE-MIT` and `LICENSE-APACHE` at the
+repository root. DR-007 permits reading the reference implementations as
+specification and porting from them with attribution, which assumes an outbound
+licence compatible with theirs; `deny.toml` already admits only permissive
+inbound ones, and this is the other half of that.
 
 **`docs/` is deliberately untracked.** It lives in the working tree and not in
 the repository, so the table above resolves for anyone working here and not in

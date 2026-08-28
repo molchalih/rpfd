@@ -76,6 +76,49 @@ fn make_archive(at: &Path) -> Vec<u8> {
     resource
 }
 
+/// An archive holding two entries that fold to one name, returning its bytes.
+///
+/// `build` will not write one, so it is built under two names of the same
+/// length and then the second is edited in the names blob: everything but that
+/// one name is what the writer produced.
+fn make_colliding_archive(at: &Path) -> Vec<u8> {
+    let files = ["A.txt", "b.txt"].map(|name| FileSpec {
+        path: name.to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    });
+
+    let mut out = Vec::new();
+    rpf_core::build(
+        &mut std::io::Cursor::new(&mut out),
+        &files,
+        &[],
+        |_| Ok(b"payload".to_vec()),
+        &mut Unwatched,
+    )
+    .expect("two distinct names build");
+
+    let written = b"b.txt";
+    let wanted = b"a.txt";
+    let occurrences = out.windows(written.len()).filter(|w| w == written).count();
+    assert_eq!(
+        occurrences, 1,
+        "the name must appear only in the names blob"
+    );
+    let offset = out
+        .windows(written.len())
+        .position(|w| w == written)
+        .expect("the name is in the blob");
+    out.get_mut(offset..offset.saturating_add(written.len()))
+        .expect("the name is in the blob")
+        .copy_from_slice(wanted);
+
+    fs::write(at, &out).expect("archive is writable");
+    out
+}
+
 /// Where one entry's payload sits and how much room it has, read from the
 /// archive so that a report about them can be checked against something other
 /// than itself.
@@ -830,8 +873,13 @@ fn a_claim_is_on_the_archive_and_not_on_the_spelling_of_its_path() {
         root.join("test.rpf").display().to_string(),
         root.join(".").join("test.rpf").display().to_string(),
     ];
-    #[cfg(unix)]
-    spellings.push("link.rpf".to_owned());
+    // `cfg!` rather than `#[cfg]`: an attribute removes the push outright,
+    // which leaves the binding needlessly mutable on Windows and the whole list
+    // a candidate for an array. A run-time-shaped branch on a compile-time
+    // constant costs nothing and keeps one spelling of the list.
+    if cfg!(unix) {
+        spellings.push("link.rpf".to_owned());
+    }
 
     let mut requests =
         vec![json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path":"test.rpf"}})];
@@ -2432,5 +2480,81 @@ fn verify_reports_no_progress_to_a_caller_that_asked_for_none() {
     assert!(
         notifications.is_empty(),
         "progress was reported to a caller that asked for none: {notifications:?}"
+    );
+}
+
+#[test]
+fn a_write_to_a_name_two_entries_answer_to_is_refused() {
+    // The daemon resolves a write through `locate` exactly as `put` does, and
+    // it echoed the caller's own spelling back in the answer while buffering an
+    // edit against the other entry. Reproduced: the commit then patched `A.txt`
+    // and reported `{"committed": 1, "method": "patch"}`.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let before = make_colliding_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"a.txt","bytes": BASE64.encode(b"changed")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+    ]);
+
+    let refusal = answer(&responses, 2);
+    assert_eq!(refusal["error"]["code"], json!(6), "{responses:?}");
+    let message = refusal["error"]["message"].as_str().expect("a message");
+    for named in ["a.txt", "A.txt"] {
+        assert!(
+            message.contains(named),
+            "the refusal must name both: {message}"
+        );
+    }
+
+    // Nothing was buffered, so there is nothing for the commit to write.
+    assert_eq!(
+        answer(&responses, 3)["result"]["unchanged"],
+        json!(true),
+        "{responses:?}"
+    );
+    assert_eq!(
+        fs::read(&archive).expect("readable"),
+        before,
+        "a refused write must leave every entry as it was"
+    );
+}
+
+#[test]
+fn the_daemon_respells_a_backslashed_path_exactly_as_the_command_line_does() {
+    // §1's test applied to a diagnostic: what the binary tells a caller about
+    // the separator, the daemon tells them too, or the two frontends have
+    // diverged. DR-016.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+            "handle":1,"path":"data\\greeting.txt"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+            "handle":1,"path":"data/absent.txt"}}),
+    ]);
+
+    let refusal = answer(&responses, 2);
+    assert_eq!(refusal["error"]["code"], json!(3), "{responses:?}");
+    let message = refusal["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.contains("data/greeting.txt"),
+        "the message must respell the path with the separator: {message}"
+    );
+
+    let plain = answer(&responses, 3)["error"]["message"]
+        .as_str()
+        .expect("a message");
+    assert!(
+        !plain.contains("separates with"),
+        "there is nothing to say about a separator here: {plain}"
     );
 }

@@ -475,6 +475,10 @@ fn the_summary_reproduces_the_measured_slack() {
 fn every_entry_of_the_sample_reads_back() {
     // 27 files over the 3 archives, and each one addressed by the path that
     // reaches it — which is what a caller acts on when one of them fails.
+    //
+    // Also what enforces `docs/rpf-format.md`, Resource page flags: every
+    // resource ends its deflate stream exactly at its payload, so a resource
+    // that grew a tail would surface here as a problem rather than silently.
     let Some((path, _)) = corpus_archive("every_entry_of_the_sample_reads_back") else {
         return;
     };

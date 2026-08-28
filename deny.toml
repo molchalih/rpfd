@@ -24,9 +24,8 @@ confidence-threshold = 0.9
 # what currently is. An entry nothing matches yet is not a finding.
 unused-allowed-license = "allow"
 
-# This project's own crates are `publish = false` and carry no license field,
-# because the project has not chosen one — R8.5 in docs/backlog.md. That is a
-# decision to make, not a dependency to audit, so it is not this tool's job.
+# This project's own crates are `MIT OR Apache-2.0` and `publish = false`. They
+# are the thing being audited for, not a dependency to audit.
 private = { ignore = true }
 
 [bans]

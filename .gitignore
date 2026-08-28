@@ -9,6 +9,11 @@ fixtures/corpus/
 # the work ships.
 docs/
 
+# Game executables, kept locally so key extraction has something to read.
+# Never tracked: DR-006 keeps key material out of this repository, and an
+# executable is where that material lives before it is extracted.
+bin/
+
 # Extracted key material. Derived from a local game install; never redistributed.
 keys/
 *.keys

@@ -10,6 +10,11 @@
 //! Each item names the row of `docs/rpf-format.md` that established it. A row
 //! marked `verified` there was measured against a real archive; do not add a
 //! constant here for a row that is not.
+//!
+//! [`unsupported_version`] is the one exception, and it states why it is
+//! allowed to be one: nothing is decoded on the strength of it. Recognising a
+//! version there is only ever the difference between a refusal that names the
+//! version and one that does not.
 
 /// Archive magic, as it appears on disk.
 ///
@@ -19,6 +24,38 @@
 ///
 /// `docs/rpf-format.md`, RPF7 header, `verified`.
 pub const MAGIC_RPF7: [u8; 4] = *b"7FPR";
+
+/// The container version named by the four bytes at an archive's base, when it
+/// is a version this build does not read.
+///
+/// [`MAGIC_RPF7`] is the only version implemented here, so it is never named:
+/// a magic this answers `Some` for is by construction one that cannot be
+/// opened, which leaves the caller nothing to finish (§4).
+///
+/// **Both byte orders are recognised**, because the convention changes at
+/// version 6. `RPF0` to `RPF4` and console `RPF7` are stored `'R','P','F',n`
+/// and read as `RPFn` on disk; PC `RPF7` and `RPF8` are stored reversed and
+/// read as `7FPR` and `8FPR`. So an archive reading `RPF7` here is the console
+/// spelling of version 7, which is a version this build does not read either.
+///
+/// `docs/rpf-format.md`, "The magic word changes byte order at version 6" —
+/// **`secondary`**, read from reference implementations rather than measured
+/// here. That is enough for this and for nothing else: a version recognised
+/// wrongly costs a less exact refusal, where a version *decoded* wrongly is the
+/// failure `AGENTS.md` records. DR-012.
+#[must_use]
+pub fn unsupported_version(magic: [u8; 4]) -> Option<u8> {
+    if magic == MAGIC_RPF7 {
+        return None;
+    }
+    let ([b'R', b'P', b'F', digit] | [digit, b'F', b'P', b'R']) = magic else {
+        return None;
+    };
+    if !digit.is_ascii_digit() {
+        return None;
+    }
+    digit.checked_sub(b'0')
+}
 
 /// Resource payload magic, at the start of the payload of any entry whose
 /// [`RESOURCE_FLAG`] is set.
@@ -347,6 +384,47 @@ mod tests {
                     "{a:?} against {b:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_other_version_is_recognised_in_both_byte_orders() {
+        // The convention changes at version 6: `RPF0`-`RPF4` and console `RPF7`
+        // read as `RPFn` on disk, PC `RPF7` and `RPF8` read reversed. A reader
+        // that sniffs one order reports half of them as "not an archive".
+        // `docs/rpf-format.md`, the magic table, `secondary`.
+        for (magic, version) in [
+            (*b"RPF0", 0_u8),
+            (*b"RPF2", 2),
+            (*b"RPF3", 3),
+            (*b"RPF4", 4),
+            (*b"RPF6", 6),
+            (*b"8FPR", 8),
+            (*b"2FPR", 2),
+        ] {
+            assert_eq!(unsupported_version(magic), Some(version), "{magic:02x?}");
+        }
+    }
+
+    #[test]
+    fn the_console_spelling_of_rpf7_is_a_version_this_build_does_not_read() {
+        // `RPF7` on disk is version 7 stored the other way round, and this
+        // build reads the `7FPR` spelling. Answering `None` for it would report
+        // a sound archive as malformed, which is the whole defect.
+        assert_eq!(unsupported_version(*b"RPF7"), Some(7));
+    }
+
+    #[test]
+    fn the_version_this_build_reads_is_never_named_as_one_it_does_not() {
+        // §4: the caller has nothing left to decide. A magic this answers
+        // `Some` for is by construction one that cannot be opened.
+        assert_eq!(unsupported_version(MAGIC_RPF7), None);
+    }
+
+    #[test]
+    fn bytes_that_are_no_rpf_magic_at_all_are_not_given_a_version() {
+        for magic in [*b"RPFx", *b"xFPR", *b"RSC7", [0_u8; 4], *b"PK\x03\x04"] {
+            assert_eq!(unsupported_version(magic), None, "{magic:02x?}");
         }
     }
 

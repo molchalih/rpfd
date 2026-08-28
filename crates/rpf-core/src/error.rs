@@ -30,6 +30,27 @@ pub enum Error {
         found: [u8; 4],
     },
 
+    /// The bytes at the archive's base are an RPF header of a version this
+    /// build does not read.
+    ///
+    /// Distinct from [`Error::NotAnArchive`], which is what the version used to
+    /// be reported as: nothing here is malformed. The version is in the first
+    /// four bytes and throwing it away told a caller the archive was broken.
+    /// DR-012, and DR-010's amendment for the category.
+    #[error(
+        "RPF{version} archive at offset {base}: magic reads {found:02x?}, \
+         and this build reads only RPF7 in its 7FPR spelling"
+    )]
+    UnsupportedVersion {
+        /// Where the archive was expected to begin.
+        base: u64,
+        /// The version number the magic names.
+        version: u8,
+        /// The four bytes actually found there, which say which of the two
+        /// byte orders the archive was written in.
+        found: [u8; 4],
+    },
+
     /// The archive is encrypted and no key material is available.
     ///
     /// Distinct from [`Error::Corrupt`] on purpose: the archive is fine, we
@@ -192,6 +213,34 @@ pub enum Error {
         actual: u64,
     },
 
+    /// The payload's deflate stream ended before the payload did, so the entry
+    /// declares bytes that are not part of anything it holds.
+    ///
+    /// A deflate stream carries its own end, so the bytes after it inflate to
+    /// nothing and are silently ignored: the contents come back exactly as the
+    /// archive promises them while the payload is longer than what produced
+    /// them. That is the archive contradicting itself, which is why it is
+    /// `Corrupt` and not a refusal — but it is reported by `verify` rather
+    /// than refused by a read, because one producer's archives are not enough
+    /// evidence to reject another's. `docs/backlog.md`, R6.10.
+    ///
+    /// Carries both lengths because both are what a caller acts on: where the
+    /// stream ends, and how much the entry claims after it.
+    #[error(
+        "entry {entry}: the deflate stream ends after {used} bytes, \
+         but the payload declares {declared}"
+    )]
+    TrailingBytes {
+        /// Index of the offending entry.
+        entry: u32,
+        /// How many bytes of payload the entry table declares. For a resource
+        /// this is its compressed size with the 16-byte `RSC7` header taken
+        /// off, which is the extent of the stream itself.
+        declared: u64,
+        /// How many of them the deflate stream consumed.
+        used: u64,
+    },
+
     /// An entry index does not exist in this archive.
     #[error("no entry with index {index}; the archive has {entry_count}")]
     NoSuchEntry {
@@ -235,6 +284,45 @@ pub enum Error {
     NotAResource {
         /// The entry being written.
         path: String,
+    },
+
+    /// Two children of one directory are one name here, so one of them cannot
+    /// be addressed by any spelling of its own path.
+    ///
+    /// Path components resolve case-insensitively in this container
+    /// ([`crate::format::same_name`]), so `A.txt` and `a.txt` in one directory
+    /// are one name and the second is unreachable. Reported by the writer,
+    /// which will not produce such an archive, and by the reader, which will
+    /// not turn one into a tree, rather than "2 files" now and a failure one
+    /// command later. R10.4.
+    ///
+    /// **Two names one reader cannot tell apart is three conditions, not one,
+    /// and this variant is the first of them.** The other two are
+    /// [`Error::BadPath`]: `"is named twice in one directory"` for one name
+    /// carried twice, and `"a file and a directory share one name"` for a
+    /// clash of kinds. The writer has always answered all three separately;
+    /// the reader answered every one of them with this variant, which rendered
+    /// `"aa.txt" and "aa.txt" are one name here` for an exact duplicate — one
+    /// string named twice, telling a caller nothing. Both variants are
+    /// [`Category::Refused`] and exit 6, so nothing branching on the number
+    /// moves; what changes is that the sentence is now the same one either
+    /// way.
+    ///
+    /// **Both are paths from the archive's root, and they are the two names
+    /// that collide** — not the request that ran into the collision. For a
+    /// directory component that is not the same thing: adding
+    /// `X64/alpha.txt` to a tree that already holds `x64` used to render
+    /// `"X64/alpha.txt" and its sibling "x64" are one name here`, which is
+    /// untrue twice over — those two are neither siblings nor one name. What
+    /// the caller has to act on is the pair of directories, and §10 says a
+    /// variant carries that rather than what was being attempted when it
+    /// surfaced.
+    #[error("{path:?} and {other:?} are one name here, so one of them cannot be addressed")]
+    NameCollision {
+        /// One of the two, by path from the archive's root.
+        path: String,
+        /// The other, likewise. The two sit in one directory.
+        other: String,
     },
 
     /// A path cannot be turned into entries.
@@ -318,6 +406,9 @@ pub enum Category {
     Corrupt,
     /// The archive is intact but needs key material we do not have.
     NeedsKey,
+    /// The archive is intact and this build cannot read it. Nobody who is
+    /// holding it can act: the missing part is here. DR-010's amendment.
+    Unsupported,
     /// The container declines to carry out the request. Either it is not well
     /// formed, or it is and the container will not do it. DR-010.
     Refused,
@@ -335,11 +426,13 @@ impl Error {
         match *self {
             Self::Io { .. } => Category::Io,
             Self::NeedsKey { .. } => Category::NeedsKey,
+            Self::UnsupportedVersion { .. } => Category::Unsupported,
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
             | Self::NotAResource { .. }
             | Self::BadPath { .. }
+            | Self::NameCollision { .. }
             | Self::WrongKind { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
             Self::NotAnArchive { .. }
@@ -353,6 +446,7 @@ impl Error {
             | Self::ResourceTooSmall { .. }
             | Self::Inflate { .. }
             | Self::LengthMismatch { .. }
+            | Self::TrailingBytes { .. }
             | Self::VerifyFailed { .. } => Category::Corrupt,
         }
     }
@@ -372,13 +466,14 @@ mod tests {
     /// The match is exhaustive, so a variant added later stops this module
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 22;
+    const VARIANTS: usize = 25;
 
     /// The variant's own name, for a test that has to say which one it means.
     fn name(error: &Error) -> &'static str {
         match *error {
             Error::Io { .. } => "Io",
             Error::NotAnArchive { .. } => "NotAnArchive",
+            Error::UnsupportedVersion { .. } => "UnsupportedVersion",
             Error::NeedsKey { .. } => "NeedsKey",
             Error::OutOfBounds { .. } => "OutOfBounds",
             Error::BadName { .. } => "BadName",
@@ -390,11 +485,13 @@ mod tests {
             Error::ResourceTooSmall { .. } => "ResourceTooSmall",
             Error::Inflate { .. } => "Inflate",
             Error::LengthMismatch { .. } => "LengthMismatch",
+            Error::TrailingBytes { .. } => "TrailingBytes",
             Error::VerifyFailed { .. } => "VerifyFailed",
             Error::NoSuchEntry { .. } => "NoSuchEntry",
             Error::NotFound { .. } => "NotFound",
             Error::FieldOverflow { .. } => "FieldOverflow",
             Error::NotAResource { .. } => "NotAResource",
+            Error::NameCollision { .. } => "NameCollision",
             Error::BadPath { .. } => "BadPath",
             Error::Overlapping { .. } => "Overlapping",
             Error::Cancelled { .. } => "Cancelled",
@@ -463,6 +560,11 @@ mod tests {
                 expected: 26,
                 actual: 25,
             },
+            Error::TrailingBytes {
+                entry: 0,
+                declared: 200_044,
+                used: 44,
+            },
             Error::VerifyFailed {
                 checked: 27,
                 failed: 1,
@@ -488,6 +590,10 @@ mod tests {
                 path: "../escape".to_owned(),
                 reason: "leaves the archive",
             },
+            Error::NameCollision {
+                path: "data/NOTES.TXT".to_owned(),
+                other: "data/notes.txt".to_owned(),
+            },
             Error::Overlapping {
                 path: "a".to_owned(),
                 other: "b".to_owned(),
@@ -511,6 +617,14 @@ mod tests {
                 Category::Io,
             ),
             (Error::NeedsKey { tag: 0x0FFF_FFF9 }, Category::NeedsKey),
+            (
+                Error::UnsupportedVersion {
+                    base: 0,
+                    version: 2,
+                    found: *b"RPF2",
+                },
+                Category::Unsupported,
+            ),
             (
                 Error::NoSuchEntry {
                     index: 9,

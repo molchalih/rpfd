@@ -15,6 +15,7 @@ pub mod error;
 pub mod format;
 pub mod inspect;
 pub mod manifest;
+pub mod name;
 pub mod patch;
 pub mod watch;
 

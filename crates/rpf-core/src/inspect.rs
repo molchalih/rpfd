@@ -109,7 +109,11 @@ impl Summary {
     }
 }
 
-/// One entry that did not read back as the archive describes it.
+/// One entry that is not as the archive describes it.
+///
+/// Either it did not read back at all, or it read back and its payload
+/// declares bytes its deflate stream never reached — [`Error::TrailingBytes`],
+/// which nothing but this walk looks for. R6.10.
 #[derive(Debug)]
 pub struct Problem {
     /// Where it is, addressed from the outermost archive.
@@ -195,9 +199,9 @@ impl Verified {
             // that passed made "1 of 26 entries failed" out of 27. R6.9.
             self.checked = self.checked.saturating_add(1);
             done = done.saturating_add(1);
-            let outcome = archive.read(src, index);
-            if let Ok(ref contents) = outcome {
-                *bytes = bytes.saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+            let outcome = archive.read_payload(src, index);
+            if let Ok(ref payload) = outcome {
+                *bytes = bytes.saturating_add(payload.len());
             }
 
             // Reported whether or not it read back, so that `done` and the
@@ -213,9 +217,21 @@ impl Verified {
                 return Err(Error::Cancelled { done, total });
             }
 
-            if let Err(error) = outcome {
-                self.problems.push(Problem { path, error });
-                continue;
+            let payload = match outcome {
+                Err(error) => {
+                    self.problems.push(Problem { path, error });
+                    continue;
+                }
+                Ok(payload) => payload,
+            };
+
+            // Reported and then walked past: the contents are sound, so an
+            // archive nested in them is still read back. R6.10.
+            if let Err(error) = payload.checked() {
+                self.problems.push(Problem {
+                    path: path.clone(),
+                    error,
+                });
             }
             if let Some(nested) = archive.nested_at(src, index)? {
                 self.walk(src, &nested, &path, watch, bytes)?;

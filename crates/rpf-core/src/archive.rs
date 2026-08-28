@@ -9,35 +9,37 @@
 //! Nothing here loads an archive. A 2.7 GB file costs its table of contents to
 //! open, and one entry to read. R3.9.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::{
+    collections::HashMap,
+    io::{Read, Seek, SeekFrom},
+};
 
 use crate::{
     entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
         BLOCK_LEN, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7, MAGIC_RSC7,
-        RESOURCE_HEADER_LEN, payload_floor, resource_len, same_name, u32_at,
+        RESOURCE_HEADER_LEN, folded, payload_floor, resource_len, same_name, u32_at,
+        unsupported_version,
     },
 };
 
 /// How deep anything in this container is walked before it is refused.
 ///
+/// **Policy, not a measured fact.** The format sets no limit and nothing about
+/// a deep archive is self-contradictory; this is the depth we choose to follow
+/// to, and DR-011 holds the reasoning and the measurements behind the number.
+/// It is deliberately absent from `docs/rpf-format.md`, which holds facts an
+/// archive told us.
+///
 /// It bounds two structures, because it is one fact about one thing: every
 /// recursive walk over an archive — `child_named` down a path, `ls -R`,
 /// `verify`, the daemon's recursive list — descends a directory tree, an
 /// archive nested inside an archive, or both, and both depths are chosen by
-/// the bytes rather than by us.
-///
-/// The bound belongs here and not at each walker (§5). A walker that carried
-/// its own counter would be one walker away from a walker that forgot, and the
-/// symptom of forgetting is a stack overflow rather than a wrong answer:
-/// measured before this existed, 5,000 stacked directory rows — 80,384 bytes —
-/// and 16,000 stacked archive headers — 8,192,000 bytes — each aborted
-/// `rpf ls -R` with exit 134, and took the daemon's session with them.
-///
-/// 32 rather than a rounder number because it is two orders of magnitude above
-/// anything real and still far below what a stack holds: the deepest tree in
-/// the sample is `x64/vehiclemods/<file>`, 3, and the deepest nesting is 1.
+/// the bytes rather than by us. The bound belongs here and not at each walker
+/// (§5): a walker that carried its own counter would be one walker away from a
+/// walker that forgot, and the symptom of forgetting is a stack overflow rather
+/// than a wrong answer.
 pub const MAX_DEPTH: u32 = 32;
 
 /// Seeks and fills `buf`, reporting where it was when it failed.
@@ -64,11 +66,67 @@ fn read_vec_at<R: Read + Seek>(src: &mut R, offset: u64, len: u64) -> Result<Vec
     Ok(buf)
 }
 
+/// One entry's contents, and how much of the payload they came out of.
+///
+/// The two lengths are the **payload's**, not the contents': `declared` is how
+/// many bytes on disk the entry table gives the stream, and `used` is how many
+/// of them the stream turned out to occupy. They can differ without anything
+/// failing to inflate, because a deflate stream carries its own end and
+/// whatever follows it is never looked at — which is the whole of R6.10 and
+/// what [`Payload::checked`] is for.
+pub(crate) struct Payload {
+    entry: u32,
+    contents: Vec<u8>,
+    declared: u64,
+    used: u64,
+}
+
+impl Payload {
+    /// A payload written as it is, which has no stream to end early.
+    fn stored(entry: u32, contents: Vec<u8>) -> Self {
+        let len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+        Self {
+            entry,
+            contents,
+            declared: len,
+            used: len,
+        }
+    }
+
+    /// How many bytes the entry holds, for a caller counting progress rather
+    /// than reading. The contents themselves come out of [`Payload::checked`]
+    /// and nowhere else (§4).
+    pub(crate) fn len(&self) -> u64 {
+        u64::try_from(self.contents.len()).unwrap_or(u64::MAX)
+    }
+
+    /// The contents, unless the payload declares bytes the stream never
+    /// reached.
+    ///
+    /// The one place that fact is decided. `docs/rpf-format.md`, Resource page
+    /// flags, `verified`: every resource in the sample ends its stream exactly
+    /// at its payload, 0 bytes over, 20 of 20.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TrailingBytes`], with both lengths.
+    pub(crate) fn checked(self) -> Result<Vec<u8>> {
+        if self.used < self.declared {
+            return Err(Error::TrailingBytes {
+                entry: self.entry,
+                declared: self.declared,
+                used: self.used,
+            });
+        }
+        Ok(self.contents)
+    }
+}
+
 /// Raw deflate, with the output length the archive promised.
 ///
 /// Bounded by `expected` on purpose: a declared length is attacker-controlled,
 /// so it caps the read rather than sizing an allocation up front.
-fn inflate(entry: u32, raw: &[u8], expected: u64) -> Result<Vec<u8>> {
+fn inflate(entry: u32, raw: &[u8], expected: u64) -> Result<Payload> {
     let limit = expected.checked_add(1).ok_or(Error::LengthMismatch {
         entry,
         expected,
@@ -76,7 +134,8 @@ fn inflate(entry: u32, raw: &[u8], expected: u64) -> Result<Vec<u8>> {
     })?;
 
     let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(raw)
+    let mut stream = flate2::read::DeflateDecoder::new(raw);
+    (&mut stream)
         .take(limit)
         .read_to_end(&mut out)
         .map_err(|source| Error::Inflate { entry, source })?;
@@ -89,7 +148,14 @@ fn inflate(entry: u32, raw: &[u8], expected: u64) -> Result<Vec<u8>> {
             actual,
         });
     }
-    Ok(out)
+    Ok(Payload {
+        entry,
+        contents: out,
+        declared: u64::try_from(raw.len()).unwrap_or(u64::MAX),
+        // What the decompressor took, rather than what it was handed: that is
+        // where the stream ends, and the bytes after it belong to nothing.
+        used: stream.total_in(),
+    })
 }
 
 /// The table of contents of one archive.
@@ -135,9 +201,10 @@ impl Archive {
     ///
     /// # Errors
     ///
-    /// [`Error::NotAnArchive`] if the magic is wrong, [`Error::NeedsKey`] if it
-    /// is encrypted, and the bounds variants if the header describes regions
-    /// that do not fit.
+    /// [`Error::NotAnArchive`] if the magic is nothing this format uses,
+    /// [`Error::UnsupportedVersion`] if it names a version this build does not
+    /// read, [`Error::NeedsKey`] if it is encrypted, and the bounds variants if
+    /// the header describes regions that do not fit.
     pub fn parse<R: Read + Seek>(src: &mut R, base: u64, len: u64) -> Result<Self> {
         // An archive parsed by name rather than through a holder is the
         // outermost one there is, so it is nested inside nothing.
@@ -359,6 +426,80 @@ impl Archive {
         Ok(parts.join("/"))
     }
 
+    /// Refuses an archive in which two children of one directory are one name
+    /// here.
+    ///
+    /// [`same_name`] folds case, so `A.txt` and `a.txt` under one parent are
+    /// one name and the second is unreachable by any spelling of its own path.
+    /// `build` has always refused to write such an archive; this is the reading
+    /// of the same rule, so an archive that cannot be packed cannot be
+    /// extracted either. R10.4.
+    ///
+    /// **Not done at parse**, deliberately, and this is the reason rather than
+    /// an omission: an archive like this is legal in the format, no corpus here
+    /// is wide enough to say the game never ships one, and refusing it at
+    /// `Archive::parse` would leave `ls` unable to show what is wrong with it.
+    /// What is refused is turning it into a tree — which is `specs_of` and
+    /// `directories_of`, and therefore `extract`, `pack` and every rebuild.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::one_name_twice`], and as [`Archive::path`] for an entry
+    /// whose ancestry does not resolve.
+    pub fn check_names(&self) -> Result<()> {
+        let mut seen: HashMap<(u32, String), u32> = HashMap::new();
+        for index in 0..count_of(&self.entries) {
+            let parent = usize::try_from(index)
+                .ok()
+                .and_then(|i| self.parents.get(i))
+                .copied()
+                .ok_or(Error::NoSuchEntry {
+                    index,
+                    entry_count: count_of(&self.entries),
+                })?;
+            // The root is nobody's child, so it has no sibling to collide with.
+            let Some(parent) = parent else { continue };
+            if let Some(first) = seen.insert((parent, folded(self.name(index)?)), index) {
+                return Err(self.one_name_twice(first, index)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// The refusal for two children of one directory that are one name here.
+    ///
+    /// **Three conditions, and the reader answers each of them as the writer
+    /// does.** `build` refuses a tree for two spellings of one folded name
+    /// ([`Error::NameCollision`]), for one path given twice, and for a file and
+    /// a directory of one name; reading an archive can meet all three, and
+    /// answering them all as a case collision told a caller `"aa.txt" and
+    /// "aa.txt" are one name here`, which names one string twice and says
+    /// nothing. All three are `Category::Refused` and exit 6 either way, so the
+    /// symmetry is in what is reported rather than in what a machine branches
+    /// on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NameCollision`] for two spellings of one name, [`Error::BadPath`]
+    /// for one name carried by two entries, and as [`Archive::path`] for an
+    /// entry whose ancestry does not resolve. It returns the refusal rather
+    /// than raising it, so the two callers spell the refusal one way.
+    fn one_name_twice(&self, first: u32, second: u32) -> Result<Error> {
+        let path = self.path(second)?;
+        if self.name(first)? != self.name(second)? {
+            return Ok(Error::NameCollision {
+                path,
+                other: self.path(first)?,
+            });
+        }
+        let reason = if self.entry(first)?.is_directory() == self.entry(second)?.is_directory() {
+            "is named twice in one directory"
+        } else {
+            "a file and a directory share one name"
+        };
+        Ok(Error::BadPath { path, reason })
+    }
+
     /// The indices of a directory's children.
     ///
     /// # Errors
@@ -577,12 +718,28 @@ impl Archive {
     /// 16-byte `RSC7` header removed and the remainder inflated. Compare
     /// [`Archive::extract`], which keeps the header.
     ///
+    /// A payload whose deflate stream ends before the payload does still reads
+    /// back, because it reads back correctly: the contents are what the archive
+    /// promises, and only the bytes after the stream are unaccounted for.
+    /// [`crate::Verified`] reports those as [`Error::TrailingBytes`]; refusing
+    /// them here would reject an archive on one producer's evidence. R6.10.
+    ///
     /// # Errors
     ///
     /// [`Error::WrongKind`] for a directory, the bounds variants for a payload
     /// that does not fit, and [`Error::Inflate`] or [`Error::LengthMismatch`]
     /// when the payload does not decompress as promised.
     pub fn read<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Vec<u8>> {
+        Ok(self.read_payload(src, index)?.contents)
+    }
+
+    /// [`Archive::read`], keeping what the read learned about the payload it
+    /// came out of.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::read`].
+    pub(crate) fn read_payload<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Payload> {
         let (offset, on_disk) = self.payload_span(index)?;
         let entry = self.entry(index)?;
 
@@ -600,7 +757,7 @@ impl Archive {
             } => {
                 let raw = read_vec_at(src, offset, on_disk)?;
                 if compressed_len == 0 {
-                    return Ok(raw);
+                    return Ok(Payload::stored(index, raw));
                 }
                 inflate(index, &raw, u64::from(uncompressed_len))
             }
@@ -691,7 +848,7 @@ impl Archive {
         let mut current = 0_u32;
         for segment in path.split('/').filter(|s| !s.is_empty()) {
             current = self
-                .child_named(current, segment)
+                .child_named(current, segment)?
                 .ok_or_else(|| Error::NotFound {
                     path: path.to_owned(),
                     segment: segment.to_owned(),
@@ -702,10 +859,35 @@ impl Archive {
 
     /// The child of `parent` with this name, or `None` if `parent` is not a
     /// directory or has no such child.
-    pub(crate) fn child_named(&self, parent: u32, name: &str) -> Option<u32> {
-        self.children(parent)
-            .ok()?
-            .find(|&index| self.name(index).is_ok_and(|n| same_name(n, name)))
+    ///
+    /// Ambiguity is refused rather than resolved. [`same_name`] folds case, so
+    /// two children of one directory can both answer to one spelling, and
+    /// taking the first of them addresses one entry by another's name: measured,
+    /// `rpf put … ax.txt` against an archive holding `AX.txt` beside `ax.txt`
+    /// reported `patched 8 bytes in place`, exit 0, and `AX.txt` is what
+    /// changed. This is the only resolution the patch-in-place path goes
+    /// through, so it is where the refusal has to be — [`Archive::check_names`]
+    /// is reached only by whoever turns the archive into a tree.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::one_name_twice`] when more than one child answers to
+    /// `name`.
+    pub(crate) fn child_named(&self, parent: u32, name: &str) -> Result<Option<u32>> {
+        let Ok(children) = self.children(parent) else {
+            return Ok(None);
+        };
+        let mut found: Option<u32> = None;
+        for index in children {
+            if !self.name(index).is_ok_and(|held| same_name(held, name)) {
+                continue;
+            }
+            if let Some(first) = found {
+                return Err(self.one_name_twice(first, index)?);
+            }
+            found = Some(index);
+        }
+        Ok(found)
     }
 
     /// Finds an entry by a path that may address **through** nested archives,
@@ -731,7 +913,7 @@ impl Archive {
 
         for (position, segment) in segments.iter().enumerate() {
             let index = archive
-                .child_named(current, segment)
+                .child_named(current, segment)?
                 .ok_or_else(|| Error::NotFound {
                     path: path.to_owned(),
                     segment: (*segment).to_owned(),
@@ -786,6 +968,15 @@ impl Archive {
     /// archive describes, and swallowing it would report a truncated listing as
     /// a complete one, which is the plausible-but-wrong value §6 rules out
     /// alongside the panic it replaced.
+    ///
+    /// **An archive of a version this build does not read is `None` here**, and
+    /// that is the limit of DR-010's amendment rather than a case it covers.
+    /// `Error::UnsupportedVersion` carries the offset so that a nested archive
+    /// of another version names where it is, which it does through
+    /// [`Archive::locate`]; the sniff cannot fail on it without failing on
+    /// every `.txt`, so `info` reports `nested 0` and `verify` passes clean on
+    /// an archive holding a nested `RPF2`. Recorded rather than changed, and
+    /// pinned by a test.
     ///
     /// # Errors
     ///
@@ -842,8 +1033,23 @@ fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
         .get(0..4)
         .and_then(|s| s.try_into().ok())
         .unwrap_or_default();
-    if filled < header.len() || magic != MAGIC_RPF7 {
+    // Too short to hold a header is not an archive of any version: nothing past
+    // the magic can be trusted, so the magic is not worth reading a version out
+    // of either.
+    if filled < header.len() {
         return Err(Error::NotAnArchive { base, found: magic });
+    }
+    if magic != MAGIC_RPF7 {
+        // The version is in the first four bytes, and discarding it reported a
+        // sound archive of another version as a malformed one. DR-012.
+        return Err(match unsupported_version(magic) {
+            Some(version) => Error::UnsupportedVersion {
+                base,
+                version,
+                found: magic,
+            },
+            None => Error::NotAnArchive { base, found: magic },
+        });
     }
 
     // Every field below is inside the sixteen bytes just filled, so the default

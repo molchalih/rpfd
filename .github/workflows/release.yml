@@ -1,0 +1,113 @@
+name: release
+
+# R8.1: a tagged release publishes a binary per platform, so that installing
+# `rpf` is downloading one file. DR-001 chose a static binary for exactly this,
+# and `docs/approach.md`'s agent consumer wants nothing installed first.
+#
+# The gates live in ci.yml and run on every push to main and every pull request.
+# This workflow builds what has already been checked rather than checking it
+# again on four runners, three of which cannot execute what they produce.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # One release to attach every asset to, created before the matrix so that four
+  # jobs finishing at once cannot each try to create it.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: the release this tag names, created if it is not there yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+
+  binaries:
+    needs: release
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Cross-compiled from the arm64 runner: one macOS image, both
+          # architectures, and the Apple SDK is what makes that ordinary.
+          - target: x86_64-apple-darwin
+            os: macos-14
+          # musl rather than gnu, so the binary carries its own libc and runs on
+          # a distribution older than the one that built it. Every dependency is
+          # pure Rust — docs/conventions.md §14 rules out C ones — so there is
+          # nothing here that a static libc cannot link.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            # Without this the .exe needs the Visual C++ runtime installed,
+            # which is the prerequisite this whole track exists to avoid.
+            rustflags: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+
+      # As in ci.yml: the toolchain is pinned in rust-toolchain.toml, and
+      # `rustup target add` follows that override rather than the default
+      # toolchain, so the standard library added here is the pinned one's.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: a musl linker
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      # --locked, because a release is the one build where resolving a
+      # dependency differently from Cargo.lock must be a failure rather than a
+      # surprise.
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p rpf
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      # `bash` on all three runners, so the packaging is one script rather than
+      # one per platform. Both licence files travel with the binary: MIT and
+      # Apache-2.0 are offered at the recipient's option, so shipping one of
+      # them would not be the offer.
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="rpf-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/rpf.exe" "dist/$name/"
+          else
+            cp "target/${{ matrix.target }}/release/rpf" "dist/$name/"
+          fi
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "$name.zip" "$name" > /dev/null
+            echo "ASSET=dist/$name.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "ASSET=dist/$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber

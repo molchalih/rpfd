@@ -4,6 +4,7 @@
 mod commands;
 mod exit;
 mod install;
+mod separator;
 mod serve;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -137,7 +138,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::from(Code::Ok as u8),
         Err(failure) => {
-            eprintln!("rpf: {failure}");
+            eprintln!("rpf: {}", separator::render(&failure));
             ExitCode::from(failure.code() as u8)
         }
     }

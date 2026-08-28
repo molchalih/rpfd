@@ -22,10 +22,10 @@
 use std::io::{Cursor, Write as _};
 
 use rpf_core::{
-    Archive, Error, MAX_DEPTH,
+    Archive, Error, MAX_DEPTH, Unwatched, Verified,
     format::{
         BLOCK_LEN, DIRECTORY_MARKER, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7,
-        RESOURCE_FLAG,
+        MAGIC_RSC7, RESOURCE_FLAG, RESOURCE_HEADER_LEN,
     },
 };
 
@@ -705,6 +705,182 @@ fn a_deflate_stream_that_lies_about_its_length_is_refused() {
     );
 }
 
+/// System page flags naming exactly one page of the base 512 bytes, which is
+/// the smallest resource there is. `docs/rpf-format.md`, Resource page flags,
+/// `verified`.
+const ONE_SYSTEM_PAGE: u32 = 0x0800_0000;
+
+/// What [`ONE_SYSTEM_PAGE`] with no graphics pages inflates to.
+const ONE_SYSTEM_PAGE_LEN: usize = 512;
+
+/// A resource payload: an `RSC7` header for one system page, then a deflate
+/// stream of exactly that much.
+///
+/// The header's version is the top nibble of each flag word, so flags naming
+/// no version make it zero. `docs/rpf-format.md`, Resource page flags.
+fn resource_payload() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC_RSC7);
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&ONE_SYSTEM_PAGE.to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&deflate(&[0xAA_u8; ONE_SYSTEM_PAGE_LEN]));
+    out
+}
+
+/// A 2,048-byte archive holding one file, its payload written at block 1 and
+/// its entry declaring `declared` bytes of it.
+///
+/// Declaring more than `payload` is long is how a payload grows a tail: the
+/// bytes after it are the zeroes the archive is padded with, which is the
+/// sample's case in miniature — 200,000 zeroes appended to a resource.
+fn one_file_archive(payload: &[u8], declared: u32, block_flag: u32, word8: u32) -> Vec<u8> {
+    let rows = [
+        directory_row(0, 1, 1),
+        file_row(1, declared, 1 | block_flag, word8, 0),
+    ];
+    let mut bytes = archive_bytes(&rows, b"\0a\0", 2_048);
+    bytes[BLOCK_LEN as usize..BLOCK_LEN as usize + payload.len()].copy_from_slice(payload);
+    bytes
+}
+
+/// Every problem `verify` reports about an archive, by path and failure.
+fn problems(bytes: &[u8]) -> Vec<(String, Error)> {
+    let archive = Archive::open(&mut Cursor::new(bytes.to_vec())).expect("well formed");
+    Verified::of(&mut Cursor::new(bytes.to_vec()), &archive, &mut Unwatched)
+        .expect("the walk itself does not fail")
+        .problems
+        .into_iter()
+        .map(|problem| (problem.path, problem.error))
+        .collect()
+}
+
+#[test]
+fn a_resource_that_ends_exactly_at_its_payload_verifies_clean() {
+    // The direction that keeps the check honest. All 20 resources of the
+    // sample end their stream exactly here — `docs/rpf-format.md`, Resource
+    // page flags, `verified` — so a check that fired on this one would fire on
+    // every archive there is.
+    let payload = resource_payload();
+    let declared = payload.len() as u32;
+    let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
+
+    assert!(
+        problems(&bytes).is_empty(),
+        "a resource that ends where it says it does is not a problem"
+    );
+}
+
+#[test]
+fn a_resource_whose_stream_ends_before_its_payload_is_reported_by_verify() {
+    // R6.10. The stream is self-terminating, so 200 bytes after it inflate to
+    // nothing and the contents come back exactly as promised: this is the
+    // archive contradicting itself, and nothing in a read has to notice it.
+    let payload = resource_payload();
+    let tail = 200_u32;
+    let declared = payload.len() as u32 + tail;
+    let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
+
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    assert_eq!(
+        archive
+            .read(&mut Cursor::new(bytes.clone()), 1)
+            .expect("reads back")
+            .len(),
+        ONE_SYSTEM_PAGE_LEN,
+        "a read is deliberately not where this is refused: `cat`, `extract` \
+         and `put` go on working on such an archive",
+    );
+
+    // The stream's own extent, which is the payload without the `RSC7` header
+    // and without the tail.
+    let used = (payload.len() as u64) - RESOURCE_HEADER_LEN;
+    match problems(&bytes).as_slice() {
+        [
+            (
+                path,
+                error @ Error::TrailingBytes {
+                    entry,
+                    declared,
+                    used: got,
+                },
+            ),
+        ] => {
+            assert_eq!(path, "a", "the problem names the entry's path");
+            assert_eq!(
+                (*entry, *declared, *got),
+                (1, used + u64::from(tail), used),
+                "expected the two payload lengths, got {error}"
+            );
+        }
+        other => panic!("expected one trailing-bytes problem, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_resource_corrupted_inside_its_stream_is_still_caught() {
+    // The other direction of the same table: bytes changed *within* the stream
+    // were caught before R6.10 and must go on being caught, as a failure of
+    // the stream rather than as a tail. Measured on the sample as
+    // `inflated to 3153921 bytes, archive declares 3153920`.
+    let mut payload = resource_payload();
+    let at = payload.len() - 4;
+    for byte in &mut payload[at - 3..at] {
+        *byte ^= 0xFF;
+    }
+    let declared = payload.len() as u32;
+    let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
+
+    match problems(&bytes).as_slice() {
+        [
+            (
+                path,
+                error @ (Error::Inflate { entry: 1, .. } | Error::LengthMismatch { entry: 1, .. }),
+            ),
+        ] => {
+            assert_eq!(path, "a", "the problem names the entry's path");
+            assert!(
+                !matches!(error, Error::TrailingBytes { .. }),
+                "a stream that does not decode is not a tail",
+            );
+        }
+        other => panic!("expected the corrupted stream to be caught, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_binary_entry_whose_stream_ends_before_its_payload_is_reported_by_verify() {
+    // The read path is shared, so the hole was too: measured 2026-08-28, a
+    // deflated binary entry declaring 200 bytes more than its stream occupies
+    // verified clean and exit 0, exactly as the resource did.
+    let stream = deflate(&[b'x'; ONE_SYSTEM_PAGE_LEN]);
+    let tail = 200_u32;
+    let declared = stream.len() as u32 + tail;
+    let bytes = one_file_archive(&stream, declared, 0, ONE_SYSTEM_PAGE_LEN as u32);
+
+    let used = stream.len() as u64;
+    match problems(&bytes).as_slice() {
+        [
+            (
+                path,
+                error @ Error::TrailingBytes {
+                    entry,
+                    declared,
+                    used: got,
+                },
+            ),
+        ] => {
+            assert_eq!(path, "a", "the problem names the entry's path");
+            assert_eq!(
+                (*entry, *declared, *got),
+                (1, used + u64::from(tail), used),
+                "expected the two payload lengths, got {error}"
+            );
+        }
+        other => panic!("expected one trailing-bytes problem, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_payload_that_is_not_deflate_at_all_is_refused() {
     let rows = [directory_row(0, 1, 1), file_row(1, 64, 1, 64, 0)];
@@ -748,4 +924,458 @@ fn a_resource_declaring_no_compressed_size_is_refused_rather_than_guessed() {
         ),
         "expected the resource to be refused by size, got {error:?}"
     );
+}
+
+// ----- names that do not mean one file below a directory --------------------
+
+#[test]
+fn a_name_that_climbs_out_of_the_archive_is_refused_on_read() {
+    // The read half of R10.3, pinned at the library boundary rather than at
+    // the command line: an archive is third-party data, and the name is what
+    // becomes a filesystem path. `specs_of` is the one route from entries to a
+    // tree specification, so both `extract` and a rebuild come through here.
+    let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
+    let bytes = archive_bytes(&rows, b"\0../escaped.txt\0", 4_096);
+
+    let archive =
+        Archive::open(&mut Cursor::new(bytes)).expect("the archive itself is well formed");
+    assert_eq!(
+        archive.path(1).expect("the name reads back"),
+        "../escaped.txt",
+        "the name is readable; it is turning it into a file that is refused"
+    );
+
+    let error = rpf_core::specs_of(&archive).expect_err("a name that leaves the tree");
+    assert!(
+        matches!(
+            error,
+            Error::BadPath {
+                ref path,
+                reason: "navigates with . or .. rather than naming a file",
+            } if path == "../escaped.txt"
+        ),
+        "expected the name to be refused as itself, got {error:?}"
+    );
+    assert!(
+        matches!(rpf_core::Manifest::of(&archive), Err(Error::BadPath { .. })),
+        "the manifest is derived from the same specification and must agree"
+    );
+}
+
+#[test]
+fn a_directory_whose_name_climbs_out_of_the_archive_is_refused_on_read() {
+    // A directory is created before any file is written into it, so it reaches
+    // the filesystem first and has to be refused on its own account.
+    let rows = [
+        directory_row(0, 1, 1),
+        directory_row(1, 2, 1),
+        file_row(4, 0, 4, 16, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0..\0a\0", 4_096);
+
+    let archive =
+        Archive::open(&mut Cursor::new(bytes)).expect("the archive itself is well formed");
+    let error = rpf_core::directories_of(&archive).expect_err("a directory that leaves the tree");
+    assert!(
+        matches!(
+            error,
+            Error::BadPath {
+                ref path,
+                reason: "navigates with . or .. rather than naming a file",
+            } if path == ".."
+        ),
+        "expected the directory to be refused as itself, got {error:?}"
+    );
+}
+
+#[test]
+fn a_name_no_host_can_hold_is_still_one_node_of_a_tree() {
+    // The tree rules and the host rules are two questions, and only the first
+    // is `rebuild`'s. `aux.ytd` is a name Windows opens as a device and a
+    // perfectly ordinary node of an archive's own tree, so refusing it at
+    // `specs_of` made an archive holding one unrepairable — and the refusal
+    // arrived after `put` had already printed `rebuilding`. DR-013's second
+    // amendment.
+    let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
+    let bytes = archive_bytes(&rows, b"\0aux.ytd\0", 4_096);
+    let mut source = Cursor::new(bytes);
+    let archive = Archive::open(&mut source).expect("the archive is well formed");
+
+    let specs = rpf_core::specs_of(&archive).expect("a device name is one node of a tree");
+    assert_eq!(specs.len(), 1);
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::rebuild(
+        &mut source,
+        &archive,
+        &mut out,
+        &std::collections::BTreeMap::new(),
+        &mut rpf_core::Unwatched,
+    )
+    .expect("an archive this build can read is an archive it can repair");
+
+    // What is refused is turning it into a tree on a filesystem, which is the
+    // manifest in both directions.
+    let error = rpf_core::Manifest::of(&archive).expect_err("no host holds AUX");
+    assert!(
+        matches!(
+            error,
+            Error::BadPath {
+                ref path,
+                reason: "has a component that names a Windows device",
+            } if path == "aux.ytd"
+        ),
+        "expected the name to be refused as itself, got {error:?}"
+    );
+}
+
+#[test]
+fn a_name_windows_would_trim_is_still_one_node_of_a_tree() {
+    // R10.12, in both of its spellings. Windows drops a trailing dot or space
+    // before it opens a name, so `a.txt.` and `a.txt ` are the file `a.txt`
+    // there and two more entries here: one archive, two trees. The refusal is
+    // a host rule, so the archive stays readable and repairable and only
+    // becoming a tree on a filesystem is refused. DR-015.
+    for name in [b"a.txt.", b"a.txt "] {
+        let mut names = vec![0u8];
+        names.extend_from_slice(name);
+        names.push(0);
+        let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
+        let bytes = archive_bytes(&rows, &names, 4_096);
+        let mut source = Cursor::new(bytes);
+        let archive = Archive::open(&mut source).expect("the archive is well formed");
+
+        let spelling = std::str::from_utf8(name).expect("ascii");
+        assert_eq!(
+            archive.path(1).expect("the name reads back"),
+            spelling,
+            "the name is readable; it is turning it into a file that is refused"
+        );
+        assert_eq!(
+            rpf_core::specs_of(&archive)
+                .expect("a name a host trims is one node of a tree")
+                .len(),
+            1,
+        );
+        rpf_core::rebuild(
+            &mut source,
+            &archive,
+            &mut Cursor::new(Vec::new()),
+            &std::collections::BTreeMap::new(),
+            &mut rpf_core::Unwatched,
+        )
+        .expect("an archive this build can read is an archive it can repair");
+
+        let error = rpf_core::Manifest::of(&archive).expect_err("Windows trims this name");
+        assert!(
+            matches!(
+                error,
+                Error::BadPath {
+                    ref path,
+                    reason: "has a component ending in a dot or a space, which Windows trims",
+                } if path == spelling
+            ),
+            "expected {spelling:?} to be refused as itself, got {error:?}"
+        );
+    }
+}
+
+// ----- container versions this build does not read --------------------------
+
+/// A sixteen-byte header of `version`, with the fields RPF7 would put there.
+///
+/// Nothing beyond the magic is read, which is the point: the version is
+/// answered from the first four bytes, before any layout is believed.
+fn header_of(magic: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    out.extend_from_slice(&magic);
+    out.extend_from_slice(&1_u32.to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
+    out
+}
+
+#[test]
+fn an_archive_of_another_version_is_refused_by_its_own_name() {
+    // All three used to report `not an RPF7 archive` and exit 4, the code for a
+    // malformed archive, while the encryption tag four words later already got
+    // an honest `NeedsKey`. Nothing about these is malformed. DR-012, R11.1.
+    for (magic, version) in [
+        (*b"RPF0", 0_u8),
+        (*b"RPF2", 2),
+        (*b"RPF6", 6),
+        (*b"RPF7", 7),
+        (*b"8FPR", 8),
+    ] {
+        let error = Archive::open(&mut Cursor::new(header_of(magic)))
+            .expect_err("this build reads RPF7 in its 7FPR spelling only");
+        assert!(
+            matches!(
+                error,
+                Error::UnsupportedVersion {
+                    base: 0,
+                    version: found,
+                    ..
+                } if found == version
+            ),
+            "expected RPF{version} to be named, got {error:?}",
+        );
+        assert!(
+            error.to_string().contains(&format!("RPF{version}")),
+            "the message must name the version: {error}",
+        );
+    }
+}
+
+#[test]
+fn a_version_this_build_cannot_read_is_its_own_category() {
+    // Not `Corrupt` — nothing is malformed — and not `Refused`, because the
+    // caller's request was fine. It is `NeedsKey`'s shape with a different
+    // answer to "who has to act": no key opens it, and the missing part is
+    // here. DR-010's amendment.
+    let error = Archive::open(&mut Cursor::new(header_of(*b"RPF2"))).expect_err("not RPF7");
+    assert_eq!(error.category(), rpf_core::Category::Unsupported);
+}
+
+#[test]
+fn a_nested_archive_of_another_version_is_named_by_locate_and_invisible_to_info() {
+    // DR-010's amendment says `UnsupportedVersion` carries the offset "so a
+    // nested archive of another version names where it is". That holds through
+    // `locate` and not through `nested_at`, which maps every failure but
+    // `TooDeep` to `None` — deliberately, because the sniff must not fail a
+    // listing at the first `.txt`. The cost is recorded here rather than
+    // changed: `info` reports `nested 0` and `verify` passes clean on this.
+    let rows = [directory_row(0, 1, 1), file_row(1, 0, 2, 16, 0)];
+    let mut bytes = archive_bytes(&rows, b"\0inner.rpf\0", 4_096);
+    let mut header = Vec::new();
+    header.extend_from_slice(b"RPF2");
+    header.extend_from_slice(&1_u32.to_le_bytes());
+    header.extend_from_slice(&2_u32.to_le_bytes());
+    header.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
+    bytes[1_024..1_024 + header.len()].copy_from_slice(&header);
+
+    let mut source = Cursor::new(bytes);
+    let archive = Archive::open(&mut source).expect("the outer archive parses");
+
+    // Through `locate`, the refusal names the version and where it begins.
+    let error = archive
+        .locate(&mut source, "inner.rpf/anything")
+        .expect_err("this build reads no RPF2");
+    assert!(
+        matches!(
+            error,
+            Error::UnsupportedVersion {
+                base: 1_024,
+                version: 2,
+                ..
+            }
+        ),
+        "expected the version and its offset, got {error:?}"
+    );
+
+    // Through the sniff, it is not there at all. This is the limit, pinned so
+    // that changing it is a decision rather than a surprise.
+    let summary = rpf_core::Summary::of(&mut source, &archive).expect("info summarises");
+    assert_eq!(summary.nested_archives, 0, "the sniff swallows the version");
+    let verified =
+        rpf_core::Verified::of(&mut source, &archive, &mut rpf_core::Unwatched).expect("verify");
+    assert!(verified.outcome().is_ok(), "verify reports nothing wrong");
+}
+
+#[test]
+fn bytes_that_are_not_an_rpf_header_at_all_are_still_not_an_archive() {
+    // The version arm must not swallow the case it was carved out of: a file
+    // that is not an archive is still `NotAnArchive`, and a file too short to
+    // hold a header is too, whatever its first four bytes say.
+    let error = Archive::open(&mut Cursor::new(header_of(*b"PK\x03\x04")))
+        .expect_err("a zip is not an archive");
+    assert!(
+        matches!(error, Error::NotAnArchive { base: 0, .. }),
+        "expected NotAnArchive, got {error:?}"
+    );
+
+    let error = Archive::open(&mut Cursor::new(b"RPF2".to_vec()))
+        .expect_err("four bytes cannot hold a header");
+    assert!(
+        matches!(error, Error::NotAnArchive { base: 0, .. }),
+        "expected a truncated file to be refused as not an archive, got {error:?}"
+    );
+}
+
+#[test]
+fn two_children_of_one_directory_that_are_one_name_are_refused_on_read() {
+    // `child_named` folds case, so the second of these is unreachable by any
+    // spelling of its own path — including its own. `build` has always refused
+    // to write such an archive; this is the same rule read back, so an archive
+    // that cannot be packed cannot be extracted either. R10.4.
+    let rows = [
+        directory_row(0, 1, 2),
+        file_row(1, 0, 4, 16, 0),
+        file_row(7, 0, 5, 16, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0A.txt\0a.txt\0", 4_096);
+
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("the archive itself parses");
+    // Listing still works: refusing at parse would leave a caller unable to see
+    // what is wrong with the archive.
+    assert_eq!(archive.name(1).expect("name"), "A.txt");
+    assert_eq!(archive.name(2).expect("name"), "a.txt");
+
+    let error = rpf_core::specs_of(&archive).expect_err("one name for two entries");
+    assert!(
+        matches!(
+            error,
+            Error::NameCollision {
+                ref path,
+                ref other,
+            } if path == "a.txt" && other == "A.txt"
+        ),
+        "expected both names to be reported, got {error:?}"
+    );
+}
+
+#[test]
+fn a_collision_between_two_directories_is_refused_on_read() {
+    // A directory pair collides in exactly the way a file pair does, and it is
+    // `directories_of` rather than `specs_of` that would have carried it into a
+    // tree — an empty directory survives a round trip through that list alone.
+    let rows = [
+        directory_row(0, 1, 2),
+        directory_row(1, 3, 0),
+        directory_row(5, 3, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0X64\0x64\0", 4_096);
+
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("the archive itself parses");
+    let error = rpf_core::directories_of(&archive).expect_err("one name for two directories");
+    assert!(
+        matches!(
+            error,
+            Error::NameCollision {
+                ref path,
+                ref other,
+            } if path == "x64" && other == "X64"
+        ),
+        "expected both names to be reported, got {error:?}"
+    );
+}
+
+#[test]
+fn one_name_carried_by_two_entries_is_not_reported_as_a_case_collision() {
+    // The reader used to answer every kind of one-name-twice with
+    // `NameCollision`, which for an exact duplicate rendered `"aa.txt" and
+    // "aa.txt" are one name here` — one string named twice. The writer has
+    // always had three answers for this; the reader now gives the same three.
+    let rows = [
+        directory_row(0, 1, 2),
+        file_row(1, 0, 4, 16, 0),
+        file_row(1, 0, 5, 16, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0aa.txt\0", 4_096);
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let error = rpf_core::specs_of(&archive).expect_err("one name for two entries");
+    assert!(
+        matches!(
+            error,
+            Error::BadPath {
+                ref path,
+                reason: "is named twice in one directory",
+            } if path == "aa.txt"
+        ),
+        "expected an exact duplicate to say so, got {error:?}"
+    );
+
+    // And a file beside a directory of the same name is the third answer, the
+    // one `build` gives as "a file and a directory share one name".
+    let rows = [
+        directory_row(0, 1, 2),
+        file_row(1, 0, 4, 16, 0),
+        directory_row(1, 3, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0aa.txt\0", 4_096);
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let error = rpf_core::specs_of(&archive).expect_err("a file and a directory");
+    assert!(
+        matches!(
+            error,
+            Error::BadPath {
+                ref path,
+                reason: "a file and a directory share one name",
+            } if path == "aa.txt"
+        ),
+        "expected the clash of kinds to say so, got {error:?}"
+    );
+}
+
+#[test]
+fn one_name_in_two_directories_is_not_a_collision() {
+    // The check is per parent, not per archive. Refusing `a/x.txt` beside
+    // `b/x.txt` would reject almost every real archive there is.
+    let rows = [
+        directory_row(0, 1, 2),
+        directory_row(1, 3, 1),
+        directory_row(3, 4, 1),
+        file_row(5, 0, 8, 16, 0),
+        file_row(5, 0, 9, 16, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0a\0b\0x.txt\0", 8_192);
+
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let specs = rpf_core::specs_of(&archive).expect("two directories, one name each");
+    let paths: Vec<String> = specs.into_iter().map(|(spec, _)| spec.path).collect();
+    assert_eq!(paths, ["a/x.txt", "b/x.txt"]);
+}
+
+#[test]
+fn a_name_two_siblings_answer_to_is_refused_rather_than_resolved_to_the_first() {
+    // The patch-in-place path never reaches `check_names`: `plan` resolves
+    // through `locate`, which folds case and used to take the first match. So
+    // `put … a.txt` against this archive patched `A.txt` and reported success.
+    // Ambiguity is a property of one resolution, so it is answered where the
+    // resolution happens.
+    let rows = [
+        directory_row(0, 1, 2),
+        file_row(1, 0, 4, 16, 0),
+        file_row(7, 0, 5, 16, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0A.txt\0a.txt\0", 4_096);
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("the archive itself parses");
+
+    for spelling in ["a.txt", "A.txt", "a.TXT"] {
+        let error = archive
+            .find(spelling)
+            .expect_err("two entries answer to it");
+        assert!(
+            matches!(
+                error,
+                Error::NameCollision {
+                    ref path,
+                    ref other,
+                } if path == "a.txt" && other == "A.txt"
+            ),
+            "{spelling}: expected both names to be reported, got {error:?}",
+        );
+    }
+
+    // And listing still works, which is why the refusal is not at parse: a
+    // caller has to be able to see what is wrong with such an archive.
+    assert_eq!(archive.name(1).expect("name"), "A.txt");
+    assert_eq!(archive.name(2).expect("name"), "a.txt");
+    assert_eq!(archive.children(0).expect("children"), 1..3);
+}
+
+#[test]
+fn one_name_in_two_directories_still_resolves() {
+    // The refusal is per parent. `a/x.txt` and `b/x.txt` are two names, and a
+    // lookup of either has exactly one answer.
+    let rows = [
+        directory_row(0, 1, 2),
+        directory_row(1, 3, 1),
+        directory_row(3, 4, 1),
+        file_row(5, 0, 8, 16, 0),
+        file_row(5, 0, 9, 16, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0a\0b\0x.txt\0", 8_192);
+    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    assert_eq!(archive.find("a/x.txt").expect("resolves"), 3);
+    assert_eq!(archive.find("b/x.txt").expect("resolves"), 4);
 }

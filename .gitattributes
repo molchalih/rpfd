@@ -1,0 +1,14 @@
+# Line endings are decided here rather than by each clone's `core.autocrlf`.
+#
+# A Windows clone with `core.autocrlf=true` — the default that installer sets —
+# rewrites every checked-out text file to CRLF. Two things then break, and
+# neither says why. `cargo fmt --check` reports a diff on every line of every
+# file, because rustfmt writes LF. And a fixture's bytes change, so the `sha256`
+# a test compares an archive against is computed over a file that is no longer
+# the one that was committed (§12: a file with the right name is not the same
+# file). R10.8.
+#
+# Everything tracked here is text: source, manifests, documents, workflows,
+# licences and one JSON fixture. `text=auto` still lets git decline to touch
+# anything it detects as binary, so a future binary fixture is safe by default.
+* text=auto eol=lf

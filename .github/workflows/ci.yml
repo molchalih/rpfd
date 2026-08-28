@@ -9,18 +9,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # macOS, Linux and Windows are one target (docs/approach.md), and until this
+  # matrix existed only one of them had ever been built. DR-012: a behaviour
+  # that differs by platform and has no test is a defect waiting for its first
+  # user, and the matrix is the mechanism rather than the intention. R10.1.
   check:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Every platform's result is wanted on every run. Cancelling the other two
+      # the moment one fails is how a divergence gets read as a single failure.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       # The toolchain is pinned in rust-toolchain.toml so that `-D warnings`
-      # means the same here as it does locally. docs/conventions.md §15.
+      # means the same here as it does locally, and the same on all three.
+      # docs/conventions.md §15.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
+      # rustfmt.toml pins `newline_style = "Unix"`, so this also fails on a
+      # clone whose line endings were rewritten — which is what .gitattributes
+      # exists to prevent and this is what notices when it has not. R10.8.
       - run: cargo fmt --all -- --check
+
+      # Per platform rather than once: the findings differ. There is a
+      # `#[cfg(not(unix))]` file-identity fallback in `serve.rs`, and with the
+      # Unix arm compiled out it produced three findings that Linux never sees.
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
       # No corpus is present here, and none ever will be: DR-006 keeps game
@@ -34,9 +55,19 @@ jobs:
       # count is written down so that adding a corpus test without a gate, or
       # gating one that should have run, fails here rather than going unnoticed.
       #
-      # `pipefail` because the default shell is `bash -e` without it, and a
-      # `tee` that succeeds would otherwise hide a suite that did not.
+      # **One number for all three platforms, and that is not an oversight.**
+      # The tests that vary by platform are `#[cfg(unix)]`, so off Unix they are
+      # not compiled at all rather than reported as ignored: they change the
+      # total the suite runs and not the count of corpus skips. Every
+      # corpus-gated test is unconditional. If that ever stops being true this
+      # step is what says so.
+      #
+      # `shell: bash` because the default on the Windows runner is PowerShell,
+      # where none of this is even syntax. `pipefail` because bash's own default
+      # is `-e` without it, and a `tee` that succeeds would otherwise hide a
+      # suite that did not.
       - name: the suite, and the tests it could not reach
+        shell: bash
         run: |
           set -o pipefail
           cargo test --all 2>&1 | tee suite.log
@@ -45,6 +76,8 @@ jobs:
           test "$skipped" -eq 10 \
             || { echo "expected 10 corpus tests to report themselves skipped, got $skipped"; exit 1; }
 
+  # Licences and advisories are a property of Cargo.lock rather than of a
+  # runner, so this is asked once. docs/conventions.md §15.
   deny:
     runs-on: ubuntu-latest
     steps:

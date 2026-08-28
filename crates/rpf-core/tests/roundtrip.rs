@@ -57,15 +57,30 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// The reason `build` gives for two names one directory cannot hold apart.
-const CASE: &str = "two children of one directory differ only in case";
+/// Asserts that a build was refused because two names in one directory are one
+/// name, naming both of them by path.
+///
+/// Names both, because which two collided is the whole of what a caller acts
+/// on: matching the variant alone accepts any pair against any archive.
+fn collision<T: std::fmt::Debug>(refused: Result<T, Error>, path: &str, against: &str) {
+    match refused {
+        Err(Error::NameCollision {
+            path: refused,
+            other,
+        }) => {
+            assert_eq!(refused, path, "the wrong path was refused");
+            assert_eq!(other, against, "refused against the wrong path");
+        }
+        other => panic!("expected {path:?} to collide with {against:?}, got {other:?}"),
+    }
+}
 
 /// Asserts that a build was refused for `path`, for `reason` and no other.
 ///
-/// [`Error::BadPath`] carries five distinct reasons and the path each is about,
-/// and both are what a caller acts on: matching the variant alone accepts any
-/// reason against any path, which is every one of these tests passing for the
-/// wrong archive.
+/// [`Error::BadPath`] carries several distinct reasons and the path each is
+/// about, and both are what a caller acts on: matching the variant alone
+/// accepts any reason against any path, which is every one of these tests
+/// passing for the wrong archive.
 fn refusal<T: std::fmt::Debug>(refused: Result<T, Error>, path: &str, reason: &str) {
     match refused {
         Err(Error::BadPath {
@@ -878,10 +893,10 @@ fn two_directories_differing_only_in_case_are_refused() {
         |_| Ok(b"contents".to_vec()),
         &mut Unwatched,
     );
-    // `BadPath` carries five reasons and the path it is about. Matching only
-    // the variant would accept any of them against any path, and the whole
-    // value of this refusal to a caller is which of its paths it has to fix.
-    refusal(refused, "x64/beta.txt", CASE);
+    // Matching only the variant would accept any pair against any archive, and
+    // the whole value of this refusal to a caller is which two names collided.
+    // Those are the two directories, not the file whose path ran into them.
+    collision(refused, "x64", "X64");
 }
 
 /// The same for two files in one directory.
@@ -896,7 +911,7 @@ fn two_files_in_one_directory_differing_only_in_case_are_refused() {
         |_| Ok(b"contents".to_vec()),
         &mut Unwatched,
     );
-    refusal(refused, "data/NOTES.TXT", CASE);
+    collision(refused, "data/NOTES.TXT", "data/notes.txt");
 }
 
 /// And an explicit directory list collides with a directory a path created.
@@ -911,9 +926,28 @@ fn a_named_directory_colliding_with_a_path_is_refused() {
         |_| Ok(b"contents".to_vec()),
         &mut Unwatched,
     );
-    // The named directories are claimed first, so it is the file's path that is
-    // reported as the one that cannot be added.
-    refusal(refused, "X64/alpha.txt", CASE);
+    // The named directories are claimed first, so `x64` is the spelling that
+    // took the name and `X64` is the one that could not have it. What used to
+    // be reported here was `"X64/alpha.txt" and its sibling "x64"`, which named
+    // two things that are neither siblings nor one name.
+    collision(refused, "X64", "x64");
+}
+
+/// One path listed twice is not a case collision, and `build` has always said
+/// so with its own reason. Nothing pinned the sentence, and the reader now
+/// gives the same one — `crates/rpf-core/tests/malformed.rs`.
+#[test]
+fn one_path_listed_twice_is_refused_as_a_duplicate() {
+    let files = [stored("data/notes.txt"), stored("data/notes.txt")];
+    let mut out = Cursor::new(Vec::new());
+    let refused = rpf_core::build(
+        &mut out,
+        &files,
+        &[],
+        |_| Ok(b"contents".to_vec()),
+        &mut Unwatched,
+    );
+    refusal(refused, "data/notes.txt", "is named twice in one directory");
 }
 
 /// A file and a directory of one name are not two things a reader can tell
@@ -935,6 +969,34 @@ fn a_file_and_a_directory_sharing_one_name_are_refused() {
         "x64/alpha.txt",
         "a file and a directory share one name",
     );
+}
+
+/// A directory named outright is checked as a path in its own right, and
+/// nothing else checks it: `build` derives parents from file paths, so a
+/// directory list holding `..` reaches `descend` with nothing between it and
+/// the entry table. Deleting the check left the whole suite green while a
+/// hostile manifest produced an archive with a `..` directory entry — which
+/// `extract` then creates above the target on the way to writing into it.
+#[test]
+fn a_named_directory_that_climbs_out_of_the_tree_is_refused() {
+    for directory in ["..", "../escaped", "a/../..", "/etc", "a\\b"] {
+        let mut out = Cursor::new(Vec::new());
+        let refused = rpf_core::build(
+            &mut out,
+            &[],
+            &[directory.to_owned()],
+            |_| Ok(b"contents".to_vec()),
+            &mut Unwatched,
+        );
+        assert!(
+            matches!(refused, Err(Error::BadPath { ref path, .. }) if path == directory),
+            "expected {directory:?} to be refused as itself, got {refused:?}",
+        );
+        assert!(
+            out.into_inner().is_empty(),
+            "{directory:?}: nothing may be written for a refused tree",
+        );
+    }
 }
 
 /// One spelling of a directory is not a collision with itself, and the reader

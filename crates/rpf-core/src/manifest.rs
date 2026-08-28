@@ -21,6 +21,7 @@ use crate::{
     entry::EntryKind,
     error::{Error, Result},
     format::ENCRYPTION_OPEN,
+    name,
 };
 
 /// What the manifest is called inside an extracted tree.
@@ -81,9 +82,15 @@ pub struct Manifest {
 impl Manifest {
     /// Derives the manifest of an archive as it stands.
     ///
+    /// This is where an archive becomes a tree on a filesystem, so it is where
+    /// [`name::check_host`] is asked. `extract` derives the manifest before it
+    /// creates the target directory, so a refused extraction leaves nothing
+    /// behind. DR-013's second amendment.
+    ///
     /// # Errors
     ///
-    /// As [`Archive::path`], for an entry whose ancestry does not resolve.
+    /// As [`Archive::path`], for an entry whose ancestry does not resolve, and
+    /// [`Error::BadPath`] for a name that could not be one file on a host.
     pub fn of(archive: &Archive) -> Result<Self> {
         let mut entries = Vec::new();
         for (spec, index) in specs_of(archive)? {
@@ -114,12 +121,30 @@ impl Manifest {
             });
         }
 
-        Ok(Self {
+        let manifest = Self {
             schema: SCHEMA_VERSION,
             encryption: archive.encryption(),
             directories: directories_of(archive)?,
             entries,
-        })
+        };
+        manifest.check_host_names()?;
+        Ok(manifest)
+    }
+
+    /// Refuses any path in the manifest that could not be one file below a
+    /// directory on a host filesystem.
+    ///
+    /// One place rather than two, because the manifest is what `extract` writes
+    /// a tree from and what `pack` reads one back through, and the rule is the
+    /// same in both directions.
+    fn check_host_names(&self) -> Result<()> {
+        for directory in &self.directories {
+            name::check_host(directory)?;
+        }
+        for entry in &self.entries {
+            name::check_host(&entry.path)?;
+        }
+        Ok(())
     }
 
     /// The build specification this manifest describes.
@@ -163,9 +188,9 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::BadPath`] when the text is not a manifest, and
-    /// [`Error::NeedsKey`] when it describes an encrypted archive, which
-    /// nothing here can rebuild yet.
+    /// [`Error::BadPath`] when the text is not a manifest or names a path that
+    /// could not be one file on a host, and [`Error::NeedsKey`] when it
+    /// describes an encrypted archive, which nothing here can rebuild yet.
     pub fn from_json(text: &str) -> Result<Self> {
         let manifest: Self = serde_json::from_str(text).map_err(|_| Error::BadPath {
             path: MANIFEST_NAME.to_owned(),
@@ -182,6 +207,10 @@ impl Manifest {
                 tag: manifest.encryption,
             });
         }
+        // Before `pack` opens anything: `build` plans the tree before it
+        // fetches a payload, and this is earlier still, so a read from a name
+        // no host should hold does not happen at all.
+        manifest.check_host_names()?;
         Ok(manifest)
     }
 }

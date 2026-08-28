@@ -1,7 +1,8 @@
 //! Exit codes, and the error type they come from.
 //!
 //! R6.3: a caller has to be able to tell "no such file" from "corrupt" from
-//! "needs a key" from "refused" without parsing a message. The classification
+//! "needs a key" from "refused" — and from "this build cannot read that
+//! version" — without parsing a message. The classification
 //! of container failures lives in `rpf-core` so that adding an error variant
 //! cannot silently invent an exit code; this adds only what the command line
 //! itself can refuse.
@@ -79,6 +80,9 @@ pub enum Code {
     Io = 7,
     /// The caller stopped the operation part-way.
     Cancelled = 8,
+    /// The archive is intact and this build cannot read it — an RPF version
+    /// with no codec here. Nobody holding it can act. DR-010's amendment.
+    Unsupported = 9,
 }
 
 impl Failure {
@@ -90,6 +94,7 @@ impl Failure {
                 Category::NotFound => Code::NotFound,
                 Category::Corrupt => Code::Corrupt,
                 Category::NeedsKey => Code::NeedsKey,
+                Category::Unsupported => Code::Unsupported,
                 Category::Refused => Code::Refused,
                 Category::Cancelled => Code::Cancelled,
                 Category::Io => Code::Io,
@@ -121,6 +126,11 @@ mod tests {
                 source: std::io::Error::other("not deflate"),
             },
             Category::NeedsKey => rpf_core::Error::NeedsKey { tag: 0x0FFF_FFF9 },
+            Category::Unsupported => rpf_core::Error::UnsupportedVersion {
+                base: 0,
+                version: 2,
+                found: *b"RPF2",
+            },
             Category::Refused => rpf_core::Error::WrongKind {
                 entry: 0,
                 found: "directory",
@@ -146,6 +156,7 @@ mod tests {
             (Category::Refused, 6),
             (Category::Io, 7),
             (Category::Cancelled, 8),
+            (Category::Unsupported, 9),
         ] {
             assert_eq!(of(category).code() as i32, code, "{category:?}");
         }

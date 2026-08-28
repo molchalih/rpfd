@@ -25,6 +25,7 @@ use crate::{
         BLOCK_LEN, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7, MAGIC_RSC7, RESOURCE_FLAG,
         RESOURCE_HEADER_LEN, folded, payload_floor, u32_at,
     },
+    name,
     watch::{Flow, Step, Watch},
 };
 
@@ -102,20 +103,32 @@ enum Child {
     File(usize),
 }
 
+/// `name` appended to the path of the directory it sits in, root included.
+fn joined(at: &str, name: &str) -> String {
+    if at.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{at}/{name}")
+    }
+}
+
 /// The child of `dir` that `name` would resolve to, or `None` if the name is
-/// free.
+/// free. `at` is the path of `dir` itself, empty for the root.
 ///
 /// Fails when a child is already there under a different spelling of the same
 /// folded name: the two are indistinguishable to a reader, so writing both
-/// loses one of them.
-fn taken(dir: &Dir, path: &str, name: &str) -> Result<Option<Child>> {
+/// loses one of them. The refusal names **the two that collide**, which for a
+/// directory component is not the path being added — `X64/alpha.txt` against an
+/// existing `x64` is a collision between `X64` and `x64`, and those are what a
+/// caller has to rename one of.
+fn taken(dir: &Dir, at: &str, name: &str) -> Result<Option<Child>> {
     let Some(exact) = dir.folded.get(&folded(name)) else {
         return Ok(None);
     };
     if exact != name {
-        return Err(Error::BadPath {
-            path: path.to_owned(),
-            reason: "two children of one directory differ only in case",
+        return Err(Error::NameCollision {
+            path: joined(at, name),
+            other: joined(at, exact),
         });
     }
     Ok(dir.children.get(exact).copied())
@@ -134,12 +147,22 @@ fn claim(arena: &mut [Dir], parent: usize, path: &str, name: &str, child: Child)
 
 /// Resolves one path component to the directory it names, creating it if the
 /// name is free.
-fn descend(arena: &mut Vec<Dir>, parent: usize, path: &str, segment: &str) -> Result<usize> {
+///
+/// `path` is the whole path being added, which is what a refusal about *it*
+/// names; `at` is the path of `parent`, which is what a refusal about the
+/// component names.
+fn descend(
+    arena: &mut Vec<Dir>,
+    parent: usize,
+    path: &str,
+    at: &str,
+    segment: &str,
+) -> Result<usize> {
     let dir = arena.get(parent).ok_or(Error::BadPath {
         path: path.to_owned(),
         reason: "unreachable parent",
     })?;
-    match taken(dir, path, segment)? {
+    match taken(dir, at, segment)? {
         Some(Child::Dir(id)) => Ok(id),
         // Silently replacing the file would drop it from the tree, and its
         // contents would never be fetched or written.
@@ -216,43 +239,43 @@ fn plan_tree(files: &[FileSpec], directories: &[String]) -> Result<Vec<Dir>> {
     // round trip. Files create their own parents below; this adds only what
     // nothing else would.
     for directory in directories {
-        let segments: Vec<&str> = directory.split('/').filter(|s| !s.is_empty()).collect();
+        name::check_tree(directory)?;
+        let segments: Vec<&str> = directory.split('/').collect();
         check_path_depth(segments.len())?;
         let mut current = 0_usize;
+        let mut at = String::new();
         for segment in segments {
-            current = descend(&mut arena, current, directory, segment)?;
+            current = descend(&mut arena, current, directory, &at, segment)?;
+            at = joined(&at, segment);
         }
     }
 
     for (index, spec) in files.iter().enumerate() {
+        name::check_tree(&spec.path)?;
         let segments: Vec<&str> = spec.path.split('/').collect();
         let Some((name, parents)) = segments.split_last() else {
             return Err(Error::BadPath {
                 path: spec.path.clone(),
-                reason: "empty",
+                reason: "is empty",
             });
         };
-        if name.is_empty() || parents.iter().any(|s| s.is_empty()) {
-            return Err(Error::BadPath {
-                path: spec.path.clone(),
-                reason: "empty component",
-            });
-        }
         check_path_depth(segments.len())?;
 
         let mut current = 0_usize;
+        let mut at = String::new();
         for segment in parents {
-            current = descend(&mut arena, current, &spec.path, segment)?;
+            current = descend(&mut arena, current, &spec.path, &at, segment)?;
+            at = joined(&at, segment);
         }
 
         let dir = arena.get(current).ok_or(Error::BadPath {
             path: spec.path.clone(),
             reason: "unreachable parent",
         })?;
-        if taken(dir, &spec.path, name)?.is_some() {
+        if taken(dir, &at, name)?.is_some() {
             return Err(Error::BadPath {
                 path: spec.path.clone(),
-                reason: "duplicate",
+                reason: "is named twice in one directory",
             });
         }
         claim(&mut arena, current, &spec.path, name, Child::File(index))?;
@@ -805,8 +828,13 @@ pub(crate) fn file_row(
 ///
 /// # Errors
 ///
-/// As [`Archive::path`], for an entry whose ancestry does not resolve.
+/// As [`Archive::path`], for an entry whose ancestry does not resolve;
+/// [`Error::BadPath`] for a name [`name::check_tree`] refuses, which is the
+/// read half of that rule — a name that cannot be one node of a tree is refused
+/// here rather than addressed as another node by whoever reads it; and
+/// [`Error::NameCollision`] as [`Archive::check_names`].
 pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
+    archive.check_names()?;
     let count = u32::try_from(archive.entries().len()).unwrap_or(u32::MAX);
     let mut out = Vec::new();
     for index in 0..count {
@@ -815,13 +843,9 @@ pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
             continue;
         }
         let kind = kind_of(index, entry)?;
-        out.push((
-            FileSpec {
-                path: archive.path(index)?,
-                kind,
-            },
-            index,
-        ));
+        let path = archive.path(index)?;
+        name::check_tree(&path)?;
+        out.push((FileSpec { path, kind }, index));
     }
     Ok(out)
 }
@@ -833,13 +857,17 @@ pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
 ///
 /// # Errors
 ///
-/// As [`Archive::path`].
+/// As [`Archive::path`], [`Error::BadPath`] for a name [`name::check_tree`]
+/// refuses, and [`Error::NameCollision`] as [`Archive::check_names`].
 pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
+    archive.check_names()?;
     let count = u32::try_from(archive.entries().len()).unwrap_or(u32::MAX);
     let mut out = Vec::new();
     for index in 1..count {
         if archive.entry(index)?.is_directory() {
-            out.push(archive.path(index)?);
+            let path = archive.path(index)?;
+            name::check_tree(&path)?;
+            out.push(path);
         }
     }
     Ok(out)
@@ -901,7 +929,7 @@ fn split_at_file<'a>(archive: &Archive, segments: &'a [&'a str]) -> Result<(u32,
     let mut current = 0_u32;
     for (position, segment) in segments.iter().enumerate() {
         let index = archive
-            .child_named(current, segment)
+            .child_named(current, segment)?
             .ok_or_else(|| Error::NotFound {
                 path: segments.join("/"),
                 segment: (*segment).to_owned(),

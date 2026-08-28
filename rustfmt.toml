@@ -1,2 +1,7 @@
 edition = "2024"
 max_width = 100
+# LF, stated rather than inferred. rustfmt's default is `Auto`, which adopts
+# whatever line ending a file already has — so a Windows clone with CRLF passes
+# `cargo fmt --check` and stays wrong. `.gitattributes` is what pins the working
+# tree; this is what notices when the pin has not held. R10.8.
+newline_style = "Unix"
