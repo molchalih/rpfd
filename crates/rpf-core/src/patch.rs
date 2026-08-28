@@ -25,14 +25,14 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
 };
 
 use crate::{
     archive::Archive,
-    build::{file_row, kind_of, prepare},
+    build::{file_row, kind_of, store},
     error::{Error, Result},
-    format::{BLOCK_LEN, ENTRY_LEN},
+    format::Row,
 };
 
 /// What a plan will do to one entry.
@@ -67,7 +67,7 @@ struct Ready {
     planned: Planned,
     payload: Vec<u8>,
     row_at: u64,
-    row: [u8; 16],
+    row: Row,
 }
 
 /// A set of edits that all fit, ready to be written.
@@ -125,10 +125,11 @@ impl Patches {
                     offset: row_at,
                     source,
                 })?;
-            file.write_all(&ready.row).map_err(|source| Error::Io {
-                offset: row_at,
-                source,
-            })?;
+            file.write_all(ready.row.as_bytes())
+                .map_err(|source| Error::Io {
+                    offset: row_at,
+                    source,
+                })?;
             file.flush().map_err(|source| Error::Io {
                 offset: row_at,
                 source,
@@ -207,9 +208,31 @@ where
         // The storage rule is the entry's, not the caller's: one that was
         // deflated stays deflated, and one that was stored stays stored.
         // Changing it would be a different operation than replacing a payload.
-        let prepared = prepare(path, kind_of(index, &entry)?, contents.clone())?;
+        //
+        // The version is the holder's for the same reason: a patch rewrites one
+        // entry of an archive that already exists, so the fields it has to fit
+        // are that archive's.
+        //
+        // A patch holds the payload it is about to write, because it writes it
+        // as one edit into a live archive rather than streaming it into a new
+        // one. So the sink here is a buffer, and `store` is still the one place
+        // the rule is applied.
+        let mut buffer = Cursor::new(Vec::new());
+        let written = store(
+            holder.version(),
+            path,
+            kind_of(index, &entry)?,
+            &mut Cursor::new(contents.clone()),
+            &mut buffer,
+        )?;
+        let mut payload = buffer.into_inner();
+        // A deflated form that did not pay for itself leaves the tail of it
+        // zeroed past the plain bytes, which is what a rebuild needs and a
+        // patch does not: the entry describes `len` bytes and no more.
+        payload.truncate(usize::try_from(written.len).unwrap_or(usize::MAX));
+
         let allocation = holder.allocation(index)?;
-        let needed = u64::try_from(prepared.bytes.len()).unwrap_or(u64::MAX);
+        let needed = written.len;
         let (at, _) = holder.payload_at(index)?;
         let row_at = holder.row_at(index)?;
 
@@ -218,14 +241,14 @@ where
         // large for where it sits — which is the verdict a build gives it.
         let block = at
             .checked_sub(holder.base())
-            .map(|relative| relative / BLOCK_LEN)
+            .and_then(|relative| relative.checked_div(holder.version().block_len()))
             .ok_or(Error::OutOfBounds {
                 region: "payload",
                 offset: at,
                 len: needed,
                 archive_len: holder.len_bytes(),
             })?;
-        let row = file_row(path, entry.name_offset, block, &prepared)?;
+        let row = file_row(holder.version(), path, entry.name_offset, block, &written)?;
 
         // Claimed whether or not it fits, so that the same set of edits always
         // reaches the same verdict rather than one that depends on how well
@@ -237,7 +260,7 @@ where
             },
             Claim {
                 at: row_at,
-                len: ENTRY_LEN,
+                len: holder.version().row_len(),
             },
         ] {
             if let Some((other, _)) = claims
@@ -268,7 +291,7 @@ where
                 len: needed,
                 allocation,
             },
-            payload: prepared.bytes,
+            payload,
             row_at,
             row,
         });

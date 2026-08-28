@@ -9,8 +9,9 @@
     reason = "test code; a panic is the reporting mechanism"
 )]
 
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, io::Cursor, path::Path, process::Command};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rpf_core::{FileKind, FileSpec, Storage, Unwatched};
 
 /// The binary under test, as cargo built it.
@@ -45,9 +46,14 @@ fn make_archive(at: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut out = fs::File::create(at).expect("archive is creatable");
     rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |wanted| Ok(contents.get(wanted).cloned().unwrap_or_default()),
+        |wanted| {
+            Ok(Cursor::new(
+                contents.get(wanted).cloned().unwrap_or_default(),
+            ))
+        },
         &mut Unwatched,
     )
     .expect("archive builds");
@@ -169,7 +175,7 @@ fn exit_codes_distinguish_the_failures() {
     let mut header = b"RPF2".to_vec();
     header.extend_from_slice(&1_u32.to_le_bytes());
     header.extend_from_slice(&0_u32.to_le_bytes());
-    header.extend_from_slice(&rpf_core::format::ENCRYPTION_OPEN.to_le_bytes());
+    header.extend_from_slice(&rpf_core::Version::Rpf7.open().to_le_bytes());
     fs::write(&other_version, &header).expect("writable");
     let (code, stderr) = run_err(&["info", &other_version.display().to_string()]);
     assert_eq!(code, 9, "another container version: {stderr}");
@@ -324,8 +330,15 @@ fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         },
     }];
     let mut out = fs::File::create(&outer_path).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(inner.clone()), &mut Unwatched)
-        .expect("outer builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(inner.clone())),
+        &mut Unwatched,
+    )
+    .expect("outer builds");
     (outer_path, inner_path)
 }
 
@@ -345,6 +358,63 @@ fn ls_of_a_nested_archive_lists_what_is_inside_it() {
     let (code, out) = run(&["cat", &outer, "x64/inner.rpf/stored.bin"]);
     assert_eq!(code, 0);
     assert_eq!(out.len(), 300, "cat through nesting");
+}
+
+/// R11.4: `pack` writes the version the manifest names, and holds no default
+/// of its own.
+///
+/// Walked over [`rpf_core::Version::ALL`], which has one member: today this
+/// says the version reaching the header came through the manifest rather than
+/// from a constant in `build`, and on the day a second codec lands it says the
+/// same of that one without anybody editing this. DR-018 is the record that
+/// asked for it — a tree extracted from one version must not pack as another.
+#[test]
+fn pack_writes_the_version_the_manifest_names() {
+    for &version in rpf_core::Version::ALL {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let archive = dir.path().join("test.rpf");
+        make_archive(&archive);
+
+        let tree = dir.path().join("tree");
+        assert_eq!(
+            run(&[
+                "extract",
+                &archive.display().to_string(),
+                &tree.display().to_string(),
+            ])
+            .0,
+            0,
+            "extract",
+        );
+
+        // Rewritten through `Manifest` rather than as text, so the test does
+        // not encode how the field is spelled on disk twice.
+        let at = tree.join(rpf_core::MANIFEST_NAME);
+        let text = fs::read_to_string(&at).expect("manifest readable");
+        let mut manifest = rpf_core::Manifest::from_json(&text).expect("manifest parses");
+        manifest.version = version;
+        manifest.codec = version.codec();
+        manifest.encryption = version.open();
+        fs::write(&at, manifest.to_json().expect("manifest renders")).expect("manifest writable");
+
+        let packed = dir.path().join("packed.rpf");
+        assert_eq!(
+            run(&[
+                "pack",
+                &tree.display().to_string(),
+                &packed.display().to_string(),
+            ])
+            .0,
+            0,
+            "pack",
+        );
+        let bytes = fs::read(&packed).expect("packed readable");
+        assert_eq!(
+            bytes.get(0..4),
+            Some(&version.magic()[..]),
+            "packed at the wrong version",
+        );
+    }
 }
 
 #[test]
@@ -406,9 +476,10 @@ fn an_empty_directory_survives_extract_and_pack() {
     let mut out = fs::File::create(&archive).expect("creatable");
     rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &["x64/empty".to_owned()],
-        |_| Ok(b"hello".to_vec()),
+        |_| Ok(Cursor::new(b"hello".to_vec())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -569,14 +640,15 @@ fn a_put_that_fits_patches_in_place_rather_than_rebuilding() {
     let mut out = fs::File::create(&archive).expect("creatable");
     rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &[stored("big.bin"), stored("tail.bin")],
         &[],
         |wanted| {
-            Ok(if wanted == "big.bin" {
+            Ok(Cursor::new(if wanted == "big.bin" {
                 vec![0xAB_u8; 4096]
             } else {
                 vec![7_u8; 300]
-            })
+            }))
         },
         &mut Unwatched,
     )
@@ -599,7 +671,7 @@ fn a_put_that_fits_patches_in_place_rather_than_rebuilding() {
     // size anyway.
     let after = fs::read(&archive).expect("readable");
     let payload = index_of(at)..index_of(at.saturating_add(allocation));
-    let row = index_of(row_at)..index_of(row_at.saturating_add(rpf_core::format::ENTRY_LEN));
+    let row = index_of(row_at)..index_of(row_at.saturating_add(rpf_core::Version::Rpf7.row_len()));
     for position in differences(&before, &after) {
         assert!(
             payload.contains(&position) || row.contains(&position),
@@ -783,7 +855,7 @@ fn verify_counts_every_entry_it_read_and_says_what_went_wrong() {
 
     let (_, message) = run_err(&["verify", &archive]);
     assert!(
-        message.contains("1 of 2 entries did not read back"),
+        message.contains("1 of 2 entries are not as they are recorded"),
         "the failure was reported as: {message}"
     );
     assert!(
@@ -867,9 +939,10 @@ fn archive_named(at: &Path, names: &[&str], placeholder: &str, actual: &str) {
     let mut out = Vec::new();
     rpf_core::build(
         &mut std::io::Cursor::new(&mut out),
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(b"payload".to_vec()),
+        |_| Ok(Cursor::new(b"payload".to_vec())),
         &mut Unwatched,
     )
     .expect("legal names build");
@@ -939,7 +1012,7 @@ fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree() {
 
     let manifest = serde_json::json!({
         "schema": 1,
-        "encryption": rpf_core::format::ENCRYPTION_OPEN,
+        "encryption": rpf_core::Version::Rpf7.open(),
         "directories": [],
         "entries": [{
             "path": "../escaped.txt",
@@ -1006,7 +1079,7 @@ fn an_entry_named_like_the_sidecar_manifest_is_refused_both_ways() {
     fs::create_dir(&tree).expect("tree");
     let manifest = serde_json::json!({
         "schema": 1,
-        "encryption": rpf_core::format::ENCRYPTION_OPEN,
+        "encryption": rpf_core::Version::Rpf7.open(),
         "directories": [],
         "entries": [{
             "path": name,
@@ -1047,7 +1120,7 @@ fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree_with_a_backslash() {
 
     let manifest = serde_json::json!({
         "schema": 1,
-        "encryption": rpf_core::format::ENCRYPTION_OPEN,
+        "encryption": rpf_core::Version::Rpf7.open(),
         "directories": [],
         "entries": [{
             "path": "..\\escaped.txt",
@@ -1349,4 +1422,592 @@ fn a_path_that_continues_past_the_archive_is_refused_rather_than_blamed_on_the_d
     let absent = dir.path().join("absent.rpf").display().to_string();
     let (code, message) = run_err(&["info", &absent]);
     assert_eq!(code, 7, "{message}");
+}
+
+#[test]
+fn an_extraction_that_would_write_over_the_archive_it_is_reading_is_refused() {
+    // `rpf extract test.rpf .` where the archive holds an entry of its own
+    // name: `write_file` truncated and rewrote the file the extraction was
+    // reading from, and every remaining entry then came out of a file that had
+    // been replaced part-way through. Refused before anything is created, so a
+    // refusal leaves nothing behind — a tree cannot be renamed into place the
+    // way a rebuilt archive can. DR-009's shape, and `pack` already had it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let files = [FileSpec {
+        path: "test.rpf".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = fs::File::create(&archive).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| {
+            Ok(Cursor::new(
+                b"an entry that shares the archive's own name".to_vec(),
+            ))
+        },
+        &mut Unwatched,
+    )
+    .expect("builds");
+    drop(out);
+    let before = fs::read(&archive).expect("readable");
+
+    let (code, message) = run_err(&[
+        "extract",
+        &archive.display().to_string(),
+        &dir.path().display().to_string(),
+    ]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains("test.rpf"), "{message}");
+    assert_eq!(
+        fs::read(&archive).expect("readable"),
+        before,
+        "the archive being read was written over"
+    );
+    assert!(
+        !dir.path().join(".rpf-manifest.json").exists(),
+        "a refused extraction left part of a tree behind"
+    );
+}
+
+// Key material — R2.7. Everything below asserts on offsets, lengths, digests
+// and paths. Nothing asserts on a key, and one test asserts that nothing the
+// binary writes could be one. DR-006, DR-020.
+
+/// A source that carries none of the anchored values.
+fn carries_nothing(at: &Path) {
+    fs::write(at, vec![0_u8; 1 << 16]).expect("writable");
+}
+
+/// Reports a skip, naming the test and what it would have read.
+///
+/// `RPF_REQUIRE_GAME_EXE` turns the skip into a failure, the way
+/// `RPF_REQUIRE_CORPUS` does for archives: a green suite and a suite that ran
+/// must not be different claims.
+fn skip<T>(test: &str, reason: &str) -> Option<T> {
+    assert!(
+        std::env::var_os("RPF_REQUIRE_GAME_EXE").is_none(),
+        "RPF_REQUIRE_GAME_EXE is set, but {test} would have skipped: {reason}",
+    );
+    eprintln!("SKIP {test}: {reason}");
+    None
+}
+
+/// One of the game executables, or `None` with a reason on standard error.
+fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
+    let Some(root) = std::env::var_os("RPF_GAME_EXE") else {
+        return skip(test, "RPF_GAME_EXE is not set");
+    };
+    let path = Path::new(&root).join(name);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip(test, &format!("{} is not a file", path.display()))
+    }
+}
+
+/// Runs the binary, returning its exit code and everything it wrote to either
+/// stream.
+fn run_output(args: &[&str]) -> (i32, Vec<u8>) {
+    let output = Command::new(RPF).args(args).output().expect("binary runs");
+    let mut both = output.stdout;
+    both.extend_from_slice(&output.stderr);
+    (output.status.code().unwrap_or(-1), both)
+}
+
+/// Whether `haystack` holds `needle` anywhere in it.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// `bytes` as lower-case hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Whether the permission bits on a directory are enforced for this process.
+///
+/// They are not for `root`, and a test that reads a refusal out of them would
+/// pass there for the wrong reason.
+#[cfg(unix)]
+fn writes_are_refused(directory: &Path) -> bool {
+    let probe = directory.join("probe");
+    if fs::write(&probe, b"").is_ok() {
+        let _ = fs::remove_file(&probe);
+        return false;
+    }
+    true
+}
+
+#[test]
+fn an_executable_carrying_nothing_is_this_build_s_problem_rather_than_the_caller_s() {
+    // A file that is intact and holds none of the anchored values is the same
+    // shape as an RPF version with no codec here: nothing the caller supplies
+    // opens it. DR-010's fifth category, exit 9. The counts are in the message
+    // because "1 of 2" and "0 of 2" are different situations to be in.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("not-a-game.exe");
+    carries_nothing(&source);
+    let cache = dir.path().join("cache");
+
+    let (code, message) = run_err(&[
+        "keys",
+        "extract",
+        &source.display().to_string(),
+        "--cache-dir",
+        &cache.display().to_string(),
+    ]);
+    assert_eq!(code, 9, "{message}");
+    assert!(message.contains("0 of 2"), "{message}");
+    assert!(message.contains("AES key"), "{message}");
+    assert!(
+        !cache.exists(),
+        "a failed extraction created a cache directory; R2.6 says a command \
+         that never got a key leaves nothing behind"
+    );
+}
+
+#[test]
+fn an_executable_that_is_not_there_is_an_i_o_failure_naming_it() {
+    // The same answer `rpf info` gives an absent archive: a filesystem path
+    // that leads nowhere is the source failing, and exit 3 is reserved for a
+    // path that is not in an archive.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let absent = dir.path().join("GTA5.exe").display().to_string();
+
+    let (code, message) = run_err(&["keys", "extract", &absent]);
+    assert_eq!(code, 7, "{message}");
+    assert!(message.contains(&absent), "{message}");
+}
+
+#[test]
+fn the_cache_command_says_where_the_material_is_kept_and_how_much_is_there() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = dir.path().join("cache");
+    let at = cache.display().to_string();
+
+    // A cache that was never written is empty rather than missing: nothing on
+    // this machine has needed a key yet, which is not a failure.
+    let (code, out) = run(&["--json", "keys", "cache", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let reported: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(reported["cache"], serde_json::json!(at), "{reported}");
+    assert_eq!(reported["entries"], serde_json::json!(0), "{reported}");
+    assert!(!cache.exists(), "asking where the cache is created one");
+
+    fs::create_dir_all(&cache).expect("creatable");
+    fs::write(cache.join(format!("{}.keys", "a".repeat(64))), b"x").expect("writable");
+    fs::write(cache.join(format!("{}.keys", "b".repeat(64))), b"y").expect("writable");
+
+    let (code, out) = run(&["--json", "keys", "cache", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let reported: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(reported["entries"], serde_json::json!(2), "{reported}");
+}
+
+#[test]
+fn invalidate_removes_every_entry_at_once_and_says_how_many() {
+    // Whole rather than per entry, and DR-020 says why: re-extraction already
+    // replaces the entry for one executable, so the only thing a per-entry
+    // removal could do that extraction does not is leave the other entries'
+    // key material on the machine.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(cache.join("held")).expect("creatable");
+    for name in [
+        &format!("{}.keys", "a".repeat(64)),
+        &format!("{}.keys", "b".repeat(64)),
+        &format!("{}.keys", "c".repeat(64)),
+    ] {
+        fs::write(cache.join(name), b"x").expect("writable");
+    }
+    let at = cache.display().to_string();
+
+    let (code, out) = run(&["--json", "keys", "invalidate", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let reported: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(reported["removed"], serde_json::json!(3), "{reported}");
+    assert_eq!(reported["cache"], serde_json::json!(at), "{reported}");
+    assert!(
+        cache.join("held").is_dir(),
+        "a directory inside the cache was removed; only its entries are ours"
+    );
+
+    // Idempotent: invalidating a cache with nothing in it is a success, so
+    // automation does not have to ask first.
+    let (code, out) = run(&["--json", "keys", "invalidate", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let reported: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(reported["removed"], serde_json::json!(0), "{reported}");
+}
+
+#[test]
+#[cfg(unix)]
+fn a_cache_that_cannot_be_written_is_an_i_o_failure_naming_the_directory() {
+    // The sink failed and nobody's input is in question, which is exactly what
+    // DR-010 narrows exit 7 to. The directory is named because fixing its
+    // permissions is what the caller has to do.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&cache).expect("creatable");
+    fs::write(cache.join(format!("{}.keys", "a".repeat(64))), b"x").expect("writable");
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    let refused = writes_are_refused(&cache);
+    let at = cache.display().to_string();
+    let (code, message) = run_err(&["keys", "invalidate", "--cache-dir", &at]);
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    if !refused {
+        eprintln!(
+            "SKIP a_cache_that_cannot_be_written_is_an_i_o_failure_naming_the_directory: \
+             this process writes into a directory it has no write permission on"
+        );
+        return;
+    }
+    assert_eq!(code, 7, "{message}");
+    assert!(message.contains(&at), "{message}");
+}
+
+#[test]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn a_game_executable_reports_offsets_and_never_a_key() {
+    // The only test here that proves the surface against a real executable,
+    // and the only one that can check DR-006 end to end: the key is read in
+    // this process, and what the binary printed is searched for it in every
+    // encoding an output path could have used. Nothing is written anywhere the
+    // repository can reach, and no assertion names a byte of it.
+    let test = "a_game_executable_reports_offsets_and_never_a_key";
+    let Some(path) = executable(test, "GTA5.exe") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the executable is readable");
+    let keys = rpf_core::keys::Keys::extract(&mut file, &mut rpf_core::Unwatched)
+        .expect("carries the material");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let at = dir.path().join("cache").display().to_string();
+    let source = path.display().to_string();
+    let (code, out) = run(&["--json", "keys", "extract", &source, "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let reported: serde_json::Value = serde_json::from_slice(&out).expect("json");
+
+    assert_eq!(reported["executable"], serde_json::json!(source));
+    assert_eq!(reported["from"], serde_json::json!("executable"));
+    assert_eq!(reported["cache"], serde_json::json!(at));
+    assert_eq!(
+        reported["values"][0]["at"],
+        serde_json::json!(keys.aes_key_offset()),
+        "{reported}"
+    );
+    assert_eq!(
+        reported["values"][1]["at"],
+        serde_json::json!(keys.hash_lut_offset()),
+        "{reported}"
+    );
+    assert_eq!(
+        reported["sha256"].as_str().map(str::len),
+        Some(64),
+        "{reported}"
+    );
+
+    // The whole point. Raw, hexadecimal in either case, and base64, because
+    // those are the ways bytes reach a JSON document.
+    let (_, printed) = run_output(&["--json", "keys", "extract", &source, "--cache-dir", &at]);
+    for value in [keys.aes_key().as_slice(), keys.hash_lut().as_slice()] {
+        assert!(!holds(&printed, value), "key material was printed raw");
+        assert!(
+            !holds(&printed, hex(value).as_bytes()),
+            "key material was printed as hexadecimal"
+        );
+        assert!(
+            !holds(&printed, hex(value).to_uppercase().as_bytes()),
+            "key material was printed as hexadecimal"
+        );
+        assert!(
+            !holds(&printed, BASE64.encode(value).as_bytes()),
+            "key material was printed as base64"
+        );
+    }
+
+    // The second run is the cache doing its job, and it says which it was.
+    let (code, out) = run(&["--json", "keys", "extract", &source, "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let cached: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(cached["from"], serde_json::json!("cache"), "{cached}");
+    assert_eq!(cached["values"], reported["values"], "{cached}");
+
+    let (code, out) = run(&["--json", "keys", "cache", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let state: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(state["entries"], serde_json::json!(1), "{state}");
+
+    let (code, out) = run(&["--json", "keys", "invalidate", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let emptied: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(emptied["removed"], serde_json::json!(1), "{emptied}");
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn a_cache_directory_that_cannot_be_created_fails_the_extraction_that_needed_it() {
+    // Four situations, and this is the third: the material was found and the
+    // sink failed. Reported rather than swallowed, because a silent exit 0
+    // leaves every later command rescanning and nobody told why. Exit 7.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let test = "a_cache_directory_that_cannot_be_created_fails_the_extraction_that_needed_it";
+    let Some(path) = executable(test, "GTA5.exe") else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let closed = dir.path().join("closed");
+    fs::create_dir_all(&closed).expect("creatable");
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o500)).expect("chmod");
+    let refused = writes_are_refused(&closed);
+    let at = closed.join("cache").display().to_string();
+
+    let (code, message) = run_err(&[
+        "keys",
+        "extract",
+        &path.display().to_string(),
+        "--cache-dir",
+        &at,
+    ]);
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    if !refused {
+        eprintln!("SKIP {test}: this process writes where it has no permission to");
+        return;
+    }
+    assert_eq!(code, 7, "{message}");
+    assert!(message.contains(&at), "{message}");
+}
+
+/// A second archive, sharing no path with [`make_archive`]'s.
+///
+/// So that a manifest of one names nothing in the other, which is the mistake a
+/// caller who has two extracted trees on disk will make.
+fn make_other_archive(at: &Path) {
+    let files = vec![FileSpec {
+        path: "elsewhere.bin".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = fs::File::create(at).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(vec![3_u8; 64])),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+}
+
+/// The binary's `--json` answer to one reporting command.
+fn cli_json(args: &[&str]) -> serde_json::Value {
+    let (_, out) = run(&[&["--json"], args].concat());
+    serde_json::from_slice(&out).expect("json on stdout")
+}
+
+#[test]
+fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_tree() {
+    // The whole reason DR-023's checksum exists, from outside the library for
+    // the first time. A stored entry declares no inflated length and carries no
+    // deflate stream that ends, so nothing in the archive says what its bytes
+    // should be and a `verify` given the archive alone reads it back clean.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let tree = dir.path().join("tree");
+    let tree_str = tree.display().to_string();
+    assert_eq!(run(&["extract", &archive_str, &tree_str]).0, 0, "extract");
+
+    let (at, _, _) = spans(&archive, "stored.bin");
+    let mut bytes = fs::read(&archive).expect("readable");
+    let start = index_of(at);
+    bytes[start] ^= 0xFF;
+    fs::write(&archive, &bytes).expect("writable");
+
+    assert_eq!(
+        run(&["verify", &archive_str]).0,
+        0,
+        "the archive on its own says nothing about a stored entry's bytes",
+    );
+
+    let (code, out) = run(&["--json", "verify", &archive_str, "--against", &tree_str]);
+    assert_eq!(code, 4, "the same archive against the tree it came from");
+    let report: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(report["entries_checked"], serde_json::json!(2), "{report}");
+    assert_eq!(report["contents_checked"], serde_json::json!(2), "{report}");
+    assert_eq!(
+        report["contents_recorded"],
+        serde_json::json!(2),
+        "{report}"
+    );
+    assert_eq!(report["against"], serde_json::json!(tree_str), "{report}");
+    let problems = report["problems"].as_array().expect("an array");
+    assert_eq!(problems.len(), 1, "{report}");
+    assert!(
+        problems[0]
+            .as_str()
+            .is_some_and(|problem| problem.starts_with("stored.bin:")),
+        "{report}",
+    );
+}
+
+#[test]
+fn a_verify_with_no_manifest_does_not_report_a_zero_as_a_pass() {
+    // `contents_checked` is zero without a manifest, and a report that prints
+    // the number without saying why reads as "nothing was wrong with the
+    // contents" rather than "the contents were not looked at". DR-023.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let (code, out) = run(&["verify", &archive_str]);
+    assert_eq!(code, 0);
+    let plain = String::from_utf8_lossy(&out);
+    assert!(
+        plain.contains("contents not checked"),
+        "the report was: {plain}",
+    );
+    assert!(
+        !plain.contains("0 contents checked"),
+        "a zero printed as though it were a result: {plain}",
+    );
+
+    let report = cli_json(&["verify", &archive_str]);
+    assert_eq!(report["contents_checked"], serde_json::json!(0), "{report}");
+    assert_eq!(
+        report["contents_recorded"],
+        serde_json::json!(0),
+        "{report}"
+    );
+    assert_eq!(report["against"], serde_json::Value::Null, "{report}");
+}
+
+#[test]
+fn a_tree_extracted_from_another_archive_is_refused_rather_than_checking_nothing() {
+    // A manifest is joined to entries by path, so one describing a different
+    // archive matches nothing and `Verified::against` reports no failure at all
+    // — deliberately, because inventing one would be a confident lie about a
+    // sound archive. Reporting nothing is the other half of the mistake, so the
+    // frontend refuses the pairing instead: exit 6, which is the caller's to
+    // fix, rather than exit 4, which would blame the archive.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let other = dir.path().join("other.rpf");
+    make_other_archive(&other);
+
+    let tree = dir.path().join("other-tree");
+    let tree_str = tree.display().to_string();
+    assert_eq!(
+        run(&["extract", &other.display().to_string(), &tree_str]).0,
+        0,
+        "extract",
+    );
+
+    let (code, message) = run_err(&[
+        "verify",
+        &archive.display().to_string(),
+        "--against",
+        &tree_str,
+    ]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains(&tree_str), "{message}");
+    assert!(
+        message.contains("nothing was checked"),
+        "the refusal was: {message}",
+    );
+}
+
+#[test]
+fn a_tree_with_no_manifest_in_it_is_reported_as_the_missing_file_it_is() {
+    // Not the archive's fault, and not a checksum mismatch: the caller named a
+    // tree that has no manifest in it, and `pack` answers the same way for the
+    // same file.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let empty = dir.path().join("empty-tree");
+    fs::create_dir_all(&empty).expect("creatable");
+
+    let (code, message) = run_err(&[
+        "verify",
+        &archive.display().to_string(),
+        "--against",
+        &empty.display().to_string(),
+    ]);
+    assert_eq!(code, 7, "{message}");
+    assert!(
+        message.contains(rpf_core::MANIFEST_NAME),
+        "the failure names what was looked for: {message}",
+    );
+}
+
+#[test]
+fn a_tree_whose_manifest_records_no_checksum_is_refused_rather_than_passed() {
+    // The other way a manifest can check nothing, and it is not the same
+    // mistake: every schema-1 and schema-2 manifest recorded none, which
+    // `Manifest::from_json` reads rather than refuses (DR-023's migration
+    // rule). A caller who asked for a contents check and got a tree that
+    // cannot answer one is told so, rather than told that nothing was wrong.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let tree = dir.path().join("tree");
+    let tree_str = tree.display().to_string();
+    assert_eq!(
+        run(&["extract", &archive.display().to_string(), &tree_str]).0,
+        0,
+        "extract",
+    );
+
+    let manifest_path = tree.join(rpf_core::MANIFEST_NAME);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("manifest")).expect("json");
+    manifest["schema"] = serde_json::json!(2);
+    for entry in manifest["entries"].as_array_mut().expect("entries") {
+        entry.as_object_mut().expect("an object").remove("checksum");
+    }
+    fs::write(&manifest_path, manifest.to_string()).expect("writable");
+
+    let (code, message) = run_err(&[
+        "verify",
+        &archive.display().to_string(),
+        "--against",
+        &tree_str,
+    ]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains("records no checksum"),
+        "the refusal was: {message}",
+    );
+    assert!(message.contains("nothing was checked"), "{message}");
 }

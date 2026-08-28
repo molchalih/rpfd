@@ -24,11 +24,25 @@ use crate::error::{Error, Result};
 /// Length of the digest an executable is identified by, in bytes.
 pub const SOURCE_DIGEST_LEN: usize = 32;
 
-/// The directory the cache lives in, below the platform's configuration root.
+/// This application's directory, below the platform's configuration root.
 const APPLICATION: &str = "rpf";
+
+/// The cache's own directory, below [`APPLICATION`].
+///
+/// Cache entries were kept directly in the application directory until
+/// 2026-08-28, which made the cache directory *be* the configuration directory:
+/// a configuration file put there later would have been inside the thing
+/// `keys invalidate` empties. DR-024.
+const KEYS: &str = "keys";
 
 /// What a cache file is called, after its source's digest.
 const SUFFIX: &str = ".keys";
+
+/// What a store that has not finished calls the file it is writing.
+///
+/// It carries the same payload the entry will, so it is one of ours for the
+/// purpose of clearing the cache even though it is not an entry.
+const TEMPORARY: &str = ".tmp";
 
 /// The first bytes of a cache file, so that a file of some other kind under the
 /// same name is not read as one.
@@ -94,6 +108,29 @@ impl SourceDigest {
         Ok(Self(hasher.finalize().into()))
     }
 
+    /// The digest a lower-case hexadecimal name spells, if it spells one.
+    ///
+    /// The inverse of [`SourceDigest::hex`], and the reason a cache entry can
+    /// be enumerated rather than only addressed: a name is where the digest of
+    /// the source it came from is recorded.
+    fn from_hex(text: &str) -> Option<Self> {
+        if text.len() != SOURCE_DIGEST_LEN.checked_mul(2)? {
+            return None;
+        }
+        if !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        let mut out = [0_u8; SOURCE_DIGEST_LEN];
+        let (pairs, _) = text.as_bytes().as_chunks::<2>();
+        for (byte, pair) in out.iter_mut().zip(pairs) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        Some(Self(out))
+    }
+
     /// The digest as lower-case hexadecimal, which is what names its cache file.
     #[must_use]
     pub fn hex(&self) -> String {
@@ -112,25 +149,53 @@ impl SourceDigest {
 pub struct Cache {
     /// Where the files are.
     directory: PathBuf,
+    /// A directory this cache kept its entries in before, and still clears.
+    ///
+    /// `Some` only for [`Cache::platform`]: a directory the caller named has
+    /// never moved, and clearing it must not reach outside what it was given.
+    superseded: Option<PathBuf>,
 }
 
 impl Cache {
     /// The cache in a directory of the caller's choosing.
+    ///
+    /// It reads, writes and clears that directory and nothing else.
     #[must_use]
     pub fn at(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
+            superseded: None,
         }
     }
 
     /// The cache in this platform's configuration directory, if there is one.
     ///
-    /// `None` where the environment does not say where that is — no `HOME` on a
-    /// Unix, no `APPDATA` on Windows — which is a complete answer rather than a
-    /// failure: the caller can still name a directory itself.
+    /// `<config>/rpf/keys`. `None` where the environment does not say where the
+    /// configuration root is — no `HOME` on a Unix, no `APPDATA` on Windows —
+    /// which is a complete answer rather than a failure: the caller can still
+    /// name a directory itself.
     #[must_use]
     pub fn platform() -> Option<Self> {
-        root(HOST, &Environment::of_this_process()).map(Self::at)
+        root(HOST, &Environment::of_this_process()).map(Self::below)
+    }
+
+    /// The cache below an application configuration directory.
+    ///
+    /// Entries go in a `keys` subdirectory so that the cache directory is not
+    /// the configuration directory, and so a later configuration file is not
+    /// inside the thing `keys invalidate` empties.
+    ///
+    /// [`Cache::clear`] also sweeps the configuration directory itself, because
+    /// that is where entries lived until 2026-08-28. Material there is **not**
+    /// migrated — re-extraction is about a second and a cache is disposable,
+    /// which is DR-017's own answer to an entry it cannot use — but it is still
+    /// removed, because "take the key material off this machine" cannot have an
+    /// exception the size of an old location. DR-024.
+    fn below(application: PathBuf) -> Self {
+        Self {
+            directory: application.join(KEYS),
+            superseded: Some(application),
+        }
     }
 
     /// Where this cache keeps its files.
@@ -182,7 +247,7 @@ impl Cache {
         let mut temporary = destination.clone();
         temporary
             .as_mut_os_string()
-            .push(format!(".{}.tmp", std::process::id()));
+            .push(format!(".{}{TEMPORARY}", std::process::id()));
 
         let mut file = create_private(&temporary)?;
         file.write_all(&encode(keys)).map_err(io)?;
@@ -192,10 +257,118 @@ impl Cache {
         fs::rename(&temporary, &destination).map_err(io)
     }
 
+    /// The sources this cache holds material for.
+    ///
+    /// One digest per entry, in whatever order the directory reads back. A file
+    /// this cache did not write — a configuration file beside them, a
+    /// subdirectory, a temporary from a store that did not finish — is not an
+    /// entry and is not reported. That rule is here rather than in a caller
+    /// because it is the same rule [`Cache::store`] names a file by (§3).
+    ///
+    /// A directory that is not there yet holds no entries, which is not a
+    /// failure: a machine that has never needed a key has no cache, and asking
+    /// about it must not make one (R2.6).
+    ///
+    /// An entry is recognised by its name and not read, so one that would fail
+    /// its own checksum is still listed. That is deliberate and it is DR-017's
+    /// rule seen from the other side: whether an entry is usable is decided by
+    /// [`Cache::load`], and a bad one is a miss that the next extraction
+    /// overwrites.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the directory exists and cannot be read.
+    pub fn entries(&self) -> Result<Vec<SourceDigest>> {
+        let mut entries = Vec::new();
+        for (_, held) in ours_in(&self.directory)? {
+            if let Held::Entry(source) = held {
+                entries.push(source);
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Removes everything this cache wrote, and says how many files that was.
+    ///
+    /// Whole rather than one entry at a time, and DR-020 says why: extraction
+    /// already replaces the entry for a given executable, so the only thing a
+    /// per-entry removal adds is leaving every *other* install's material where
+    /// it was — which for "take the key material off this machine" is not a
+    /// partial answer but a wrong one.
+    ///
+    /// It removes entries and any temporary a store left behind, and leaves
+    /// every other file and every subdirectory alone. It is idempotent: a cache
+    /// that is empty or absent is `0`.
+    ///
+    /// The platform cache also sweeps the directory it superseded, so the count
+    /// can exceed what [`Cache::entries`] reported — an entry at the old
+    /// location is material this build cannot read but can still remove. See
+    /// [`Cache::below`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if a directory cannot be read or a file cannot be removed.
+    pub fn clear(&self) -> Result<usize> {
+        let mut removed = 0_usize;
+        for directory in std::iter::once(&self.directory).chain(self.superseded.as_ref()) {
+            for (path, _) in ours_in(directory)? {
+                fs::remove_file(&path).map_err(io)?;
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
+    }
+
     /// The file the material from this source is kept in.
     fn path_for(&self, source: &SourceDigest) -> PathBuf {
         self.directory.join(format!("{}{SUFFIX}", source.hex()))
     }
+}
+
+/// What a file under a cache directory is, when it is one of the cache's own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Held {
+    /// A cache entry, keyed by the digest its name spells.
+    Entry(SourceDigest),
+    /// A temporary left by a store that did not finish.
+    Temporary,
+}
+
+/// What a file name means to this cache, or `None` if it means nothing.
+fn held(name: &str) -> Option<Held> {
+    let (digest, rest) = name.split_once(SUFFIX)?;
+    let source = SourceDigest::from_hex(digest)?;
+    if rest.is_empty() {
+        Some(Held::Entry(source))
+    } else if rest.ends_with(TEMPORARY) {
+        Some(Held::Temporary)
+    } else {
+        None
+    }
+}
+
+/// This cache's own files in a directory, each with what it is.
+///
+/// A directory that is not there holds none, which is why neither
+/// [`Cache::entries`] nor [`Cache::clear`] creates one.
+fn ours_in(directory: &Path) -> Result<Vec<(PathBuf, Held)>> {
+    let reading = match fs::read_dir(directory) {
+        Ok(reading) => reading,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io(error)),
+    };
+    let mut found = Vec::new();
+    for entry in reading {
+        let entry = entry.map_err(io)?;
+        if !entry.file_type().map_err(io)?.is_file() {
+            continue;
+        }
+        let Some(what) = entry.file_name().to_str().and_then(held) else {
+            continue;
+        };
+        found.push((entry.path(), what));
+    }
+    Ok(found)
 }
 
 /// Wraps a filesystem failure, which has no offset to report.
@@ -370,8 +543,8 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        APPLICATION, Cache, Environment, MAGIC, PAYLOAD_AT, Platform, SUFFIX, SourceDigest, decode,
-        encode, root,
+        APPLICATION, Cache, Environment, KEYS, MAGIC, PAYLOAD_AT, Platform, SUFFIX, SourceDigest,
+        TEMPORARY, decode, encode, root,
     };
     use crate::keys::{AES_KEY_LEN, HASH_LUT_LEN, Keys};
 
@@ -605,6 +778,179 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "mode is {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn the_platform_cache_keeps_its_entries_below_the_configuration_directory() {
+        // The cache directory used to *be* the application's configuration
+        // directory, so any configuration file put there later would have been
+        // inside the thing `keys invalidate` empties. DR-024.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::below(directory.path().to_path_buf());
+        assert_eq!(cache.directory(), directory.path().join(KEYS));
+    }
+
+    #[test]
+    fn clearing_the_platform_cache_reaches_the_place_entries_used_to_live() {
+        // A path change users already have on disk. Material is not migrated —
+        // re-extraction is a second of work and a cache is disposable, DR-017 —
+        // but it is still removed, because "take the key material off this
+        // machine" cannot have an exception the size of an old location.
+        let application = tempfile::tempdir().unwrap();
+        let cache = Cache::below(application.path().to_path_buf());
+        let old = digest_of(b"a build cached before the move");
+        let new = digest_of(b"a build cached after it");
+
+        std::fs::write(
+            application.path().join(format!("{}{SUFFIX}", old.hex())),
+            encode(&material()),
+        )
+        .unwrap();
+        cache.store(&new, &material()).unwrap();
+        let settings = application.path().join("settings.json");
+        std::fs::write(&settings, b"{}").unwrap();
+
+        assert_eq!(
+            cache.entries().unwrap().len(),
+            1,
+            "an entry at the old location was reported as one this cache can read"
+        );
+        assert_eq!(cache.clear().unwrap(), 2);
+        assert!(cache.entries().unwrap().is_empty());
+        assert!(
+            !application
+                .path()
+                .join(format!("{}{SUFFIX}", old.hex()))
+                .exists(),
+            "material at the old location survived an invalidation"
+        );
+        assert!(settings.is_file(), "a configuration file was removed");
+    }
+
+    #[test]
+    fn a_cache_in_a_named_directory_supersedes_nothing_and_touches_no_parent() {
+        // Only the platform cache moved, so only the platform cache sweeps. A
+        // `--cache-dir` pointed inside somebody's tree must not reach outside
+        // the directory it was given.
+        let parent = tempfile::tempdir().unwrap();
+        let source = digest_of(b"one build");
+        let above = parent.path().join(format!("{}{SUFFIX}", source.hex()));
+        std::fs::write(&above, encode(&material())).unwrap();
+
+        let cache = Cache::at(parent.path().join("named"));
+        cache.store(&source, &material()).unwrap();
+        assert_eq!(cache.clear().unwrap(), 1);
+        assert!(
+            above.is_file(),
+            "clearing reached outside its own directory"
+        );
+    }
+
+    #[test]
+    fn the_entries_a_cache_holds_are_its_own_files_and_nothing_else() {
+        // §3: what a cache entry is, is the cache's own rule. A frontend
+        // counting regular files decides it a second time, and decides it
+        // differently — anything else under the directory used to be one.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let one = digest_of(b"one build");
+        let two = digest_of(b"another build");
+
+        assert!(
+            cache.entries().unwrap().is_empty(),
+            "a fresh cache holds an entry"
+        );
+        cache.store(&one, &material()).unwrap();
+        cache.store(&two, &material()).unwrap();
+        std::fs::write(directory.path().join("settings.json"), b"{}").unwrap();
+        std::fs::write(directory.path().join("notes"), b"").unwrap();
+        std::fs::create_dir(directory.path().join("held")).unwrap();
+
+        let mut held: Vec<String> = cache
+            .entries()
+            .unwrap()
+            .iter()
+            .map(SourceDigest::hex)
+            .collect();
+        held.sort();
+        let mut expected = vec![one.hex(), two.hex()];
+        expected.sort();
+        assert_eq!(held, expected, "a file that is not an entry was counted");
+    }
+
+    #[test]
+    fn clearing_removes_the_cache_s_own_files_and_leaves_everything_else() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache.store(&digest_of(b"one build"), &material()).unwrap();
+        cache
+            .store(&digest_of(b"another build"), &material())
+            .unwrap();
+        let beside = directory.path().join("settings.json");
+        std::fs::write(&beside, b"{}").unwrap();
+        std::fs::create_dir(directory.path().join("held")).unwrap();
+
+        assert_eq!(cache.clear().unwrap(), 2);
+        assert!(cache.entries().unwrap().is_empty());
+        assert!(beside.is_file(), "a file that is not ours was removed");
+        assert!(directory.path().join("held").is_dir());
+    }
+
+    #[test]
+    fn clearing_a_cache_that_was_never_written_is_zero_and_creates_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let absent = directory.path().join("never-written");
+        let cache = Cache::at(&absent);
+        assert_eq!(cache.clear().unwrap(), 0);
+        assert!(cache.entries().unwrap().is_empty());
+        assert!(!absent.exists(), "asking emptied a cache into existence");
+    }
+
+    #[test]
+    fn a_temporary_from_a_store_that_did_not_finish_is_cleared_too() {
+        // It holds the same payload an entry does, mode and all. Leaving it
+        // would make "take the key material off this machine" untrue by the
+        // width of one crash.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let source = digest_of(b"one build");
+        std::fs::create_dir_all(directory.path()).unwrap();
+        let stale = directory
+            .path()
+            .join(format!("{}{SUFFIX}.4321{TEMPORARY}", source.hex()));
+        std::fs::write(&stale, encode(&material())).unwrap();
+
+        assert!(
+            cache.entries().unwrap().is_empty(),
+            "a half-written store was reported as an entry"
+        );
+        assert_eq!(cache.clear().unwrap(), 1);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_digest_is_not_an_entry() {
+        // The naming rule is the whole of what makes an entry addressable, so
+        // it is pinned rather than left to `store` and a reader agreeing.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        std::fs::create_dir_all(directory.path()).unwrap();
+        let source = digest_of(b"one build");
+        for name in [
+            format!("{}{SUFFIX}", &source.hex()[1..]),
+            format!("{}{SUFFIX}", source.hex().to_uppercase()),
+            format!("{}.key", source.hex()),
+            source.hex(),
+            format!("{}{SUFFIX}.notatemporary", source.hex()),
+        ] {
+            std::fs::write(directory.path().join(&name), b"x").unwrap();
+            assert!(
+                cache.entries().unwrap().is_empty(),
+                "{name} was read as an entry"
+            );
+            assert_eq!(cache.clear().unwrap(), 0, "{name} was removed");
+            std::fs::remove_file(directory.path().join(&name)).unwrap();
+        }
     }
 
     fn environment(home: &str, xdg: Option<&str>, appdata: Option<&str>) -> Environment {

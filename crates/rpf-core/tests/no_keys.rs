@@ -36,7 +36,7 @@ use std::{
 use rpf_core::{
     Archive, Category, Error, FileKind, FileSpec, Manifest, Plan, Storage, Summary, Unwatched,
     Verified,
-    format::ENCRYPTION_OPEN,
+    format::Version,
     keys::{Cache, SourceDigest},
 };
 
@@ -67,13 +67,16 @@ fn built(files: &[FileSpec], contents: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     rpf_core::build(
         sink.as_file_mut(),
+        rpf_core::Version::Rpf7,
         files,
         &[],
         |path| {
-            Ok(contents
-                .get(path)
-                .cloned()
-                .unwrap_or_else(|| path.as_bytes().to_vec()))
+            Ok(Cursor::new(
+                contents
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| path.as_bytes().to_vec()),
+            ))
         },
         &mut Unwatched,
     )
@@ -120,7 +123,7 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     // Open, resolve, read.
     let mut source = Cursor::new(bytes.clone());
     let archive = Archive::open(&mut source).expect("opens with no key material");
-    assert_eq!(archive.encryption(), ENCRYPTION_OPEN);
+    assert!(archive.version().is_open(archive.encryption()));
     for (path, expected) in &contents {
         let index = archive.find(path).expect("resolves");
         let read = archive.read(&mut source, index).expect("reads");
@@ -172,6 +175,7 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
         &reopened,
         &grew,
         sink.as_file_mut(),
+        &mut rpf_core::InMemory,
         &mut Unwatched,
     )
     .expect("rebuilds with no key material");
@@ -183,6 +187,17 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     let rebuilt_archive = Archive::open(&mut rebuilt_source).expect("the rebuild opens");
     let manifest = Manifest::of(&rebuilt_archive).expect("describes");
     assert_eq!(manifest.specs().len(), files.len());
+    // R11.3: the tree records what it came out of, so it cannot be packed as
+    // another container without saying so. The manifest round-trips through
+    // its own JSON with both fields intact.
+    assert_eq!(manifest.version, rebuilt_archive.version());
+    assert_eq!(manifest.codec, rebuilt_archive.version().codec());
+    assert_eq!(manifest.schema, rpf_core::manifest::SCHEMA_VERSION);
+    let text = manifest.to_json().expect("renders");
+    assert_eq!(
+        rpf_core::Manifest::from_json(&text).expect("reads back"),
+        manifest
+    );
     let index = rebuilt_archive.find("data/notes.meta").expect("resolves");
     assert_eq!(
         rebuilt_archive
@@ -210,7 +225,7 @@ fn an_encrypted_archive_asks_for_a_key_rather_than_being_opened_or_refused() {
     // it currently answers for them would turn implementing it into a failing
     // test. R1.5 owns that question.
     for tag in [0x0FFF_FFF9_u32, 0x0FEF_FFFF] {
-        assert_ne!(tag, ENCRYPTION_OPEN);
+        assert!(!Version::Rpf7.is_open(tag));
         let error = Archive::open(&mut Cursor::new(encrypted_header(tag)))
             .expect_err("an archive that is not OPEN cannot be opened here");
         assert!(

@@ -7,12 +7,12 @@
 //! Layout is computed before any payload is touched. The entry count and the
 //! names blob follow from the paths alone, so the first payload's position is
 //! known up front; payloads are then written in one pass and the header and
-//! entry table filled in afterwards. That keeps one file in memory at a time
-//! rather than the archive.
+//! entry table filled in afterwards. Each payload is **streamed** from where it
+//! comes from to where it goes, so neither a file nor the archive is held.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::{Cursor, Seek, SeekFrom, Write},
+    io::{Cursor, Read, Seek, SeekFrom, Write},
 };
 
 use flate2::{Compression, write::DeflateEncoder};
@@ -22,19 +22,14 @@ use crate::{
     entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
-        BLOCK_LEN, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7, MAGIC_RSC7, RESOURCE_FLAG,
-        RESOURCE_HEADER_LEN, folded, payload_floor, u32_at,
+        Content, FileFields, Header, Row, Version, folded,
+        resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
+        u32_at,
     },
     name,
+    scratch::Scratch,
     watch::{Flow, Step, Watch},
 };
-
-/// Largest value a 24-bit size field holds.
-const MAX_SIZE_24: u64 = 0x00FF_FFFF;
-/// Largest block index, the resource bit excluded.
-const MAX_BLOCK: u64 = 0x007F_FFFF;
-/// Largest name offset a **file** entry holds. Directories get a full word.
-const MAX_FILE_NAME_OFFSET: u64 = 0x0000_FFFF;
 
 /// Whether a payload is deflated or written as it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,13 +195,14 @@ impl Planned {
     }
 }
 
-/// Rounds `value` up to the next multiple of [`BLOCK_LEN`].
-fn align_up(value: u64) -> Option<u64> {
-    let over = value % BLOCK_LEN;
+/// Rounds `value` up to the next multiple of the version's block unit.
+fn align_up(version: Version, value: u64) -> Option<u64> {
+    let block = version.block_len();
+    let over = value.checked_rem(block)?;
     if over == 0 {
         return Some(value);
     }
-    value.checked_add(BLOCK_LEN.checked_sub(over)?)
+    value.checked_add(block.checked_sub(over)?)
 }
 
 /// Refuses a path that would put an entry deeper than a reader will walk.
@@ -340,43 +336,44 @@ fn plan_entries(arena: &[Dir]) -> Result<Vec<Planned>> {
     Ok(planned)
 }
 
-/// Lays out the names blob, one copy of each distinct name.
-fn plan_names(planned: &[Planned]) -> Result<(Vec<u8>, Vec<u32>)> {
-    let mut blob = Vec::new();
-    let mut seen: HashMap<&str, u32> = HashMap::new();
-    let mut offsets = Vec::with_capacity(planned.len());
-
-    for entry in planned {
-        let name = entry.name().as_str();
-        if let Some(&at) = seen.get(name) {
-            offsets.push(at);
-            continue;
-        }
-        let at = u32::try_from(blob.len()).map_err(|_| Error::FieldOverflow {
-            path: name.to_owned(),
-            what: "names blob",
-            len: u64::try_from(blob.len()).unwrap_or(u64::MAX),
-            limit: u64::from(u32::MAX),
-        })?;
-        blob.extend_from_slice(name.as_bytes());
-        blob.push(0);
-        seen.insert(name, at);
-        offsets.push(at);
-    }
-    Ok((blob, offsets))
-}
-
-/// The payload of one file, ready to write, and the fields describing it.
+/// Bytes one payload can be read from, in full, from its start.
 ///
-/// `compressed_len` is left wide on purpose. Narrowing it to the entry's 24-bit
-/// field is [`file_row`]'s job and nobody else's, so a value that will not fit
-/// arrives there to be refused rather than being quietly cut down on the way.
-pub(crate) struct Prepared {
-    pub(crate) bytes: Vec<u8>,
+/// [`build`] takes its payloads as readers rather than as buffers, so that a
+/// cascading rebuild can hand it an ancestor sitting in scratch space instead
+/// of one sitting in memory. R4.13, DR-022. Anything that is both [`Read`] and
+/// [`Seek`] is one; a caller holding bytes wraps them in a [`Cursor`].
+///
+/// Seekable because [`store`] reads a payload twice in one case — the deflated
+/// form that did not pay for itself, which is then written as it came.
+pub trait Payload: Read + Seek {}
+
+impl<T: Read + Seek> Payload for T {}
+
+/// One payload as it went into the archive, and the fields describing it.
+///
+/// `compressed_len` is left wide on purpose. Narrowing it to whatever width the
+/// version's row gives that field is [`file_row`]'s job and nobody else's, so a
+/// value that will not fit arrives there to be refused rather than being
+/// quietly cut down on the way.
+pub(crate) struct Written {
+    /// What the row's compressed-size field describes: the deflated length, or
+    /// zero for a payload stored as it came. `docs/rpf-format.md`, Compression.
     pub(crate) compressed_len: u64,
-    pub(crate) word_at_8: u32,
-    pub(crate) word_at_12: u32,
-    pub(crate) resource: bool,
+    /// The fields the payload's own form decides.
+    pub(crate) content: Content,
+    /// The payload's length — what the entry addresses, and what the next
+    /// payload's position is measured from.
+    pub(crate) len: u64,
+    /// How far past the payload's start anything was written.
+    ///
+    /// Equal to `len` except in one case, and that case is why it exists: a
+    /// deflate stream that turned out no smaller than what it encoded is
+    /// overwritten by the plain bytes, which are shorter, and the tail of it is
+    /// zeroed rather than left behind (§8). Nothing is left stale, but the
+    /// write did reach further than the payload now does, and the caller's
+    /// high-water mark has to know that or the archive ends up longer than the
+    /// length it reports.
+    pub(crate) reached: u64,
 }
 
 /// The storage rule an existing entry carries, as the [`FileKind`] that spells
@@ -412,111 +409,216 @@ pub(crate) fn kind_of(index: u32, entry: &Entry) -> Result<FileKind> {
     }
 }
 
-/// Applies a storage rule to one file's contents.
+/// Copies the rest of `src` into `out`, reporting how many bytes moved.
+fn copy_all<S, W>(src: &mut S, out: &mut W, at: u64) -> Result<u64>
+where
+    S: Read,
+    W: Write,
+{
+    std::io::copy(src, out).map_err(|source| Error::Io { offset: at, source })
+}
+
+/// The uncompressed length as the entry's field has to hold it.
+fn uncompressed_len(path: &str, len: u64) -> Result<u32> {
+    u32::try_from(len).map_err(|_| Error::FieldOverflow {
+        path: path.to_owned(),
+        what: "uncompressed size",
+        len,
+        limit: u64::from(u32::MAX),
+    })
+}
+
+/// Applies a storage rule to one file, streaming it from `src` into `out` at
+/// wherever `out` is now.
 ///
-/// The one implementation of it. A rebuild reaches it with the rule the caller
-/// asked for and a patch with the rule the entry already carries, but the rule
-/// is applied here in both cases — the two used to apply it separately, and a
-/// resource over the 24-bit size field was refused by one and truncated by the
-/// other.
+/// The one implementation of the rule. A rebuild reaches it with the rule the
+/// caller asked for and a patch with the rule the entry already carries, but
+/// the rule is applied here in both cases — the two used to apply it
+/// separately, and a resource over the 24-bit size field was refused by one and
+/// truncated by the other.
+///
+/// Nothing larger than a copy buffer is held: the payload passes from `src` to
+/// `out`, and the deflated form goes out as it is produced rather than being
+/// assembled first. R4.13 is what that is for — an ancestor a cascade has just
+/// rebuilt is read out of scratch space here, not out of memory.
+///
+/// `src` is read from its start, whatever position it arrives at.
 ///
 /// # Errors
 ///
-/// [`Error::NotAResource`] for a resource whose payload is not one, and
-/// [`Error::FieldOverflow`] for contents too long for the entry's fields.
-pub(crate) fn prepare(path: &str, kind: FileKind, contents: Vec<u8>) -> Result<Prepared> {
-    let plain_len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+/// [`Error::NotAResource`] for a resource whose payload is not one,
+/// [`Error::FieldOverflow`] for contents too long for the entry's fields, and
+/// [`Error::Io`] from either side.
+pub(crate) fn store<S, W>(
+    version: Version,
+    path: &str,
+    kind: FileKind,
+    src: &mut S,
+    out: &mut W,
+) -> Result<Written>
+where
+    S: Payload,
+    W: Write + Seek,
+{
+    let start = out
+        .stream_position()
+        .map_err(|source| Error::Io { offset: 0, source })?;
+    src.rewind().map_err(|source| Error::Io {
+        offset: start,
+        source,
+    })?;
 
     match kind {
-        FileKind::Resource => {
-            if plain_len < RESOURCE_HEADER_LEN {
-                return Err(Error::NotAResource {
-                    path: path.to_owned(),
-                });
-            }
-            let magic: [u8; 4] = contents
-                .get(0..4)
-                .and_then(|s| s.try_into().ok())
-                .unwrap_or_default();
-            if magic != MAGIC_RSC7 {
-                return Err(Error::NotAResource {
-                    path: path.to_owned(),
-                });
-            }
-            // The flags are the payload's own, at offsets 8 and 12 of its
-            // RSC7 header, and they are what the entry duplicates. Both are
-            // inside the sixteen bytes checked just above, so the default is
-            // unreachable rather than a guess at a truncated header.
-            let word_at_8 = u32_at(&contents, 8).unwrap_or_default();
-            let word_at_12 = u32_at(&contents, 12).unwrap_or_default();
-            Ok(Prepared {
-                bytes: contents,
-                compressed_len: plain_len,
-                word_at_8,
-                word_at_12,
-                resource: true,
-            })
-        }
-
+        FileKind::Resource => store_resource(path, src, out, start),
         FileKind::Binary {
-            storage,
+            storage: Storage::Stored,
             encryption,
         } => {
-            let uncompressed = u32::try_from(plain_len).map_err(|_| Error::FieldOverflow {
-                path: path.to_owned(),
-                what: "uncompressed size",
-                len: plain_len,
-                limit: u64::from(u32::MAX),
-            })?;
-
-            if storage == Storage::Deflate {
-                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-                encoder
-                    .write_all(&contents)
-                    .and_then(|()| encoder.try_finish())
-                    .map_err(|source| Error::Io { offset: 0, source })?;
-                let deflated = encoder
-                    .finish()
-                    .map_err(|source| Error::Io { offset: 0, source })?;
-                let deflated_len = u64::try_from(deflated.len()).unwrap_or(u64::MAX);
-
-                // Deflating has to pay for itself, and it has to fit the field.
-                // Falling back to stored is R4.4, not a workaround.
-                if deflated_len < plain_len && deflated_len <= MAX_SIZE_24 {
-                    return Ok(Prepared {
-                        bytes: deflated,
-                        compressed_len: deflated_len,
-                        word_at_8: uncompressed,
-                        word_at_12: encryption,
-                        resource: false,
-                    });
-                }
-            }
-
-            // Stored: the compressed-size field is the sentinel zero and the
-            // real length lives at offset 8. docs/rpf-format.md, Compression.
-            Ok(Prepared {
-                bytes: contents,
+            let len = copy_all(src, out, start)?;
+            Ok(Written {
+                // Stored: the compressed-size field carries the sentinel zero
+                // and the real length goes with the contents.
+                // docs/rpf-format.md, Compression.
                 compressed_len: 0,
-                word_at_8: uncompressed,
-                word_at_12: encryption,
-                resource: false,
+                content: Content::Binary {
+                    uncompressed_len: uncompressed_len(path, len)?,
+                    encryption,
+                },
+                len,
+                reached: len,
             })
         }
+        FileKind::Binary {
+            storage: Storage::Deflate,
+            encryption,
+        } => store_deflated(version, path, encryption, src, out, start),
     }
 }
 
-/// Fails when a value will not fit its field.
-fn check(path: &str, what: &'static str, len: u64, limit: u64) -> Result<()> {
-    if len > limit {
-        return Err(Error::FieldOverflow {
+/// [`store`] for a resource: written through untouched, with its own flags read
+/// out of its `RSC7` header on the way past.
+fn store_resource<S, W>(path: &str, src: &mut S, out: &mut W, start: u64) -> Result<Written>
+where
+    S: Payload,
+    W: Write,
+{
+    // The header is read before anything goes out, so a payload that is not a
+    // resource is refused with nothing written for it. Read rather than seeked
+    // over: the flags in it are what the entry duplicates.
+    let mut head = Vec::new();
+    (&mut *src)
+        .take(RESOURCE_HEADER_LEN)
+        .read_to_end(&mut head)
+        .map_err(|source| Error::Io {
+            offset: start,
+            source,
+        })?;
+    if u64::try_from(head.len()).unwrap_or(u64::MAX) < RESOURCE_HEADER_LEN {
+        return Err(Error::NotAResource {
             path: path.to_owned(),
-            what,
-            len,
-            limit,
         });
     }
-    Ok(())
+    let magic: [u8; 4] = head
+        .get(0..4)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or_default();
+    if magic != MAGIC_RSC7 {
+        return Err(Error::NotAResource {
+            path: path.to_owned(),
+        });
+    }
+    // The flags are the payload's own, at offsets 8 and 12 of its RSC7 header,
+    // and they are what the entry duplicates. Both are inside the sixteen bytes
+    // checked just above, so the default is unreachable rather than a guess at
+    // a truncated header.
+    let word_at_8 = u32_at(&head, 8).unwrap_or_default();
+    let word_at_12 = u32_at(&head, 12).unwrap_or_default();
+
+    out.write_all(&head).map_err(|source| Error::Io {
+        offset: start,
+        source,
+    })?;
+    let len = RESOURCE_HEADER_LEN.saturating_add(copy_all(src, out, start)?);
+    Ok(Written {
+        compressed_len: len,
+        content: Content::Resource {
+            system_flags: word_at_8,
+            graphics_flags: word_at_12,
+        },
+        len,
+        reached: len,
+    })
+}
+
+/// [`store`] for a payload offered to the compressor, including the case where
+/// the compressor does not earn its place.
+fn store_deflated<S, W>(
+    version: Version,
+    path: &str,
+    encryption: u32,
+    src: &mut S,
+    out: &mut W,
+    start: u64,
+) -> Result<Written>
+where
+    S: Payload,
+    W: Write + Seek,
+{
+    let (plain, deflated) = {
+        let mut encoder = DeflateEncoder::new(&mut *out, Compression::default());
+        let plain = std::io::copy(src, &mut encoder).map_err(|source| Error::Io {
+            offset: start,
+            source,
+        })?;
+        encoder.try_finish().map_err(|source| Error::Io {
+            offset: start,
+            source,
+        })?;
+        (plain, encoder.total_out())
+    };
+    let content = Content::Binary {
+        uncompressed_len: uncompressed_len(path, plain)?,
+        encryption,
+    };
+
+    // Deflating has to pay for itself, and it has to fit the field — whose
+    // width is the version's, so the seam is asked rather than a limit written
+    // here. Falling back to stored is R4.4, not a workaround.
+    if deflated < plain && version.holds_compressed_len(deflated) {
+        return Ok(Written {
+            compressed_len: deflated,
+            content,
+            len: deflated,
+            reached: deflated,
+        });
+    }
+
+    // It did not pay. The plain bytes go over the stream that was speculatively
+    // written, and what is left of that stream past them is zeroed: real
+    // archives carry stale bytes in their slack and this one must not write its
+    // own (§8). The zeroing is bounded by deflate's worst-case expansion, which
+    // is a fraction of a percent of the payload.
+    out.seek(SeekFrom::Start(start))
+        .map_err(|source| Error::Io {
+            offset: start,
+            source,
+        })?;
+    src.rewind().map_err(|source| Error::Io {
+        offset: start,
+        source,
+    })?;
+    let len = copy_all(src, out, start)?;
+    let reached = deflated.max(len);
+    let overhang = reached.saturating_sub(len);
+    if overhang > 0 {
+        copy_all(&mut std::io::repeat(0).take(overhang), out, start)?;
+    }
+    Ok(Written {
+        compressed_len: 0,
+        content,
+        len,
+        reached,
+    })
 }
 
 /// The tree as it will be written: the files as specified, the entries they
@@ -526,6 +628,7 @@ fn check(path: &str, what: &'static str, len: u64, limit: u64) -> Result<()> {
 /// anything together, and passing them singly put `write_payloads` over the
 /// argument limit `clippy.toml` sets.
 struct Layout<'a> {
+    version: Version,
     files: &'a [FileSpec],
     planned: &'a [Planned],
     name_offsets: &'a [u32],
@@ -536,7 +639,8 @@ struct Layout<'a> {
 /// was, which includes an archive whose every payload is empty.
 ///
 /// `cursor` enters at the first payload's offset and leaves at the archive's
-/// end. One file is resident at a time; the archive never is.
+/// end. Payloads stream from `fetch` to `out`, so neither a file nor the
+/// archive is resident.
 ///
 /// That second value is where padding may begin, and it is deliberately neither
 /// `cursor`, which is rounded up to the next block, nor the position the last
@@ -555,18 +659,20 @@ struct Layout<'a> {
 /// bytes in it moves it.
 ///
 /// `watch` is stepped once per file written, and can stop the write. DR-008.
-fn write_payloads<W, F>(
+fn write_payloads<W, P, F>(
     out: &mut W,
     layout: &Layout<'_>,
     cursor: &mut u64,
     fetch: &mut F,
     watch: &mut impl Watch,
-) -> Result<(Vec<[u8; 16]>, u64)>
+) -> Result<(Vec<Row>, u64)>
 where
     W: Write + Seek,
-    F: FnMut(&str) -> Result<Vec<u8>>,
+    P: Payload,
+    F: FnMut(&str) -> Result<P>,
 {
     let Layout {
+        version,
         files,
         planned,
         name_offsets,
@@ -585,7 +691,7 @@ where
                 child_count,
                 ..
             } => {
-                rows.push(directory_row(name_offset, first_child, child_count));
+                rows.push(version.directory_row(name_offset, first_child, child_count));
                 continue;
             }
             Planned::File { spec, .. } => spec,
@@ -595,33 +701,33 @@ where
             path: String::new(),
             reason: "unknown file",
         })?;
-        let prepared = prepare(&spec.path, spec.kind, fetch(&spec.path)?)?;
-
         let at = *cursor;
-        let block = at / BLOCK_LEN;
-        // The row is built before the payload goes out, so a value the entry
-        // cannot describe is refused with nothing written for it.
-        let row = file_row(&spec.path, name_offset, block, &prepared)?;
-
         out.seek(SeekFrom::Start(at))
             .map_err(|source| Error::Io { offset: at, source })?;
-        out.write_all(&prepared.bytes)
-            .map_err(|source| Error::Io { offset: at, source })?;
+        let written = store(version, &spec.path, spec.kind, &mut fetch(&spec.path)?, out)?;
 
-        let written = u64::try_from(prepared.bytes.len()).unwrap_or(u64::MAX);
+        // The row is built after the payload rather than before it, because a
+        // streamed payload's length is not known until it has been streamed.
+        // A value the entry cannot describe is therefore refused with bytes
+        // already in the sink — which is a temporary file that a failed build
+        // never renames into place (§8), not the archive.
+        let block = at.checked_div(version.block_len()).unwrap_or(u64::MAX);
+        let row = file_row(version, &spec.path, name_offset, block, &written)?;
+
         // Only a write that put bytes somewhere moves the high-water mark. An
         // empty payload leaves the sink exactly as long as it was, so claiming
         // its start as the end of what was written loses everything between
         // there and the previous payload's last byte.
-        if written > 0 {
-            end = at.saturating_add(written);
+        if written.reached > 0 {
+            end = at.saturating_add(written.reached);
         }
-        *cursor = align_up(at.saturating_add(written)).ok_or(Error::FieldOverflow {
-            path: spec.path.clone(),
-            what: "archive length",
-            len: at,
-            limit: u64::MAX,
-        })?;
+        *cursor =
+            align_up(version, at.saturating_add(written.reached)).ok_or(Error::FieldOverflow {
+                path: spec.path.clone(),
+                what: "archive length",
+                len: at,
+                limit: u64::MAX,
+            })?;
 
         rows.push(row);
 
@@ -644,8 +750,16 @@ where
 /// `fetch` at the moment it is written.
 ///
 /// `fetch` is called once per file, in entry-table order, and is given the
-/// path from the [`FileSpec`]. One file is resident at a time; the archive
-/// never is.
+/// path from the [`FileSpec`]. What it answers is a [`Payload`] — a reader,
+/// read from its start — and the bytes go straight through to `out`, so
+/// neither a file nor the archive is resident. A caller holding bytes hands
+/// back a [`Cursor`] over them.
+///
+/// `version` is what the archive is written as, and it is the caller's: a
+/// rebuild takes it from the archive it is rebuilding and `pack` takes it from
+/// the manifest, which has recorded it since schema 2. [`Version`] is closed
+/// over the versions this build has a codec for, so one it does not have
+/// cannot be named here. DR-018.
 ///
 /// # Errors
 ///
@@ -653,8 +767,9 @@ where
 /// [`Error::NotAResource`] for a resource whose payload is not one,
 /// [`Error::FieldOverflow`] when a value will not fit the format's field, and
 /// [`Error::Io`] from the sink or from `fetch`.
-pub fn build<W, F>(
+pub fn build<W, P, F>(
     out: &mut W,
+    version: Version,
     files: &[FileSpec],
     directories: &[String],
     mut fetch: F,
@@ -662,11 +777,13 @@ pub fn build<W, F>(
 ) -> Result<Report>
 where
     W: Write + Seek,
-    F: FnMut(&str) -> Result<Vec<u8>>,
+    P: Payload,
+    F: FnMut(&str) -> Result<P>,
 {
     let arena = plan_tree(files, directories)?;
     let planned = plan_entries(&arena)?;
-    let (names_blob, name_offsets) = plan_names(&planned)?;
+    let names = version.plan_names(planned.iter().map(|entry| entry.name().as_str()))?;
+    let (names_blob, name_offsets) = (names.blob, names.offsets);
 
     let entry_count = u32::try_from(planned.len()).map_err(|_| Error::FieldOverflow {
         path: String::new(),
@@ -676,11 +793,11 @@ where
     })?;
     let names_len = u32::try_from(names_blob.len()).unwrap_or(u32::MAX);
 
-    let table_len = u64::from(entry_count).saturating_mul(ENTRY_LEN);
+    let table_len = u64::from(entry_count).saturating_mul(version.row_len());
     // The same sum `Archive` checks every payload offset against, so an archive
     // laid out here cannot have its first payload refused by the reader.
-    let floor = payload_floor(u64::from(entry_count), u64::from(names_len));
-    let mut cursor = align_up(floor).ok_or(Error::FieldOverflow {
+    let floor = version.payload_floor(u64::from(entry_count), u64::from(names_len));
+    let mut cursor = align_up(version, floor).ok_or(Error::FieldOverflow {
         path: String::new(),
         what: "archive length",
         len: floor,
@@ -689,6 +806,7 @@ where
 
     // Payloads first, at their aligned positions, one file resident at a time.
     let layout = Layout {
+        version,
         files,
         planned: &planned,
         name_offsets: &name_offsets,
@@ -698,21 +816,22 @@ where
     // Then the header, the table and the names, now that every offset is known.
     out.seek(SeekFrom::Start(0))
         .map_err(|source| Error::Io { offset: 0, source })?;
-    let mut header = Vec::with_capacity(16);
-    header.extend_from_slice(&MAGIC_RPF7);
-    header.extend_from_slice(&entry_count.to_le_bytes());
-    header.extend_from_slice(&names_len.to_le_bytes());
-    header.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
-    out.write_all(&header)
+    let header = Header {
+        version,
+        entry_count,
+        names_len,
+        encryption: version.open(),
+    };
+    out.write_all(&header.write())
         .map_err(|source| Error::Io { offset: 0, source })?;
     for row in &rows {
-        out.write_all(row).map_err(|source| Error::Io {
-            offset: HEADER_LEN,
+        out.write_all(row.as_bytes()).map_err(|source| Error::Io {
+            offset: version.header_len(),
             source,
         })?;
     }
     out.write_all(&names_blob).map_err(|source| Error::Io {
-        offset: HEADER_LEN.saturating_add(table_len),
+        offset: version.header_len().saturating_add(table_len),
         source,
     })?;
 
@@ -759,63 +878,32 @@ where
     })
 }
 
-/// One directory row.
-fn directory_row(name_offset: u32, first_child: u32, child_count: u32) -> [u8; 16] {
-    let mut row = [0_u8; 16];
-    row[0..4].copy_from_slice(&name_offset.to_le_bytes());
-    row[4..8].copy_from_slice(&crate::format::DIRECTORY_MARKER.to_le_bytes());
-    row[8..12].copy_from_slice(&first_child.to_le_bytes());
-    row[12..16].copy_from_slice(&child_count.to_le_bytes());
-    row
-}
-
-/// One file row: a 16-bit name offset, a 24-bit size and a 24-bit block, then
-/// two words whose meaning depends on the resource bit.
+/// One file's row, from a path, a name offset, a block and a written payload.
 ///
-/// Every narrow field is checked **here**, where the narrowing happens, rather
-/// than by whoever calls it. A row is sixteen bytes of truncation waiting to
-/// happen — the compressed size is written as the low three bytes of a wider
-/// value, and dropping the top byte produces an entry that describes a
-/// fraction of its own payload and reads back without complaint. The two
-/// callers used to check different subsets of these, so one of them wrote that
-/// row. A value that will not fit the format cannot now become a row at all.
+/// The one place the three of those become the version's fields (§4). A rebuild
+/// reaches it through [`write_payloads`] and an in-place patch through
+/// [`crate::patch::plan`], and both go through [`Version::file_row`] so that
+/// neither can narrow a value the other would have refused.
 ///
 /// # Errors
 ///
 /// [`Error::FieldOverflow`] for a value the row cannot represent.
 pub(crate) fn file_row(
+    version: Version,
     path: &str,
     name_offset: u32,
     block: u64,
-    prepared: &Prepared,
-) -> Result<[u8; 16]> {
-    check(
+    written: &Written,
+) -> Result<Row> {
+    version.file_row(
         path,
-        "file name offset",
-        u64::from(name_offset),
-        MAX_FILE_NAME_OFFSET,
-    )?;
-    check(
-        path,
-        "compressed size",
-        prepared.compressed_len,
-        MAX_SIZE_24,
-    )?;
-    check(path, "block offset", block, MAX_BLOCK)?;
-
-    let offset_field = if prepared.resource {
-        block | u64::from(RESOURCE_FLAG)
-    } else {
-        block
-    };
-
-    let mut row = [0_u8; 16];
-    row[0..2].copy_from_slice(&name_offset.to_le_bytes()[..2]);
-    row[2..5].copy_from_slice(&prepared.compressed_len.to_le_bytes()[..3]);
-    row[5..8].copy_from_slice(&offset_field.to_le_bytes()[..3]);
-    row[8..12].copy_from_slice(&prepared.word_at_8.to_le_bytes());
-    row[12..16].copy_from_slice(&prepared.word_at_12.to_le_bytes());
-    Ok(row)
+        &FileFields {
+            name_offset,
+            block,
+            compressed_len: written.compressed_len,
+            content: written.content,
+        },
+    )
 }
 
 /// The specification that would rebuild an archive as it stands, paired with
@@ -881,18 +969,27 @@ pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
 /// the form [`build`]'s `fetch` is defined in, and using one form throughout is
 /// what keeps a replaced resource from losing its flags.
 ///
+/// The map is taken by value and each override is **moved out of it** as its
+/// entry is written, because an override may be a whole rebuilt ancestor and
+/// copying one to hand it over is the cost R4.13 exists to remove. Each entry
+/// is written once, so each override is taken once; one left over was for an
+/// entry this archive does not have.
+///
+/// The rebuilt archive is written at the version the original was read at. A
+/// rebuild is not a conversion, and this is where that is said.
+///
 /// # Errors
 ///
 /// As [`build`], plus the read errors for payloads taken from the source.
-pub fn rebuild<R, W>(
+pub fn rebuild<'p, R, W>(
     src: &mut R,
     archive: &Archive,
     out: &mut W,
-    overrides: &BTreeMap<u32, Vec<u8>>,
+    mut overrides: BTreeMap<u32, Box<dyn Payload + 'p>>,
     watch: &mut impl Watch,
 ) -> Result<Report>
 where
-    R: std::io::Read + Seek,
+    R: Read + Seek,
     W: Write + Seek,
 {
     let specs = specs_of(archive)?;
@@ -905,6 +1002,7 @@ where
 
     build(
         out,
+        archive.version(),
         &files,
         &directories,
         |wanted| {
@@ -912,9 +1010,9 @@ where
                 path: wanted.to_owned(),
                 reason: "not an entry of this archive",
             })?;
-            match overrides.get(&index) {
-                Some(bytes) => Ok(bytes.clone()),
-                None => archive.extract(src, index),
+            match overrides.remove(&index) {
+                Some(payload) => Ok(payload),
+                None => Ok(Box::new(Cursor::new(archive.extract(src, index)?))),
             }
         },
         watch,
@@ -947,32 +1045,6 @@ fn split_at_file<'a>(archive: &Archive, segments: &'a [&'a str]) -> Result<(u32,
     })
 }
 
-/// Rebuilds `archive` into `out` with one entry replaced, **cascading through
-/// nesting**.
-///
-/// A convenience for the single-edit case; see [`replace_many`], which is where
-/// the work happens.
-///
-/// # Errors
-///
-/// As [`replace_many`].
-pub fn replace_at<R, W>(
-    src: &mut R,
-    archive: &Archive,
-    path: &str,
-    contents: Vec<u8>,
-    out: &mut W,
-    watch: &mut impl Watch,
-) -> Result<Report>
-where
-    R: std::io::Read + Seek,
-    W: Write + Seek,
-{
-    let mut edits = BTreeMap::new();
-    edits.insert(path.to_owned(), contents);
-    replace_many(src, archive, &edits, out, watch)
-}
-
 /// Rebuilds `archive` into `out` with any number of entries replaced,
 /// **cascading through nesting**.
 ///
@@ -985,8 +1057,14 @@ where
 /// Each value is the file as it exists outside the archive: for a resource, its
 /// `RSC7` header and still-deflated body.
 ///
-/// Intermediates are rebuilt in memory one level at a time, so peak cost is the
-/// largest single ancestor. `docs/backlog.md` R4.13.
+/// **Each rebuilt ancestor goes to scratch space and is streamed from there
+/// into its parent**, never assembled in memory, so what is held at once does
+/// not scale with the ancestor. Where that space comes from is the caller's
+/// answer, because this crate opens no files: [`Scratch`], DR-022, R4.13.
+///
+/// `done` and `total` in a [`Step`] count the archive being written now rather
+/// than the whole nesting, unchanged by this: there is no honest total for a
+/// cascade until it has been walked. DR-008's fourth amendment.
 ///
 /// Two edits that resolve to one entry are refused, whether they spell it the
 /// same way or not: `x/y`, `x//y` and `X/Y` are one file, and a whole nested
@@ -1001,18 +1079,20 @@ where
 /// [`Error::NotAnArchive`] for a component that is not one,
 /// [`Error::Overlapping`] for two edits that resolve to one entry, and as
 /// [`build`].
-pub fn replace_many<R, W>(
+pub fn replace_many<R, W, S>(
     src: &mut R,
     archive: &Archive,
     edits: &BTreeMap<String, Vec<u8>>,
     out: &mut W,
+    scratch: &mut S,
     watch: &mut impl Watch,
 ) -> Result<Report>
 where
-    R: std::io::Read + Seek,
+    R: Read + Seek,
     W: Write + Seek,
+    S: Scratch,
 {
-    let mut direct: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut direct: BTreeMap<u32, Box<dyn Payload>> = BTreeMap::new();
     // Which edit replaced each entry outright, so a second one naming the same
     // entry is refused rather than quietly winning. Keying the edits by path
     // string and then by index collapsed them: last write won, and the losers
@@ -1039,7 +1119,7 @@ where
                 });
             }
             claimed.insert(index, path.clone());
-            direct.insert(index, contents.clone());
+            direct.insert(index, Box::new(Cursor::new(contents.clone())));
         } else {
             let nested = deeper.entry(index).or_insert_with(|| Nested {
                 first: path.clone(),
@@ -1064,12 +1144,16 @@ where
             .map(|(within, (_, bytes))| (within, bytes))
             .collect();
         let holder = archive.open_nested(src, index)?;
-        let mut buffer = Cursor::new(Vec::new());
-        replace_many(src, &holder, &inner, &mut buffer, watch)?;
-        direct.insert(index, buffer.into_inner());
+        // The ancestor is rebuilt into scratch space and handed on as a reader
+        // over it. It is never a `Vec`, which is the whole of R4.13: this used
+        // to be `Cursor::new(Vec::new())` and then `buffer.into_inner()`, and
+        // the archive above it copied that again to write it.
+        let mut sink = scratch.create()?;
+        replace_many(src, &holder, &inner, &mut sink, scratch, watch)?;
+        direct.insert(index, Box::new(sink));
     }
 
-    rebuild(src, archive, out, &direct, watch)
+    rebuild(src, archive, out, direct, watch)
 }
 
 /// The edits landing inside one nested archive.

@@ -7,7 +7,10 @@
 
 use std::io;
 
-use crate::format::{MAGIC_RPF7, unsupported_version};
+use crate::{
+    format::{Version, unsupported_version},
+    manifest::Checksum,
+};
 
 /// Anything that can go wrong reading a container.
 #[derive(Debug, thiserror::Error)]
@@ -78,14 +81,26 @@ pub enum Error {
     /// on an offset, so a match is its own proof and a miss means the value is
     /// not present in that exact form — a different build of the game, a
     /// patched executable, or the wrong file entirely. It carries the counts
-    /// because "1 of 2" and "0 of 2" are different situations to be in.
+    /// because "1 of 2" and "0 of 2" are different situations to be in, and it
+    /// names the values it did not find because "1 of 2" does not say which.
     ///
     /// [`Category::Unsupported`] for the reason [`Error::UnsupportedVersion`]
     /// is: the file is intact and the part that is missing is here.
-    #[error("{what}: {found} of {wanted} values are in this executable")]
+    #[error(
+        "{what}: {found} of {wanted} values are in this executable; missing {}",
+        .missing.join(" and ")
+    )]
     UnrecognisedExecutable {
         /// Which material was looked for.
         what: &'static str,
+        /// The values that were not found, by name, and never empty — a search
+        /// that found everything is not this failure.
+        ///
+        /// A kind rather than each value: the NG survey looks for 373 of them
+        /// and 373 names are not something a caller acts on, while `found` and
+        /// `wanted` already say how many. Names only, so nothing here can carry
+        /// a byte of what was looked for (DR-006).
+        missing: &'static [&'static str],
         /// How many of its values were found.
         found: u32,
         /// How many there are to find.
@@ -272,6 +287,34 @@ pub enum Error {
         used: u64,
     },
 
+    /// An entry's contents are not the contents recorded for it.
+    ///
+    /// The one failure here that the archive cannot state on its own. A
+    /// deflated entry declares its inflated length and its stream carries its
+    /// own end, so bytes changed inside one surface as [`Error::Inflate`],
+    /// [`Error::LengthMismatch`] or [`Error::TrailingBytes`]; a **stored**
+    /// entry declares neither, so a byte changed inside it reads back
+    /// perfectly and is the wrong byte. Only a checksum recorded elsewhere —
+    /// the sidecar manifest's, DR-004's territory, since nothing in an RPF
+    /// archive carries one — can see it. DR-023.
+    ///
+    /// [`Category::Corrupt`], not [`Category::Refused`]: the caller asked a
+    /// reasonable question and the answer is that the archive's bytes are not
+    /// the bytes they were. DR-010.
+    ///
+    /// Identifies the entry by index, as every other per-entry failure in this
+    /// enum does. The path is `crate::Problem`'s to carry, and repeating it
+    /// here would be the same string twice in one sentence.
+    #[error("entry {entry}: contents digest {found}, not the recorded {recorded}")]
+    ChecksumMismatch {
+        /// Index of the offending entry.
+        entry: u32,
+        /// The digest recorded for it.
+        recorded: Checksum,
+        /// The digest its contents actually have.
+        found: Checksum,
+    },
+
     /// An entry index does not exist in this archive.
     #[error("no entry with index {index}; the archive has {entry_count}")]
     NoSuchEntry {
@@ -390,16 +433,22 @@ pub enum Error {
         total: u32,
     },
 
-    /// Entries did not read back as the archive describes them.
+    /// Entries are not as they are recorded.
     ///
     /// What a failing `verify` returns. It is one failure about a set of
     /// entries rather than about any one of them, so it carries the two counts
-    /// a caller acts on — how many were read, and how many of those did not
-    /// come back as promised — and leaves the per-entry detail to the report
-    /// beside it. R6.9. Borrowing [`Error::LengthMismatch`] for this rendered
+    /// a caller acts on — how many were read, and how many of those were not
+    /// as recorded — and leaves the per-entry detail to the report beside it.
+    /// R6.9. Borrowing [`Error::LengthMismatch`] for this rendered
     /// "entry 0: inflated to 25 bytes, archive declares 26", a sentence about
     /// inflation with nothing to do with what happened.
-    #[error("{failed} of {checked} entries did not read back as the archive describes them")]
+    ///
+    /// "as they are recorded" rather than "as the archive describes them",
+    /// which was true until a manifest could be given: a checksum mismatch is
+    /// an entry that read back *perfectly* and disagrees with what the sidecar
+    /// recorded for it, so the archive is not the only thing doing the
+    /// describing any more. DR-023, DR-025.
+    #[error("{failed} of {checked} entries are not as they are recorded")]
     VerifyFailed {
         /// How many file entries were read, the failing ones included.
         checked: u32,
@@ -457,7 +506,7 @@ pub enum Category {
 /// only recognises. Either claim is enough — what matters is that something
 /// asserted an archive was there.
 fn claims_a_container(magic: [u8; 4]) -> bool {
-    magic == MAGIC_RPF7 || unsupported_version(magic).is_some()
+    magic == Version::Rpf7.magic() || unsupported_version(magic).is_some()
 }
 
 impl Error {
@@ -501,6 +550,7 @@ impl Error {
             | Self::Inflate { .. }
             | Self::LengthMismatch { .. }
             | Self::TrailingBytes { .. }
+            | Self::ChecksumMismatch { .. }
             | Self::VerifyFailed { .. } => Category::Corrupt,
         }
     }
@@ -520,7 +570,7 @@ mod tests {
     /// The match is exhaustive, so a variant added later stops this module
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 26;
+    const VARIANTS: usize = 27;
 
     /// The variant's own name, for a test that has to say which one it means.
     fn name(error: &Error) -> &'static str {
@@ -541,6 +591,7 @@ mod tests {
             Error::Inflate { .. } => "Inflate",
             Error::LengthMismatch { .. } => "LengthMismatch",
             Error::TrailingBytes { .. } => "TrailingBytes",
+            Error::ChecksumMismatch { .. } => "ChecksumMismatch",
             Error::VerifyFailed { .. } => "VerifyFailed",
             Error::NoSuchEntry { .. } => "NoSuchEntry",
             Error::NotFound { .. } => "NotFound",
@@ -569,7 +620,7 @@ mod tests {
             // spelling of this variant is in `refused()`.
             Error::NotAnArchive {
                 base: 0,
-                found: crate::format::MAGIC_RPF7,
+                found: crate::format::Version::Rpf7.magic(),
             },
             Error::OutOfBounds {
                 region: "payload",
@@ -621,6 +672,13 @@ mod tests {
                 entry: 0,
                 declared: 200_044,
                 used: 44,
+            },
+            // The archive's bytes are not the bytes recorded for them, which is
+            // a fact about the archive and not about the request. DR-023.
+            Error::ChecksumMismatch {
+                entry: 0,
+                recorded: crate::manifest::Checksum::of(b"as extracted"),
+                found: crate::manifest::Checksum::of(b"as it is now"),
             },
             Error::VerifyFailed {
                 checked: 27,
@@ -692,6 +750,7 @@ mod tests {
             (
                 Error::UnrecognisedExecutable {
                     what: "AES key and hash lookup table",
+                    missing: &["the hash lookup table"],
                     found: 1,
                     wanted: 2,
                 },
@@ -752,7 +811,7 @@ mod tests {
         // to hold one are a malformed archive, and bytes that name nothing are
         // a request that called an ordinary file an archive.
         for (found, expected) in [
-            (crate::format::MAGIC_RPF7, Category::Corrupt),
+            (crate::format::Version::Rpf7.magic(), Category::Corrupt),
             (*b"RPF2", Category::Corrupt),
             (*b"hell", Category::Refused),
             ([0; 4], Category::Refused),

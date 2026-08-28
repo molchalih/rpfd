@@ -19,14 +19,24 @@
 /// until it is finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step<'a> {
-    /// The entry just written, by path within the archive being written.
+    /// What this step is about: the entry just written, by path within the
+    /// archive being written.
+    ///
+    /// A scan over a source that has no entries — `keys` — names the material
+    /// it is looking for instead. There is no path to give: §7 keeps one from
+    /// reaching the library at all, and the unit of work is a block of the
+    /// source rather than an entry. DR-024.
     pub path: &'a str,
-    /// How many entries have been written, this one included.
+    /// How many units of work are done, this one included: entries written, or
+    /// blocks of a source scanned.
     pub done: u32,
-    /// How many will be written in total.
+    /// How many there are in total.
+    ///
+    /// A scan that finds everything it was looking for stops where it is, so
+    /// its last step can name fewer than this.
     pub total: u32,
     /// How many bytes have been written so far, the header and entry table
-    /// included.
+    /// included — or, for a scan, how many have been read.
     pub bytes: u64,
 }
 

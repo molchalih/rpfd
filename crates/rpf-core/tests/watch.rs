@@ -65,9 +65,10 @@ fn a_build_reports_every_entry_it_writes() {
     let mut out = Cursor::new(Vec::new());
     rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(vec![b'x'; wanted.len()]),
+        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut watch,
     )
     .expect("builds");
@@ -98,9 +99,10 @@ fn stopping_a_build_stops_it_and_says_so() {
     let mut out = Cursor::new(Vec::new());
     let stopped = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(vec![b'x'; wanted.len()]),
+        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut watch,
     );
 
@@ -119,9 +121,10 @@ fn a_cancellation_is_its_own_category() {
     let mut out = Cursor::new(Vec::new());
     let stopped = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(vec![b'x'; wanted.len()]),
+        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut watch,
     )
     .expect_err("stops");
@@ -135,9 +138,10 @@ fn a_caller_that_does_not_care_says_so() {
     let mut out = Cursor::new(Vec::new());
     let report = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(vec![b'x'; wanted.len()]),
+        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut Unwatched,
     )
     .expect("builds");
@@ -151,9 +155,10 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
     let mut inner = Cursor::new(Vec::new());
     rpf_core::build(
         &mut inner,
+        rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(vec![b'x'; wanted.len()]),
+        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut Unwatched,
     )
     .expect("inner builds");
@@ -169,9 +174,10 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
     let mut outer = Cursor::new(Vec::new());
     rpf_core::build(
         &mut outer,
+        rpf_core::Version::Rpf7,
         &outer_specs,
         &[],
-        |_| Ok(inner.clone()),
+        |_| Ok(Cursor::new(inner.clone())),
         &mut Unwatched,
     )
     .expect("outer builds");
@@ -185,7 +191,15 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
 
     let mut watch = Recorder::watching();
     let mut out = Cursor::new(Vec::new());
-    rpf_core::replace_many(&mut src, &archive, &edits, &mut out, &mut watch).expect("rebuilds");
+    rpf_core::replace_many(
+        &mut src,
+        &archive,
+        &edits,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut watch,
+    )
+    .expect("rebuilds");
 
     let paths: Vec<&str> = watch.seen.iter().map(|(p, ..)| p.as_str()).collect();
     assert_eq!(
@@ -202,9 +216,10 @@ fn a_verify_reports_every_entry_it_reads_and_stops_when_told_to() {
     let mut out = Cursor::new(Vec::new());
     rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(vec![b'x'; wanted.len()]),
+        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut Unwatched,
     )
     .expect("builds");

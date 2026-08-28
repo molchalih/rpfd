@@ -8,7 +8,10 @@ use std::{
 use sha1::{Digest, Sha1};
 
 use super::{ANCHOR_ALIGN, ANCHOR_DIGEST_LEN};
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    watch::{Flow, Step, Watch},
+};
 
 /// A value to be found by the SHA-1 of its exact bytes.
 #[derive(Clone, Copy, Debug)]
@@ -38,12 +41,20 @@ const STRIDE: usize = 1 << 20;
 /// three times in `GTA5_Enhanced.exe` — the lowest offset is the one reported,
 /// and every anchor carrying that digest is filled from it.
 ///
+/// `what` names the material for the watcher; `watch` is told once per block
+/// read, which is DR-008's seam at the boundary this scan already had. A scan
+/// that has found everything stops where it is, so the last step can name fewer
+/// blocks than the total — that is what finishing early looks like.
+///
 /// # Errors
 ///
-/// [`Error::Io`] if the source cannot be read, naming the offset reached.
-pub(super) fn find<S: Read + Seek>(
+/// [`Error::Io`] if the source cannot be read, naming the offset reached;
+/// [`Error::Cancelled`] if the watcher said to stop.
+pub(super) fn find<S: Read + Seek, W: Watch>(
     source: &mut S,
     anchors: &[Anchor],
+    what: &'static str,
+    watch: &mut W,
 ) -> Result<Vec<Option<Sighting>>> {
     let mut found: Vec<Option<Sighting>> = anchors.iter().map(|_| None).collect();
 
@@ -67,7 +78,13 @@ pub(super) fn find<S: Read + Seek>(
         .map_err(|source| Error::Io { offset: 0, source })?;
 
     let step = u64::try_from(ANCHOR_ALIGN).unwrap_or(u64::MAX);
-    let stride = u64::try_from(STRIDE).unwrap_or(u64::MAX);
+    let stride = u64::try_from(STRIDE).unwrap_or(u64::MAX).max(1);
+    let total = u32::try_from(
+        end.div_euclid(stride)
+            .saturating_add(u64::from(end.rem_euclid(stride) != 0)),
+    )
+    .unwrap_or(u32::MAX);
+    let mut done = 0_u32;
     let mut buffer = vec![0_u8; STRIDE.saturating_add(longest)];
     let mut base: u64 = 0;
     while base < end && !wanted.is_empty() {
@@ -104,6 +121,16 @@ pub(super) fn find<S: Read + Seek>(
         }
 
         base = base.saturating_add(stride);
+        done = done.saturating_add(1);
+        if watch.step(Step {
+            path: what,
+            done,
+            total,
+            bytes: base.min(end),
+        }) == Flow::Stop
+        {
+            return Err(Error::Cancelled { done, total });
+        }
     }
 
     Ok(found)
@@ -143,8 +170,53 @@ mod tests {
 
     use sha1::{Digest, Sha1};
 
-    use super::{Anchor, STRIDE, find};
-    use crate::keys::ANCHOR_DIGEST_LEN;
+    use super::{Anchor, STRIDE, Sighting, find};
+    use crate::{
+        Error, Result, Unwatched,
+        keys::ANCHOR_DIGEST_LEN,
+        watch::{Flow, Step, Watch},
+    };
+
+    /// What the tests here call the material they plant.
+    const SEARCHING: &str = "a planted value";
+
+    /// A search nobody is watching, which is what every test but the last two
+    /// is about.
+    fn look<S: std::io::Read + std::io::Seek>(
+        source: &mut S,
+        anchors: &[Anchor],
+    ) -> Result<Vec<Option<Sighting>>> {
+        find(source, anchors, SEARCHING, &mut Unwatched)
+    }
+
+    /// Every step it was told about.
+    #[derive(Default)]
+    struct Seen(Vec<(String, u32, u32, u64)>);
+
+    impl Watch for Seen {
+        fn step(&mut self, step: Step<'_>) -> Flow {
+            self.0
+                .push((step.path.to_owned(), step.done, step.total, step.bytes));
+            Flow::Continue
+        }
+    }
+
+    /// A watcher that stops after `after` steps.
+    struct Stops {
+        after: u32,
+        seen: u32,
+    }
+
+    impl Watch for Stops {
+        fn step(&mut self, _step: Step<'_>) -> Flow {
+            self.seen += 1;
+            if self.seen >= self.after {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            }
+        }
+    }
 
     /// A block of bytes that will not occur by accident.
     fn planted(seed: u8, len: usize) -> Vec<u8> {
@@ -178,7 +250,7 @@ mod tests {
         let mut hay = haystack(4096);
         plant(&mut hay, 2048, &value);
 
-        let found = find(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
+        let found = look(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
         let sighting = found[0].as_ref().expect("the planted value is found");
         assert_eq!(sighting.offset, 2048);
         assert_eq!(sighting.bytes, value);
@@ -194,7 +266,7 @@ mod tests {
         let mut hay = haystack(4096);
         plant(&mut hay, 2044, &value);
 
-        let found = find(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
+        let found = look(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
         assert!(found[0].is_none(), "an unaligned value was reported found");
     }
 
@@ -205,7 +277,7 @@ mod tests {
         plant(&mut hay, 1024, &value);
         plant(&mut hay, 4096, &value);
 
-        let found = find(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
+        let found = look(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
         assert_eq!(found[0].as_ref().expect("found").offset, 1024);
     }
 
@@ -219,7 +291,7 @@ mod tests {
         let mut hay = haystack(STRIDE * 2);
         plant(&mut hay, at, &value);
 
-        let found = find(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
+        let found = look(&mut Cursor::new(hay), &[anchor(&value)]).unwrap();
         assert_eq!(
             found[0].as_ref().expect("found across the boundary").offset,
             u64::try_from(at).unwrap()
@@ -233,7 +305,7 @@ mod tests {
         let mut hay = haystack(4096);
         plant(&mut hay, 512, &present);
 
-        let found = find(&mut Cursor::new(hay), &[anchor(&present), anchor(&absent)]).unwrap();
+        let found = look(&mut Cursor::new(hay), &[anchor(&present), anchor(&absent)]).unwrap();
         assert!(found[0].is_some());
         assert!(found[1].is_none());
     }
@@ -246,7 +318,7 @@ mod tests {
         let mut hay = haystack(8192);
         plant(&mut hay, 2048, &value);
 
-        let found = find(&mut Cursor::new(hay), &[anchor(&value), anchor(&value)]).unwrap();
+        let found = look(&mut Cursor::new(hay), &[anchor(&value), anchor(&value)]).unwrap();
         assert_eq!(found[0].as_ref().expect("first").offset, 2048);
         assert_eq!(found[1].as_ref().expect("second").offset, 2048);
     }
@@ -254,7 +326,89 @@ mod tests {
     #[test]
     fn a_source_shorter_than_the_value_finds_nothing() {
         let value = planted(23, 1024);
-        let found = find(&mut Cursor::new(haystack(64)), &[anchor(&value)]).unwrap();
+        let found = look(&mut Cursor::new(haystack(64)), &[anchor(&value)]).unwrap();
         assert!(found[0].is_none());
+    }
+
+    #[test]
+    fn a_scan_reports_one_step_per_block_and_counts_bytes_read() {
+        // DR-008's seam at the boundary the scan already had. The step is a
+        // block because that is where the reads are, and where a cancellation
+        // can land.
+        let absent = planted(29, 32);
+        let mut watching = Seen::default();
+        let end = STRIDE * 3 + 17;
+        find(
+            &mut Cursor::new(haystack(end)),
+            &[anchor(&absent)],
+            SEARCHING,
+            &mut watching,
+        )
+        .unwrap();
+
+        assert_eq!(watching.0.len(), 4, "{:?}", watching.0);
+        for (index, &(ref path, done, total, bytes)) in watching.0.iter().enumerate() {
+            assert_eq!(path, SEARCHING, "the step names something else");
+            assert_eq!(done, u32::try_from(index).unwrap() + 1);
+            assert_eq!(total, 4);
+            assert_eq!(
+                bytes,
+                (u64::try_from(STRIDE).unwrap() * u64::from(done)).min(u64::try_from(end).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn a_scan_that_finds_everything_stops_before_the_end() {
+        // The loop already ended early on a complete search; this pins that the
+        // watcher sees it as fewer steps than the total rather than as a stall.
+        let value = planted(31, 32);
+        let mut hay = haystack(STRIDE * 3);
+        plant(&mut hay, 512, &value);
+        let mut watching = Seen::default();
+        find(
+            &mut Cursor::new(hay),
+            &[anchor(&value)],
+            SEARCHING,
+            &mut watching,
+        )
+        .unwrap();
+
+        assert_eq!(watching.0.len(), 1, "{:?}", watching.0);
+        assert_eq!(watching.0[0].1, 1, "done");
+        assert_eq!(watching.0[0].2, 3, "total");
+    }
+
+    #[test]
+    fn a_scan_told_to_stop_stops_and_says_where() {
+        let absent = planted(37, 32);
+        let mut stopping = Stops { after: 2, seen: 0 };
+        let refused = find(
+            &mut Cursor::new(haystack(STRIDE * 4)),
+            &[anchor(&absent)],
+            SEARCHING,
+            &mut stopping,
+        );
+        match refused {
+            Err(Error::Cancelled { done, total }) => {
+                assert_eq!(done, 2);
+                assert_eq!(total, 4);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_source_reports_no_steps_at_all() {
+        let absent = planted(41, 32);
+        let mut watching = Seen::default();
+        find(
+            &mut Cursor::new(Vec::new()),
+            &[anchor(&absent)],
+            SEARCHING,
+            &mut watching,
+        )
+        .unwrap();
+        assert!(watching.0.is_empty(), "{:?}", watching.0);
     }
 }

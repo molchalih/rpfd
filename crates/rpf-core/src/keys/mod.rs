@@ -7,7 +7,7 @@
 //! nothing weaker than the value hashes to it.
 //!
 //! The container itself never reaches this module. An archive whose encryption
-//! tag is not [`crate::format::ENCRYPTION_OPEN`] is refused with
+//! tag its version calls open (see [`crate::format::Version::open`]) is refused with
 //! [`crate::Error::NeedsKey`] before any key is wanted, which is what keeps
 //! every unencrypted path — the whole of the primary workflow — working with no
 //! key material present at all. R2.6.
@@ -25,7 +25,10 @@ use std::{
 
 use scan::{Anchor, Sighting};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    watch::Watch,
+};
 
 /// Length of a SHA-1 digest, which is what a value is anchored by.
 const ANCHOR_DIGEST_LEN: usize = 20;
@@ -91,6 +94,24 @@ const KEYS_WANTED: u32 = 2;
 /// short rather than that "a search" did.
 const KEYS_NAMED: &str = "AES key and hash lookup table";
 
+/// Names the AES-256 key where a failure has to say it was the one missing.
+const AES_KEY_NAMED: &str = "the AES key";
+
+/// Names the hash lookup table, for the same reason.
+const HASH_LUT_NAMED: &str = "the hash lookup table";
+
+/// What [`Keys::extract`] did not find, given what it did.
+///
+/// Both present is not a failure and so does not occur here; it is the arm that
+/// names both, because naming neither would be an answer with nothing in it.
+const fn keys_missing(aes: bool, lut: bool) -> &'static [&'static str] {
+    match (aes, lut) {
+        (false, true) => &[AES_KEY_NAMED],
+        (true, false) => &[HASH_LUT_NAMED],
+        _ => &[AES_KEY_NAMED, HASH_LUT_NAMED],
+    }
+}
+
 impl Keys {
     /// Finds the key material in a game executable.
     ///
@@ -99,11 +120,17 @@ impl Keys {
     /// bytes, so an executable's section table, its packing and its build date
     /// are all beside the point.
     ///
+    /// `watch` is told once per block read and can stop the scan, which is
+    /// DR-008's seam. A caller that wants neither passes
+    /// [`crate::Unwatched`] — the parameter is not optional, because §4 permits
+    /// one spelling per operation.
+    ///
     /// # Errors
     ///
-    /// [`Error::UnrecognisedExecutable`] if either value is missing, naming how
-    /// many of the two were found; [`Error::Io`] if the source cannot be read.
-    pub fn extract<S: Read + Seek>(source: &mut S) -> Result<Self> {
+    /// [`Error::UnrecognisedExecutable`] if either value is missing, naming
+    /// which and how many of the two were found; [`Error::Io`] if the source
+    /// cannot be read; [`Error::Cancelled`] if the watcher said to stop.
+    pub fn extract<S: Read + Seek, W: Watch>(source: &mut S, watch: &mut W) -> Result<Self> {
         let wanted = [
             Anchor {
                 len: AES_KEY_LEN,
@@ -114,7 +141,7 @@ impl Keys {
                 digest: anchors::HASH_LUT,
             },
         ];
-        let mut found = scan::find(source, &wanted)?.into_iter();
+        let mut found = scan::find(source, &wanted, KEYS_NAMED, watch)?.into_iter();
         let aes = found
             .next()
             .flatten()
@@ -135,6 +162,7 @@ impl Keys {
             }),
             (aes, lut) => Err(Error::UnrecognisedExecutable {
                 what: KEYS_NAMED,
+                missing: keys_missing(aes.is_some(), lut.is_some()),
                 found: u32::from(aes.is_some()).saturating_add(u32::from(lut.is_some())),
                 wanted: KEYS_WANTED,
             }),
@@ -194,6 +222,24 @@ const NG_WANTED: usize = NG_EXPANDED_KEY_COUNT.saturating_add(NG_DECRYPT_TABLE_C
 /// Names the material in a failure.
 const NG_NAMED: &str = "NG expanded keys and decrypt tables";
 
+/// Names the expanded keys where a failure has to say they were short.
+const NG_EXPANDED_NAMED: &str = "the expanded keys";
+
+/// Names the decrypt tables, for the same reason.
+const NG_TABLES_NAMED: &str = "the decrypt tables";
+
+/// Which kinds [`NgKeys::extract`] is short of, given what each found.
+///
+/// The kind rather than the value: 373 names is not something a caller acts on,
+/// and `found` against `wanted` already says how many are missing.
+const fn ng_missing(expanded: bool, tables: bool) -> &'static [&'static str] {
+    match (expanded, tables) {
+        (false, true) => &[NG_EXPANDED_NAMED],
+        (true, false) => &[NG_TABLES_NAMED],
+        _ => &[NG_EXPANDED_NAMED, NG_TABLES_NAMED],
+    }
+}
+
 /// The NG key material: 101 expanded keys and 272 decrypt tables.
 ///
 /// **No executable this was measured against carries it, so the extraction
@@ -222,8 +268,13 @@ impl NgKeys {
     /// # Errors
     ///
     /// [`Error::UnrecognisedExecutable`] unless every one of the 373 values is
-    /// there, naming how many were; [`Error::Io`] if the source cannot be read.
-    pub fn extract<S: Read + Seek>(source: &mut S) -> Result<Self> {
+    /// there, naming which kinds are short and how many were found;
+    /// [`Error::Io`] if the source cannot be read; [`Error::Cancelled`] if the
+    /// watcher said to stop.
+    ///
+    /// This is the survey DR-017 measures at about a minute over 373 anchors,
+    /// so it is the call that actually wants a watcher.
+    pub fn extract<S: Read + Seek, W: Watch>(source: &mut S, watch: &mut W) -> Result<Self> {
         let mut wanted =
             Vec::with_capacity(NG_EXPANDED_KEY_COUNT.saturating_add(NG_DECRYPT_TABLE_COUNT));
         for digest in anchors::NG_EXPANDED_KEYS {
@@ -239,26 +290,33 @@ impl NgKeys {
             });
         }
 
-        let found = scan::find(source, &wanted)?;
+        let found = scan::find(source, &wanted, NG_NAMED, watch)?;
         let mut expanded = Vec::new();
         let mut tables = Vec::new();
-        let mut hits = 0_usize;
+        let mut expanded_hits = 0_usize;
+        let mut table_hits = 0_usize;
         for (anchor, sighting) in wanted.iter().zip(found.iter()) {
             let Some(sighting) = sighting else { continue };
             if sighting.bytes.len() != anchor.len {
                 continue;
             }
-            hits = hits.saturating_add(1);
             if anchor.len == NG_EXPANDED_KEY_LEN {
+                expanded_hits = expanded_hits.saturating_add(1);
                 expanded.extend_from_slice(&sighting.bytes);
             } else {
+                table_hits = table_hits.saturating_add(1);
                 tables.extend_from_slice(&sighting.bytes);
             }
         }
 
+        let hits = expanded_hits.saturating_add(table_hits);
         if hits != NG_WANTED {
             return Err(Error::UnrecognisedExecutable {
                 what: NG_NAMED,
+                missing: ng_missing(
+                    expanded_hits == NG_EXPANDED_KEY_COUNT,
+                    table_hits == NG_DECRYPT_TABLE_COUNT,
+                ),
                 found: u32::try_from(hits).unwrap_or(u32::MAX),
                 wanted: u32::try_from(NG_WANTED).unwrap_or(u32::MAX),
             });
@@ -300,5 +358,47 @@ impl fmt::Debug for NgKeys {
             .field("expanded_keys", &NG_EXPANDED_KEY_COUNT)
             .field("decrypt_tables", &NG_DECRYPT_TABLE_COUNT)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AES_KEY_NAMED, HASH_LUT_NAMED, NG_EXPANDED_NAMED, NG_TABLES_NAMED, keys_missing, ng_missing,
+    };
+
+    #[test]
+    fn a_half_found_search_names_the_half_it_did_not_find() {
+        // The arm no synthetic source can reach: producing "1 of 2" needs the
+        // real value, which DR-006 keeps out of this repository. The decision
+        // is a function of two booleans precisely so it can be tested without
+        // one.
+        assert_eq!(keys_missing(true, false), [HASH_LUT_NAMED]);
+        assert_eq!(keys_missing(false, true), [AES_KEY_NAMED]);
+        assert_eq!(keys_missing(false, false), [AES_KEY_NAMED, HASH_LUT_NAMED]);
+        assert_eq!(ng_missing(true, false), [NG_TABLES_NAMED]);
+        assert_eq!(ng_missing(false, true), [NG_EXPANDED_NAMED]);
+        assert_eq!(
+            ng_missing(false, false),
+            [NG_EXPANDED_NAMED, NG_TABLES_NAMED]
+        );
+    }
+
+    #[test]
+    fn nothing_a_failure_names_is_a_value() {
+        // DR-006 checked where it is easiest to lose: these strings are the
+        // only new thing an `UnrecognisedExecutable` renders, and they are
+        // written here rather than derived from anything that was read.
+        for name in [
+            AES_KEY_NAMED,
+            HASH_LUT_NAMED,
+            NG_EXPANDED_NAMED,
+            NG_TABLES_NAMED,
+        ] {
+            assert!(
+                name.is_ascii() && name.starts_with("the "),
+                "a name that is not a name: {name}"
+            );
+        }
     }
 }

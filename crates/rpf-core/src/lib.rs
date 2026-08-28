@@ -6,7 +6,9 @@
 //!
 //! Every constant and decode in [`format`] cites the row of `docs/rpf-format.md`
 //! it comes from. A fact is encoded here exactly once (§3), so that changing it
-//! is one edit rather than a search.
+//! is one edit rather than a search — and every fact that is one *version's*
+//! rather than the container's lives behind [`format::Version`], the seam
+//! DR-012 asks for. `RPF7` is its only implementation.
 
 pub mod archive;
 pub mod build;
@@ -18,16 +20,19 @@ pub mod keys;
 pub mod manifest;
 pub mod name;
 pub mod patch;
+pub mod scratch;
 pub mod watch;
 
 pub use archive::{Archive, MAX_DEPTH};
 pub use build::{
-    FileKind, FileSpec, Report, Storage, build, directories_of, rebuild, replace_at, replace_many,
+    FileKind, FileSpec, Payload, Report, Storage, build, directories_of, rebuild, replace_many,
     specs_of,
 };
 pub use entry::{Entry, EntryKind};
 pub use error::{Category, Error, Result};
+pub use format::{Codec, Version};
 pub use inspect::{Listed, ListedKind, Problem, Summary, Verified};
-pub use manifest::{MANIFEST_NAME, Manifest};
+pub use manifest::{Checksum, MANIFEST_NAME, Manifest};
 pub use patch::{Patches, Plan, Planned, TooLarge, plan};
+pub use scratch::{InMemory, Scratch};
 pub use watch::{Flow, Step, Unwatched, Watch};

@@ -18,9 +18,9 @@ use crate::{
     entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
-        BLOCK_LEN, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7, MAGIC_RSC7,
-        RESOURCE_HEADER_LEN, folded, payload_floor, resource_len, same_name, u32_at,
-        unsupported_version,
+        Header, MAX_HEADER_LEN, Names, Version, folded,
+        resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, resource_len},
+        same_name,
     },
 };
 
@@ -163,33 +163,15 @@ fn inflate(entry: u32, raw: &[u8], expected: u64) -> Result<Payload> {
 pub struct Archive {
     base: u64,
     len: u64,
+    version: Version,
     encryption: u32,
     /// How many archives this one sits inside. Zero for a file opened on its
     /// own, and one more than its holder's for every nested archive, which is
     /// what [`MAX_DEPTH`] is counted against.
     depth: u32,
     entries: Vec<Entry>,
-    names: Vec<NameSpan>,
+    names: Names,
     parents: Vec<Option<u32>>,
-    names_blob: Vec<u8>,
-}
-
-/// Where one entry's name lies in the names blob.
-///
-/// A span rather than an owned `String`, because nothing stops an archive
-/// pointing every entry at one long name: materialising each copy makes the
-/// cost of *opening* the archive `entry_count × names_len`. Measured before
-/// this was a span — 40,000 entries over a 40,000-byte blob, a 680,016-byte
-/// file — 1,980,317,696 bytes of resident memory in 4.2 seconds, and ~7 MB of
-/// input would have asked for ~200 GB. `Archive::open` is on the path of every
-/// command and every daemon session, so that is a small file away from every
-/// caller.
-#[derive(Debug, Clone, Copy)]
-struct NameSpan {
-    /// Offset into the names blob.
-    at: u32,
-    /// Length in bytes, up to but not including the terminator.
-    len: u32,
 }
 
 impl Archive {
@@ -227,35 +209,34 @@ impl Archive {
         }
 
         let Header {
+            version,
             entry_count,
             names_len,
             encryption,
         } = read_header(src, base)?;
+        let table_at = version.header_len();
 
-        let table_len =
-            u64::from(entry_count)
-                .checked_mul(ENTRY_LEN)
-                .ok_or(Error::OutOfBounds {
-                    region: "entry table",
-                    offset: HEADER_LEN,
-                    len: u64::MAX,
-                    archive_len: len,
-                })?;
-        let names_at = HEADER_LEN
-            .checked_add(table_len)
+        let table_len = u64::from(entry_count)
+            .checked_mul(version.row_len())
             .ok_or(Error::OutOfBounds {
                 region: "entry table",
-                offset: HEADER_LEN,
-                len: table_len,
+                offset: table_at,
+                len: u64::MAX,
                 archive_len: len,
             })?;
+        let names_at = table_at.checked_add(table_len).ok_or(Error::OutOfBounds {
+            region: "entry table",
+            offset: table_at,
+            len: table_len,
+            archive_len: len,
+        })?;
         // Checked before the names blob, so that a header claiming more
         // entries than the file can hold names the entry table rather than the
         // blob that never got a chance to start (§10).
         if names_at > len {
             return Err(Error::OutOfBounds {
                 region: "entry table",
-                offset: HEADER_LEN,
+                offset: table_at,
                 len: table_len,
                 archive_len: len,
             });
@@ -277,8 +258,8 @@ impl Archive {
             });
         }
 
-        let table = read_vec_at(src, base.checked_add(HEADER_LEN).unwrap_or(base), table_len)?;
-        let entries = parse_entries(&table, entry_count)?;
+        let table = read_vec_at(src, base.checked_add(table_at).unwrap_or(base), table_len)?;
+        let entries = parse_entries(version, &table, entry_count)?;
 
         let names_blob = read_vec_at(
             src,
@@ -287,21 +268,21 @@ impl Archive {
         )?;
 
         // Names are located once, here, so that `name` has nothing left to
-        // find (§5). What it costs is one pass over the blob, not one scan and
-        // one allocation per entry — see [`NameSpan`].
-        let names = resolve_names(&names_blob, &entries)?;
+        // find (§5). How they are encoded is the version's, which is why the
+        // seam is asked rather than the blob read here.
+        let names = Names::parse(version, names_blob, &entries)?;
 
         let parents = parse_parents(&entries)?;
 
         Ok(Self {
             base,
             len,
+            version,
             encryption,
             depth,
             entries,
             names,
             parents,
-            names_blob,
         })
     }
 
@@ -329,7 +310,13 @@ impl Archive {
         self.len
     }
 
-    /// The archive's encryption tag. Always [`ENCRYPTION_OPEN`] for now, since
+    /// The container version this archive is.
+    #[must_use]
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+
+    /// The archive's encryption tag. Always [`Version::open`] for now, since
     /// anything else is refused at parse.
     #[must_use]
     pub const fn encryption(&self) -> u32 {
@@ -345,7 +332,7 @@ impl Archive {
     /// The names blob exactly as it appears on disk.
     #[must_use]
     pub fn names_blob(&self) -> &[u8] {
-        &self.names_blob
+        self.names.blob()
     }
 
     /// One entry by index.
@@ -373,24 +360,7 @@ impl Archive {
     /// answer for third-party bytes, and it is a name the caller can be shown
     /// rather than a repair it cannot check.
     pub fn name(&self, index: u32) -> Result<&str> {
-        let span = usize::try_from(index)
-            .ok()
-            .and_then(|i| self.names.get(i))
-            .copied()
-            .ok_or(Error::NoSuchEntry {
-                index,
-                entry_count: count_of(&self.entries),
-            })?;
-
-        let bad = || Error::BadName {
-            entry: index,
-            name_offset: span.at,
-            names_len: u32::try_from(self.names_blob.len()).unwrap_or(u32::MAX),
-        };
-        let start = usize::try_from(span.at).unwrap_or(usize::MAX);
-        let end = start.saturating_add(usize::try_from(span.len).unwrap_or(usize::MAX));
-        let raw = self.names_blob.get(start..end).ok_or_else(bad)?;
-        std::str::from_utf8(raw).map_err(|_| bad())
+        self.names.at(index)
     }
 
     /// The full path of an entry, addressed from the archive root.
@@ -573,7 +543,7 @@ impl Archive {
         };
 
         let relative = u64::from(block)
-            .checked_mul(BLOCK_LEN)
+            .checked_mul(self.version.block_len())
             .ok_or(Error::OutOfBounds {
                 region: "payload",
                 offset: 0,
@@ -586,9 +556,9 @@ impl Archive {
         // reads back the table of contents, which is a plausible-but-wrong
         // value rather than a failure, and `allocation` then offers those same
         // bytes to a patch as room to write into.
-        let floor = payload_floor(
+        let floor = self.version.payload_floor(
             u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
-            u64::try_from(self.names_blob.len()).unwrap_or(u64::MAX),
+            u64::try_from(self.names.blob().len()).unwrap_or(u64::MAX),
         );
         if relative < floor {
             return Err(Error::PayloadUnderflow {
@@ -698,14 +668,14 @@ impl Archive {
     /// [`Error::NoSuchEntry`] if the index is past the end.
     pub fn row_at(&self, index: u32) -> Result<u64> {
         let _ = self.entry(index)?;
-        let offset = u64::from(index)
-            .checked_mul(ENTRY_LEN)
-            .and_then(|by| HEADER_LEN.checked_add(by))
-            .and_then(|by| self.base.checked_add(by))
+        let offset = self
+            .version
+            .row_at(index)
+            .and_then(|at| self.base.checked_add(at))
             .ok_or(Error::OutOfBounds {
                 region: "entry table",
-                offset: HEADER_LEN,
-                len: ENTRY_LEN,
+                offset: self.version.header_len(),
+                len: self.version.row_len(),
                 archive_len: self.len,
             })?;
         Ok(offset)
@@ -991,34 +961,27 @@ impl Archive {
     }
 }
 
-/// The three fields of an RPF7 header that say anything about the archive.
-///
-/// `docs/rpf-format.md`, RPF7 header, `verified`. The magic is not carried
-/// because a [`Header`] cannot exist without it having matched, and the length
-/// is not in the header at all.
-struct Header {
-    entry_count: u32,
-    names_len: u32,
-    encryption: u32,
-}
-
 /// Reads the header at `base`, or says why those bytes are not one.
+///
+/// The bytes are fetched here and decoded behind the seam: which fields a
+/// header has, and how many bytes it occupies, are the version's.
+/// [`Header::read`].
 ///
 /// Leaves the source positioned wherever the read ended; every read after this
 /// one seeks for itself.
 fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
-    // Read as much of the header as there is. A file too short to hold one is
-    // not an archive, which is a better answer than "i/o failure" — nothing
-    // failed, the bytes simply are not there.
+    // Read as much of the longest header any version has as there is. A file
+    // too short to hold one is not an archive, which is a better answer than
+    // "i/o failure" — nothing failed, the bytes simply are not there.
     src.seek(SeekFrom::Start(base))
         .map_err(|source| Error::Io {
             offset: base,
             source,
         })?;
-    let mut header = [0u8; 16];
+    let mut bytes = [0u8; MAX_HEADER_LEN];
     let mut filled = 0_usize;
-    while filled < header.len() {
-        let rest = header.get_mut(filled..).unwrap_or_default();
+    while filled < bytes.len() {
+        let rest = bytes.get_mut(filled..).unwrap_or_default();
         let read = src.read(rest).map_err(|source| Error::Io {
             offset: base,
             source,
@@ -1029,43 +992,15 @@ fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
         filled = filled.saturating_add(read);
     }
 
-    let magic: [u8; 4] = header
-        .get(0..4)
-        .and_then(|s| s.try_into().ok())
-        .unwrap_or_default();
-    // Too short to hold a header is not an archive of any version: nothing past
-    // the magic can be trusted, so the magic is not worth reading a version out
-    // of either.
-    if filled < header.len() {
-        return Err(Error::NotAnArchive { base, found: magic });
-    }
-    if magic != MAGIC_RPF7 {
-        // The version is in the first four bytes, and discarding it reported a
-        // sound archive of another version as a malformed one. DR-012.
-        return Err(match unsupported_version(magic) {
-            Some(version) => Error::UnsupportedVersion {
-                base,
-                version,
-                found: magic,
-            },
-            None => Error::NotAnArchive { base, found: magic },
-        });
-    }
-
-    // Every field below is inside the sixteen bytes just filled, so the default
-    // is unreachable rather than a decision about a short header.
-    let encryption = u32_at(&header, 12).unwrap_or_default();
+    let header = Header::read(bytes.get(0..filled).unwrap_or_default(), base)?;
     // Every encrypted path is R2. Refusing here, with a distinct variant, keeps
     // "cannot open this" separate from "this is broken". R6.3.
-    if encryption != ENCRYPTION_OPEN {
-        return Err(Error::NeedsKey { tag: encryption });
+    if !header.version.is_open(header.encryption) {
+        return Err(Error::NeedsKey {
+            tag: header.encryption,
+        });
     }
-
-    Ok(Header {
-        entry_count: u32_at(&header, 4).unwrap_or_default(),
-        names_len: u32_at(&header, 8).unwrap_or_default(),
-        encryption,
-    })
+    Ok(header)
 }
 
 /// How many entries, saturating rather than truncating.
@@ -1073,104 +1008,28 @@ fn count_of(entries: &[Entry]) -> u32 {
     u32::try_from(entries.len()).unwrap_or(u32::MAX)
 }
 
-/// Splits the entry table into rows.
-fn parse_entries(table: &[u8], entry_count: u32) -> Result<Vec<Entry>> {
-    let stride = usize::try_from(ENTRY_LEN).unwrap_or(16);
+/// Splits the entry table into rows, at the stride its version gives them.
+fn parse_entries(version: Version, table: &[u8], entry_count: u32) -> Result<Vec<Entry>> {
+    let row_len = version.row_len();
+    let stride = usize::try_from(row_len).unwrap_or(usize::MAX);
+    let overrun = || Error::OutOfBounds {
+        region: "entry table",
+        offset: version.header_len(),
+        len: u64::from(entry_count).saturating_mul(row_len),
+        archive_len: 0,
+    };
     let mut entries = Vec::new();
     for index in 0..entry_count {
         let start = usize::try_from(index)
             .ok()
             .and_then(|i| i.checked_mul(stride))
-            .ok_or(Error::OutOfBounds {
-                region: "entry table",
-                offset: HEADER_LEN,
-                len: u64::from(entry_count).saturating_mul(ENTRY_LEN),
-                archive_len: 0,
-            })?;
-        let end = start.checked_add(stride).ok_or(Error::OutOfBounds {
-            region: "entry table",
-            offset: HEADER_LEN,
-            len: u64::from(entry_count).saturating_mul(ENTRY_LEN),
-            archive_len: 0,
-        })?;
-        let row = table.get(start..end).ok_or(Error::OutOfBounds {
-            region: "entry table",
-            offset: HEADER_LEN,
-            len: u64::from(entry_count).saturating_mul(ENTRY_LEN),
-            archive_len: 0,
-        })?;
-        let entry = Entry::parse(row).ok_or(Error::OutOfBounds {
-            region: "entry table",
-            offset: HEADER_LEN,
-            len: u64::from(entry_count).saturating_mul(ENTRY_LEN),
-            archive_len: 0,
-        })?;
+            .ok_or_else(overrun)?;
+        let end = start.checked_add(stride).ok_or_else(overrun)?;
+        let row = table.get(start..end).ok_or_else(overrun)?;
+        let entry = version.decode_row(row).ok_or_else(overrun)?;
         entries.push(entry);
     }
     Ok(entries)
-}
-
-/// Locates every entry's name in the names blob, refusing anything that is not
-/// a terminated string inside it.
-///
-/// The blob is `namesLength` bytes and no more, never the backing buffer: the
-/// bytes after it can be stale names from a previous pack. `docs/rpf-format.md`,
-/// Slack.
-///
-/// Distinct name offsets are visited in ascending order and share one cursor,
-/// so finding every terminator costs one pass over the blob rather than one
-/// scan per entry. That is the same reason the result is a span and not a
-/// `String`: both readings are `entry_count × names_len` when an archive points
-/// every entry at one long name, and an archive may.
-fn resolve_names(blob: &[u8], entries: &[Entry]) -> Result<Vec<NameSpan>> {
-    let names_len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
-    // The entry index is what a caller needs to act on, and the offset is
-    // shared, so the first entry carrying it is the one reported.
-    let bad = |name_offset: u32| Error::BadName {
-        entry: entries
-            .iter()
-            .position(|entry| entry.name_offset == name_offset)
-            .and_then(|index| u32::try_from(index).ok())
-            .unwrap_or(u32::MAX),
-        name_offset,
-        names_len,
-    };
-
-    let mut offsets: Vec<u32> = entries.iter().map(|entry| entry.name_offset).collect();
-    offsets.sort_unstable();
-    offsets.dedup();
-
-    let mut located: Vec<NameSpan> = Vec::with_capacity(offsets.len());
-    let mut cursor = 0_usize;
-    for &at in &offsets {
-        let start = usize::try_from(at).map_err(|_| bad(at))?;
-        if start >= blob.len() {
-            return Err(bad(at));
-        }
-        if cursor < start {
-            cursor = start;
-        }
-        while blob.get(cursor).is_some_and(|&byte| byte != 0) {
-            cursor = cursor.saturating_add(1);
-        }
-        if cursor >= blob.len() {
-            return Err(bad(at));
-        }
-        let len = u32::try_from(cursor.saturating_sub(start)).map_err(|_| bad(at))?;
-        located.push(NameSpan { at, len });
-    }
-
-    entries
-        .iter()
-        .map(|entry| {
-            offsets
-                .binary_search(&entry.name_offset)
-                .ok()
-                .and_then(|index| located.get(index))
-                .copied()
-                .ok_or_else(|| bad(entry.name_offset))
-        })
-        .collect()
 }
 
 /// Builds the child-to-parent map, and with it establishes that the entries are

@@ -31,7 +31,7 @@ use std::{
 };
 
 use rpf_core::{
-    Category, Error,
+    Category, Error, Flow, Step, Unwatched, Watch,
     keys::{
         AES_KEY_LEN, Cache, HASH_LUT_LEN, Keys, NG_COLUMNS, NG_DECRYPT_TABLE_COUNT,
         NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NG_ROUNDS, NgKeys,
@@ -85,7 +85,8 @@ struct Measured {
 fn measure(test: &str, name: &str) -> Option<Measured> {
     let path = executable(test, name)?;
     let bytes = fs::read(&path).expect("the executable is readable");
-    let keys = Keys::extract(&mut Cursor::new(bytes)).expect("the executable carries the material");
+    let keys = Keys::extract(&mut Cursor::new(bytes), &mut Unwatched)
+        .expect("the executable carries the material");
     let measured = Measured {
         aes_key: digest(keys.aes_key()),
         aes_key_offset: keys.aes_key_offset(),
@@ -102,10 +103,11 @@ fn measure(test: &str, name: &str) -> Option<Measured> {
 #[test]
 fn a_source_carrying_nothing_is_refused_by_name_and_by_count() {
     let nothing = vec![0_u8; 1 << 16];
-    let refused = Keys::extract(&mut Cursor::new(nothing));
+    let refused = Keys::extract(&mut Cursor::new(nothing), &mut Unwatched);
     match refused {
         Err(Error::UnrecognisedExecutable {
             what,
+            missing,
             found,
             wanted,
         }) => {
@@ -115,6 +117,73 @@ fn a_source_carrying_nothing_is_refused_by_name_and_by_count() {
                 what.contains("AES key"),
                 "the failure does not name the material: {what}"
             );
+            assert_eq!(
+                missing,
+                ["the AES key", "the hash lookup table"],
+                "a count is not which value was missing"
+            );
+        }
+        other => panic!("expected UnrecognisedExecutable, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_failure_says_which_value_was_missing_and_never_what_it_holds() {
+    // "1 of 2" is not something a caller acts on. Which of the two it was, is.
+    // Rendered rather than matched here, because the rendering is what reaches
+    // a bug report — and the rendering is the path a key would leak down.
+    let refused = Keys::extract(&mut Cursor::new(vec![0_u8; 1 << 16]), &mut Unwatched)
+        .expect_err("a buffer of zeroes carries no key material");
+    let message = refused.to_string();
+    assert!(message.contains("0 of 2"), "{message}");
+    assert!(
+        message.contains("missing the AES key and the hash lookup table"),
+        "{message}"
+    );
+
+    let ng = NgKeys::extract(&mut Cursor::new(vec![0_u8; 1 << 16]), &mut Unwatched)
+        .expect_err("a buffer of zeroes carries no NG material");
+    let message = ng.to_string();
+    assert!(message.contains("0 of 373"), "{message}");
+    assert!(
+        message.contains("missing the expanded keys and the decrypt tables"),
+        "{message}"
+    );
+}
+
+#[test]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn an_executable_carrying_one_value_is_told_which_one_it_is_short_of() {
+    // The half-found case, on the only input that can produce it: a real
+    // executable cut off after the first of its two values. Nothing is planted,
+    // nothing is written, and the assertion is on a name and a count.
+    let test = "an_executable_carrying_one_value_is_told_which_one_it_is_short_of";
+    let Some(path) = executable(test, "GTA5.exe") else {
+        return;
+    };
+    let bytes = fs::read(&path).expect("the executable is readable");
+    let whole = Keys::extract(&mut Cursor::new(&bytes), &mut Unwatched).expect("carries both");
+
+    // Cut just past the earlier of the two, so the later one is not there.
+    let (first, first_len, later) = if whole.aes_key_offset() < whole.hash_lut_offset() {
+        (whole.aes_key_offset(), AES_KEY_LEN, "the hash lookup table")
+    } else {
+        (whole.hash_lut_offset(), HASH_LUT_LEN, "the AES key")
+    };
+    let cut = usize::try_from(first).expect("fits") + first_len;
+    let mut short = bytes;
+    short.truncate(cut);
+
+    match Keys::extract(&mut Cursor::new(short), &mut Unwatched) {
+        Err(Error::UnrecognisedExecutable {
+            missing,
+            found,
+            wanted,
+            ..
+        }) => {
+            assert_eq!(found, 1, "the truncation removed both values");
+            assert_eq!(wanted, 2);
+            assert_eq!(missing, [later]);
         }
         other => panic!("expected UnrecognisedExecutable, got {other:?}"),
     }
@@ -124,18 +193,90 @@ fn a_source_carrying_nothing_is_refused_by_name_and_by_count() {
 fn an_unrecognised_executable_is_not_the_callers_fault_to_fix() {
     // The file is intact and this build is what cannot read it, which is the
     // same shape as an RPF version we do not implement. DR-010.
-    let refused = Keys::extract(&mut Cursor::new(vec![0_u8; 4096]))
+    let refused = Keys::extract(&mut Cursor::new(vec![0_u8; 4096]), &mut Unwatched)
         .expect_err("nothing is in an empty buffer");
     assert_eq!(refused.category(), Category::Unsupported);
 }
 
 #[test]
 fn an_empty_source_is_refused_rather_than_read_past() {
-    let refused = Keys::extract(&mut Cursor::new(Vec::new()));
+    let refused = Keys::extract(&mut Cursor::new(Vec::new()), &mut Unwatched);
     assert!(matches!(
         refused,
         Err(Error::UnrecognisedExecutable { found: 0, .. })
     ));
+}
+
+/// A watcher that counts what it was told and can stop the scan.
+struct Counting {
+    steps: u32,
+    named: Option<String>,
+    stop_after: Option<u32>,
+}
+
+impl Watch for Counting {
+    fn step(&mut self, step: Step<'_>) -> Flow {
+        self.steps += 1;
+        self.named = Some(step.path.to_owned());
+        assert!(step.done <= step.total, "{} of {}", step.done, step.total);
+        match self.stop_after {
+            Some(after) if self.steps >= after => Flow::Stop,
+            _ => Flow::Continue,
+        }
+    }
+}
+
+#[test]
+fn an_extraction_can_be_watched_and_stopped_from_outside_the_crate() {
+    // DR-008's seam, reachable. DR-020 decided the *command* stays unwatched
+    // because one pass over one executable is about a second; that stands and
+    // is its call to make. What could not be done at all was passing a watcher,
+    // and this is the test that it now can be — from outside the crate, which
+    // is where the frontends and the NG survey are.
+    let mut watching = Counting {
+        steps: 0,
+        named: None,
+        stop_after: None,
+    };
+    let refused = Keys::extract(&mut Cursor::new(vec![0_u8; 3 << 20]), &mut watching);
+    assert!(refused.is_err(), "a buffer of zeroes carried key material");
+    assert_eq!(watching.steps, 3, "one step per block of the source");
+    assert_eq!(
+        watching.named.as_deref(),
+        Some("AES key and hash lookup table"),
+        "the step does not name the material being looked for"
+    );
+
+    let mut stopping = Counting {
+        steps: 0,
+        named: None,
+        stop_after: Some(1),
+    };
+    let stopped = Keys::extract(&mut Cursor::new(vec![0_u8; 3 << 20]), &mut stopping);
+    match stopped {
+        Err(Error::Cancelled { done, total }) => {
+            assert_eq!(done, 1);
+            assert_eq!(total, 3);
+        }
+        other => panic!("expected Cancelled, got {other:?}"),
+    }
+    assert_eq!(
+        stopped_category(),
+        Category::Cancelled,
+        "a stop is the caller's, not a refusal of ours"
+    );
+}
+
+/// The category a stopped scan carries, said once so the test above reads.
+fn stopped_category() -> Category {
+    let mut stopping = Counting {
+        steps: 0,
+        named: None,
+        stop_after: Some(1),
+    };
+    Keys::extract(&mut Cursor::new(vec![0_u8; 2 << 20]), &mut stopping)
+        .expect_err("the watcher said stop")
+        .category()
 }
 
 #[test]
@@ -163,10 +304,11 @@ fn the_lengths_are_the_ones_the_format_uses() {
 
 #[test]
 fn the_ng_material_is_refused_whole_rather_than_in_part() {
-    let refused = NgKeys::extract(&mut Cursor::new(vec![0_u8; 1 << 16]));
+    let refused = NgKeys::extract(&mut Cursor::new(vec![0_u8; 1 << 16]), &mut Unwatched);
     match refused {
         Err(Error::UnrecognisedExecutable {
             what,
+            missing,
             found,
             wanted,
         }) => {
@@ -177,6 +319,11 @@ fn the_ng_material_is_refused_whole_rather_than_in_part() {
                 "the count asked for is not the number of values there are"
             );
             assert!(what.contains("NG"), "the failure does not name NG: {what}");
+            assert_eq!(
+                missing,
+                ["the expanded keys", "the decrypt tables"],
+                "the two kinds are what a caller can act on, not 373 names"
+            );
         }
         other => panic!("expected UnrecognisedExecutable, got {other:?}"),
     }
@@ -216,7 +363,8 @@ fn an_extracted_key_never_prints_itself() {
         return;
     };
     let bytes = fs::read(&path).expect("the executable is readable");
-    let keys = Keys::extract(&mut Cursor::new(bytes)).expect("carries the material");
+    let keys =
+        Keys::extract(&mut Cursor::new(bytes), &mut Unwatched).expect("carries the material");
 
     let rendered = format!("{keys:?}");
     assert!(
@@ -279,7 +427,7 @@ fn no_executable_here_carries_the_ng_material() {
             return;
         };
         let bytes = fs::read(&path).expect("the executable is readable");
-        let refused = NgKeys::extract(&mut Cursor::new(bytes));
+        let refused = NgKeys::extract(&mut Cursor::new(bytes), &mut Unwatched);
         match refused {
             Err(Error::UnrecognisedExecutable { found, wanted, .. }) => {
                 eprintln!("{name}: {found} of {wanted} NG values");
@@ -306,12 +454,58 @@ fn the_platform_cache_is_an_absolute_directory_of_this_tool_s_own() {
         "{} is relative, so the cache would follow the working directory",
         cache.directory().display()
     );
+    // Below the application's configuration directory rather than being it. A
+    // cache directory that *is* the configuration directory puts any later
+    // configuration file inside the thing `keys invalidate` empties. DR-024.
     assert_eq!(
         cache.directory().file_name().and_then(|name| name.to_str()),
+        Some("keys"),
+        "{}",
+        cache.directory().display()
+    );
+    assert_eq!(
+        cache
+            .directory()
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str()),
         Some("rpf"),
         "{}",
         cache.directory().display()
     );
+}
+
+#[test]
+fn a_caller_can_enumerate_and_empty_the_cache_without_knowing_how_it_names_files() {
+    // §1 and §3 together. A frontend that has to work out for itself which
+    // files under the directory are entries has taken over a rule the cache
+    // owns, and it took it over wrongly: counting regular files counts anything
+    // that happens to be there. This is the API that makes that unnecessary,
+    // pinned from outside the crate because outside the crate is where it is
+    // needed.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let absent = directory.path().join("never-written");
+    let cache = Cache::at(&absent);
+
+    assert!(cache.entries().expect("reads").is_empty());
+    assert_eq!(cache.clear().expect("clears"), 0, "an empty cache removed");
+    assert!(!absent.exists(), "asking about a cache created one");
+
+    let populated = Cache::at(directory.path());
+    let beside = directory.path().join("settings.json");
+    fs::write(&beside, b"{}").expect("writable");
+    fs::create_dir(directory.path().join("held")).expect("creatable");
+    assert!(
+        populated.entries().expect("reads").is_empty(),
+        "a file beside the entries was counted as one"
+    );
+    assert_eq!(populated.clear().expect("clears"), 0);
+    assert_eq!(
+        fs::read(&beside).expect("readable"),
+        b"{}",
+        "a file the cache did not write was removed"
+    );
+    assert!(directory.path().join("held").is_dir());
 }
 
 #[test]
@@ -326,7 +520,8 @@ fn material_extracted_from_an_executable_reads_back_from_the_cache() {
     };
     let bytes = fs::read(&path).expect("the executable is readable");
     let source = SourceDigest::of(&mut Cursor::new(&bytes)).expect("digests");
-    let keys = Keys::extract(&mut Cursor::new(&bytes)).expect("carries the material");
+    let keys =
+        Keys::extract(&mut Cursor::new(&bytes), &mut Unwatched).expect("carries the material");
 
     let directory = tempfile::tempdir().expect("a temporary directory");
     let cache = Cache::at(directory.path());
@@ -339,4 +534,18 @@ fn material_extracted_from_an_executable_reads_back_from_the_cache() {
     assert_eq!(cached.aes_key_offset(), keys.aes_key_offset());
     assert_eq!(cached.hash_lut_offset(), keys.hash_lut_offset());
     eprintln!("GTA5.exe sha256 {}", source.hex());
+
+    // The entry is addressable by the digest it was stored under, and clearing
+    // takes it off the machine. Real material rather than a fixture, because
+    // this is the one place both ends of R2.4 are the real thing.
+    let held: Vec<String> = cache
+        .entries()
+        .expect("reads")
+        .iter()
+        .map(SourceDigest::hex)
+        .collect();
+    assert_eq!(held, vec![source.hex()]);
+    assert_eq!(cache.clear().expect("clears"), 1);
+    assert!(cache.entries().expect("reads").is_empty());
+    assert!(cache.load(&source).expect("reads").is_none());
 }

@@ -13,7 +13,7 @@
 
 use std::{
     fs,
-    io::{BufRead as _, Write as _},
+    io::{BufRead as _, Cursor, Write as _},
     path::Path,
     process::{Command, Stdio},
 };
@@ -61,14 +61,15 @@ fn make_archive(at: &Path) -> Vec<u8> {
     let mut out = fs::File::create(at).expect("creatable");
     rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &[],
         |wanted| {
-            Ok(if wanted == "art.yft" {
+            Ok(Cursor::new(if wanted == "art.yft" {
                 payload.clone()
             } else {
                 b"hello there".to_vec()
-            })
+            }))
         },
         &mut Unwatched,
     )
@@ -93,9 +94,10 @@ fn make_colliding_archive(at: &Path) -> Vec<u8> {
     let mut out = Vec::new();
     rpf_core::build(
         &mut std::io::Cursor::new(&mut out),
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(b"payload".to_vec()),
+        |_| Ok(Cursor::new(b"payload".to_vec())),
         &mut Unwatched,
     )
     .expect("two distinct names build");
@@ -709,7 +711,15 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
         .collect();
     let bulk = incompressible(512 * 1024);
     let mut out = fs::File::create(&archive).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(bulk.clone()), &mut Unwatched).expect("builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(bulk.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
     drop(out);
     let before = fs::read(&archive).expect("readable");
 
@@ -798,7 +808,15 @@ fn make_bulk_archive(at: &Path, entries: u32, payload: usize) {
         .collect();
     let bytes = vec![0_u8; payload];
     let mut out = fs::File::create(at).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(bytes.clone()), &mut Unwatched).expect("builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(bytes.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
 }
 
 #[test]
@@ -942,7 +960,15 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
         .collect();
     let bulk = incompressible(512 * 1024);
     let mut out = fs::File::create(&archive).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(bulk.clone()), &mut Unwatched).expect("builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(bulk.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
     drop(out);
 
     let mut child = Command::new(RPF)
@@ -1613,7 +1639,15 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
         .collect();
     let bulk = incompressible(512 * 1024);
     let mut out = fs::File::create(&archive).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(bulk.clone()), &mut Unwatched).expect("builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(bulk.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
     drop(out);
 
     let mut child = Command::new(RPF)
@@ -2113,7 +2147,15 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         .collect();
     let bulk = incompressible(512 * 1024);
     let mut out = fs::File::create(&archive).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(bulk.clone()), &mut Unwatched).expect("builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(bulk.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
     drop(out);
 
     let mut child = daemon()
@@ -2426,7 +2468,7 @@ fn verify_names_the_entry_that_did_not_read_back_and_still_answers() {
     // Past the RSC7 header, where the deflate stream begins. 0xFF opens a block
     // with the reserved type, so the stream is refused rather than inflating to
     // some other length.
-    let header = usize::try_from(rpf_core::format::RESOURCE_HEADER_LEN).expect("16 fits");
+    let header = usize::try_from(rpf_core::format::resource::RESOURCE_HEADER_LEN).expect("16 fits");
     let mut bytes = fs::read(&archive).expect("readable");
     let start = usize::try_from(at).expect("a test offset fits") + header;
     bytes[start..start + 8].fill(0xFF);
@@ -2575,8 +2617,15 @@ fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         },
     }];
     let mut out = fs::File::create(&outer_path).expect("creatable");
-    rpf_core::build(&mut out, &files, &[], |_| Ok(inner.clone()), &mut Unwatched)
-        .expect("outer builds");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(inner.clone())),
+        &mut Unwatched,
+    )
+    .expect("outer builds");
     (outer_path, inner_path)
 }
 
@@ -2842,4 +2891,450 @@ fn extract_and_pack_report_progress_as_notifications() {
             "a pack is not a session: {step}"
         );
     }
+}
+
+#[test]
+fn extracting_from_a_session_with_buffered_edits_is_refused_and_names_them() {
+    // `read` prefers a buffered edit, because an editor that wrote a buffer
+    // and read it back should see what it wrote. `extract` did neither: it
+    // read the archive off disk and reported success, so a `write`, `extract`,
+    // `pack` sequence produced an archive without the edit and said nothing.
+    //
+    // The answer is a refusal rather than a merge, because a tree means one
+    // thing in both frontends — the archive as it is on disk, which is what
+    // `rpf extract` produces and what `pack` reads back. A merged tree would
+    // be an archive-shaped thing no archive holds, and packing it would leave
+    // the edit in two places at once.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+    let tree = dir.path().join("tree");
+    let into = tree.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"edited")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"extract","params":{"handle":1,"into": into}}),
+    ]);
+
+    let refused = answer(&responses, 3);
+    assert_eq!(refused["error"]["code"], json!(6), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("data/greeting.txt")),
+        "the refusal must name what has to be committed first: {refused}"
+    );
+    assert!(
+        !tree.exists(),
+        "a refused extraction created part of a tree"
+    );
+
+    // Discarding them is one of the two ways out, and the same request is then
+    // the ordinary one.
+    let recovered = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"edited")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"discard","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"extract","params":{"handle":1,"into": into}}),
+    ]);
+    assert_eq!(answer(&recovered, 4)["result"]["files"], json!(2));
+    assert!(tree.is_dir());
+}
+
+#[test]
+fn extracting_over_an_archive_an_open_session_holds_is_refused() {
+    // DR-009 arriving through a third door. A session's offsets are true only
+    // of the bytes it parsed, and an extraction writing an entry over that
+    // file moves all of them while the session goes on committing against the
+    // old ones — which is what `pack`'s guard was added to make unreachable.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let held = dir.path().join("held.rpf");
+    make_archive(&held);
+    let before = fs::read(&held).expect("readable");
+
+    // An archive whose one entry is named after the archive beside it.
+    let source = dir.path().join("source.rpf");
+    let files = [FileSpec {
+        path: "held.rpf".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = fs::File::create(&source).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(b"not an archive".to_vec())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+    drop(out);
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": held.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"open","params":{
+            "path": source.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"extract","params":{
+            "handle":2,"into": dir.path().display().to_string()}}),
+    ]);
+
+    let refused = answer(&responses, 3);
+    assert_eq!(refused["error"]["code"], json!(6), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("handle 1")),
+        "the refusal must name the handle holding it: {refused}"
+    );
+    assert_eq!(
+        fs::read(&held).expect("readable"),
+        before,
+        "an archive an open session holds was written over"
+    );
+}
+
+// Key material — R2.7, DR-020. Three methods with no handle, because there is
+// no archive open: an executable and a cache are named by paths on the
+// daemon's own filesystem, which is the one thing a path on this wire has ever
+// meant. DR-014.
+
+/// Reports a skip, naming the test and what it would have read.
+fn skip<T>(test: &str, reason: &str) -> Option<T> {
+    assert!(
+        std::env::var_os("RPF_REQUIRE_GAME_EXE").is_none(),
+        "RPF_REQUIRE_GAME_EXE is set, but {test} would have skipped: {reason}",
+    );
+    eprintln!("SKIP {test}: {reason}");
+    None
+}
+
+/// One of the game executables, or `None` with a reason on standard error.
+fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
+    let Some(root) = std::env::var_os("RPF_GAME_EXE") else {
+        return skip(test, "RPF_GAME_EXE is not set");
+    };
+    let path = Path::new(&root).join(name);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip(test, &format!("{} is not a file", path.display()))
+    }
+}
+
+/// Whether `haystack` holds `needle` anywhere in it.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// `bytes` as lower-case hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+#[test]
+fn the_daemon_answers_every_keys_command_the_binary_does() {
+    // §1's test, for the three commands R2.7 added: if `rpf` can do it and
+    // `serve --stdio` cannot, the logic is in the wrong crate.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("not-a-game.exe");
+    fs::write(&source, vec![0_u8; 1 << 16]).expect("writable");
+    let cache = dir.path().join("cache");
+    fs::create_dir_all(&cache).expect("creatable");
+    for name in [
+        &format!("{}.keys", "a".repeat(64)),
+        &format!("{}.keys", "b".repeat(64)),
+    ] {
+        fs::write(cache.join(name), b"x").expect("writable");
+    }
+    let at = cache.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
+            "executable": source.display().to_string(), "cache": at}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"keys.cache","params":{"cache": at}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"keys.invalidate","params":{"cache": at}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"keys.cache","params":{"cache": at}}),
+    ]);
+
+    // The same number the command line exits with: intact file, and the part
+    // that is missing is here. DR-010's fifth category.
+    let refused = answer(&responses, 1);
+    assert_eq!(refused["error"]["code"], json!(9), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("0 of 2")),
+        "{refused}"
+    );
+
+    assert_eq!(answer(&responses, 2)["result"]["entries"], json!(2));
+    assert_eq!(answer(&responses, 3)["result"]["removed"], json!(2));
+    assert_eq!(answer(&responses, 3)["result"]["cache"], json!(at));
+    assert_eq!(answer(&responses, 4)["result"]["entries"], json!(0));
+}
+
+#[test]
+fn a_keys_method_says_which_parameter_it_wanted() {
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"keys.cache","params":{"cache": 7}}),
+    ]);
+    for id in [1, 2] {
+        let refused = answer(&responses, id);
+        assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    }
+}
+
+#[test]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn the_daemon_reports_offsets_and_never_a_key() {
+    // DR-006 over the wire. The key is read in this process and every line the
+    // daemon wrote is searched for it, raw, as hexadecimal and as base64 —
+    // base64 especially, because `read` already puts entry payloads on this
+    // wire that way and a key must never travel the same road.
+    let test = "the_daemon_reports_offsets_and_never_a_key";
+    let Some(path) = executable(test, "GTA5.exe") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the executable is readable");
+    let keys = rpf_core::keys::Keys::extract(&mut file, &mut rpf_core::Unwatched)
+        .expect("carries the material");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let at = dir.path().join("cache").display().to_string();
+    let source = path.display().to_string();
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
+            "executable": source, "cache": at}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"keys.extract","params":{
+            "executable": source, "cache": at}}),
+    ]);
+
+    let found = answer(&responses, 1);
+    assert_eq!(found["result"]["from"], json!("executable"), "{found}");
+    assert_eq!(
+        found["result"]["values"][0]["at"],
+        json!(keys.aes_key_offset()),
+        "{found}"
+    );
+    assert_eq!(
+        found["result"]["values"][1]["at"],
+        json!(keys.hash_lut_offset()),
+        "{found}"
+    );
+    assert_eq!(
+        answer(&responses, 2)["result"]["from"],
+        json!("cache"),
+        "the second call rescanned rather than reading the cache"
+    );
+
+    let written = responses
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<String>();
+    for value in [keys.aes_key().as_slice(), keys.hash_lut().as_slice()] {
+        assert!(!holds(written.as_bytes(), value), "a key went on the wire");
+        assert!(
+            !holds(written.as_bytes(), hex(value).as_bytes()),
+            "a key went on the wire as hexadecimal"
+        );
+        assert!(
+            !holds(written.as_bytes(), hex(value).to_uppercase().as_bytes()),
+            "a key went on the wire as hexadecimal"
+        );
+        assert!(
+            !holds(written.as_bytes(), BASE64.encode(value).as_bytes()),
+            "a key went on the wire as base64"
+        );
+    }
+}
+
+#[test]
+fn the_daemon_verifies_against_a_tree_as_the_command_line_does() {
+    // §1's own test, on the last thing `rpf-core` could do that neither
+    // frontend could ask for: DR-023 gave the library a per-entry checksum and
+    // `Verified::against` to check it, and nothing outside the library could
+    // reach either. `against` is a path on the daemon's own filesystem, the
+    // same thing `open`'s `path`, `extract`'s `into` and `pack`'s `from`
+    // already are. DR-014, DR-025.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let tree = dir.path().join("tree").display().to_string();
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+            "handle":1,"into": tree, "progress": false}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"verify","params":{
+            "handle":1,"against": tree, "progress": false}}),
+    ]);
+
+    let verified = &answer(&responses, 3)["result"];
+    let from_cli = cli_json(&["verify", &archive_str, "--against", &tree]);
+    for field in ["entries_checked", "contents_checked", "contents_recorded"] {
+        assert_eq!(
+            verified[field], from_cli[field],
+            "verify disagrees about {field}: {verified}"
+        );
+    }
+    assert_eq!(verified["contents_checked"], json!(2), "{verified}");
+    assert_eq!(verified["against"], json!(tree), "{verified}");
+    assert_eq!(verified["problems"], json!([]), "{verified}");
+
+    // And without one, the number is zero and the field that says why is null,
+    // so a client cannot read the zero as a result.
+    let alone = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"verify","params":{"handle":1,"progress":false}}),
+    ]);
+    let alone = &answer(&alone, 2)["result"];
+    assert_eq!(alone["contents_checked"], json!(0), "{alone}");
+    assert_eq!(alone["against"], Value::Null, "{alone}");
+}
+
+#[test]
+fn a_byte_changed_inside_a_stored_entry_is_a_finding_on_the_wire_too() {
+    // The archive says nothing about a stored entry's bytes, so this is the one
+    // failure only a manifest can see. It is still an answer rather than an
+    // error — the call did what it was asked and what it found is its result —
+    // which is what the command line spends its exit code 4 on.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let tree = dir.path().join("tree").display().to_string();
+    assert_eq!(
+        cli_json(&["extract", &archive_str, &tree])["files"],
+        json!(2)
+    );
+
+    // Eleven bytes of greeting deflate to more than eleven, so `build` stored
+    // them: nothing declares an inflated length and no stream ends.
+    let (at, _) = spans(&archive, "data/greeting.txt");
+    let mut bytes = fs::read(&archive).expect("readable");
+    let start = usize::try_from(at).expect("a test offset fits");
+    bytes[start] ^= 0xFF;
+    fs::write(&archive, &bytes).expect("writable");
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"verify","params":{"handle":1,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"verify","params":{
+            "handle":1,"against": tree, "progress": false}}),
+    ]);
+
+    let alone = &answer(&responses, 2)["result"];
+    assert_eq!(alone["problems"], json!([]), "the archive alone: {alone}");
+
+    let against = &answer(&responses, 3)["result"];
+    let problems = against["problems"].as_array().expect("an array");
+    assert_eq!(problems.len(), 1, "{against}");
+    assert_eq!(problems[0]["path"], json!("data/greeting.txt"), "{against}");
+    assert_eq!(against["contents_checked"], json!(2), "{against}");
+}
+
+#[test]
+fn a_tree_of_another_archive_is_refused_on_the_wire_as_it_is_on_the_command_line() {
+    // Refused rather than answered with nothing checked, and refused with the
+    // exit code the command line uses for it, because the two must not answer
+    // one mistake with two numbers. DR-025.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let other = dir.path().join("other.rpf");
+    make_other_archive(&other);
+
+    let tree = dir.path().join("other-tree").display().to_string();
+    assert_eq!(
+        cli_json(&["extract", &other.display().to_string(), &tree])["files"],
+        json!(1),
+    );
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"verify","params":{
+            "handle":1,"against": tree, "progress": false}}),
+    ]);
+
+    let refusal = &answer(&responses, 2)["error"];
+    assert_eq!(refusal["code"], json!(6), "{refusal}");
+    let message = refusal["message"].as_str().expect("a message");
+    assert!(message.contains(&tree), "{message}");
+    assert!(message.contains("nothing was checked"), "{message}");
+}
+
+#[test]
+fn a_verify_against_a_tree_still_reports_one_step_per_entry() {
+    // Digesting an entry's contents is bounded work per entry, so it happens
+    // inside the step that entry already reports: `done` and `total` are the
+    // same numbers with a manifest and without one, and a `cancel` lands in the
+    // same places. DR-008.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+    let tree = dir.path().join("tree").display().to_string();
+    assert_eq!(
+        cli_json(&["extract", &archive_str, &tree])["files"],
+        json!(2)
+    );
+
+    let (_, notifications) = narrated(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"verify","params":{
+            "handle":1,"against": tree}}),
+    ]);
+
+    let named: Vec<&str> = notifications
+        .iter()
+        .filter_map(|n| n["params"]["path"].as_str())
+        .collect();
+    assert_eq!(named, vec!["art.yft", "data/greeting.txt"], "{named:?}");
+    assert!(
+        notifications
+            .iter()
+            .all(|n| n["params"]["total"] == json!(2)),
+        "{notifications:?}",
+    );
+}
+
+/// A second archive, sharing no path with [`make_archive`]'s.
+fn make_other_archive(at: &Path) {
+    let files = vec![FileSpec {
+        path: "elsewhere.bin".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = fs::File::create(at).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(vec![3_u8; 64])),
+        &mut Unwatched,
+    )
+    .expect("builds");
 }

@@ -7,8 +7,11 @@
 //! *named error*, never a panic, a hang, or a plausible-but-wrong value.
 //!
 //! Every archive here is assembled byte by byte from the constants in
-//! `rpf_core::format`, so a test says what the bytes are rather than what some
-//! builder thought they should be. Corpus-free by construction.
+//! `rpf_core::format::rpf7` — the codec that owns them — so a test says what
+//! the bytes are rather than what some builder thought they should be. Nothing
+//! here holds a width of its own: the seam is asked for every one, which is why
+//! moving a constant behind it cannot leave these tests measuring the old
+//! value. Corpus-free by construction.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -22,16 +25,25 @@
 use std::io::{Cursor, Write as _};
 
 use rpf_core::{
-    Archive, Category, Error, MAX_DEPTH, Summary, Unwatched, Verified,
+    Archive, Category, Error, MAX_DEPTH, Manifest, Summary, Unwatched, Verified,
     format::{
-        BLOCK_LEN, DIRECTORY_MARKER, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7,
-        MAGIC_RSC7, RESOURCE_FLAG, RESOURCE_HEADER_LEN,
+        Version,
+        resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
+        rpf7::{DIRECTORY_MARKER, ENCRYPTION_OPEN, MAGIC, RESOURCE_FLAG, ROW_LEN},
     },
 };
 
+/// The version every archive below is assembled at.
+const V: Version = Version::Rpf7;
+/// Its header length, entry-row width and block unit, asked of the seam rather
+/// than restated here.
+const HEADER_LEN: u64 = V.header_len();
+const ENTRY_LEN: u64 = V.row_len();
+const BLOCK_LEN: u64 = V.block_len();
+
 /// One directory row: name offset, the marker, first child, child count.
-fn directory_row(name_offset: u32, first_child: u32, child_count: u32) -> [u8; 16] {
-    let mut row = [0u8; 16];
+fn directory_row(name_offset: u32, first_child: u32, child_count: u32) -> [u8; ROW_LEN] {
+    let mut row = [0u8; ROW_LEN];
     row[0..4].copy_from_slice(&name_offset.to_le_bytes());
     row[4..8].copy_from_slice(&DIRECTORY_MARKER.to_le_bytes());
     row[8..12].copy_from_slice(&first_child.to_le_bytes());
@@ -48,8 +60,8 @@ fn file_row(
     block: u32,
     word8: u32,
     word12: u32,
-) -> [u8; 16] {
-    let mut row = [0u8; 16];
+) -> [u8; ROW_LEN] {
+    let mut row = [0u8; ROW_LEN];
     row[0..2].copy_from_slice(&name_offset.to_le_bytes());
     row[2..5].copy_from_slice(&compressed_len.to_le_bytes()[..3]);
     row[5..8].copy_from_slice(&block.to_le_bytes()[..3]);
@@ -59,9 +71,9 @@ fn file_row(
 }
 
 /// Header, entry table, names blob, then zeroes out to `len`.
-fn archive_bytes(rows: &[[u8; 16]], names: &[u8], len: usize) -> Vec<u8> {
+fn archive_bytes(rows: &[[u8; ROW_LEN]], names: &[u8], len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&MAGIC_RPF7);
+    out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
     out.extend_from_slice(&(names.len() as u32).to_le_bytes());
     out.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
@@ -88,7 +100,7 @@ fn deflate(plain: &[u8]) -> Vec<u8> {
 ///
 /// Well formed as it stands; the tests that are about layout replace the rows
 /// they care about.
-fn named_root(count: u32) -> (Vec<[u8; 16]>, Vec<u8>) {
+fn named_root(count: u32) -> (Vec<[u8; ROW_LEN]>, Vec<u8>) {
     let mut names = vec![0u8];
     let mut rows = vec![directory_row(0, 1, count)];
     for index in 0..count {
@@ -171,7 +183,7 @@ fn two_directories_claiming_one_child_are_refused() {
     // in 63 seconds, having accumulated every one of them in memory first. Two
     // more rows is four times that, and the file does not get any bigger.
     const ROWS: u32 = 26;
-    let rows: Vec<[u8; 16]> = (0..ROWS)
+    let rows: Vec<[u8; ROW_LEN]> = (0..ROWS)
         .map(|index| directory_row(0, index + 1, ROWS - 1 - index))
         .collect();
     let bytes = archive_bytes(&rows, &[0], 512);
@@ -199,7 +211,7 @@ fn a_directory_tree_deeper_than_the_limit_is_refused() {
     // overflow, exit 134. The bound belongs at parse, so that no walker has to
     // carry a counter of its own (§5).
     let deep = MAX_DEPTH + 1;
-    let rows: Vec<[u8; 16]> = (0..=deep)
+    let rows: Vec<[u8; ROW_LEN]> = (0..=deep)
         .map(|index| {
             if index == deep {
                 directory_row(0, 0, 0)
@@ -231,7 +243,7 @@ fn a_directory_tree_exactly_at_the_limit_still_opens() {
     // The other side of it: the limit is the deepest tree that works, not the
     // shallowest that fails. Without this, a limit set one too low would look
     // just as green as a correct one.
-    let rows: Vec<[u8; 16]> = (0..=MAX_DEPTH)
+    let rows: Vec<[u8; ROW_LEN]> = (0..=MAX_DEPTH)
         .map(|index| {
             if index == MAX_DEPTH {
                 directory_row(0, 0, 0)
@@ -533,7 +545,7 @@ fn an_entry_table_that_does_not_fit_the_archive_is_refused() {
     // A header claiming 100 entries in a 64-byte file. The entry table is what
     // does not fit, and saying so is what tells the caller where to look.
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(&MAGIC_RPF7);
+    bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&100_u32.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
     bytes.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
@@ -556,7 +568,7 @@ fn an_entry_table_that_does_not_fit_the_archive_is_refused() {
 #[test]
 fn a_names_blob_that_does_not_fit_the_archive_is_refused() {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(&MAGIC_RPF7);
+    bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&1_u32.to_le_bytes());
     bytes.extend_from_slice(&4_096_u32.to_le_bytes());
     bytes.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
@@ -1068,7 +1080,7 @@ fn a_name_no_host_can_hold_is_still_one_node_of_a_tree() {
         &mut source,
         &archive,
         &mut out,
-        &std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
         &mut rpf_core::Unwatched,
     )
     .expect("an archive this build can read is an archive it can repair");
@@ -1120,7 +1132,7 @@ fn a_name_windows_would_trim_is_still_one_node_of_a_tree() {
             &mut source,
             &archive,
             &mut Cursor::new(Vec::new()),
-            &std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
             &mut rpf_core::Unwatched,
         )
         .expect("an archive this build can read is an archive it can repair");
@@ -1438,4 +1450,136 @@ fn one_name_in_two_directories_still_resolves() {
     let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
     assert_eq!(archive.find("a/x.txt").expect("resolves"), 3);
     assert_eq!(archive.find("b/x.txt").expect("resolves"), 4);
+}
+
+// ----- contents nothing in the archive describes ---------------------------
+
+#[test]
+fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_manifest() {
+    // The blind spot, measured before it was closed: with the assertion below
+    // reduced to `!problems(&changed).is_empty()` and nothing else in the
+    // tree, this test failed — `verify` reported nothing at all about an
+    // archive whose contents had changed. A stored entry declares no inflated
+    // length and carries no stream that ends, so nothing in the archive says
+    // what its bytes should be. It is the shape of the `build` defect of
+    // 2026-08-27, every pack silently corrupting the last file whose length
+    // was a multiple of 512. DR-023.
+    let sound = b"hello there!";
+    let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
+
+    let mut changed = bytes.clone();
+    changed[BLOCK_LEN as usize + 4] ^= 0xFF;
+
+    // Nothing but the payload moved: the header, the entry table and the names
+    // blob are byte for byte the same, so no length and no offset changed.
+    assert_eq!(
+        changed[..BLOCK_LEN as usize],
+        bytes[..BLOCK_LEN as usize],
+        "the change is inside the payload and nowhere else",
+    );
+
+    let archive = Archive::open(&mut Cursor::new(changed.clone())).expect("well formed");
+    assert_eq!(
+        archive
+            .read(&mut Cursor::new(changed.clone()), 1)
+            .expect("reads back"),
+        b"hell\x90 there!",
+        "the entry reads back, and reads back wrong",
+    );
+
+    // What the archive can say about itself: nothing. Pinned in this direction
+    // too, because a check that fired here would be a check against a fact the
+    // container does not hold.
+    assert!(
+        problems(&changed).is_empty(),
+        "an archive carries no record of its own stored contents",
+    );
+
+    // What the manifest can. Its checksums are taken from the sound archive,
+    // and the changed one is read back against them.
+    let sound_archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let manifest = Manifest::of_contents(
+        &mut Cursor::new(bytes.clone()),
+        &sound_archive,
+        &mut Unwatched,
+    )
+    .expect("digests every entry");
+
+    let verified = Verified::against(
+        &mut Cursor::new(changed),
+        &archive,
+        &manifest,
+        &mut Unwatched,
+    )
+    .expect("the walk itself does not fail");
+    match verified
+        .problems
+        .iter()
+        .map(|problem| (problem.path.as_str(), &problem.error))
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [("a", error @ Error::ChecksumMismatch { entry: 1, .. })] => {
+            assert_eq!(
+                error.category(),
+                Category::Corrupt,
+                "the archive's bytes are not the recorded ones, which is exit 4",
+            );
+        }
+        other => panic!("expected one checksum mismatch, got {other:?}"),
+    }
+    assert_eq!(verified.checked, 1);
+    assert_eq!(verified.contents_checked, 1);
+
+    // And the archive the checksums were taken from passes the same walk.
+    let verified = Verified::against(
+        &mut Cursor::new(bytes),
+        &sound_archive,
+        &manifest,
+        &mut Unwatched,
+    )
+    .expect("the walk itself does not fail");
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+    assert_eq!(verified.contents_checked, 1);
+}
+
+#[test]
+fn a_verify_with_no_manifest_says_it_checked_no_contents() {
+    // `verify` is given an archive, not a tree, so no manifest is the ordinary
+    // case and it has to go on working. What it must not do is report the
+    // stronger claim: entries read back is not entries whose contents were
+    // checked against anything, and the second number is what says so.
+    let sound = b"hello there!";
+    let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+
+    let verified = Verified::of(&mut Cursor::new(bytes), &archive, &mut Unwatched).expect("walks");
+    assert_eq!(verified.checked, 1);
+    assert_eq!(
+        verified.contents_checked, 0,
+        "one entry read back, and nothing said its contents were the right ones",
+    );
+    assert!(verified.outcome().is_ok());
+}
+
+#[test]
+fn a_manifest_that_records_no_checksum_leaves_the_entry_unchecked() {
+    // A schema-2 manifest, and what a missing checksum means: not recorded.
+    // Never "the contents matched" and never "the contents are empty". The
+    // entry is still read back — it is one of `checked` — and it is not one of
+    // `contents_checked`. DR-023's migration rule.
+    let sound = b"hello there!";
+    let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+
+    let text = r#"{"schema":2,"version":"rpf7","codec":"deflate",
+                   "encryption":1313165391,"directories":[],
+                   "entries":[{"path":"a","class":"binary",
+                               "storage":"stored","encryption":0}]}"#;
+    let manifest = Manifest::from_json(text).expect("schema 2 still reads");
+
+    let verified = Verified::against(&mut Cursor::new(bytes), &archive, &manifest, &mut Unwatched)
+        .expect("walks");
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+    assert_eq!((verified.checked, verified.contents_checked), (1, 0));
 }

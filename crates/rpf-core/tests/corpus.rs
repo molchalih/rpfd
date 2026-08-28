@@ -30,7 +30,9 @@ use std::{
     path::PathBuf,
 };
 
-use rpf_core::{Archive, EntryKind, Summary, Unwatched, Verified, format::resource_len};
+use rpf_core::{
+    Archive, EntryKind, Manifest, Summary, Unwatched, Verified, format::resource::resource_len,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -494,4 +496,66 @@ fn every_entry_of_the_sample_reads_back() {
     assert!(named.is_empty(), "entries did not read back: {named:?}");
     assert_eq!(verified.checked, 27);
     assert!(verified.outcome().is_ok());
+    assert_eq!(
+        verified.contents_checked, 0,
+        "read back is not checked against anything: there is no manifest here",
+    );
+}
+
+#[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
+fn the_sample_verifies_against_a_manifest_of_itself() {
+    // The other end of DR-023 on a real archive, and how far it reaches. The
+    // manifest describes the **outer** archive — 7 files of the 11 entries —
+    // and `verify` walks 27 across the three archives, so 7 is what a clean
+    // run can honestly claim contents for. The other 20 live inside the two
+    // nested archives, and they are covered transitively: `x64/…rpf` is one
+    // entry of the outer archive, and its checksum is over the whole of it.
+    //
+    // Cost, measured on this 145 MB sample, `--release`, three rounds warm:
+    // `Verified::of` 84 ms, `Verified::against` 102 ms, `Manifest::of_contents`
+    // 22 ms. So the whole of what a checksum adds to a `verify` of the sample
+    // is 18 ms against a walk that already inflates 65 MB.
+    let Some((path, _)) = corpus_archive("the_sample_verifies_against_a_manifest_of_itself") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("archive opens");
+    let archive = Archive::open(&mut file).expect("archive parses");
+
+    let manifest =
+        Manifest::of_contents(&mut file, &archive, &mut Unwatched).expect("digests every entry");
+    assert_eq!(manifest.entries.len(), 7);
+    assert_eq!(
+        manifest.checksums().len(),
+        7,
+        "every one records a checksum"
+    );
+
+    let verified = Verified::against(&mut file, &archive, &manifest, &mut Unwatched)
+        .expect("reads back against its own record");
+    let named: Vec<&str> = verified
+        .problems
+        .iter()
+        .map(|problem| problem.path.as_str())
+        .collect();
+    assert!(named.is_empty(), "entries did not read back: {named:?}");
+    assert_eq!((verified.checked, verified.contents_checked), (27, 7));
+
+    // And the values are the file's own, not an internal encoding of it: what
+    // the manifest records for an entry is what `sha256sum` prints for the
+    // file `extract` writes.
+    let (spec, index) = rpf_core::specs_of(&archive)
+        .expect("specs")
+        .into_iter()
+        .next()
+        .expect("the sample holds files");
+    let extracted = archive.extract(&mut file, index).expect("extracts");
+    assert_eq!(
+        manifest
+            .checksums()
+            .get(spec.path.as_str())
+            .expect("recorded")
+            .to_string(),
+        sha256(&extracted),
+    );
 }

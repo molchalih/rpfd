@@ -982,6 +982,9 @@ fn dispatch(
         "extract" => extract(state, params, wire, request),
         "pack" => pack(state, params, wire, request),
         "commit" => commit(state, params, wire, request),
+        "keys.extract" => keys_extract(params),
+        "keys.cache" => keys_cache(params),
+        "keys.invalidate" => keys_invalidate(params),
         other => Err(Rejected::Protocol {
             code: METHOD_NOT_FOUND,
             message: format!("no method {other:?}"),
@@ -1216,7 +1219,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
     }
     // R6.6: a resource entry takes an RSC7 payload and nothing else.
     if matches!(holder.entry(index)?.kind, EntryKind::Resource { .. })
-        && bytes.get(0..4) != Some(&rpf_core::format::MAGIC_RSC7)
+        && bytes.get(0..4) != Some(&rpf_core::format::resource::MAGIC_RSC7)
     {
         return Err(Failure::Refused {
             reason: format!("{inside} is a resource entry; its payload must begin with RSC7"),
@@ -1261,8 +1264,17 @@ fn info(state: &mut State, params: &Value) -> Answered {
 /// An entry that does not read back is reported in `problems` rather than as an
 /// error: the call did what it was asked, and what it found is its answer. The
 /// command line still exits 4, because a process has one bit to say it with.
+///
+/// `against` names an extracted tree of this archive on the **daemon's own**
+/// filesystem — `rpf verify --against`'s parameter, under the vocabulary every
+/// other path on this wire already uses (DR-014). Its manifest records what
+/// each entry's contents should be, which is the only thing that can see a
+/// **stored** entry's bytes change. Without it `contents_checked` is zero and
+/// `against` is `null`, so a client cannot read the zero as a result. DR-023,
+/// DR-025.
 fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let handle = handle_of(params)?;
+    let against = optional_path(params, "against")?;
     let wanted = wants_progress(params)?;
     let name = name_of(request);
     let session = session(state, params)?;
@@ -1277,20 +1289,22 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     };
     wire.cancel
         .begin(request, Some(handle), "verify", Stoppable::Yes);
-    let outcome = rpf_core::Verified::of(&mut session.file, &session.archive, &mut watch);
+    let outcome = commands::verified(
+        &mut session.file,
+        &session.archive,
+        against.as_deref(),
+        &mut watch,
+    );
     wire.cancel.finish();
-    let verified = outcome.map_err(|error| watch.explain(Failure::from(error)))?;
+    let checked = outcome.map_err(|failure| watch.explain(failure))?;
 
-    let problems: Vec<Value> = verified
+    let problems: Vec<Value> = checked
+        .verified
         .problems
         .iter()
         .map(|problem| json!({ "path": problem.path, "reason": problem.error.to_string() }))
         .collect();
-    Ok(json!({
-        "path": session.path.display().to_string(),
-        "entries_checked": verified.checked,
-        "problems": problems,
-    }))
+    Ok(commands::verify_report(&session.path, &checked, &problems))
 }
 
 /// `extract` — write every entry of an open archive to a tree.
@@ -1304,12 +1318,42 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 /// a rebuild does. A cancelled extraction leaves the files it had already
 /// written where they are — a tree is not replaced by rename the way an archive
 /// is, and DR-014 says so rather than leaving it to be discovered.
+///
+/// Two things it refuses, both before anything is written.
+///
+/// **A session with buffered edits.** `read` prefers a pending edit to what is
+/// on disk; `extract` read past them and reported success, so `write`,
+/// `extract`, `pack` produced an archive without the edit and said nothing. It
+/// is a refusal rather than a merge because a tree means one thing in both
+/// frontends — the archive as it is on disk — and `rpf extract` cannot produce
+/// anything else. A merged tree would be an archive-shaped thing no archive
+/// holds, and packing it would leave one edit in two places.
+///
+/// **A path an open session holds.** DR-009's corruption through a third door,
+/// refused with DR-009's own test and `pack`'s own sentence. It is asked once
+/// up front, over every path the extraction will write, because a refusal found
+/// part-way would leave the part already written.
 fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let handle = handle_of(params)?;
     let into = PathBuf::from(string(params, "into")?);
     let wanted = wants_progress(params)?;
     let name = name_of(request);
-    let session = session(state, params)?;
+
+    // Immutably, and a handle of its own: the claim check below reads every
+    // session while this one is being extracted, which a `&mut Session` would
+    // forbid. `try_clone` also leaves the session's own handle where it was.
+    let state: &State = state;
+    let session = state
+        .sessions
+        .get(&handle)
+        .ok_or_else(|| no_such_handle(handle))?;
+    if !session.pending.is_empty() {
+        return Err(extracting_with_edits(&session.pending).into());
+    }
+    let mut src = session.file.try_clone().map_err(|source| Failure::Io {
+        path: session.path.display().to_string(),
+        source,
+    })?;
 
     let mut watch = Notifying {
         wire,
@@ -1321,7 +1365,17 @@ fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> A
     };
     wire.cancel
         .begin(request, Some(handle), "extract", Stoppable::Yes);
-    let outcome = commands::extract_into(&mut session.file, &session.archive, &into, &mut watch);
+    let outcome = commands::extract_into(
+        &mut src,
+        &session.archive,
+        &into,
+        &|target| {
+            state
+                .holder_of(target, identity_of(target))
+                .map(|(holder, held)| extracting_over_held(target, held, holder))
+        },
+        &mut watch,
+    );
     wire.cancel.finish();
     let extracted = outcome.map_err(|failure| watch.explain(failure))?;
 
@@ -1332,6 +1386,44 @@ fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> A
         "directories": extracted.directories,
         "manifest": extracted.manifest.display().to_string(),
     }))
+}
+
+/// Why a tree cannot be extracted while edits are still buffered.
+///
+/// It names them, because committing or discarding them is what the caller has
+/// to do, and a refusal that does not say which is one the client has to guess
+/// at.
+fn extracting_with_edits(pending: &BTreeMap<String, Vec<u8>>) -> Failure {
+    let paths: Vec<&str> = pending.keys().map(String::as_str).collect();
+    Failure::Refused {
+        reason: format!(
+            "{} buffered {} not been committed ({}). An extracted tree is the archive as it \
+             is on disk — the same tree `rpf extract` writes and `pack` reads back — so it \
+             cannot also carry an edit no archive holds. Commit them first, or discard them",
+            paths.len(),
+            if paths.len() == 1 {
+                "edit has"
+            } else {
+                "edits have"
+            },
+            paths.join(", "),
+        ),
+    }
+}
+
+/// Why an extraction cannot write here, and which handle has it.
+///
+/// `pack`'s sentence, with the operation's own name in it: it is the same
+/// corruption reached another way, and a client should recognise it as one
+/// thing.
+fn extracting_over_held(path: &Path, held: &Path, holder: u64) -> Failure {
+    Failure::Refused {
+        reason: format!(
+            "{}. Extracting an entry over it would move every offset that session holds. \
+             Close handle {holder} first, or extract somewhere else",
+            names_held(path, held, holder),
+        ),
+    }
 }
 
 /// `pack` — build an archive from a tree and its manifest.
@@ -1419,6 +1511,55 @@ fn packing_over_held(path: &Path, held: &Path, holder: u64) -> Failure {
             names_held(path, held, holder),
         ),
     }
+}
+
+/// An optional path parameter, on the daemon's own filesystem. DR-014.
+fn optional_path(params: &Value, name: &str) -> Answer<Option<PathBuf>> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|path| Some(PathBuf::from(path)))
+            .ok_or_else(|| invalid_params(format!("{name:?} is a path, as a string"))),
+    }
+}
+
+/// `keys.extract` — find the key material a game executable carries.
+///
+/// One of the methods with no handle: it works on an executable and a cache
+/// rather than on an open archive, so there is nothing to name it by. Both
+/// `executable` and the optional `cache` are paths on the **daemon's own**
+/// filesystem, which is what every path on this wire that is not an in-archive
+/// path already means. DR-014, DR-020.
+///
+/// It reports offsets, lengths, the source executable's digest and where the
+/// material was cached. **Never a key**: DR-006, and `commands::keys_report`
+/// is the one place the object is built, so the command line and this method
+/// cannot come to say different things.
+///
+/// It takes no `progress` and no `cancel`. The work is one pass over one file
+/// — about a second for a 47 MB executable at `--release`, DR-017 — which is
+/// bounded the way `read` of one large entry is, and `rpf_core::keys` takes no
+/// watcher to report on it with.
+fn keys_extract(params: &Value) -> Answered {
+    let executable = PathBuf::from(string(params, "executable")?);
+    let cache = optional_path(params, "cache")?;
+    let found = commands::find_keys(&executable, cache.as_deref())?;
+    Ok(commands::keys_report(&found))
+}
+
+/// `keys.cache` — where extracted material is kept, and how much is there.
+fn keys_cache(params: &Value) -> Answered {
+    let cache = optional_path(params, "cache")?;
+    let state = commands::cache_state(cache.as_deref())?;
+    Ok(commands::cache_report(&state))
+}
+
+/// `keys.invalidate` — remove every cached entry.
+fn keys_invalidate(params: &Value) -> Answered {
+    let cache = optional_path(params, "cache")?;
+    let state = commands::invalidate_keys(cache.as_deref())?;
+    Ok(commands::invalidated_report(&state))
 }
 
 /// `pending` — what has been written but not committed.
@@ -1679,11 +1820,15 @@ fn rebuild(session: &mut Session, wire: &Wire, asked: &Asked<'_>) -> crate::exit
         skipped: 0,
         stopped: None,
     };
+    // Intermediates go where the rebuilt archive is going, which is the answer
+    // for a daemon precisely because there is nobody to ask for another one.
+    // DR-022.
     let outcome = rpf_core::replace_many(
         &mut session.file,
         &session.archive,
         &session.pending,
         scratch.as_file_mut(),
+        &mut commands::ScratchIn::beside(&session.path),
         &mut watch,
     );
     if let Err(error) = outcome {
@@ -1745,9 +1890,10 @@ mod tests {
         let mut out = fs::File::create(&path).expect("creatable");
         rpf_core::build(
             &mut out,
+            rpf_core::Version::Rpf7,
             &files,
             &[],
-            |_| Ok(b"contents".to_vec()),
+            |_| Ok(std::io::Cursor::new(b"contents".to_vec())),
             &mut rpf_core::Unwatched,
         )
         .expect("builds");

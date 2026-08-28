@@ -51,6 +51,20 @@ fn is_nested_archive(name: &str) -> bool {
     name.ends_with(".rpf")
 }
 
+/// Scratch space on disk, as the frontends supply it.
+///
+/// Unnamed, so it is unlinked as soon as it is made and an interrupted rebuild
+/// leaves nothing behind.
+struct OnDisk;
+
+impl rpf_core::Scratch for OnDisk {
+    type Sink = fs::File;
+
+    fn create(&mut self) -> Result<fs::File, Error> {
+        tempfile::tempfile().map_err(|source| Error::Io { offset: 0, source })
+    }
+}
+
 fn sha256(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
@@ -203,11 +217,12 @@ fn a_rebuilt_archive_holds_the_same_contents() {
     let mut rebuilt = tempfile::NamedTempFile::new().expect("temp file");
     let report = rpf_core::build(
         rebuilt.as_file_mut(),
+        rpf_core::Version::Rpf7,
         &files,
         &directories,
         |wanted| {
             let index = *by_path.get(wanted).expect("path came from this archive");
-            original.extract(&mut source, index)
+            original.extract(&mut source, index).map(Cursor::new)
         },
         &mut Unwatched,
     )
@@ -314,11 +329,12 @@ fn an_injected_corruption_is_caught() {
     let mut rebuilt = tempfile::NamedTempFile::new().expect("temp file");
     rpf_core::build(
         rebuilt.as_file_mut(),
+        rpf_core::Version::Rpf7,
         &files,
         &directories,
         |wanted| {
             let index = *by_path.get(wanted).expect("known path");
-            original.extract(&mut source, index)
+            original.extract(&mut source, index).map(Cursor::new)
         },
         &mut Unwatched,
     )
@@ -381,12 +397,15 @@ fn replacing_a_nested_entry_cascades() {
     };
 
     let mut rebuilt = tempfile::NamedTempFile::new().expect("temp file");
-    rpf_core::replace_at(
+    let edits = BTreeMap::from([(TARGET.to_owned(), donor_bytes)]);
+    rpf_core::replace_many(
         &mut source,
         &original,
-        TARGET,
-        donor_bytes,
+        &edits,
         rebuilt.as_file_mut(),
+        // The corpus cascade: a 62 MB ancestor, rebuilt into scratch on disk
+        // rather than into memory. R4.13.
+        &mut OnDisk,
         &mut Unwatched,
     )
     .expect("cascading rebuild");
@@ -449,6 +468,164 @@ fn replacing_a_nested_entry_cascades() {
 
 // --- Corpus-free: what a build writes, and what it refuses ------------------
 
+/// Bytes that do not compress, so a deflate of them is larger than they are.
+///
+/// A xorshift rather than a pattern: anything with structure in it deflates,
+/// and this exists to reach the branch where deflate does not.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut state = 0x1234_5678_u32;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+/// A payload offered to the compressor that comes back bigger is written as it
+/// came, and the archive is exactly as long as it says it is.
+///
+/// This is R4.4's fallback, and streaming changed how it is reached: the
+/// deflate stream is now written into the sink before its length is known, so
+/// the fallback overwrites it. It reached further than the plain bytes do, and
+/// what is left of it has to be accounted for — zeroed rather than left stale
+/// (§8), and inside the archive's own length rather than past it. Left
+/// unaccounted, the last such payload in an archive makes the file longer than
+/// `Report::len`, which is what `build_on_disk` asserts against.
+///
+/// Two entries, so the case is covered both with a payload after it and as the
+/// last thing in the archive.
+#[test]
+fn a_deflate_that_does_not_pay_for_itself_is_stored_and_nothing_stale_is_left() {
+    let deflated = |path: &str| FileSpec {
+        path: path.to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Deflate,
+            encryption: 0,
+        },
+    };
+    // 511 bytes: one short of a block, so the padding a smaller payload would
+    // have left is not wide enough to absorb what deflate added.
+    let bulk = incompressible(511);
+    let files = [deflated("first.bin"), deflated("last.bin")];
+    let (report, bytes) = build_on_disk(&files, &[], |_| Ok(bulk.clone()));
+
+    let mut src = Cursor::new(bytes.clone());
+    let archive = Archive::open(&mut src).expect("parses");
+    for path in ["first.bin", "last.bin"] {
+        let index = archive.find(path).expect("resolves");
+        let EntryKind::Binary { compressed_len, .. } = archive.entry(index).expect("in range").kind
+        else {
+            panic!("{path} should be binary")
+        };
+        assert_eq!(
+            compressed_len, 0,
+            "{path} should have fallen back to stored"
+        );
+        assert_eq!(
+            archive.extract(&mut src, index).expect("extracts"),
+            bulk,
+            "{path} did not read back"
+        );
+    }
+
+    // `build_on_disk` already compares the file's length with the report's.
+    // This says the same thing from the archive's side: every byte past the
+    // last payload is the padding the archive claims, not a tail of a deflate
+    // stream nobody kept.
+    let last = archive.find("last.bin").expect("resolves");
+    let EntryKind::Binary { block, .. } = archive.entry(last).expect("in range").kind else {
+        panic!("last.bin should be binary")
+    };
+    let at = u64::from(block) * 512 + u64::from(bulk.len() as u32);
+    assert!(
+        bytes[at as usize..].iter().all(|byte| *byte == 0),
+        "the slack after the last payload is not zero"
+    );
+    assert_eq!(bytes.len() as u64, report.len, "length");
+}
+
+/// R11.4: an archive is written at the version its caller named, and `build`
+/// holds no opinion of its own about which that is.
+///
+/// Walked over [`rpf_core::Version::ALL`] rather than asserted of `RPF7`, for
+/// the reason that list exists: with one member this says only that the one
+/// version round-trips, and on the day a second codec lands it says the same of
+/// that one without anybody remembering to come back here. What it pins today
+/// is that the version reaching the header is the parameter and not a constant
+/// — delete the argument and this stops compiling.
+#[test]
+fn an_archive_is_written_at_the_version_it_was_asked_for() {
+    for &version in rpf_core::Version::ALL {
+        let mut sink = tempfile::NamedTempFile::new().expect("temp file");
+        rpf_core::build(
+            sink.as_file_mut(),
+            version,
+            &[stored("a.txt")],
+            &[],
+            |_| Ok(Cursor::new(b"contents".to_vec())),
+            &mut Unwatched,
+        )
+        .expect("builds");
+        sink.as_file_mut().flush().expect("flushed");
+        let bytes = fs::read(sink.path()).expect("readable");
+
+        assert_eq!(
+            bytes.get(0..4),
+            Some(&version.magic()[..]),
+            "{version:?} was not written with its own magic"
+        );
+        let mut src = Cursor::new(bytes);
+        assert_eq!(
+            Archive::open(&mut src).expect("parses").version(),
+            version,
+            "{version:?} did not read back as itself"
+        );
+    }
+}
+
+/// A rebuild is not a conversion: it writes the version it read.
+#[test]
+fn a_rebuild_writes_the_version_the_original_was_read_at() {
+    for &version in rpf_core::Version::ALL {
+        let mut sink = tempfile::NamedTempFile::new().expect("temp file");
+        rpf_core::build(
+            sink.as_file_mut(),
+            version,
+            &[stored("a.txt")],
+            &[],
+            |_| Ok(Cursor::new(b"contents".to_vec())),
+            &mut Unwatched,
+        )
+        .expect("builds");
+        sink.as_file_mut().flush().expect("flushed");
+
+        let mut src = Cursor::new(fs::read(sink.path()).expect("readable"));
+        let archive = Archive::open(&mut src).expect("parses");
+        let edits = BTreeMap::from([("a.txt".to_owned(), b"replaced".to_vec())]);
+        let mut out = tempfile::NamedTempFile::new().expect("temp file");
+        rpf_core::replace_many(
+            &mut src,
+            &archive,
+            &edits,
+            out.as_file_mut(),
+            &mut rpf_core::InMemory,
+            &mut Unwatched,
+        )
+        .expect("rebuilds");
+        out.as_file_mut().flush().expect("flushed");
+
+        let mut round = Cursor::new(fs::read(out.path()).expect("readable"));
+        assert_eq!(
+            Archive::open(&mut round).expect("parses").version(),
+            version,
+            "a rebuild changed the version"
+        );
+    }
+}
+
 /// One stored file. Stored, because a stored payload is the case with nothing
 /// to check it against — a deflate stream that lost its last byte fails to
 /// inflate, and a resource's page flags disagree with what it inflates to, but
@@ -482,7 +659,7 @@ fn stored(path: &str) -> FileSpec {
 fn build_on_disk<F>(
     files: &[FileSpec],
     directories: &[String],
-    fetch: F,
+    mut fetch: F,
 ) -> (rpf_core::Report, Vec<u8>)
 where
     F: FnMut(&str) -> Result<Vec<u8>, Error>,
@@ -490,9 +667,10 @@ where
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     let report = rpf_core::build(
         sink.as_file_mut(),
+        rpf_core::Version::Rpf7,
         files,
         directories,
-        fetch,
+        |wanted| fetch(wanted).map(Cursor::new),
         &mut Unwatched,
     )
     .expect("builds");
@@ -518,6 +696,7 @@ fn replaced_on_disk(source: &[u8], edits: &BTreeMap<String, Vec<u8>>) -> Vec<u8>
         &archive,
         edits,
         sink.as_file_mut(),
+        &mut rpf_core::InMemory,
         &mut Unwatched,
     )
     .expect("rebuilds");
@@ -699,7 +878,14 @@ fn a_file_name_offset_past_sixteen_bits_is_refused() {
     // A cursor is the right sink here precisely because nothing should reach
     // it: this asserts the refusal, not what was written.
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::build(&mut out, &files, &[], |_| Ok(b"x".to_vec()), &mut Unwatched);
+    let refused = rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_| Ok(Cursor::new(b"x".to_vec())),
+        &mut Unwatched,
+    );
 
     match refused {
         Err(Error::FieldOverflow {
@@ -786,7 +972,14 @@ fn replacing_an_archive_and_a_file_inside_it_is_refused() {
         ("sub/inner.rpf/f.txt".to_owned(), b"DEEP-EDIT".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::replace_many(&mut src, &archive, &edits, &mut out, &mut Unwatched);
+    let refused = rpf_core::replace_many(
+        &mut src,
+        &archive,
+        &edits,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    );
     // Which two collided, not merely that two did: the caller has to drop one
     // of them or rebuild, and it can do neither without being told which.
     match refused {
@@ -813,7 +1006,14 @@ fn several_spellings_of_one_edit_are_refused() {
         ("SUB/INNER.RPF/F.TXT".to_owned(), b"third".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::replace_many(&mut src, &archive, &edits, &mut out, &mut Unwatched);
+    let refused = rpf_core::replace_many(
+        &mut src,
+        &archive,
+        &edits,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    );
     // The edits are visited in sorted order, so the pair named is the third
     // spelling against the second — the two that reached one path within the
     // nested archive.
@@ -838,7 +1038,14 @@ fn two_spellings_of_one_entry_are_refused_at_the_top_level() {
         ("F.TXT".to_owned(), b"second".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::replace_many(&mut src, &archive, &edits, &mut out, &mut Unwatched);
+    let refused = rpf_core::replace_many(
+        &mut src,
+        &archive,
+        &edits,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    );
     match refused {
         Err(Error::Overlapping { path, other }) => {
             assert_eq!(path, "f.txt");
@@ -861,7 +1068,15 @@ fn edits_in_one_nested_archive_still_rebuild_it_once() {
         ("SUB/inner.rpf/g.txt".to_owned(), b"two".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    rpf_core::replace_many(&mut src, &archive, &edits, &mut out, &mut Unwatched).expect("rebuilds");
+    rpf_core::replace_many(
+        &mut src,
+        &archive,
+        &edits,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    )
+    .expect("rebuilds");
 
     let mut file = Cursor::new(out.into_inner());
     let round = Archive::open(&mut file).expect("parses");
@@ -888,9 +1103,10 @@ fn two_directories_differing_only_in_case_are_refused() {
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(b"contents".to_vec()),
+        |_| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     // Matching only the variant would accept any pair against any archive, and
@@ -906,9 +1122,10 @@ fn two_files_in_one_directory_differing_only_in_case_are_refused() {
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(b"contents".to_vec()),
+        |_| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     collision(refused, "data/NOTES.TXT", "data/notes.txt");
@@ -921,9 +1138,10 @@ fn a_named_directory_colliding_with_a_path_is_refused() {
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &["x64".to_owned()],
-        |_| Ok(b"contents".to_vec()),
+        |_| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     // The named directories are claimed first, so `x64` is the spelling that
@@ -942,9 +1160,10 @@ fn one_path_listed_twice_is_refused_as_a_duplicate() {
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(b"contents".to_vec()),
+        |_| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     refusal(refused, "data/notes.txt", "is named twice in one directory");
@@ -959,9 +1178,10 @@ fn a_file_and_a_directory_sharing_one_name_are_refused() {
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
+        rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(b"contents".to_vec()),
+        |_| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     refusal(
@@ -983,9 +1203,10 @@ fn a_named_directory_that_climbs_out_of_the_tree_is_refused() {
         let mut out = Cursor::new(Vec::new());
         let refused = rpf_core::build(
             &mut out,
+            rpf_core::Version::Rpf7,
             &[],
             &[directory.to_owned()],
-            |_| Ok(b"contents".to_vec()),
+            |_| Ok(Cursor::new(b"contents".to_vec())),
             &mut Unwatched,
         );
         assert!(

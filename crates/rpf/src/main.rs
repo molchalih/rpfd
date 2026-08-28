@@ -94,6 +94,48 @@ enum Command {
     Verify {
         /// The archive.
         archive: PathBuf,
+        /// An extracted tree of this archive, whose manifest records what each
+        /// entry's contents should be. Without it a stored entry's bytes are
+        /// checked against nothing, because the archive declares nothing about
+        /// them.
+        #[arg(long, value_name = "TREE")]
+        against: Option<PathBuf>,
+    },
+    /// Find the key material a game executable carries, and manage its cache.
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommand,
+    },
+}
+
+/// What can be asked about key material.
+///
+/// **Nothing here prints a key.** DR-006 keeps extracted material off every
+/// output path, so what is reported is offsets, lengths, digests and cache
+/// paths — assume `--json` is piped into automation and pasted into a bug
+/// report. DR-020.
+#[derive(Debug, Subcommand)]
+enum KeysCommand {
+    /// Find the key material in a game executable, and cache what it found.
+    Extract {
+        /// The game executable.
+        executable: PathBuf,
+        /// Keep the material here rather than in the platform's configuration
+        /// directory.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Show where extracted key material is kept, and how much is there.
+    Cache {
+        /// Ask about this directory rather than the platform's.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Remove every cached entry.
+    Invalidate {
+        /// Empty this directory rather than the platform's.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
     },
 }
 
@@ -138,7 +180,22 @@ fn main() -> ExitCode {
                 })
             }
         }
-        Command::Verify { ref archive } => commands::verify(archive, cli.json),
+        Command::Verify {
+            ref archive,
+            ref against,
+        } => commands::verify(archive, against.as_deref(), cli.json),
+        Command::Keys { ref command } => match *command {
+            KeysCommand::Extract {
+                ref executable,
+                ref cache_dir,
+            } => commands::keys_extract(executable, cache_dir.as_deref(), cli.json),
+            KeysCommand::Cache { ref cache_dir } => {
+                commands::keys_cache(cache_dir.as_deref(), cli.json)
+            }
+            KeysCommand::Invalidate { ref cache_dir } => {
+                commands::keys_invalidate(cache_dir.as_deref(), cli.json)
+            }
+        },
     };
 
     match outcome {

@@ -15,12 +15,108 @@ rpf cat     dlc.rpf data/vehicles.meta
 rpf put     dlc.rpf x64/vehicles.rpf/meringls63amg24.ytd new.ytd   # patches in place
 rpf extract dlc.rpf tree/ && rpf pack tree/ dlc.rpf
 rpf put     dlc.rpf data/vehicles.meta new.meta --dry-run   # decide, write nothing
-rpf verify  dlc.rpf
+rpf verify  dlc.rpf --against tree/   # and against what the tree recorded
+rpf keys extract GTA5.exe   # find the key material in your own install
 rpf serve --stdio        # JSON-RPC, one object per line, edits held until commit
 ```
 
 A path addresses through nesting in one string. Every reporting command takes
 `--json`.
+
+## Installing
+
+R8.2. `rpf` is one statically linked file with no runtime prerequisite —
+DR-001, and the reason `docs/conventions.md` §14 rules out C dependencies — so
+installing it is putting that file somewhere on your `PATH`. **No Rust, no
+Node, no package manager.** Every step below uses a tool the platform already
+ships.
+
+> **Read this first.** *No release has ever been produced.* There is no git
+> remote, no tag has ever been pushed, and `.github/workflows/release.yml` has
+> never been executed — nor has `ci.yml`. Each target has been compiled locally;
+> the musl link, the Windows link, the packaging step and the upload have run
+> nowhere. So the steps below describe **what to do with an asset that workflow
+> would produce**, named as that workflow names it. They are not a download
+> instruction, because there is nothing yet to download, and this section will
+> assert a URL when a release exists and not before. The workflow also publishes
+> no checksums, so there is nothing to check a download against.
+
+A tagged release publishes one archive per target, named
+`rpf-<tag>-<target>.tar.gz` — `.zip` on Windows — each holding a directory of
+the same name with the binary, this file, and both licence files.
+
+| Target | For |
+|---|---|
+| `aarch64-apple-darwin` | Apple silicon Macs. `uname -m` says `arm64` |
+| `x86_64-apple-darwin` | Intel Macs. `uname -m` says `x86_64` |
+| `x86_64-unknown-linux-musl` | Linux on `x86_64`, any distribution |
+| `x86_64-pc-windows-msvc` | Windows on `x86_64` |
+
+There is no build for Linux or Windows on ARM. Build from source there.
+
+### macOS
+
+```
+tar -xzf rpf-<tag>-aarch64-apple-darwin.tar.gz
+sudo install -m 755 rpf-<tag>-aarch64-apple-darwin/rpf /usr/local/bin/rpf
+rpf --version
+```
+
+The binary is **not signed and not notarised**, so a copy a browser downloaded
+carries the `com.apple.quarantine` attribute and Gatekeeper refuses to run it —
+"cannot be opened because the developer cannot be verified". Clear it once:
+
+```
+xattr -d com.apple.quarantine /usr/local/bin/rpf
+```
+
+A copy fetched with `curl` in a terminal never gets the attribute, so this step
+is only for the browser route.
+
+### Linux
+
+```
+mkdir -p ~/.local/bin
+tar -xzf rpf-<tag>-x86_64-unknown-linux-musl.tar.gz
+install -m 755 rpf-<tag>-x86_64-unknown-linux-musl/rpf ~/.local/bin/rpf
+rpf --version
+```
+
+`~/.local/bin` needs no root and is on `PATH` by default on most distributions;
+`/usr/local/bin` with `sudo` is the system-wide alternative. The binary is
+linked against musl and carries its own libc, so it has no glibc version
+requirement and runs on a distribution older than the one that built it —
+`ldd ~/.local/bin/rpf` answers "not a dynamic executable".
+
+### Windows
+
+In PowerShell:
+
+```
+Unblock-File .\rpf-<tag>-x86_64-pc-windows-msvc.zip
+Expand-Archive .\rpf-<tag>-x86_64-pc-windows-msvc.zip -DestinationPath $env:LOCALAPPDATA\Programs
+[Environment]::SetEnvironmentVariable(
+  'Path',
+  "$env:Path;$env:LOCALAPPDATA\Programs\rpf-<tag>-x86_64-pc-windows-msvc",
+  'User')
+```
+
+Open a new terminal, then `rpf --version`. `Unblock-File` before extracting is
+what stops SmartScreen refusing the extracted `rpf.exe`; without it the first
+run shows "Windows protected your PC", and **More info → Run anyway** is the
+other way past it. The executable is unsigned, which is why either is needed.
+It is built with `-C target-feature=+crt-static`, so the Visual C++
+redistributable is **not** a prerequisite.
+
+### From source
+
+The fallback, and the only route that assumes a language runtime. It needs the
+Rust toolchain `rust-toolchain.toml` pins:
+
+```
+git clone <this repository> && cd rpf
+cargo build --release          # target/release/rpf
+```
 
 ## Exit codes
 
@@ -64,11 +160,24 @@ written and how much room its entry has, or which edits will not fit and force
 the rebuild. It needs no write permission, and a refusal is reported as a
 refusal, so what it says is what the real call would do.
 
+`verify` reads every entry back and checks it against what the archive says
+about itself, which for a **stored** entry is nothing at all: it declares no
+inflated length and carries no deflate stream that ends, so a byte changed
+inside one reads back perfectly. `--against TREE` closes that, by checking each
+entry against the SHA-256 an `extract` of the same archive recorded for it —
+`rpf verify dlc.rpf --against tree/`. The report says how far it reached in two
+numbers, because they are not the same: 27 entries read back on the sample and 7
+of them checked against a recorded checksum, the other twenty being inside
+nested archives, each covered by the checksum of the entry that holds it. A tree
+extracted from a *different* archive names none of this one's entries, so it is
+refused — exit 6 — rather than reported as nothing checked. DR-023, DR-025.
+
 The daemon answers everything the binary does. `info` and `verify` are methods
-on an open handle; `extract` and `pack` are too, with a tree named by a path on
-the daemon's own filesystem — the same thing `open`'s path already is, and
-DR-014 says why. An editor client, which reaches the container only through the
-daemon, is not limited to a subset of what the command line can do.
+on an open handle — `verify` taking the same tree as `against` — and `extract`
+and `pack` are too, with a tree named by a path on the daemon's own filesystem —
+the same thing `open`'s path already is, and DR-014 says why. An editor client,
+which reaches the container only through the daemon, is not limited to a subset
+of what the command line can do.
 
 A rebuild reports progress as it goes: on the command line to standard error
 when there is a terminal to read it, and over the daemon as JSON-RPC
@@ -79,11 +188,41 @@ does. A `cancel` sent to the daemon during either stops it: standard input is
 read on its own thread, so it arrives while there is still something to cancel. Nothing is left behind, because a
 rebuild only replaces the archive once it has finished.
 
+## Key material
+
+An encrypted archive needs the RAGE AES-256 key and the NG hash lookup table,
+and both live inside the game executable. Nothing is bundled here: the material
+is found in **your own installation**, by the SHA-1 of each value's own bytes
+rather than by an offset, and cached under the SHA-256 of the file it came
+from. DR-006, DR-017.
+
+```
+rpf keys extract /path/to/GTA5.exe   # find it, and cache what was found
+rpf keys cache                       # where the cache is, and how much is in it
+rpf keys invalidate                  # remove every cached entry
+```
+
+`--cache-dir DIR` puts the cache somewhere other than this platform's
+configuration directory, which is `$XDG_CONFIG_HOME/rpf` or `$HOME/.config/rpf`
+on Linux, `~/Library/Application Support/rpf` on macOS and `%APPDATA%\rpf` on
+Windows. The daemon answers `keys.extract`, `keys.cache` and `keys.invalidate`,
+taking `executable` and `cache` as paths on its own filesystem and returning
+the same objects `--json` prints.
+
+**No output path prints a key.** What is reported is offsets, lengths, the
+executable's SHA-256 and the cache path — `--json` is written to be piped into
+automation and pasted into a bug report. Extraction is whole or it is a
+failure: an executable carrying neither value exits 9, one that is not there
+exits 7, and a cache that cannot be written exits 7 naming the directory.
+
+Extracting a key does not yet let `rpf` open an encrypted archive — R3.6, which
+is deliberately unwritten while there is no encrypted archive to check a cipher
+against.
+
 ## Building and testing
 
-A tagged release publishes a static binary per platform — macOS on both
-architectures, Linux `x86_64` against musl, and Windows `x86_64` — with both
-licence files beside it. Nothing has to be installed first.
+What a tagged release would publish, and what to do with it, is **Installing**
+above — including what has and has not ever been run.
 
 ```
 cargo build --release          # target/release/rpf
@@ -100,6 +239,15 @@ directory holding them and set `RPF_REQUIRE_CORPUS` so a skip becomes a failure
 
 ```
 RPF_CORPUS=/path/to/corpus RPF_REQUIRE_CORPUS=1 cargo test --all
+```
+
+Key extraction is gated the same way, on its own variable, because a game
+executable is not an archive and no archive here is encrypted: `RPF_GAME_EXE`
+names a directory holding them, and `RPF_REQUIRE_GAME_EXE` turns its skips into
+failures.
+
+```
+RPF_GAME_EXE=/path/to/executables RPF_REQUIRE_GAME_EXE=1 cargo test --release --all
 ```
 
 `fixtures/` records what each corpus archive looked like to an implementation

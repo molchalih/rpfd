@@ -12,13 +12,17 @@
 //! entry each belongs to, so the command line, `--json` and the editor client
 //! each say it their own way (§10).
 
-use std::io::{Read, Seek};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Seek},
+};
 
 use crate::{
     archive::Archive,
     entry::EntryKind,
     error::{Error, Result},
-    format::{payload_floor, resource_len},
+    format::resource::resource_len,
+    manifest::{Checksum, Manifest},
     watch::{Flow, Step, Watch},
 };
 
@@ -199,7 +203,7 @@ impl Summary {
         // `payload_floor` is the one place that sum lives, so this cannot drift
         // from where the reader and the writer put the first payload.
         // `docs/rpf-format.md`, Slack, `verified`.
-        let mut referenced = payload_floor(
+        let mut referenced = archive.version().payload_floor(
             u64::from(entries),
             u64::try_from(archive.names_blob().len()).unwrap_or(u64::MAX),
         );
@@ -255,9 +259,11 @@ impl Summary {
 
 /// One entry that is not as the archive describes it.
 ///
-/// Either it did not read back at all, or it read back and its payload
-/// declares bytes its deflate stream never reached — [`Error::TrailingBytes`],
-/// which nothing but this walk looks for. R6.10.
+/// It did not read back at all; or it read back and its payload declares bytes
+/// its deflate stream never reached — [`Error::TrailingBytes`], which nothing
+/// but this walk looks for, R6.10; or it read back and its contents are not
+/// the contents a manifest recorded for it — [`Error::ChecksumMismatch`],
+/// DR-023.
 #[derive(Debug)]
 pub struct Problem {
     /// Where it is, addressed from the outermost archive.
@@ -267,12 +273,46 @@ pub struct Problem {
 }
 
 /// The result of reading every entry back.
+///
+/// **What a clean result proves depends on which walk produced it.** Every
+/// entry is checked against what the archive says about it, and an archive
+/// says nothing at all about a stored entry's bytes: no inflated length, no
+/// stream that ends. So a clean [`Verified::of`] means every entry read back,
+/// which is weaker than every entry being right. [`Verified::contents_checked`]
+/// is how far past that a result reaches, and it is zero unless a manifest was
+/// given. DR-023.
 #[derive(Debug)]
 pub struct Verified {
     /// How many file entries were read, the failing ones included.
     pub checked: u32,
+    /// How many of them had their contents checked against a recorded
+    /// checksum.
+    ///
+    /// Zero for [`Verified::of`], which is given no manifest, and for a
+    /// manifest that recorded none. Never larger than
+    /// [`Verified::checked`], and a caller reporting one number without the
+    /// other reports more than was measured.
+    pub contents_checked: u32,
     /// Those that did not come back as the archive promised.
     pub problems: Vec<Problem>,
+}
+
+/// What a [`Verified`] walk carries unchanged from one archive into the ones
+/// nested inside it.
+///
+/// One value rather than five parameters threaded through a recursion: the
+/// source, what a checksum was recorded for, the watcher, and how many bytes
+/// have come back so far — which is the whole nesting's count, not this
+/// archive's.
+struct Reading<'a, R, W> {
+    /// The source every archive in the nesting is read from.
+    src: &'a mut R,
+    /// The checksums a manifest recorded, by path. Empty when there is none.
+    recorded: &'a BTreeMap<&'a str, Checksum>,
+    /// Where progress goes and where a stop comes from. DR-008.
+    watch: &'a mut W,
+    /// Contents read back so far, across the whole nesting.
+    bytes: u64,
 }
 
 impl Verified {
@@ -295,11 +335,56 @@ impl Verified {
         archive: &Archive,
         watch: &mut impl Watch,
     ) -> Result<Self> {
+        Self::walked(src, archive, &BTreeMap::new(), watch)
+    }
+
+    /// [`Verified::of`], and each entry's contents against the checksum the
+    /// manifest recorded for its path.
+    ///
+    /// This is the only walk that can see a **stored** entry's bytes change:
+    /// nothing in the archive says what they should be, so nothing in a read
+    /// can notice. DR-023.
+    ///
+    /// Paths are the manifest's own — from the archive's root, as
+    /// [`crate::specs_of`] gives them — so a manifest of this archive matches
+    /// its entries and a manifest of another matches none of them, which
+    /// leaves [`Verified::contents_checked`] at zero rather than reporting
+    /// failures. Entries of a *nested* archive are addressed through the file
+    /// that holds them and are not in the manifest either; the nested archive
+    /// itself is one entry of the outer one, and checking that entry's
+    /// contents covers everything inside it at once.
+    ///
+    /// # Errors
+    ///
+    /// As [`Verified::of`].
+    pub fn against<R: Read + Seek>(
+        src: &mut R,
+        archive: &Archive,
+        manifest: &Manifest,
+        watch: &mut impl Watch,
+    ) -> Result<Self> {
+        Self::walked(src, archive, &manifest.checksums(), watch)
+    }
+
+    /// The one walk both entry points are.
+    fn walked<R: Read + Seek, W: Watch>(
+        src: &mut R,
+        archive: &Archive,
+        recorded: &BTreeMap<&str, Checksum>,
+        watch: &mut W,
+    ) -> Result<Self> {
         let mut verified = Self {
             checked: 0,
+            contents_checked: 0,
             problems: Vec::new(),
         };
-        verified.walk(src, archive, "", watch, &mut 0)?;
+        let mut reading = Reading {
+            src,
+            recorded,
+            watch,
+            bytes: 0,
+        };
+        verified.walk(&mut reading, archive, "")?;
         Ok(verified)
     }
 
@@ -319,13 +404,11 @@ impl Verified {
     }
 
     /// One archive's entries, then the archives nested in them.
-    fn walk<R: Read + Seek>(
+    fn walk<R: Read + Seek, W: Watch>(
         &mut self,
-        src: &mut R,
+        reading: &mut Reading<'_, R, W>,
         archive: &Archive,
         prefix: &str,
-        watch: &mut impl Watch,
-        bytes: &mut u64,
     ) -> Result<()> {
         let total = files_in(archive)?;
         let mut done = 0_u32;
@@ -343,19 +426,19 @@ impl Verified {
             // that passed made "1 of 26 entries failed" out of 27. R6.9.
             self.checked = self.checked.saturating_add(1);
             done = done.saturating_add(1);
-            let outcome = archive.read_payload(src, index);
+            let outcome = archive.read_payload(reading.src, index);
             if let Ok(ref payload) = outcome {
-                *bytes = bytes.saturating_add(payload.len());
+                reading.bytes = reading.bytes.saturating_add(payload.len());
             }
 
             // Reported whether or not it read back, so that `done` and the
             // entries named agree: an entry skipped on the wire while still
             // counted is a gap the watcher cannot account for.
-            if watch.step(Step {
+            if reading.watch.step(Step {
                 path: &path,
                 done,
                 total,
-                bytes: *bytes,
+                bytes: reading.bytes,
             }) == Flow::Stop
             {
                 return Err(Error::Cancelled { done, total });
@@ -371,15 +454,60 @@ impl Verified {
 
             // Reported and then walked past: the contents are sound, so an
             // archive nested in them is still read back. R6.10.
-            if let Err(error) = payload.checked() {
-                self.problems.push(Problem {
+            match payload.checked() {
+                Err(error) => self.problems.push(Problem {
                     path: path.clone(),
                     error,
-                });
+                }),
+                Ok(contents) => self.check_contents(reading, archive, index, &path, &contents)?,
             }
-            if let Some(nested) = archive.nested_at(src, index)? {
-                self.walk(src, &nested, &path, watch, bytes)?;
+            if let Some(nested) = archive.nested_at(reading.src, index)? {
+                self.walk(reading, &nested, &path)?;
             }
+        }
+        Ok(())
+    }
+
+    /// One entry's contents against the checksum recorded for its path, when
+    /// one was.
+    ///
+    /// `contents` is what the read already produced, so a binary entry costs
+    /// nothing more than the digest. A **resource** is the one kind where the
+    /// two forms differ — a read inflates it, and the file it is outside the
+    /// archive keeps its `RSC7` header and its deflated body — and the recorded
+    /// digest is over that second form, so this reads its payload once more.
+    /// [`Checksum`] is where that choice is argued; it is what makes the value
+    /// survive a rebuild and match `sha256sum` over an extracted tree.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::extract`] for a resource whose payload does not read back
+    /// the second time.
+    fn check_contents<R: Read + Seek, W: Watch>(
+        &mut self,
+        reading: &mut Reading<'_, R, W>,
+        archive: &Archive,
+        index: u32,
+        path: &str,
+        contents: &[u8],
+    ) -> Result<()> {
+        let Some(&recorded) = reading.recorded.get(path) else {
+            return Ok(());
+        };
+        let found = match archive.entry(index)?.kind {
+            EntryKind::Resource { .. } => Checksum::of(&archive.extract(reading.src, index)?),
+            _ => Checksum::of(contents),
+        };
+        self.contents_checked = self.contents_checked.saturating_add(1);
+        if found != recorded {
+            self.problems.push(Problem {
+                path: path.to_owned(),
+                error: Error::ChecksumMismatch {
+                    entry: index,
+                    recorded,
+                    found,
+                },
+            });
         }
         Ok(())
     }
@@ -437,6 +565,7 @@ mod tests {
     use crate::{
         archive::Archive,
         build::{FileKind, FileSpec, Storage, build},
+        format::Version,
         watch::Unwatched,
     };
 
@@ -476,14 +605,15 @@ mod tests {
         let mut out = Vec::new();
         build(
             &mut Cursor::new(&mut out),
+            Version::Rpf7,
             &files,
             &[],
             |wanted| {
-                Ok(if wanted == "art.yft" {
+                Ok(Cursor::new(if wanted == "art.yft" {
                     resource()
                 } else {
                     b"hello there".to_vec()
-                })
+                }))
             },
             &mut Unwatched,
         )
