@@ -1,0 +1,126 @@
+{
+  "name": "rpf",
+  "displayName": "RPF Archives",
+  "description": "Edit files inside RAGE .rpf archives as ordinary files, backed by the rpf daemon",
+  "version": "0.0.0",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=20"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "rpf",
+    "rage",
+    "archive"
+  ],
+  "main": "./dist/src/extension.js",
+  "activationEvents": [
+    "onFileSystem:rpf"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "rpf.mountArchive",
+        "title": "Mount Archive as Folder",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.unmountArchive",
+        "title": "Unmount Archive",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.saveArchive",
+        "title": "Save Archive",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.previewSave",
+        "title": "Preview Archive Save",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.discardEdits",
+        "title": "Discard Buffered Edits",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.verifyArchive",
+        "title": "Verify Archive",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.handOff",
+        "title": "Edit With Another Tool",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.endHandOff",
+        "title": "Stop Watching Handed-Off Files",
+        "category": "RPF"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "rpf.mountArchive",
+          "when": "resourceExtname == .rpf",
+          "group": "navigation@50"
+        },
+        {
+          "command": "rpf.handOff",
+          "when": "resourceScheme == rpf && !explorerResourceIsFolder",
+          "group": "navigation@50"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "RPF Archives",
+      "properties": {
+        "rpf.binaryPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `rpf` binary. Empty means: use the one bundled with this extension if there is one, otherwise the first `rpf` on `PATH`."
+        },
+        "rpf.handOff.extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".ytd",
+            ".ydr",
+            ".yft",
+            ".ycd",
+            ".ynv",
+            ".awc",
+            ".dds",
+            ".ydd",
+            ".ypt",
+            ".yed"
+          ],
+          "markdownDescription": "Entry extensions this extension will not try to edit itself. Opening one offers to extract it, watch it, and re-import it when it changes."
+        },
+        "rpf.handOff.directory": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Where handed-off files are written. Empty means a directory under the system temporary directory."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "check": "tsc -p . --noEmit",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "package": "npm run build && node dist/scripts/vsix.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.9.0"
+  }
+}
