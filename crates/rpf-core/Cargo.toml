@@ -10,13 +10,25 @@ rust-version.workspace = true
 flate2.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# docs/conventions.md §14, the checksums row. `sha2` was already there for the
+# executable hash R2.4 keys its cache on and is now a dependency rather than a
+# dev-dependency, because that hash is computed by the library. `sha1` is the
+# same row and the same family: the key-material anchors are SHA-1 digests, so
+# the algorithm is not ours to pick — it is what the values were published as.
+#
+# `directories`, which §14 names for the key cache location, is **not** here.
+# Its transitive `option-ext` is MPL-2.0, which `deny.toml` rejects, so
+# `cargo deny check licenses` fails with it in the tree. The three platform
+# rules are twenty lines in `keys::cache` instead, tested for all three from
+# any one of them.
+sha1 = "0.11"
+sha2 = "0.11"
 thiserror.workspace = true
 
 [dev-dependencies]
 hex = "0.4"
 serde_json = "1"
 tempfile = "3"
-sha2 = "0.11"
 
 [lints]
 workspace = true

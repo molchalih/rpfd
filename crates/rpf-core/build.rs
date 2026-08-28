@@ -10,15 +10,24 @@
 //! `RPF_REQUIRE_CORPUS` deliberately suppresses the gate: a caller that says
 //! the corpus must be there wants the tests to run and fail, not to be skipped
 //! quietly at a level `--include-ignored` is needed to see past.
+//!
+//! `RPF_GAME_EXE` gates the same way and is a separate variable because it
+//! names a separate thing: `docs/corpus.md` records that the game executables
+//! are not corpus — none of them is an archive — and key extraction reads them
+//! while nothing else does. R2.
 
 fn main() {
-    println!("cargo::rerun-if-env-changed=RPF_CORPUS");
-    println!("cargo::rerun-if-env-changed=RPF_REQUIRE_CORPUS");
-    println!("cargo::rustc-check-cfg=cfg(no_corpus)");
+    gate("RPF_CORPUS", "RPF_REQUIRE_CORPUS", "no_corpus");
+    gate("RPF_GAME_EXE", "RPF_REQUIRE_GAME_EXE", "no_executables");
+}
 
-    let located = std::env::var_os("RPF_CORPUS").is_some();
-    let required = std::env::var_os("RPF_REQUIRE_CORPUS").is_some();
-    if !located && !required {
-        println!("cargo::rustc-cfg=no_corpus");
+/// Sets `flag` unless `located` is set, or `required` says it must be there.
+fn gate(located: &str, required: &str, flag: &str) {
+    println!("cargo::rerun-if-env-changed={located}");
+    println!("cargo::rerun-if-env-changed={required}");
+    println!("cargo::rustc-check-cfg=cfg({flag})");
+
+    if std::env::var_os(located).is_none() && std::env::var_os(required).is_none() {
+        println!("cargo::rustc-cfg={flag}");
     }
 }

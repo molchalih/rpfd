@@ -14,6 +14,7 @@ pub mod entry;
 pub mod error;
 pub mod format;
 pub mod inspect;
+pub mod keys;
 pub mod manifest;
 pub mod name;
 pub mod patch;

@@ -165,6 +165,14 @@ pub struct Summary {
     /// How many entries hold an archive of their own, one level down.
     pub nested_archives: u32,
     /// Bytes of the archive that no region claims.
+    ///
+    /// An entry's tail is claimed, so it is not counted here and no other
+    /// field counts it either: a summary is silent about an archive holding a
+    /// payload whose deflate stream ends early, and that is decided rather
+    /// than overlooked. Finding one costs the inflate of every payload, which
+    /// is `verify`'s walk — with the watcher DR-008 gives unbounded work, and
+    /// which reports each one against its own path. R6.10, and the test named
+    /// `a_tail_is_referenced_by_its_entry_and_is_verifys_to_report`.
     pub unreferenced_bytes: u64,
 }
 

@@ -48,6 +48,23 @@ pub enum Failure {
         /// Where the installation was detected.
         root: PathBuf,
     },
+
+    /// A directory above the archive would not say what is in it, so the game
+    /// install guard has no answer rather than a negative one.
+    ///
+    /// Separate from [`Failure::GameInstall`] because that one names an
+    /// installation, and naming one that was never found would assert
+    /// something nothing measured. Both refuse and both take `--force`; only
+    /// the sentence differs.
+    #[error(
+        "refusing to write below {directory}: that directory cannot be \
+         examined, so whether this is a game installation cannot be told from \
+         here. Pass --force to override, or copy the archive out first"
+    )]
+    UncertainInstall {
+        /// The directory the filesystem would not answer for.
+        directory: PathBuf,
+    },
 }
 
 /// Process exit codes. Stable, and part of the contract.
@@ -87,8 +104,11 @@ pub enum Code {
 
 impl Failure {
     /// The exit code for this failure.
+    ///
+    /// Not `const`, because `rpf_core::Error::category` is not: one container
+    /// variant is classified from the bytes it carries. DR-019.
     #[must_use]
-    pub const fn code(&self) -> Code {
+    pub fn code(&self) -> Code {
         match *self {
             Self::Container(ref error) => match error.category() {
                 Category::NotFound => Code::NotFound,
@@ -100,7 +120,9 @@ impl Failure {
                 Category::Io => Code::Io,
             },
             Self::Io { .. } => Code::Io,
-            Self::Refused { .. } | Self::GameInstall { .. } => Code::Refused,
+            Self::Refused { .. } | Self::GameInstall { .. } | Self::UncertainInstall { .. } => {
+                Code::Refused
+            }
         }
     }
 }
@@ -173,5 +195,26 @@ mod tests {
             .code() as i32,
             Code::Refused as i32,
         );
+    }
+
+    #[test]
+    fn both_halves_of_the_install_guard_refuse_on_the_same_number() {
+        // The guard has two answers — an installation it found, and a
+        // directory it could not look into — and one thing for the caller to
+        // do about either. Two sentences, one number. DR-010.
+        for failure in [
+            Failure::GameInstall {
+                root: "/games/GTAV".into(),
+            },
+            Failure::UncertainInstall {
+                directory: "/games".into(),
+            },
+        ] {
+            assert_eq!(
+                failure.code() as i32,
+                Code::Refused as i32,
+                "{failure} is a refusal",
+            );
+        }
     }
 }

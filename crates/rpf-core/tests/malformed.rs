@@ -22,7 +22,7 @@
 use std::io::{Cursor, Write as _};
 
 use rpf_core::{
-    Archive, Error, MAX_DEPTH, Unwatched, Verified,
+    Archive, Category, Error, MAX_DEPTH, Summary, Unwatched, Verified,
     format::{
         BLOCK_LEN, DIRECTORY_MARKER, ENCRYPTION_OPEN, ENTRY_LEN, HEADER_LEN, MAGIC_RPF7,
         MAGIC_RSC7, RESOURCE_FLAG, RESOURCE_HEADER_LEN,
@@ -879,6 +879,66 @@ fn a_binary_entry_whose_stream_ends_before_its_payload_is_reported_by_verify() {
         }
         other => panic!("expected one trailing-bytes problem, got {other:?}"),
     }
+}
+
+#[test]
+fn a_tail_is_referenced_by_its_entry_and_is_verifys_to_report() {
+    // R6.10's other half, decided rather than left. `info` summarises an
+    // archive and says nothing about a tail, and this pins both why and how
+    // far: the entry *does* reference those bytes — `unreferenced_bytes` is
+    // what no region claims, and a tail is claimed — so the two summaries
+    // below differ by exactly the tail and in nothing else.
+    //
+    // Nothing cheaper than `verify` can find one. A tail is only visible after
+    // the stream has been inflated and its extent compared with the entry's,
+    // so a count in `Summary` would make `info` read and inflate the whole
+    // archive — the unbounded work DR-008 gave `verify` a watcher for, in a
+    // call that has none. Measured 2026-08-28 on the 145 MB sample: `info`
+    // reads 11 entry rows, `verify` inflates 65,159,372 bytes.
+    let stream = deflate(&[b'x'; ONE_SYSTEM_PAGE_LEN]);
+    let tail = 200_u32;
+    let tidy = one_file_archive(&stream, stream.len() as u32, 0, ONE_SYSTEM_PAGE_LEN as u32);
+    let with_tail = one_file_archive(
+        &stream,
+        stream.len() as u32 + tail,
+        0,
+        ONE_SYSTEM_PAGE_LEN as u32,
+    );
+
+    let summarise = |bytes: &[u8]| {
+        let mut src = Cursor::new(bytes.to_vec());
+        let archive = Archive::open(&mut src).expect("well formed");
+        Summary::of(&mut src, &archive, "").expect("summarises")
+    };
+    let (tidy_summary, tail_summary) = (summarise(&tidy), summarise(&with_tail));
+
+    assert_eq!(
+        tail_summary.unreferenced_bytes + u64::from(tail),
+        tidy_summary.unreferenced_bytes,
+        "the tail is inside what the entry claims, so no region is short of it",
+    );
+    assert_eq!(
+        Summary {
+            unreferenced_bytes: tidy_summary.unreferenced_bytes,
+            ..tail_summary
+        },
+        tidy_summary,
+        "no other field of a summary tells the two archives apart",
+    );
+
+    // And the command that is asked to look does look, per entry, with the
+    // path and both lengths, at exit code 4.
+    match problems(&with_tail).as_slice() {
+        [(path, error @ Error::TrailingBytes { .. })] => {
+            assert_eq!(path, "a");
+            assert_eq!(error.category(), Category::Corrupt);
+        }
+        other => panic!("expected one trailing-bytes problem, got {other:?}"),
+    }
+    assert!(
+        problems(&tidy).is_empty(),
+        "and says nothing about the archive without one",
+    );
 }
 
 #[test]

@@ -15,7 +15,10 @@ docs/
 bin/
 
 # Extracted key material. Derived from a local game install; never redistributed.
-keys/
+# Anchored at the root: the rule is about a `keys/` directory beside `assets/`
+# and `bin/`, and unanchored it also swallowed `crates/rpf-core/src/keys/`,
+# which is source.
+/keys/
 *.keys
 
 # Rust

@@ -1533,8 +1533,16 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     }
     // Before the dry run, not after: what a commit would do here is refuse, and
     // a dry run reports what the real call would do.
-    if !force && let Some(root) = install::detect(&session.path) {
-        return Err(Failure::GameInstall { root }.into());
+    if !force {
+        match install::detect(&session.path) {
+            Some(install::Detected::Installation(root)) => {
+                return Err(Failure::GameInstall { root }.into());
+            }
+            Some(install::Detected::Unexaminable(directory)) => {
+                return Err(Failure::UncertainInstall { directory }.into());
+            }
+            None => {}
+        }
     }
     if dry_run {
         return would_commit(session, asked_to_rebuild);

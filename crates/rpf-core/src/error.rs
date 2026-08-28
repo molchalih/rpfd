@@ -7,6 +7,8 @@
 
 use std::io;
 
+use crate::format::{MAGIC_RPF7, unsupported_version};
+
 /// Anything that can go wrong reading a container.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -22,11 +24,19 @@ pub enum Error {
     },
 
     /// The bytes at the archive's base are not an RPF7 header.
+    ///
+    /// **Its category is decided by `found`.** The four bytes are the only
+    /// thing in the format that ever claims an archive is here — no entry row
+    /// marks a payload as one, which is why every walk sniffs — so bytes that
+    /// name a container version and then fail to hold a whole header are a
+    /// malformed archive, and bytes that name nothing are a request that
+    /// called an ordinary file an archive. DR-019.
     #[error("not an RPF7 archive at offset {base}: magic reads {found:02x?}")]
     NotAnArchive {
         /// Where the archive was expected to begin.
         base: u64,
-        /// The four bytes actually found there.
+        /// The four bytes actually found there. Also what decides whether this
+        /// is [`Category::Corrupt`] or [`Category::Refused`].
         found: [u8; 4],
     },
 
@@ -59,6 +69,27 @@ pub enum Error {
     NeedsKey {
         /// The encryption tag from the header.
         tag: u32,
+    },
+
+    /// A game executable does not carry the key material this build knows how
+    /// to find.
+    ///
+    /// Extraction anchors each value on the SHA-1 of its own bytes rather than
+    /// on an offset, so a match is its own proof and a miss means the value is
+    /// not present in that exact form — a different build of the game, a
+    /// patched executable, or the wrong file entirely. It carries the counts
+    /// because "1 of 2" and "0 of 2" are different situations to be in.
+    ///
+    /// [`Category::Unsupported`] for the reason [`Error::UnsupportedVersion`]
+    /// is: the file is intact and the part that is missing is here.
+    #[error("{what}: {found} of {wanted} values are in this executable")]
+    UnrecognisedExecutable {
+        /// Which material was looked for.
+        what: &'static str,
+        /// How many of its values were found.
+        found: u32,
+        /// How many there are to find.
+        wanted: u32,
     },
 
     /// A region the header describes does not fit inside the archive.
@@ -419,14 +450,29 @@ pub enum Category {
     Io,
 }
 
+/// Whether four bytes at an archive's base claim to be a container at all.
+///
+/// Composed from the two things `format` already names, rather than spelling
+/// the magic again (§3): the version this build reads, and the versions it
+/// only recognises. Either claim is enough — what matters is that something
+/// asserted an archive was there.
+fn claims_a_container(magic: [u8; 4]) -> bool {
+    magic == MAGIC_RPF7 || unsupported_version(magic).is_some()
+}
+
 impl Error {
     /// What kind of failure this is.
+    ///
+    /// Not `const`, because [`Error::NotAnArchive`] is classified from the
+    /// bytes it carries and that reads a `format` function. DR-019.
     #[must_use]
-    pub const fn category(&self) -> Category {
+    pub fn category(&self) -> Category {
         match *self {
             Self::Io { .. } => Category::Io,
             Self::NeedsKey { .. } => Category::NeedsKey,
-            Self::UnsupportedVersion { .. } => Category::Unsupported,
+            Self::UnsupportedVersion { .. } | Self::UnrecognisedExecutable { .. } => {
+                Category::Unsupported
+            }
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
@@ -435,8 +481,16 @@ impl Error {
             | Self::NameCollision { .. }
             | Self::WrongKind { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
-            Self::NotAnArchive { .. }
-            | Self::OutOfBounds { .. }
+            // DR-019: the bytes decide. A payload that never claimed to be an
+            // archive was named one by the caller's own path.
+            Self::NotAnArchive { found, .. } => {
+                if claims_a_container(found) {
+                    Category::Corrupt
+                } else {
+                    Category::Refused
+                }
+            }
+            Self::OutOfBounds { .. }
             | Self::BadName { .. }
             | Self::BadChildRange { .. }
             | Self::CyclicTree { .. }
@@ -466,7 +520,7 @@ mod tests {
     /// The match is exhaustive, so a variant added later stops this module
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 25;
+    const VARIANTS: usize = 26;
 
     /// The variant's own name, for a test that has to say which one it means.
     fn name(error: &Error) -> &'static str {
@@ -474,6 +528,7 @@ mod tests {
             Error::Io { .. } => "Io",
             Error::NotAnArchive { .. } => "NotAnArchive",
             Error::UnsupportedVersion { .. } => "UnsupportedVersion",
+            Error::UnrecognisedExecutable { .. } => "UnrecognisedExecutable",
             Error::NeedsKey { .. } => "NeedsKey",
             Error::OutOfBounds { .. } => "OutOfBounds",
             Error::BadName { .. } => "BadName",
@@ -510,9 +565,11 @@ mod tests {
     /// then failed to decode. DR-010.
     fn corrupt() -> Vec<Error> {
         vec![
+            // The bytes name a container and then do not hold one. The other
+            // spelling of this variant is in `refused()`.
             Error::NotAnArchive {
                 base: 0,
-                found: [0; 4],
+                found: crate::format::MAGIC_RPF7,
             },
             Error::OutOfBounds {
                 region: "payload",
@@ -577,6 +634,13 @@ mod tests {
     /// for what the caller passed. DR-010.
     fn refused() -> Vec<Error> {
         vec![
+            // Bytes that never claimed to be a container. Nothing about them
+            // is malformed; the request that called them an archive was wrong.
+            // DR-019.
+            Error::NotAnArchive {
+                base: 512,
+                found: *b"hell",
+            },
             Error::FieldOverflow {
                 path: "big.bin".to_owned(),
                 what: "compressed size",
@@ -622,6 +686,14 @@ mod tests {
                     base: 0,
                     version: 2,
                     found: *b"RPF2",
+                },
+                Category::Unsupported,
+            ),
+            (
+                Error::UnrecognisedExecutable {
+                    what: "AES key and hash lookup table",
+                    found: 1,
+                    wanted: 2,
                 },
                 Category::Unsupported,
             ),
@@ -673,7 +745,28 @@ mod tests {
     }
 
     #[test]
-    fn the_taxonomy_covers_every_variant_exactly_once() {
+    fn what_the_bytes_claim_decides_who_has_to_act_on_them() {
+        // DR-019. The four bytes are the only thing that ever says an archive
+        // is here — nothing in an entry row marks a payload as one, which is
+        // why every walk sniffs. So bytes that name a container and then fail
+        // to hold one are a malformed archive, and bytes that name nothing are
+        // a request that called an ordinary file an archive.
+        for (found, expected) in [
+            (crate::format::MAGIC_RPF7, Category::Corrupt),
+            (*b"RPF2", Category::Corrupt),
+            (*b"hell", Category::Refused),
+            ([0; 4], Category::Refused),
+            (*b"PK\x03\x04", Category::Refused),
+        ] {
+            let error = Error::NotAnArchive { base: 0, found };
+            assert_eq!(error.category(), expected, "{found:02x?}");
+        }
+    }
+
+    #[test]
+    fn the_taxonomy_covers_every_variant() {
+        // `NotAnArchive` is listed twice, once per category, because its
+        // category is decided by the bytes it carries. DR-019.
         let named: BTreeSet<&str> = taxonomy().iter().map(|(error, _)| name(error)).collect();
         assert_eq!(
             named.len(),

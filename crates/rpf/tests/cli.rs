@@ -130,15 +130,16 @@ fn exit_codes_distinguish_the_failures() {
     assert_eq!(run(&["info", &archive]).0, 0, "a good archive");
     assert_eq!(run(&["cat", &archive, "nope/missing"]).0, 3, "not found");
 
-    // Both shapes of "not an archive": long enough to have a header and the
-    // magic is wrong, and too short to have one at all. Neither is an i/o
-    // failure — nothing failed, the bytes are simply not an archive.
+    // Both shapes of "not an archive". Neither is an i/o failure — nothing
+    // failed, the bytes are simply not an archive — and the two are not one
+    // exit code either: what the four bytes claim decides who has to act on
+    // them. DR-019.
     let wrong_magic = dir.path().join("plain.txt");
     fs::write(&wrong_magic, b"this is definitely not an archive at all").expect("writable");
     assert_eq!(
         run(&["info", &wrong_magic.display().to_string()]).0,
-        4,
-        "wrong magic"
+        6,
+        "bytes that never claimed to be an archive"
     );
 
     let too_short = dir.path().join("stub.rpf");
@@ -146,12 +147,20 @@ fn exit_codes_distinguish_the_failures() {
     assert_eq!(
         run(&["info", &too_short.display().to_string()]).0,
         4,
-        "too short"
+        "an archive that says so and does not hold a header"
     );
 
     let empty = dir.path().join("empty.rpf");
     fs::write(&empty, b"").expect("writable");
-    assert_eq!(run(&["info", &empty.display().to_string()]).0, 4, "empty");
+    assert_eq!(run(&["info", &empty.display().to_string()]).0, 6, "empty");
+
+    // The case DR-019 is about: an entry that is an ordinary file, named as an
+    // archive by the caller's own path. Nothing in `test.rpf` is wrong.
+    assert_eq!(
+        run(&["info", &archive, "stored.bin"]).0,
+        6,
+        "an ordinary entry named as a nested archive"
+    );
 
     // An RPF of a version with no codec here is not the same failure as either
     // of those: nothing is malformed and the caller's request was fine. It used

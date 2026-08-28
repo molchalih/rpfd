@@ -6,7 +6,7 @@
 
 use std::{
     ffi::OsStr,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -25,25 +25,62 @@ const EXECUTABLES: &[&str] = &[
 /// installation; beyond this depth a match is more likely a coincidence.
 const MAX_ASCENT: usize = 8;
 
-/// The installation root above `path`, if there is one.
+/// What the ascent above an archive found.
+///
+/// Two answers rather than one path, because "this is an installation" and
+/// "this could not be looked at" are different things to tell a caller, and a
+/// refusal that named the second as the first would assert something nothing
+/// measured (§10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detected {
+    /// A directory holding a file only a game installation holds.
+    Installation(PathBuf),
+    /// A directory on the way up that the filesystem would not answer
+    /// questions about, so whether an installation is there is not knowable
+    /// from here.
+    Unexaminable(PathBuf),
+}
+
+/// The installation above `path`, or the directory that stopped the ascent
+/// from being able to say.
 ///
 /// Deliberately conservative in one direction only: a false positive costs an
-/// explicit override, a false negative costs a broken installation.
-pub fn detect(path: &Path) -> Option<PathBuf> {
+/// explicit override, a false negative costs a broken installation. A
+/// directory that cannot be examined is therefore reported rather than passed
+/// over — the whole guard is a negative answer, and one that came from a
+/// question the filesystem refused is not an answer at all.
+///
+/// [`Detected::Installation`] wins over [`Detected::Unexaminable`] wherever
+/// both are found, because a directory named outright says more than one that
+/// could not be looked at below it.
+pub fn detect(path: &Path) -> Option<Detected> {
     let resolved = resolve(path);
     let mut current = resolved.parent()?;
+    let mut unexaminable: Option<PathBuf> = None;
     for _ in 0..MAX_ASCENT {
-        if EXECUTABLES.iter().any(|exe| holds(current, exe)) {
-            return Some(current.to_path_buf());
+        match verdict(current) {
+            Held::Yes => return Some(Detected::Installation(current.to_path_buf())),
+            Held::Unknown if unexaminable.is_none() => {
+                unexaminable = Some(current.to_path_buf());
+            }
+            Held::Unknown | Held::No => {}
         }
-        // A `common.rpf` beside an `x64a.rpf` is the shape of a game data
-        // directory even when the executable lives a level further up.
-        if holds(current, "common.rpf") && holds(current, "x64a.rpf") {
-            return Some(current.to_path_buf());
-        }
-        current = current.parent()?;
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
     }
-    None
+    unexaminable.map(Detected::Unexaminable)
+}
+
+/// Whether one directory is an installation, as far as it will say.
+fn verdict(directory: &Path) -> Held {
+    let named = EXECUTABLES
+        .iter()
+        .fold(Held::No, |so_far, exe| so_far.or(holds(directory, exe)));
+    // A `common.rpf` beside an `x64a.rpf` is the shape of a game data
+    // directory even when the executable lives a level further up.
+    named.or(holds(directory, "common.rpf").and(holds(directory, "x64a.rpf")))
 }
 
 /// `path` with the directories above it resolved, so that ascending from it
@@ -90,28 +127,92 @@ fn is_named(found: &OsStr, name: &str) -> bool {
         .is_some_and(|found| found.eq_ignore_ascii_case(name))
 }
 
+/// What the filesystem will say about a name in a directory.
+///
+/// Three answers rather than two, because a question the filesystem refuses to
+/// answer is not the answer `false` (§4). Every "no" this guard acts on is a
+/// reason to write into a directory, so a "no" invented out of a permission
+/// error is the one failure direction the module opens with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// The name is there, and is a file.
+    Yes,
+    /// The name is not there, or is there and is not a file.
+    No,
+    /// The filesystem would not say.
+    Unknown,
+}
+
+impl Held {
+    /// The stronger of two answers about the same directory: a name found
+    /// beats one the filesystem would not discuss, which beats one that is
+    /// not there.
+    #[must_use]
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Yes, _) | (_, Self::Yes) => Self::Yes,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::No, Self::No) => Self::No,
+        }
+    }
+
+    /// Whether both are there. A pair is only present when both halves are,
+    /// and only absent when a half is known to be.
+    #[must_use]
+    const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::No, _) | (_, Self::No) => Self::No,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Yes, Self::Yes) => Self::Yes,
+        }
+    }
+}
+
 /// Whether `directory` holds a file of this name, in any case.
 ///
 /// The directory is listed and each entry compared by [`is_named`], rather than
 /// the name being joined on and stat'd, so the answer is the same on all three
 /// platforms.
 ///
+/// A directory that cannot be listed is asked the other way — the exact join
+/// this replaced — because the two fail on different permissions and neither
+/// subsumes the other. Measured 2026-08-28 on macOS, one `GTA5.exe` inside:
+/// mode `111` refuses the listing and answers the join, mode `444` answers the
+/// listing and refuses the stat, and mode `000` refuses both. All three used to
+/// answer `false`, and the first two are the case-fold's own trade rather than
+/// a limit of the filesystem.
+///
 /// The entry is stat'd through its own path rather than through
 /// `DirEntry::file_type`, so a symlinked executable still counts as one.
-fn holds(directory: &Path, name: &str) -> bool {
+fn holds(directory: &Path, name: &str) -> Held {
     let Ok(entries) = fs::read_dir(directory) else {
-        return false;
+        return of_path(&directory.join(name));
     };
     entries
         .flatten()
-        .any(|entry| is_named(&entry.file_name(), name) && entry.path().is_file())
+        .filter(|entry| is_named(&entry.file_name(), name))
+        .fold(Held::No, |so_far, entry| so_far.or(of_path(&entry.path())))
+}
+
+/// What a path says about itself, when it will say anything.
+///
+/// Only [`io::ErrorKind::NotFound`] is an answer; every other failure is the
+/// filesystem declining the question, and answering `No` for it is what let a
+/// directory nobody could look into pass for one with no game in it.
+fn of_path(path: &Path) -> Held {
+    match path.metadata() {
+        Ok(found) if found.is_file() => Held::Yes,
+        Ok(_) => Held::No,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Held::No,
+        Err(_) => Held::Unknown,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsStr, fs};
 
-    use super::{detect, holds, is_named};
+    use super::{Detected, Held, detect, holds, is_named};
 
     /// An installation: an executable at the root, and an archive some way
     /// below it.
@@ -150,18 +251,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         fs::write(dir.path().join("gta5.exe"), b"not really").expect("writable");
 
-        assert!(holds(dir.path(), "GTA5.exe"));
-        assert!(holds(dir.path(), "gta5.exe"));
-        assert!(!holds(dir.path(), "GTA4.exe"));
-        assert!(!holds(dir.path().join("nowhere").as_path(), "gta5.exe"));
+        assert_eq!(holds(dir.path(), "GTA5.exe"), Held::Yes);
+        assert_eq!(holds(dir.path(), "gta5.exe"), Held::Yes);
+        assert_eq!(holds(dir.path(), "GTA4.exe"), Held::No);
+        assert_eq!(
+            holds(dir.path().join("nowhere").as_path(), "gta5.exe"),
+            Held::No,
+            "a directory that is not there is an answer, not a refusal to answer",
+        );
 
         // The fold is ours and it is ASCII. A case-insensitive volume folds
         // more than that — measured on this one, `ÄTA5.exe` opens as
         // `äta5.exe` — so on the platform where the first assertion above
         // cannot tell the listing from an exact join, this one can.
         fs::write(dir.path().join("ÄTA5.exe"), b"not really").expect("writable");
-        assert!(
-            !holds(dir.path(), "äta5.exe"),
+        assert_eq!(
+            holds(dir.path(), "äta5.exe"),
+            Held::No,
             "the comparison is this crate's rather than the volume's"
         );
     }
@@ -170,7 +276,7 @@ mod tests {
     fn a_directory_of_the_right_name_is_not_an_executable() {
         let dir = tempfile::tempdir().expect("temp dir");
         fs::create_dir(dir.path().join("GTA5.exe")).expect("directory");
-        assert!(!holds(dir.path(), "GTA5.exe"));
+        assert_eq!(holds(dir.path(), "GTA5.exe"), Held::No);
     }
 
     #[test]
@@ -179,8 +285,10 @@ mod tests {
         let root = dir.path().join("Grand Theft Auto V");
         let archive = installation(&root, "gta5.exe");
         assert_eq!(
-            detect(&archive).map(|found| found.canonicalize().expect("canonical")),
-            Some(root.canonicalize().expect("canonical")),
+            detect(&archive),
+            Some(Detected::Installation(
+                root.canonicalize().expect("canonical")
+            )),
         );
     }
 
@@ -194,6 +302,96 @@ mod tests {
         let fresh = archive.with_file_name("new.rpf");
         assert!(!fresh.exists());
         assert!(detect(&fresh).is_some());
+    }
+
+    /// The three ways a directory can be closed to a question about a name in
+    /// it. Unix only, because a mode is what makes one.
+    #[cfg(unix)]
+    mod closed {
+        use std::{fs, os::unix::fs::PermissionsExt as _, path::Path};
+
+        use super::super::{Detected, Held, detect, holds};
+
+        /// Measured 2026-08-28 in a tempdir on macOS, one `GTA5.exe` inside:
+        ///
+        /// | mode | `read_dir` | listed names | join stat | was | is |
+        /// |---|---|---|---|---|---|
+        /// | `000` | denied | — | denied | `false` | `Unknown` |
+        /// | `111` | denied | — | file | `false` | `Yes` |
+        /// | `444` | ok | `GTA5.exe` | denied | `false` | `Unknown` |
+        ///
+        /// Only `111` is the trade the case-fold made — the exact join it
+        /// replaced answered `true` there. The other two were never right and
+        /// were never noticed; `444` had the name in its hand and threw it away
+        /// on a stat it was not allowed to make. What the tests below assert is
+        /// the property behind all three: never a confident `No` from a
+        /// question that was refused.
+        const MODES: [u32; 3] = [0o000, 0o111, 0o444];
+
+        /// Sets the mode, and says whether it actually closed the directory.
+        ///
+        /// Asked of the filesystem rather than of the user id: root reads
+        /// every directory whatever its mode says, and so do some mounts, and
+        /// there the test has nothing to reproduce. A directory is closed when
+        /// it refuses at least one of the two questions [`holds`] asks.
+        fn closes(directory: &Path, mode: u32) -> bool {
+            fs::set_permissions(directory, fs::Permissions::from_mode(mode)).is_ok()
+                && (fs::read_dir(directory).is_err()
+                    || directory.join("GTA5.exe").metadata().is_err())
+        }
+
+        /// A directory holding an executable, at `mode`, with what it is worth
+        /// asking of it.
+        fn closed_over(mode: u32) -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let root = temp.path().join("Grand Theft Auto V");
+            fs::create_dir(&root).expect("directory");
+            fs::write(root.join("GTA5.exe"), b"not really").expect("writable");
+            if closes(&root, mode) {
+                return Some((temp, root));
+            }
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod back");
+            None
+        }
+
+        #[test]
+        fn a_directory_that_cannot_be_examined_is_not_answered_no() {
+            for mode in MODES {
+                let Some((_temp, root)) = closed_over(mode) else {
+                    eprintln!("skipped: mode {mode:04o} does not close a directory here");
+                    continue;
+                };
+                let answer = holds(&root, "GTA5.exe");
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod back");
+                assert_ne!(
+                    answer,
+                    Held::No,
+                    "mode {mode:04o}: a directory that cannot be examined must not \
+                     be reported as one that does not hold the executable"
+                );
+            }
+        }
+
+        #[test]
+        fn an_archive_below_a_directory_that_cannot_be_examined_is_still_guarded() {
+            for mode in MODES {
+                let Some((_temp, root)) = closed_over(mode) else {
+                    eprintln!("skipped: mode {mode:04o} does not close a directory here");
+                    continue;
+                };
+                let archive = root.join("dlc.rpf");
+                let found = detect(&archive);
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod back");
+                assert!(
+                    matches!(
+                        found,
+                        Some(Detected::Installation(_) | Detected::Unexaminable(_))
+                    ),
+                    "mode {mode:04o}: the guard must not wave through what it \
+                     could not look at, and got {found:?}"
+                );
+            }
+        }
     }
 
     #[test]

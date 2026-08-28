@@ -610,12 +610,19 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
-/// Refuses to write into a detected game installation.
+/// Refuses to write into a detected game installation, or below a directory
+/// that would not say whether it is one.
 fn refuse_game_install(path: &Path, force: bool) -> Result<()> {
-    if !force && let Some(root) = install::detect(path) {
-        return Err(Failure::GameInstall { root });
+    if force {
+        return Ok(());
     }
-    Ok(())
+    match install::detect(path) {
+        Some(install::Detected::Installation(root)) => Err(Failure::GameInstall { root }),
+        Some(install::Detected::Unexaminable(directory)) => {
+            Err(Failure::UncertainInstall { directory })
+        }
+        None => Ok(()),
+    }
 }
 
 /// Moves a freshly written archive into place, keeping any permissions the
