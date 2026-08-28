@@ -457,10 +457,10 @@ fn an_allocation_of_a_directory_is_a_wrong_kind() {
         matches!(
             error,
             Error::WrongKind {
-                entry: 0,
+                ref path,
                 found: "directory",
                 wanted: "file"
-            }
+            } if path.is_empty()
         ),
         "expected a wrong kind, got {error:?}"
     );
@@ -1079,6 +1079,7 @@ fn a_name_no_host_can_hold_is_still_one_node_of_a_tree() {
     rpf_core::rebuild(
         &mut source,
         &archive,
+        &rpf_core::Changes::new(),
         &mut out,
         std::collections::BTreeMap::new(),
         &mut rpf_core::Unwatched,
@@ -1131,6 +1132,7 @@ fn a_name_windows_would_trim_is_still_one_node_of_a_tree() {
         rpf_core::rebuild(
             &mut source,
             &archive,
+            &rpf_core::Changes::new(),
             &mut Cursor::new(Vec::new()),
             std::collections::BTreeMap::new(),
             &mut rpf_core::Unwatched,

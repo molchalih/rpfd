@@ -5,14 +5,13 @@
 //! same thing. `docs/conventions.md` §1.
 
 use std::{
-    collections::BTreeMap,
     fs,
     io::{IsTerminal, Seek as _, Write},
     path::{Path, PathBuf},
 };
 
 use rpf_core::{
-    Archive, Flow, ListedKind, Step, Unwatched, Watch,
+    Archive, Change, Changes, Flow, ListedKind, Step, Unwatched, Watch,
     keys::{AES_KEY_LEN, Cache, HASH_LUT_LEN, Keys, SourceDigest},
 };
 use serde_json::{Value, json};
@@ -263,32 +262,153 @@ pub fn cat(path: &Path, inside: &str) -> Result<()> {
     })
 }
 
-/// How a write is allowed to happen.
+/// How a change to what an archive holds is allowed to happen.
 ///
-/// Grouped rather than passed as three more parameters: `put` was already at
-/// the argument and boolean limits `clippy.toml` sets, and a call site reading
-/// `put(a, b, c, false, false, true)` says nothing about which `false` is which.
+/// Grouped rather than passed as more parameters: a call site reading
+/// `remove(a, b, false, true)` says nothing about which `false` is which.
 #[derive(Debug, Clone, Copy, clap::Args)]
-pub struct WriteOptions {
+pub struct ChangeOptions {
     /// Write even into a detected game installation.
     #[arg(long)]
     pub force: bool,
-    /// Rebuild the whole archive rather than patching in place. Slower, and
-    /// atomic: an interrupted rebuild leaves the original untouched.
-    #[arg(long)]
-    pub rebuild: bool,
     /// Report what would be written, and write nothing.
     #[arg(long)]
     pub dry_run: bool,
 }
 
+/// How a write is allowed to happen: [`ChangeOptions`], and the two questions
+/// only replacing an entry can be asked.
+///
+/// Adding, removing and renaming always rebuild — each of them moves the entry
+/// count or the names blob, DR-026 — so `--rebuild` would be a flag with one
+/// value on `rm`, `mv` and `mkdir`, and it is not offered there.
+#[derive(Debug, Clone, Copy, clap::Args)]
+pub struct WriteOptions {
+    /// What every change to an archive may be told.
+    #[command(flatten)]
+    pub change: ChangeOptions,
+    /// Rebuild the whole archive rather than patching in place. Slower, and
+    /// atomic: an interrupted rebuild leaves the original untouched.
+    #[arg(long)]
+    pub rebuild: bool,
+    /// Create the entry if the archive holds nothing at that path, rather than
+    /// reporting it as not found. Creating one rebuilds; this changes nothing
+    /// about a path the archive already holds.
+    #[arg(long)]
+    pub create: bool,
+}
+
+impl From<ChangeOptions> for WriteOptions {
+    fn from(change: ChangeOptions) -> Self {
+        Self {
+            change,
+            rebuild: false,
+            create: false,
+        }
+    }
+}
+
 /// `put` — replace one entry.
 ///
-/// Prefers patching in place: if the new payload fits where the old one sits,
-/// only that payload and its entry row are written, and an archive of any size
-/// costs the same as the file being put. `docs/approach.md`. When it does not
-/// fit, or `rebuild` is asked for, the archive is rebuilt to a temporary file
-/// and renamed into place.
+/// Reads the file and hands the whole of the decision to [`apply`], which is
+/// where every command that changes an archive goes: they differ in what change
+/// they ask for and in nothing else (§4).
+pub fn put(
+    path: &Path,
+    inside: &str,
+    from: &Path,
+    options: WriteOptions,
+    json_out: bool,
+) -> Result<()> {
+    let contents = fs::read(from).map_err(|source| Failure::Io {
+        path: from.display().to_string(),
+        source,
+    })?;
+    apply(
+        path,
+        inside,
+        &Changes::one(
+            inside,
+            Change::Write {
+                contents,
+                create: options.create,
+            },
+        ),
+        options,
+        json_out,
+    )
+}
+
+/// `rm` — remove an entry, and its children when it is a directory and
+/// `recursive`.
+pub fn remove(
+    path: &Path,
+    inside: &str,
+    recursive: bool,
+    options: ChangeOptions,
+    json_out: bool,
+) -> Result<()> {
+    apply(
+        path,
+        inside,
+        &Changes::one(inside, Change::Remove { recursive }),
+        options.into(),
+        json_out,
+    )
+}
+
+/// `mv` — move an entry to another path in the same archive.
+///
+/// A destination the archive already holds is refused rather than replaced:
+/// `rm` it first, which is the same two steps said out loud. DR-026.
+pub fn rename(
+    path: &Path,
+    from: &str,
+    to: &str,
+    options: ChangeOptions,
+    json_out: bool,
+) -> Result<()> {
+    apply(
+        path,
+        from,
+        &Changes::one(from, Change::RenameTo(to.to_owned())),
+        options.into(),
+        json_out,
+    )
+}
+
+/// `mkdir` — add a directory, and whatever above it is missing.
+pub fn make_directory(
+    path: &Path,
+    inside: &str,
+    options: ChangeOptions,
+    json_out: bool,
+) -> Result<()> {
+    apply(
+        path,
+        inside,
+        &Changes::one(inside, Change::MakeDirectory),
+        options.into(),
+        json_out,
+    )
+}
+
+/// What an attempt to write a change set in place came to.
+enum Attempted {
+    /// It was written, or a dry run reported what would have been. There is
+    /// nothing left to do.
+    Done,
+    /// No patch can express this set, or its payloads will not fit. The
+    /// archive has to be rebuilt, and nothing has been written.
+    MustRebuild,
+}
+
+/// Applies a set of changes to an archive, patching in place when every one of
+/// them fits where it already sits and rebuilding when any does not.
+///
+/// The one path every write takes. `put`, `rm`, `mv` and `mkdir` differ in the
+/// [`Changes`] they build and in nothing else, which is what keeps four
+/// commands from growing four answers to "patch or rebuild".
 ///
 /// The two are not equivalent in durability, and the report says which ran. A
 /// rebuild is atomic. A patch is not: it writes into the live archive, and an
@@ -299,74 +419,38 @@ pub struct WriteOptions {
 /// the same decision, taken the same way, so what it reports is what would
 /// happen — including a refusal, which is why the game-install guard runs
 /// first here too.
-pub fn put(
+///
+/// `inside` is the in-archive path the command is about, and it is what a
+/// report names. Every command here asks for exactly one change, so it is that
+/// change's path; a plan reports each entry it decided under the entry's own
+/// path, which for one change is the same string.
+pub fn apply(
     path: &Path,
     inside: &str,
-    from: &Path,
+    changes: &Changes,
     options: WriteOptions,
     json_out: bool,
 ) -> Result<()> {
-    refuse_game_install(path, options.force)?;
-
-    let contents = fs::read(from).map_err(|source| Failure::Io {
-        path: from.display().to_string(),
-        source,
-    })?;
+    refuse_game_install(path, options.change.force)?;
 
     if !options.rebuild {
-        // A dry run only reads: needing write permission to answer "what would
-        // this write do" would make it useless on the archives worth asking
-        // about.
-        let mut file = if options.dry_run {
-            fs::File::open(path)
-        } else {
-            fs::OpenOptions::new().read(true).write(true).open(path)
+        match in_place(path, changes, options, json_out)? {
+            Attempted::Done => return Ok(()),
+            Attempted::MustRebuild => {}
         }
-        .map_err(|source| Failure::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let archive = rpf_core::Archive::open(&mut file)?;
-
-        let edits = BTreeMap::from([(inside.to_owned(), contents.clone())]);
-        match rpf_core::plan(&mut file, &archive, &edits)? {
-            rpf_core::Plan::Fits(patches) => {
-                if !options.dry_run {
-                    patches.apply(&mut file)?;
-                }
-                for entry in patches.planned() {
-                    report_patch(inside, entry, options.dry_run, json_out);
-                }
-                return Ok(());
-            }
-            rpf_core::Plan::DoesNotFit(rejected) => {
-                if options.dry_run {
-                    for entry in &rejected {
-                        report_would_rebuild(inside, entry, json_out);
-                    }
-                    return Ok(());
-                }
-                if !json_out {
-                    for entry in &rejected {
-                        eprintln!(
-                            "rpf: {} bytes will not fit the {} available; rebuilding",
-                            entry.needed, entry.allocation,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    if options.dry_run {
+    } else if options.change.dry_run {
         // Reached only with --rebuild --dry-run: the rebuild was asked for
-        // rather than forced by a payload that would not fit, so there is no
-        // allocation to report against.
+        // rather than forced by anything about the changes, so there is no
+        // allocation and no structural change to report against.
         if json_out {
             emit(&json!({ "method": "rebuild", "path": inside, "dry_run": true }));
         } else {
             println!("would rebuild the archive");
         }
+        return Ok(());
+    }
+
+    if options.change.dry_run {
         return Ok(());
     }
 
@@ -377,11 +461,10 @@ pub fn put(
         source,
     })?;
 
-    let edits = BTreeMap::from([(inside.to_owned(), contents)]);
-    let report = rpf_core::replace_many(
+    let report = rpf_core::rewrite(
         &mut file,
         &archive,
-        &edits,
+        changes,
         scratch.as_file_mut(),
         &mut ScratchIn::beside(path),
         &mut OnStderr::new(),
@@ -404,6 +487,85 @@ pub fn put(
     Ok(())
 }
 
+/// Tries to write `changes` where the entries already sit, reporting whatever
+/// it decided.
+///
+/// A dry run only reads: needing write permission to answer "what would this
+/// write do" would make it useless on the archives worth asking about.
+fn in_place(
+    path: &Path,
+    changes: &Changes,
+    options: WriteOptions,
+    json_out: bool,
+) -> Result<Attempted> {
+    let mut file = if options.change.dry_run {
+        fs::File::open(path)
+    } else {
+        fs::OpenOptions::new().read(true).write(true).open(path)
+    }
+    .map_err(|source| Failure::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let archive = rpf_core::Archive::open(&mut file)?;
+
+    match rpf_core::plan(&mut file, &archive, changes)? {
+        rpf_core::Plan::Fits(patches) => {
+            if !options.change.dry_run {
+                patches.apply(&mut file)?;
+            }
+            for entry in patches.planned() {
+                report_patch(entry, options.change.dry_run, json_out);
+            }
+            Ok(Attempted::Done)
+        }
+        rpf_core::Plan::DoesNotFit(rejected) => {
+            if options.change.dry_run {
+                for entry in &rejected {
+                    report_would_rebuild(entry, json_out);
+                }
+                return Ok(Attempted::Done);
+            }
+            if !json_out {
+                for entry in &rejected {
+                    eprintln!(
+                        "rpf: {} bytes will not fit the {} available; rebuilding",
+                        entry.needed, entry.allocation,
+                    );
+                }
+            }
+            Ok(Attempted::MustRebuild)
+        }
+        rpf_core::Plan::Structural(structural) => {
+            // Resolved before it is reported, because a plan decides only *how*
+            // a change would be written and a dry run has to answer a refusal
+            // as well. `allows` runs the resolution the rebuild runs and throws
+            // the result away, so what it accepts is what the rebuild accepts
+            // — and it is asked only of the changes a patch could not express,
+            // because a write to an entry that exists is fully resolved by the
+            // plan itself. R6.7.
+            for change in &structural {
+                let asked = changes.at(&change.path).ok_or_else(|| Failure::Refused {
+                    reason: format!("{} is not a change that was asked for", change.path),
+                })?;
+                rpf_core::allows(&mut file, &archive, &change.path, asked)?;
+            }
+            if options.change.dry_run {
+                for change in &structural {
+                    report_would_restructure(change, json_out);
+                }
+                return Ok(Attempted::Done);
+            }
+            if !json_out {
+                for change in &structural {
+                    eprintln!("rpf: {} {}; rebuilding", change.path, change.what);
+                }
+            }
+            Ok(Attempted::MustRebuild)
+        }
+    }
+}
+
 /// Whether these bytes may go to standard output as it stands.
 ///
 /// A terminal takes text; anything else goes to a file or a pipe. Separated
@@ -415,11 +577,11 @@ fn goes_to(bytes: &[u8], terminal: bool) -> bool {
 }
 
 /// Reports one patch, made or merely planned.
-fn report_patch(inside: &str, entry: &rpf_core::Planned, dry_run: bool, json_out: bool) {
+fn report_patch(entry: &rpf_core::Planned, dry_run: bool, json_out: bool) {
     if json_out {
         emit(&json!({
             "method": "patch",
-            "path": inside,
+            "path": entry.path,
             "at": entry.at,
             "len": entry.len,
             "allocation": entry.allocation,
@@ -438,12 +600,27 @@ fn report_patch(inside: &str, entry: &rpf_core::Planned, dry_run: bool, json_out
     }
 }
 
-/// Reports that an edit would force a rebuild, and why.
-fn report_would_rebuild(inside: &str, entry: &rpf_core::TooLarge, json_out: bool) {
+/// Reports that a change would force a rebuild because no patch can express
+/// it, and which change.
+fn report_would_restructure(change: &rpf_core::Structural, json_out: bool) {
     if json_out {
         emit(&json!({
             "method": "rebuild",
-            "path": inside,
+            "path": change.path,
+            "structural": change.what,
+            "dry_run": true,
+        }));
+    } else {
+        println!("would rebuild: {} {}", change.path, change.what);
+    }
+}
+
+/// Reports that an edit would force a rebuild, and why.
+fn report_would_rebuild(entry: &rpf_core::TooLarge, json_out: bool) {
+    if json_out {
+        emit(&json!({
+            "method": "rebuild",
+            "path": entry.path,
             "needed": entry.needed,
             "allocation": entry.allocation,
             "dry_run": true,
@@ -454,6 +631,68 @@ fn report_would_rebuild(inside: &str, entry: &rpf_core::TooLarge, json_out: bool
             entry.needed, entry.allocation,
         );
     }
+}
+
+/// Whether an extraction may write into a directory that already holds
+/// something.
+///
+/// An enum rather than a boolean because a call site reading
+/// `extract_into(a, b, c, d, false, e)` says nothing, and because the two cases
+/// are named decisions rather than a switch: DR-029.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Refuse a target that holds anything. What both frontends do unless told
+    /// otherwise.
+    Refuse,
+    /// Write into it, replacing what an entry names and leaving the rest.
+    Overwrite,
+}
+
+/// Refuses a target that already holds something.
+///
+/// An extraction claims the tree **is** the archive — `pack` reads it back and
+/// `verify --against` checks against its manifest — and a tree that also holds
+/// files no entry names is not that. Writing into one silently is how an
+/// extraction of a second archive leaves the first archive's entries beside it,
+/// and how `rpf extract a.rpf .` scatters an archive over a working directory.
+/// DR-029.
+///
+/// A target that does not exist is not "already holding something"; nor is an
+/// empty directory. So the ordinary first extraction is unaffected.
+///
+/// # Errors
+///
+/// [`Failure::Refused`] naming what is there, and [`Failure::Io`] for a target
+/// that cannot be read at all.
+fn refuse_existing(into: &Path, existing: Existing) -> Result<()> {
+    if existing == Existing::Overwrite {
+        return Ok(());
+    }
+    let held = match fs::read_dir(into) {
+        Ok(mut held) => held.next(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(Failure::Io {
+                path: into.display().to_string(),
+                source,
+            });
+        }
+    };
+    let Some(first) = held else {
+        return Ok(());
+    };
+    let named = first.map_or_else(
+        |_| "something".to_owned(),
+        |entry| entry.file_name().to_string_lossy().into_owned(),
+    );
+    Err(Failure::Refused {
+        reason: format!(
+            "{} already holds {named:?}; an extracted tree is the archive, and one that also \
+             holds files no entry names is not. Extract somewhere else, empty it, or pass \
+             --overwrite to write into it as it is",
+            into.display(),
+        ),
+    })
 }
 
 /// What an extraction put on the filesystem.
@@ -474,13 +713,14 @@ pub struct Extracted {
 /// name truncated and rewrote the file every remaining entry was still being
 /// read out of. The daemon's rule is wider — every archive an open session
 /// holds — and both are asked the same way, before anything is created.
-pub fn extract(path: &Path, into: &Path, json_out: bool) -> Result<()> {
+pub fn extract(path: &Path, into: &Path, existing: Existing, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
     let reading = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let extracted = extract_into(
         &mut file,
         &archive,
         into,
+        existing,
         &|target| {
             (target == reading).then(|| Failure::Refused {
                 reason: format!(
@@ -524,6 +764,10 @@ pub fn extract(path: &Path, into: &Path, json_out: bool) -> Result<()> {
 /// unlike a rebuild, which goes to a temporary file and is renamed only on
 /// success. DR-014.
 ///
+/// `existing` decides what happens when the target already holds something:
+/// refused unless the caller says otherwise, because an extracted tree claims
+/// to *be* the archive. DR-029, and [`refuse_existing`] carries the argument.
+///
 /// `claimed` is asked of **every path this will write**, before anything is
 /// created, and the first refusal it gives is the answer. It is a parameter
 /// rather than a check each frontend remembers to make first, because a tree
@@ -534,7 +778,8 @@ pub fn extract(path: &Path, into: &Path, json_out: bool) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Whatever `claimed` returns for a path this would write,
+/// [`Failure::Refused`] for a target that already holds something,
+/// whatever `claimed` returns for a path this would write,
 /// [`Failure::Io`] for a file or directory that could not be written,
 /// `Error::Cancelled` when the watcher stops it, and as
 /// `rpf_core::Manifest::of` for an archive whose names no host can hold.
@@ -542,9 +787,16 @@ pub fn extract_into<R: std::io::Read + std::io::Seek>(
     src: &mut R,
     archive: &Archive,
     into: &Path,
+    existing: Existing,
     claimed: &dyn Fn(&Path) -> Option<Failure>,
     watch: &mut impl Watch,
 ) -> Result<Extracted> {
+    // Before the walk that reads and digests every entry, so a refusal costs
+    // nothing, and before anything is created, for `claimed`'s reason: a tree
+    // cannot be renamed into place, so a refusal found part-way would leave the
+    // part already written.
+    refuse_existing(into, existing)?;
+
     let manifest = rpf_core::Manifest::of_contents(src, archive, watch)?;
     let specs = rpf_core::specs_of(archive)?;
 
@@ -918,11 +1170,22 @@ pub fn verified<R: std::io::Read + std::io::Seek>(
     Ok(checked)
 }
 
+/// One `verify` problem as JSON, for whichever frontend is reporting it.
+///
+/// An object with the path and the reason apart, on both frontends. The command
+/// line answered `"path: reason"` until DR-027, which cannot be split back
+/// apart: a reason carries colons of its own — `entry 0: payload did not
+/// inflate` — so a consumer looking for the path got the whole sentence up to
+/// the first one. A breaking change to `--json`, made in one place so the two
+/// frontends cannot come to say different things again.
+pub fn verify_problem(problem: &rpf_core::Problem) -> Value {
+    json!({ "path": problem.path, "reason": problem.error.to_string() })
+}
+
 /// A `verify` report as JSON, for whichever frontend is reporting it.
 ///
 /// One place, so `--json verify` and the daemon's answer carry the same numbers
-/// under the same names (§1). `problems` is the caller's, because the command
-/// line renders one as a sentence and the daemon as an object.
+/// under the same names (§1), and since DR-027 the same problems too.
 pub fn verify_report(path: &Path, checked: &Checked, problems: &[Value]) -> Value {
     json!({
         "path": path.display().to_string(),
@@ -975,19 +1238,14 @@ fn coverage(checked: &Checked) -> Vec<String> {
 pub fn verify(path: &Path, against: Option<&Path>, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path)?;
     let checked = verified(&mut file, &archive, against, &mut OnStderr::new())?;
-    let problems: Vec<String> = checked
-        .verified
-        .problems
-        .iter()
-        .map(|problem| format!("{}: {}", problem.path, problem.error))
-        .collect();
+    let problems = &checked.verified.problems;
 
     if json_out {
-        let rendered: Vec<Value> = problems.iter().map(|problem| json!(problem)).collect();
+        let rendered: Vec<Value> = problems.iter().map(verify_problem).collect();
         emit(&verify_report(path, &checked, &rendered));
     } else {
-        for problem in &problems {
-            println!("{problem}");
+        for problem in problems {
+            println!("{}: {}", problem.path, problem.error);
         }
         for line in coverage(&checked) {
             println!("{line}");

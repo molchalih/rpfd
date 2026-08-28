@@ -179,10 +179,10 @@ fn cascade<S: Scratch>(outer: &Path, into: &Path, scratch: &mut S) -> usize {
     let baseline = LIVE.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
 
-    rpf_core::replace_many(
+    rpf_core::rewrite(
         &mut src,
         &archive,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         &mut out,
         scratch,
         &mut Unwatched,

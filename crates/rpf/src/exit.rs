@@ -154,7 +154,7 @@ mod tests {
                 found: *b"RPF2",
             },
             Category::Refused => rpf_core::Error::WrongKind {
-                entry: 0,
+                path: "data".to_owned(),
                 found: "directory",
                 wanted: "file",
             },

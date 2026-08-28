@@ -144,12 +144,17 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     let mut in_place = tempfile::NamedTempFile::new().expect("temp file");
     in_place.write_all(&bytes).expect("written");
     in_place.as_file_mut().rewind().expect("rewound");
-    let plan = rpf_core::plan(in_place.as_file_mut(), &archive, &edits).expect("plans");
+    let plan = rpf_core::plan(
+        in_place.as_file_mut(),
+        &archive,
+        &rpf_core::Changes::writing(edits),
+    )
+    .expect("plans");
     match plan {
         Plan::Fits(ready) => ready
             .apply(in_place.as_file_mut())
             .expect("patches with no key material"),
-        Plan::DoesNotFit(rejected) => panic!("expected a patch, got a rebuild: {rejected:?}"),
+        other => panic!("expected a patch, got {other:?}"),
     }
     in_place.as_file_mut().flush().expect("flushed");
     let after = fs::read(in_place.path()).expect("readable");
@@ -170,10 +175,10 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     let mut again = Cursor::new(bytes.clone());
     let reopened = Archive::open(&mut again).expect("opens");
-    rpf_core::replace_many(
+    rpf_core::rewrite(
         &mut again,
         &reopened,
-        &grew,
+        &rpf_core::Changes::writing(grew),
         sink.as_file_mut(),
         &mut rpf_core::InMemory,
         &mut Unwatched,

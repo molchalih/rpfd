@@ -20,10 +20,7 @@
               64-bit hosts against buffers the test itself created"
 )]
 
-use std::{
-    collections::BTreeMap,
-    io::{Cursor, Write as _},
-};
+use std::io::{Cursor, Write as _};
 
 use rpf_core::{Archive, FileKind, FileSpec, Plan, Storage, Unwatched};
 
@@ -84,11 +81,13 @@ fn archive_bytes() -> Vec<u8> {
 }
 
 /// The edits a plan is asked for, in the shape the daemon holds them.
-fn edits(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
-    pairs
-        .iter()
-        .map(|(path, bytes)| ((*path).to_owned(), bytes.clone()))
-        .collect()
+fn edits(pairs: &[(&str, Vec<u8>)]) -> rpf_core::Changes {
+    rpf_core::Changes::writing(
+        pairs
+            .iter()
+            .map(|(path, bytes)| ((*path).to_owned(), bytes.clone()))
+            .collect(),
+    )
 }
 
 /// Bytes that do not compress, so they cannot be squeezed into a block.
@@ -190,7 +189,7 @@ fn a_patch_that_does_not_fit_writes_nothing_at_all() {
             assert_eq!(rejected[0].path, "data/notes.txt");
             assert!(rejected[0].needed > rejected[0].allocation);
         }
-        Plan::Fits(_) => panic!("that should not have fitted"),
+        other => panic!("that should not have fitted, got {other:?}"),
     }
     assert_eq!(
         file.into_inner(),
@@ -228,7 +227,7 @@ fn one_edit_that_does_not_fit_holds_back_the_ones_that_do() {
                 "only the edit that does not fit should be named"
             );
         }
-        Plan::Fits(_) => panic!("one of those cannot fit"),
+        other => panic!("one of those cannot fit, got {other:?}"),
     }
     assert_eq!(
         file.into_inner(),

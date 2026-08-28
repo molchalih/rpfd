@@ -19,6 +19,7 @@ use flate2::{Compression, write::DeflateEncoder};
 
 use crate::{
     archive::{Archive, MAX_DEPTH},
+    edit::{self, Changes},
     entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
@@ -343,7 +344,7 @@ fn plan_entries(arena: &[Dir]) -> Result<Vec<Planned>> {
 /// of one sitting in memory. R4.13, DR-022. Anything that is both [`Read`] and
 /// [`Seek`] is one; a caller holding bytes wraps them in a [`Cursor`].
 ///
-/// Seekable because [`store`] reads a payload twice in one case — the deflated
+/// Seekable because `store` reads a payload twice in one case — the deflated
 /// form that did not pay for itself, which is then written as it came.
 pub trait Payload: Read + Seek {}
 
@@ -386,10 +387,10 @@ pub(crate) struct Written {
 /// # Errors
 ///
 /// [`Error::WrongKind`] for a directory, which has no payload to store.
-pub(crate) fn kind_of(index: u32, entry: &Entry) -> Result<FileKind> {
+pub(crate) fn kind_of(path: &str, entry: &Entry) -> Result<FileKind> {
     match entry.kind {
         EntryKind::Directory { .. } => Err(Error::WrongKind {
-            entry: index,
+            path: path.to_owned(),
             found: "directory",
             wanted: "file",
         }),
@@ -930,8 +931,8 @@ pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
         if entry.is_directory() {
             continue;
         }
-        let kind = kind_of(index, entry)?;
         let path = archive.path(index)?;
+        let kind = kind_of(&path, entry)?;
         name::check_tree(&path)?;
         out.push((FileSpec { path, kind }, index));
     }
@@ -961,13 +962,20 @@ pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Rebuilds `archive` into `out`, taking each payload from the source except
-/// where `overrides` supplies one.
+/// Rebuilds `archive` into `out` with `changes` applied to what it holds,
+/// taking each payload from the source except where `overrides` supplies one.
+///
+/// `changes` is what the rebuilt archive holds that the original did not, and
+/// the other way round: an entry added, removed or renamed, and new contents
+/// for one that stays. `edit::tree_of` is where each of those is
+/// resolved and refused; nothing about them is decided here.
 ///
 /// An override is the file **as it exists outside the archive** — the same form
 /// [`Archive::extract`] returns, so a resource keeps its `RSC7` header. That is
 /// the form [`build`]'s `fetch` is defined in, and using one form throughout is
-/// what keeps a replaced resource from losing its flags.
+/// what keeps a replaced resource from losing its flags. Overrides are keyed by
+/// the entry index they replace, which is what makes them survive a rename: the
+/// entry moves, and the bytes a cascade rebuilt for it move with it.
 ///
 /// The map is taken by value and each override is **moved out of it** as its
 /// entry is written, because an override may be a whole rebuilt ancestor and
@@ -980,10 +988,12 @@ pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
 ///
 /// # Errors
 ///
-/// As [`build`], plus the read errors for payloads taken from the source.
+/// As `edit::tree_of` for a change that cannot be made, as [`build`],
+/// plus the read errors for payloads taken from the source.
 pub fn rebuild<'p, R, W>(
     src: &mut R,
     archive: &Archive,
+    changes: &'p Changes,
     out: &mut W,
     mut overrides: BTreeMap<u32, Box<dyn Payload + 'p>>,
     watch: &mut impl Watch,
@@ -992,70 +1002,46 @@ where
     R: Read + Seek,
     W: Write + Seek,
 {
-    let specs = specs_of(archive)?;
-    let by_path: BTreeMap<&str, u32> = specs
-        .iter()
-        .map(|(spec, index)| (spec.path.as_str(), *index))
-        .collect();
-    let files: Vec<FileSpec> = specs.iter().map(|(spec, _)| spec.clone()).collect();
-    let directories = directories_of(archive)?;
+    let tree = edit::tree_of(archive, changes)?;
+    let files = tree.files();
+    let sources = tree.sources();
 
     build(
         out,
         archive.version(),
         &files,
-        &directories,
+        &tree.directories,
         |wanted| {
-            let index = *by_path.get(wanted).ok_or(Error::BadPath {
+            let source = sources.get(wanted).ok_or_else(|| Error::BadPath {
                 path: wanted.to_owned(),
                 reason: "not an entry of this archive",
             })?;
-            match overrides.remove(&index) {
-                Some(payload) => Ok(payload),
-                None => Ok(Box::new(Cursor::new(archive.extract(src, index)?))),
+            match **source {
+                edit::Source::Entry(index) => match overrides.remove(&index) {
+                    Some(payload) => Ok(payload),
+                    None => Ok(Box::new(Cursor::new(archive.extract(src, index)?))),
+                },
+                edit::Source::Written(ref at) => {
+                    let contents = changes.contents_at(at).ok_or_else(|| Error::BadPath {
+                        path: wanted.to_owned(),
+                        reason: "has no contents to write",
+                    })?;
+                    Ok(Box::new(Cursor::new(contents)))
+                }
             }
         },
         watch,
     )
 }
 
-/// Resolves the first component of `segments` that names a file, returning its
-/// index and whatever path is left over.
-///
-/// A non-empty remainder means the file is an archive to descend into.
-fn split_at_file<'a>(archive: &Archive, segments: &'a [&'a str]) -> Result<(u32, &'a [&'a str])> {
-    let mut current = 0_u32;
-    for (position, segment) in segments.iter().enumerate() {
-        let index = archive
-            .child_named(current, segment)?
-            .ok_or_else(|| Error::NotFound {
-                path: segments.join("/"),
-                segment: (*segment).to_owned(),
-            })?;
-        if archive.entry(index)?.is_directory() {
-            current = index;
-            continue;
-        }
-        let rest = segments.get(position.saturating_add(1)..).unwrap_or(&[]);
-        return Ok((index, rest));
-    }
-    Err(Error::NotFound {
-        path: segments.join("/"),
-        segment: segments.last().copied().unwrap_or_default().to_owned(),
-    })
-}
-
-/// Rebuilds `archive` into `out` with any number of entries replaced,
-/// **cascading through nesting**.
+/// Rebuilds `archive` into `out` with a set of changes, **cascading through
+/// nesting**.
 ///
 /// Paths may address through nested archives in one string, as
-/// [`Archive::locate`] does. Edits are grouped by the archive they land in, so
-/// several changes inside one nested archive rebuild it **once** rather than
-/// once each — which is the difference between an editor saving three files and
-/// an editor rebuilding a 62 MB payload three times.
-///
-/// Each value is the file as it exists outside the archive: for a resource, its
-/// `RSC7` header and still-deflated body.
+/// [`Archive::locate`] does. Changes are grouped by the archive they land in,
+/// so several inside one nested archive rebuild it **once** rather than once
+/// each — which is the difference between an editor saving three files and an
+/// editor rebuilding a 62 MB payload three times.
 ///
 /// **Each rebuilt ancestor goes to scratch space and is streamed from there
 /// into its parent**, never assembled in memory, so what is held at once does
@@ -1066,23 +1052,23 @@ fn split_at_file<'a>(archive: &Archive, segments: &'a [&'a str]) -> Result<(u32,
 /// than the whole nesting, unchanged by this: there is no honest total for a
 /// cascade until it has been walked. DR-008's fourth amendment.
 ///
-/// Two edits that resolve to one entry are refused, whether they spell it the
+/// Two changes that resolve to one entry are refused, whether they spell it the
 /// same way or not: `x/y`, `x//y` and `X/Y` are one file, and a whole nested
-/// archive and a file inside it are the same bytes twice. [`crate::patch::plan`]
-/// refuses exactly these, and the two write paths have to agree — a caller that
-/// falls back from one to the other would otherwise get a different archive
-/// depending on which ran.
+/// archive and a file inside it are the same bytes twice.
+/// [`crate::patch::plan`] refuses exactly these, and the two write paths have
+/// to agree — a caller that falls back from one to the other would otherwise
+/// get a different archive depending on which ran.
 ///
 /// # Errors
 ///
 /// [`Error::NotFound`] for a path that does not resolve,
 /// [`Error::NotAnArchive`] for a component that is not one,
-/// [`Error::Overlapping`] for two edits that resolve to one entry, and as
-/// [`build`].
-pub fn replace_many<R, W, S>(
+/// [`Error::Overlapping`] for two changes that resolve to one entry, and as
+/// [`rebuild`].
+pub fn rewrite<R, W, S>(
     src: &mut R,
     archive: &Archive,
-    edits: &BTreeMap<String, Vec<u8>>,
+    changes: &Changes,
     out: &mut W,
     scratch: &mut S,
     watch: &mut impl Watch,
@@ -1092,78 +1078,19 @@ where
     W: Write + Seek,
     S: Scratch,
 {
-    let mut direct: BTreeMap<u32, Box<dyn Payload>> = BTreeMap::new();
-    // Which edit replaced each entry outright, so a second one naming the same
-    // entry is refused rather than quietly winning. Keying the edits by path
-    // string and then by index collapsed them: last write won, and the losers
-    // vanished with an Ok.
-    let mut claimed: BTreeMap<u32, String> = BTreeMap::new();
-    let mut deeper: BTreeMap<u32, Nested> = BTreeMap::new();
+    let (here, nested) = edit::split(archive, changes)?;
 
-    for (path, contents) in edits {
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let (index, rest) = split_at_file(archive, &segments)?;
-
-        if let Some(other) = claimed.get(&index) {
-            return Err(Error::Overlapping {
-                path: path.clone(),
-                other: other.clone(),
-            });
-        }
-
-        if rest.is_empty() {
-            if let Some(nested) = deeper.get(&index) {
-                return Err(Error::Overlapping {
-                    path: path.clone(),
-                    other: nested.first.clone(),
-                });
-            }
-            claimed.insert(index, path.clone());
-            direct.insert(index, Box::new(Cursor::new(contents.clone())));
-        } else {
-            let nested = deeper.entry(index).or_insert_with(|| Nested {
-                first: path.clone(),
-                edits: BTreeMap::new(),
-            });
-            if let Some((other, _)) = nested
-                .edits
-                .insert(rest.join("/"), (path.clone(), contents.clone()))
-            {
-                return Err(Error::Overlapping {
-                    path: path.clone(),
-                    other,
-                });
-            }
-        }
-    }
-
-    for (index, nested) in deeper {
-        let inner: BTreeMap<String, Vec<u8>> = nested
-            .edits
-            .into_iter()
-            .map(|(within, (_, bytes))| (within, bytes))
-            .collect();
+    let mut overrides: BTreeMap<u32, Box<dyn Payload>> = BTreeMap::new();
+    for (index, group) in nested {
         let holder = archive.open_nested(src, index)?;
         // The ancestor is rebuilt into scratch space and handed on as a reader
         // over it. It is never a `Vec`, which is the whole of R4.13: this used
         // to be `Cursor::new(Vec::new())` and then `buffer.into_inner()`, and
         // the archive above it copied that again to write it.
         let mut sink = scratch.create()?;
-        replace_many(src, &holder, &inner, &mut sink, scratch, watch)?;
-        direct.insert(index, Box::new(sink));
+        rewrite(src, &holder, &group.changes, &mut sink, scratch, watch)?;
+        overrides.insert(index, Box::new(sink));
     }
 
-    rebuild(src, archive, out, direct, watch)
-}
-
-/// The edits landing inside one nested archive.
-struct Nested {
-    /// The first edit that addressed through this archive. It is what an edit
-    /// replacing the archive wholesale is reported as colliding with.
-    first: String,
-    /// Path within the nested archive, to the edit that named it and its new
-    /// contents. Two spellings reaching one path within are two entries in the
-    /// map only until the recursive call resolves them, which is where the
-    /// refusal comes from; two reaching the *same* string are caught here.
-    edits: BTreeMap<String, (String, Vec<u8>)>,
+    rebuild(src, archive, &here, out, overrides, watch)
 }

@@ -29,7 +29,14 @@ use crate::{
 /// One entry, as a listing reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
-    /// Where it is, addressed from the path that was listed.
+    /// Where it is: **the whole path**, addressed from the path that was
+    /// listed, in the spelling that path was given in.
+    ///
+    /// Not a name. Listing `x64/inner.rpf` gives rows whose path is
+    /// `x64/inner.rpf/art.yft`, so a row addresses [`Archive::locate`] as it
+    /// stands and a caller that joined it onto what it asked for would build
+    /// the prefix twice. Components resolve case-insensitively, so the
+    /// spelling is the caller's rather than the archive's. DR-028.
     pub path: String,
     /// What it is, and the one number that belongs with it.
     pub kind: ListedKind,
@@ -68,6 +75,14 @@ impl Listed {
     /// lists what is inside it, because a nested archive is a directory as far
     /// as a path is concerned; a path naming an ordinary file is that one
     /// entry.
+    ///
+    /// **That last case is what makes this a `stat` as well as a listing**, and
+    /// it is the only one there is: a caller tells "this is a file" from "this
+    /// directory holds one child" by comparing the row's [`Listed::path`] with
+    /// the one it asked for. Equal means the path named that entry. The
+    /// comparison is exact — a child's path is its parent's plus a separator
+    /// and a name, so it can never equal its parent's — and an empty answer is
+    /// unambiguous, because a file always gives one row. DR-028.
     ///
     /// # Errors
     ///
@@ -521,6 +536,18 @@ impl Verified {
 /// directory or to an ordinary file is an error rather than a summary of
 /// something that is not one.
 ///
+/// A path that resolves to something that is **not** an archive is refused with
+/// the path the caller gave, rather than with the entry index the archive
+/// happens to hold it at: `rpf info a.rpf data` reported `entry 1 is a
+/// directory, expected a file`, which a caller cannot act on without first
+/// working out what entry 1 is. It is the same refusal and the same exit code —
+/// one sentence, refilled with the name it was asked by, rather than a second
+/// spelling of "this is not an archive" (§3).
+///
+/// The refill matters most through nesting, where the two differ: an entry
+/// inside `x64/inner.rpf` has a path within that archive and a path within the
+/// one the caller opened, and only the second is what was typed.
+///
 /// # Errors
 ///
 /// As [`Archive::locate`] and [`Archive::open_nested`].
@@ -529,7 +556,14 @@ fn archive_at<R: Read + Seek>(src: &mut R, archive: &Archive, path: &str) -> Res
         return Ok(archive.clone());
     }
     let (holder, index) = archive.locate(src, path)?;
-    holder.open_nested(src, index)
+    holder.open_nested(src, index).map_err(|error| match error {
+        Error::WrongKind { found, wanted, .. } => Error::WrongKind {
+            path: path.to_owned(),
+            found,
+            wanted,
+        },
+        other => other,
+    })
 }
 
 /// Entries in an archive, saturating rather than truncating.

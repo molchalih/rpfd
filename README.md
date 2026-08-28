@@ -13,7 +13,11 @@ rpf info    dlc.rpf x64/vehicles.rpf   # or the archive alone
 rpf ls -R   dlc.rpf x64
 rpf cat     dlc.rpf data/vehicles.meta
 rpf put     dlc.rpf x64/vehicles.rpf/meringls63amg24.ytd new.ytd   # patches in place
-rpf extract dlc.rpf tree/ && rpf pack tree/ dlc.rpf
+rpf put     dlc.rpf data/new.meta new.meta --create   # add an entry
+rpf rm      dlc.rpf data/old.meta            # and -r for a directory
+rpf mv      dlc.rpf data/old.meta data/new.meta
+rpf mkdir   dlc.rpf data/empty
+rpf extract dlc.rpf tree/ && rpf pack tree/ dlc.rpf   # --overwrite to reuse a tree
 rpf put     dlc.rpf data/vehicles.meta new.meta --dry-run   # decide, write nothing
 rpf verify  dlc.rpf --against tree/   # and against what the tree recorded
 rpf keys extract GTA5.exe   # find the key material in your own install
@@ -21,7 +25,15 @@ rpf serve --stdio        # JSON-RPC, one object per line, edits held until commi
 ```
 
 A path addresses through nesting in one string. Every reporting command takes
-`--json`.
+`--json`, and what it prints is the same object the daemon answers with, under
+the same field names.
+
+> **`--json verify` changed shape on 2026-08-28.** `problems` was an array of
+> `"path: reason"` sentences and is now an array of `{"path": …, "reason": …}`
+> objects, which is what the daemon has always answered. A reason carries colons
+> of its own — `entry 0: payload did not inflate` — so the sentence could not be
+> split back apart, and a consumer looking for the path got everything up to the
+> first colon. Nothing else about `--json` moved. DR-027.
 
 ## Installing
 
@@ -154,11 +166,35 @@ original in one step. It is not a claim about surviving power loss — the repla
 is not followed by a sync — and it is measured on macOS and Linux, not yet on
 Windows.
 
+Adding, removing and renaming an entry always rebuild, and the tool says so
+before it starts: each of them changes the entry count or the names blob, so
+every offset after the header moves and there is nothing to patch in place.
+`put --create`, `rm`, `mv` and `mkdir` are the command line's; `write` with
+`"create": true`, `delete`, `rename` and `mkdir` are the daemon's, all buffered
+until `commit` like any other edit. A rename onto a path the archive already
+holds is refused rather than replacing it — remove that path in the same set,
+which says the same thing out loud — and a directory that holds anything needs
+`-r`, or `"recursive": true`, before it takes its children with it.
+
+**One thing about that is unverified, and it is the important one.** A rebuilt
+archive with a different entry count parses, verifies and reads back here, and
+whether the *game* accepts one has never been tested: it needs a machine running
+a RAGE title and there is not one. `docs/backlog.md` Q8, and DR-026.
+
 `--dry-run` on `put`, and `"dry_run": true` on the daemon's `commit`, take that
 same decision and stop before acting on it — reporting where each edit would be
 written and how much room its entry has, or which edits will not fit and force
 the rebuild. It needs no write permission, and a refusal is reported as a
 refusal, so what it says is what the real call would do.
+
+`extract` refuses a directory that already holds something, and `--overwrite`
+— `"overwrite": true` on the daemon — is the way through. An extracted tree
+claims to *be* the archive: `pack` reads it back and `verify --against` checks
+each entry against the manifest beside it, and a tree that also holds files no
+entry names is not that. A target that does not exist is created, and an empty
+one is written into, so a first extraction is unaffected. `--overwrite` writes
+into the directory as it is, replacing what an entry names and leaving the rest
+— it never deletes what it did not write. DR-029.
 
 `verify` reads every entry back and checks it against what the archive says
 about itself, which for a **stored** entry is nothing at all: it declares no
@@ -171,6 +207,9 @@ of them checked against a recorded checksum, the other twenty being inside
 nested archives, each covered by the checksum of the entry that holds it. A tree
 extracted from a *different* archive names none of this one's entries, so it is
 refused — exit 6 — rather than reported as nothing checked. DR-023, DR-025.
+
+Each entry that failed is one object in `problems`, with its in-archive `path`
+and the `reason` apart — the same on both frontends. DR-027.
 
 The daemon answers everything the binary does. `info` and `verify` are methods
 on an open handle — `verify` taking the same tree as `against` — and `extract`

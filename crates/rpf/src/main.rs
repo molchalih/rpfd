@@ -54,7 +54,7 @@ enum Command {
         /// A path inside it.
         path: String,
     },
-    /// Replace one entry and rebuild, cascading through nesting.
+    /// Replace one entry, or create it, cascading through nesting.
     Put {
         /// The archive.
         archive: PathBuf,
@@ -66,12 +66,54 @@ enum Command {
         #[command(flatten)]
         options: commands::WriteOptions,
     },
+    /// Remove an entry, rebuilding the archive without it.
+    Rm {
+        /// The archive.
+        archive: PathBuf,
+        /// A path inside it.
+        path: String,
+        /// Take a directory's children with it. Without this a directory that
+        /// holds anything is refused.
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// How the change is allowed to happen.
+        #[command(flatten)]
+        options: commands::ChangeOptions,
+    },
+    /// Move an entry to another path in the same archive.
+    Mv {
+        /// The archive.
+        archive: PathBuf,
+        /// The path inside it to move.
+        from: String,
+        /// Where to move it, spelled the same way `from` is. A path the archive
+        /// already holds is refused; remove it first.
+        to: String,
+        /// How the change is allowed to happen.
+        #[command(flatten)]
+        options: commands::ChangeOptions,
+    },
+    /// Add a directory, and whatever above it is missing.
+    Mkdir {
+        /// The archive.
+        archive: PathBuf,
+        /// A path inside it.
+        path: String,
+        /// How the change is allowed to happen.
+        #[command(flatten)]
+        options: commands::ChangeOptions,
+    },
     /// Write every entry to a tree, with a manifest beside it.
     Extract {
         /// The archive.
         archive: PathBuf,
-        /// The directory to write into. Created if it does not exist.
+        /// The directory to write into. Created if it does not exist, and
+        /// refused if it exists and holds anything.
         into: PathBuf,
+        /// Write into a directory that already holds something, replacing what
+        /// an entry names and leaving the rest.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Build an archive from a tree and its manifest.
     Pack {
@@ -139,6 +181,18 @@ enum KeysCommand {
     },
 }
 
+/// What `--overwrite`, or the wire's `overwrite`, means to an extraction.
+///
+/// One function so the flag and the wire parameter cannot come to mean two
+/// things. DR-029.
+const fn existing(overwrite: bool) -> commands::Existing {
+    if overwrite {
+        commands::Existing::Overwrite
+    } else {
+        commands::Existing::Refuse
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -162,10 +216,28 @@ fn main() -> ExitCode {
             ref from,
             options,
         } => commands::put(archive, path, from, options, cli.json),
+        Command::Rm {
+            ref archive,
+            ref path,
+            recursive,
+            options,
+        } => commands::remove(archive, path, recursive, options, cli.json),
+        Command::Mv {
+            ref archive,
+            ref from,
+            ref to,
+            options,
+        } => commands::rename(archive, from, to, options, cli.json),
+        Command::Mkdir {
+            ref archive,
+            ref path,
+            options,
+        } => commands::make_directory(archive, path, options, cli.json),
         Command::Extract {
             ref archive,
             ref into,
-        } => commands::extract(archive, into, cli.json),
+            overwrite,
+        } => commands::extract(archive, into, existing(overwrite), cli.json),
         Command::Pack {
             ref from,
             ref archive,

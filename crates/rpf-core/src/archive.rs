@@ -369,7 +369,7 @@ impl Archive {
     /// slash-separated with no leading slash.
     ///
     /// The walk up the parent map is unguarded because it does not need a
-    /// guard: [`parse_parents`] refuses any archive in which a child's index is
+    /// guard: `parse_parents` refuses any archive in which a child's index is
     /// not greater than its parent's, so every step of this loop moves to a
     /// smaller index and it ends (§5).
     ///
@@ -414,7 +414,7 @@ impl Archive {
     ///
     /// # Errors
     ///
-    /// As [`Archive::one_name_twice`], and as [`Archive::path`] for an entry
+    /// As `Archive::one_name_twice`, and as [`Archive::path`] for an entry
     /// whose ancestry does not resolve.
     pub fn check_names(&self) -> Result<()> {
         let mut seen: HashMap<(u32, String), u32> = HashMap::new();
@@ -470,6 +470,17 @@ impl Archive {
         Ok(Error::BadPath { path, reason })
     }
 
+    /// How an entry is named in a failure: its path from this archive's root,
+    /// or `entry N` when the tree does not resolve far enough to give it one.
+    ///
+    /// The fallback is not a guess — it names the entry exactly, by the only
+    /// thing that is still true of it — and it is reached only from an archive
+    /// whose parent map is already broken, which is a failure of its own.
+    fn named(&self, index: u32) -> String {
+        self.path(index)
+            .unwrap_or_else(|_| format!("entry {index}"))
+    }
+
     /// The indices of a directory's children.
     ///
     /// # Errors
@@ -493,7 +504,7 @@ impl Archive {
                 Ok(first_child..end)
             }
             other => Err(Error::WrongKind {
-                entry: index,
+                path: self.named(index),
                 found: other.noun(),
                 wanted: "directory",
             }),
@@ -507,7 +518,7 @@ impl Archive {
         let (block, on_disk) = match entry.kind {
             EntryKind::Directory { .. } => {
                 return Err(Error::WrongKind {
-                    entry: index,
+                    path: self.named(index),
                     found: "directory",
                     wanted: "file",
                 });
@@ -715,7 +726,7 @@ impl Archive {
 
         match entry.kind {
             EntryKind::Directory { .. } => Err(Error::WrongKind {
-                entry: index,
+                path: self.named(index),
                 found: "directory",
                 wanted: "file",
             }),

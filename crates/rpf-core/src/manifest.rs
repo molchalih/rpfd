@@ -56,13 +56,13 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// only container this tool had ever read or written, so a schema-1 manifest
 /// describes an `RPF7` tree with deflated payloads and nothing else it could
 /// describe. It is therefore **read as that** rather than refused —
-/// [`schema_1_version`] and [`schema_1_codec`] are where that reading is
+/// `schema_1_version` and `schema_1_codec` are where that reading is
 /// written down, and DR-018 is why. Refusing it instead would have made a
 /// schema bump break every tree already extracted, for no fact recovered.
 ///
 /// Schema 2 carried no checksum, and 1 is still the oldest read: a manifest
 /// without one is a manifest that recorded none, which is a thing a reader can
-/// act on rather than a thing it has to guess. [`schema_2_checksum`], DR-023.
+/// act on rather than a thing it has to guess. `schema_2_checksum`, DR-023.
 pub const OLDEST_SCHEMA: u32 = 1;
 
 /// The container version a manifest that does not name one was written from.
@@ -192,7 +192,7 @@ pub struct ManifestEntry {
     /// `None` means **no checksum was recorded**, which is what every schema-1
     /// and schema-2 manifest says and what [`Manifest::of`] writes: it is not a
     /// claim that the contents are empty and not a claim that they were
-    /// checked. [`schema_2_checksum`], DR-023.
+    /// checked. `schema_2_checksum`, DR-023.
     #[serde(default = "schema_2_checksum", skip_serializing_if = "Option::is_none")]
     pub checksum: Option<Checksum>,
 }

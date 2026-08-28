@@ -398,10 +398,10 @@ fn replacing_a_nested_entry_cascades() {
 
     let mut rebuilt = tempfile::NamedTempFile::new().expect("temp file");
     let edits = BTreeMap::from([(TARGET.to_owned(), donor_bytes)]);
-    rpf_core::replace_many(
+    rpf_core::rewrite(
         &mut source,
         &original,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         rebuilt.as_file_mut(),
         // The corpus cascade: a 62 MB ancestor, rebuilt into scratch on disk
         // rather than into memory. R4.13.
@@ -464,6 +464,100 @@ fn replacing_a_nested_entry_cascades() {
     if let Some(dest) = env::var_os("RPF_CASCADE_OUT") {
         fs::copy(rebuilt.path(), PathBuf::from(dest)).expect("copyable");
     }
+}
+
+/// R4.10 against the real thing: an entry added, one removed and one renamed
+/// inside a nested archive of the 145 MB sample, all in one change set.
+///
+/// What this proves is what this repository can prove — the archive parses,
+/// every entry reads back, and the tree is what was asked for. **It is not
+/// evidence the game loads it.** Whether the runtime accepts an entry count
+/// that is not the one its producer wrote is Q8 and needs a machine running
+/// the game; DR-026 records that the answer is unknown rather than assumed.
+#[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
+fn a_structural_change_to_the_sample_reads_back() {
+    const INSIDE: &str = "x64/vehicles.rpf";
+
+    let Some((path, _)) = corpus_archive("a_structural_change_to_the_sample_reads_back") else {
+        return;
+    };
+
+    let mut source = fs::File::open(&path).expect("archive opens");
+    let original = Archive::open(&mut source).expect("archive parses");
+    let before = rpf_core::Listed::at(&mut source, &original, INSIDE, false)
+        .expect("lists")
+        .len();
+
+    let mut changes = rpf_core::Changes::new();
+    changes.set(
+        format!("{INSIDE}/added.meta"),
+        rpf_core::Change::Write {
+            contents: b"<added/>".to_vec(),
+            create: true,
+        },
+    );
+    changes.set(
+        format!("{INSIDE}/meringls63amg24.ytd"),
+        rpf_core::Change::Remove { recursive: false },
+    );
+    changes.set(
+        format!("{INSIDE}/meringls63amg24.yft"),
+        rpf_core::Change::RenameTo(format!("{INSIDE}/renamed.yft")),
+    );
+
+    let mut rebuilt = tempfile::NamedTempFile::new().expect("temp file");
+    rpf_core::rewrite(
+        &mut source,
+        &original,
+        &changes,
+        rebuilt.as_file_mut(),
+        &mut OnDisk,
+        &mut Unwatched,
+    )
+    .expect("rewrites");
+    rebuilt.as_file_mut().flush().expect("flushed");
+
+    let mut handle = fs::File::open(rebuilt.path()).expect("rebuild opens");
+    let round = Archive::open(&mut handle).expect("rebuild parses");
+
+    let after: Vec<String> = rpf_core::Listed::at(&mut handle, &round, INSIDE, false)
+        .expect("lists")
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    assert_eq!(
+        after.len(),
+        before,
+        "one added, one removed: the count should not have moved"
+    );
+    assert!(
+        after.contains(&format!("{INSIDE}/added.meta")),
+        "the addition is not there: {after:?}"
+    );
+    assert!(
+        !after.contains(&format!("{INSIDE}/meringls63amg24.ytd")),
+        "the removal is still there: {after:?}"
+    );
+    assert!(
+        after.contains(&format!("{INSIDE}/renamed.yft")),
+        "the rename did not take: {after:?}"
+    );
+
+    let (holder, index) = round
+        .locate(&mut handle, &format!("{INSIDE}/added.meta"))
+        .expect("the added entry resolves");
+    assert_eq!(
+        holder.extract(&mut handle, index).expect("extracts"),
+        b"<added/>".to_vec(),
+    );
+
+    // And every entry of the whole archive still reads back as it describes
+    // itself, which is the strongest thing this end can say about it.
+    rpf_core::Verified::of(&mut handle, &round, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("reads back clean");
 }
 
 // --- Corpus-free: what a build writes, and what it refuses ------------------
@@ -606,10 +700,10 @@ fn a_rebuild_writes_the_version_the_original_was_read_at() {
         let archive = Archive::open(&mut src).expect("parses");
         let edits = BTreeMap::from([("a.txt".to_owned(), b"replaced".to_vec())]);
         let mut out = tempfile::NamedTempFile::new().expect("temp file");
-        rpf_core::replace_many(
+        rpf_core::rewrite(
             &mut src,
             &archive,
-            &edits,
+            &rpf_core::Changes::writing(edits),
             out.as_file_mut(),
             &mut rpf_core::InMemory,
             &mut Unwatched,
@@ -691,10 +785,10 @@ fn replaced_on_disk(source: &[u8], edits: &BTreeMap<String, Vec<u8>>) -> Vec<u8>
     let archive = Archive::open(&mut src).expect("parses");
 
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
-    let report = rpf_core::replace_many(
+    let report = rpf_core::rewrite(
         &mut src,
         &archive,
-        edits,
+        &rpf_core::Changes::writing(edits.clone()),
         sink.as_file_mut(),
         &mut rpf_core::InMemory,
         &mut Unwatched,
@@ -972,10 +1066,10 @@ fn replacing_an_archive_and_a_file_inside_it_is_refused() {
         ("sub/inner.rpf/f.txt".to_owned(), b"DEEP-EDIT".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::replace_many(
+    let refused = rpf_core::rewrite(
         &mut src,
         &archive,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         &mut out,
         &mut rpf_core::InMemory,
         &mut Unwatched,
@@ -1006,10 +1100,10 @@ fn several_spellings_of_one_edit_are_refused() {
         ("SUB/INNER.RPF/F.TXT".to_owned(), b"third".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::replace_many(
+    let refused = rpf_core::rewrite(
         &mut src,
         &archive,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         &mut out,
         &mut rpf_core::InMemory,
         &mut Unwatched,
@@ -1038,10 +1132,10 @@ fn two_spellings_of_one_entry_are_refused_at_the_top_level() {
         ("F.TXT".to_owned(), b"second".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::replace_many(
+    let refused = rpf_core::rewrite(
         &mut src,
         &archive,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         &mut out,
         &mut rpf_core::InMemory,
         &mut Unwatched,
@@ -1068,10 +1162,10 @@ fn edits_in_one_nested_archive_still_rebuild_it_once() {
         ("SUB/inner.rpf/g.txt".to_owned(), b"two".to_vec()),
     ]);
     let mut out = Cursor::new(Vec::new());
-    rpf_core::replace_many(
+    rpf_core::rewrite(
         &mut src,
         &archive,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         &mut out,
         &mut rpf_core::InMemory,
         &mut Unwatched,

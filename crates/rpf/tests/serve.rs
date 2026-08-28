@@ -2982,8 +2982,12 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
             "path": held.display().to_string()}}),
         json!({"jsonrpc":"2.0","id":2,"method":"open","params":{
             "path": source.display().to_string()}}),
+        // `overwrite` because the directory being extracted into is the one the
+        // archives sit in, which DR-029 refuses on its own. That refusal is not
+        // what this test is about, and it is the cheaper of the two, so it is
+        // waived to reach the claim.
         json!({"jsonrpc":"2.0","id":3,"method":"extract","params":{
-            "handle":2,"into": dir.path().display().to_string()}}),
+            "handle":2,"into": dir.path().display().to_string(),"overwrite":true}}),
     ]);
 
     let refused = answer(&responses, 3);
@@ -3337,4 +3341,430 @@ fn make_other_archive(at: &Path) {
         &mut Unwatched,
     )
     .expect("builds");
+}
+
+// --- R4.10 on the wire: adding, deleting and renaming an entry --------------
+
+/// Every path an open archive holds, from a recursive `list`.
+fn listed(archive: &str) -> Vec<String> {
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"list","params":{
+            "handle":1,"path":"","recursive":true}}),
+    ]);
+    answer(&responses, 2)["result"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["path"].as_str().expect("path").to_owned())
+        .collect()
+}
+
+/// `write` with `create` adds an entry the archive did not hold, and `commit`
+/// rebuilds for it. The wire can do what `rpf put --create` can, which is the
+/// whole of §1's test.
+#[test]
+fn a_created_entry_is_buffered_and_committed() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        // Without `create` it is still not found, which is what it has always
+        // been.
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/added.txt","bytes": BASE64.encode(b"new")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"data/added.txt","bytes": BASE64.encode(b"new"),
+            "create":true}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+            "handle":1,"path":"data/added.txt"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"commit","params":{"handle":1,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"read","params":{
+            "handle":1,"path":"data/added.txt"}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"verify","params":{"handle":1,"progress":false}}),
+    ]);
+
+    assert!(answer(&responses, 2)["error"].is_object(), "{responses:?}");
+    assert_eq!(answer(&responses, 3)["result"]["pending"], json!(1));
+    // A read of the buffered path answers what was written, before it exists.
+    assert_eq!(answer(&responses, 4)["result"]["pending"], json!(true));
+
+    let committed = answer(&responses, 5);
+    assert_eq!(
+        committed["result"]["method"],
+        json!("rebuild"),
+        "{committed}"
+    );
+    assert_eq!(committed["result"]["committed"], json!(1), "{committed}");
+
+    let read = answer(&responses, 6);
+    assert_eq!(read["result"]["pending"], json!(false), "{read}");
+    assert_eq!(
+        BASE64
+            .decode(read["result"]["bytes"].as_str().expect("bytes"))
+            .expect("base64"),
+        b"new".to_vec(),
+    );
+    assert_eq!(
+        answer(&responses, 7)["result"]["problems"],
+        json!([]),
+        "{responses:?}"
+    );
+    assert!(listed(&archive_str).contains(&"data/added.txt".to_owned()));
+}
+
+/// `delete` buffers a removal, and a directory that holds something needs
+/// saying so — the same rule the command line has, because it is the same rule
+/// in `rpf-core`.
+#[test]
+fn delete_buffers_a_removal_and_asks_before_taking_children() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{"handle":1,"path":"data"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"delete","params":{
+            "handle":1,"path":"data","recursive":true}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"commit","params":{"handle":1,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"list","params":{
+            "handle":1,"path":"","recursive":true}}),
+    ]);
+
+    let refused = answer(&responses, 2);
+    assert!(refused["error"].is_object(), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("not empty"),
+        "{refused}",
+    );
+
+    assert_eq!(answer(&responses, 3)["result"]["pending"], json!(1));
+    assert_eq!(answer(&responses, 4)["result"]["paths"], json!(["data"]));
+    assert_eq!(
+        answer(&responses, 5)["result"]["method"],
+        json!("rebuild"),
+        "{responses:?}"
+    );
+
+    let rows: Vec<String> = answer(&responses, 6)["result"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["path"].as_str().expect("path").to_owned())
+        .collect();
+    assert_eq!(rows, vec!["art.yft".to_owned()], "{rows:?}");
+}
+
+/// `rename` moves an entry, and refuses a destination the archive already
+/// holds rather than destroying it.
+#[test]
+fn rename_moves_an_entry_and_refuses_an_occupied_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"data/greeting.txt"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"data/moved.yft"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"verify","params":{"handle":1,"progress":false}}),
+    ]);
+
+    let refused = answer(&responses, 2);
+    assert!(refused["error"].is_object(), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("already in the archive"),
+        "{refused}",
+    );
+
+    assert_eq!(answer(&responses, 3)["result"]["pending"], json!(1));
+    assert_eq!(answer(&responses, 4)["result"]["committed"], json!(1));
+    assert_eq!(answer(&responses, 5)["result"]["problems"], json!([]));
+
+    let rows = listed(&archive_str);
+    assert!(rows.contains(&"data/moved.yft".to_owned()), "{rows:?}");
+    assert!(!rows.contains(&"art.yft".to_owned()), "{rows:?}");
+}
+
+/// `mkdir` adds a directory that holds nothing, which a rebuild would
+/// otherwise lose: `build` derives parents from file paths and cannot see one.
+#[test]
+fn mkdir_adds_a_directory_and_refuses_one_that_is_there() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"mkdir","params":{"handle":1,"path":"data"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"mkdir","params":{"handle":1,"path":"empty"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1,"progress":false}}),
+    ]);
+
+    assert!(answer(&responses, 2)["error"].is_object(), "{responses:?}");
+    assert_eq!(answer(&responses, 3)["result"]["pending"], json!(1));
+    assert_eq!(answer(&responses, 4)["result"]["committed"], json!(1));
+    assert!(listed(&archive_str).contains(&"empty".to_owned()));
+}
+
+/// A dry run reports the change as what it is rather than as a payload that
+/// would not fit, and writes nothing.
+#[test]
+fn a_dry_run_names_the_structural_change_it_would_make() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+    let before = fs::read(&archive).expect("readable");
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{"handle":1,"path":"art.yft"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"dry_run":true}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
+    ]);
+
+    let planned = answer(&responses, 3);
+    assert_eq!(planned["result"]["method"], json!("rebuild"), "{planned}");
+    assert_eq!(planned["result"]["committed"], json!(0), "{planned}");
+    assert_eq!(
+        planned["result"]["structural"],
+        json!([{"path": "art.yft", "structural": "removes an entry"}]),
+        "{planned}",
+    );
+    // The change is still buffered, and nothing was written.
+    assert_eq!(answer(&responses, 4)["result"]["paths"], json!(["art.yft"]));
+    assert_eq!(fs::read(&archive).expect("readable"), before, "it wrote");
+}
+
+/// Every structural method resolves the change when it is offered, so a client
+/// is told at the moment it can still act on it rather than at the commit.
+#[test]
+fn a_structural_change_is_refused_when_it_is_offered() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{"handle":1,"path":"nowhere"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"rename","params":{
+            "handle":1,"from":"nowhere","to":"somewhere"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
+    ]);
+
+    for id in [2, 3] {
+        let refused = answer(&responses, id);
+        assert!(refused["error"].is_object(), "{refused}");
+        assert_eq!(refused["error"]["code"], json!(3), "{refused}");
+    }
+    assert_eq!(answer(&responses, 4)["result"]["paths"], json!([]));
+}
+
+// --- What `list` answers, and how a caller reads it. DR-028 -----------------
+
+/// `list` of a file answers that one entry, which is what makes it a `stat`.
+///
+/// Pinned because a client depends on it and nothing said so: the editor client
+/// builds its whole tree out of `list`, and "is this a file" is the question it
+/// asks most. The tie-break is the row's `path` against the one that was asked
+/// for — equal means the path named that entry, different means it named the
+/// directory the entry is in — and it is exact, because a child's path is its
+/// parent's plus a separator and a name and can never equal its parent's.
+#[test]
+fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"list","params":{
+            "handle":1,"path":"data/greeting.txt"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"list","params":{"handle":1,"path":"data"}}),
+    ]);
+
+    // The file: one row, whose path is the one asked for.
+    let file = answer(&responses, 2)["result"]
+        .as_array()
+        .expect("an array")
+        .clone();
+    assert_eq!(file.len(), 1, "{file:?}");
+    assert_eq!(file[0]["path"], json!("data/greeting.txt"), "{file:?}");
+    assert_eq!(file[0]["kind"], json!("binary"), "{file:?}");
+
+    // The directory holding it: one row too, and its path is *not* the one
+    // asked for. Only that comparison separates the two cases.
+    let directory = answer(&responses, 3)["result"]
+        .as_array()
+        .expect("an array")
+        .clone();
+    assert_eq!(directory.len(), 1, "{directory:?}");
+    assert_eq!(
+        directory[0]["path"],
+        json!("data/greeting.txt"),
+        "{directory:?}"
+    );
+}
+
+/// A row's `path` is the whole in-archive path, not a name.
+///
+/// So a client uses it directly with `read`, `write` or `list`, and a client
+/// that joined it onto the path it asked for would build
+/// `x64/inner.rpf/x64/inner.rpf/art.yft`. Addressed from the path that was
+/// asked for, in the caller's own spelling of it.
+#[test]
+fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer_path, _) = make_nested(dir.path());
+    let outer = outer_path.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": outer}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"list","params":{
+            "handle":1,"path":"x64/inner.rpf"}}),
+        // The caller's own spelling is what comes back, folded case and all:
+        // the rows are addressed from what was asked for, not from what the
+        // archive spells the components as.
+        json!({"jsonrpc":"2.0","id":3,"method":"list","params":{
+            "handle":1,"path":"X64/INNER.RPF"}}),
+    ]);
+
+    let rows: Vec<String> = answer(&responses, 2)["result"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["path"].as_str().expect("path").to_owned())
+        .collect();
+    assert!(
+        rows.iter().all(|path| path.starts_with("x64/inner.rpf/")),
+        "a row must carry the whole path: {rows:?}",
+    );
+    // And each of them addresses: a client uses a row's path as it stands.
+    let first = rows.first().expect("at least one entry").clone();
+    let read = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": outer}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{"handle":1,"path": first}}),
+    ]);
+    assert!(answer(&read, 2)["result"]["bytes"].is_string(), "{read:?}");
+
+    let spelled: Vec<String> = answer(&responses, 3)["result"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["path"].as_str().expect("path").to_owned())
+        .collect();
+    assert!(
+        spelled
+            .iter()
+            .all(|path| path.starts_with("X64/INNER.RPF/")),
+        "the caller's spelling is what comes back: {spelled:?}",
+    );
+}
+
+/// The wire refuses a non-empty target the way the command line does, and takes
+/// the same way through. Both, or neither. DR-029.
+#[test]
+fn extract_over_a_target_that_holds_something_is_refused_on_the_wire_too() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+    let tree = dir.path().join("tree").display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+            "handle":1,"into": tree,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"extract","params":{
+            "handle":1,"into": tree,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"extract","params":{
+            "handle":1,"into": tree,"overwrite":true,"progress":false}}),
+    ]);
+
+    assert_eq!(answer(&responses, 2)["result"]["files"], json!(2));
+
+    let refused = answer(&responses, 3);
+    assert_eq!(refused["error"]["code"], json!(6), "{refused}");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .contains("--overwrite"),
+        "{refused}",
+    );
+
+    assert_eq!(answer(&responses, 4)["result"]["files"], json!(2));
+}
+
+/// A listing is the archive **on disk**: a buffered change is not in it until
+/// the commit, and `read` is the one method that prefers what was buffered.
+///
+/// Pinned because the asymmetry is easy to read as a bug and is deliberate:
+/// nothing on disk changes until `commit`, so a listing that showed an entry no
+/// archive holds would describe something that does not exist. A client showing
+/// a buffered addition keeps that view itself, and `pending` is what it
+/// confirms it against.
+#[test]
+fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{"handle":1,"path":"art.yft"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"added.txt","bytes": BASE64.encode(b"new"),"create":true}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"list","params":{
+            "handle":1,"path":"","recursive":true}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"read","params":{"handle":1,"path":"added.txt"}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"pending","params":{"handle":1}}),
+    ]);
+
+    let rows: Vec<String> = answer(&responses, 4)["result"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["path"].as_str().expect("path").to_owned())
+        .collect();
+    assert!(
+        rows.contains(&"art.yft".to_owned()),
+        "a buffered removal is not in the listing: {rows:?}",
+    );
+    assert!(
+        !rows.contains(&"added.txt".to_owned()),
+        "a buffered addition is not in the listing either: {rows:?}",
+    );
+
+    // And `read` is the exception: what was written comes back before it is
+    // anywhere on disk.
+    let read = answer(&responses, 5);
+    assert_eq!(read["result"]["pending"], json!(true), "{read}");
+
+    // `pending` is what a client confirms its own view against.
+    assert_eq!(
+        answer(&responses, 6)["result"]["paths"],
+        json!(["added.txt", "art.yft"]),
+    );
 }

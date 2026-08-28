@@ -191,10 +191,10 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
 
     let mut watch = Recorder::watching();
     let mut out = Cursor::new(Vec::new());
-    rpf_core::replace_many(
+    rpf_core::rewrite(
         &mut src,
         &archive,
-        &edits,
+        &rpf_core::Changes::writing(edits),
         &mut out,
         &mut rpf_core::InMemory,
         &mut watch,

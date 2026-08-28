@@ -303,7 +303,7 @@ impl Cache {
     /// The platform cache also sweeps the directory it superseded, so the count
     /// can exceed what [`Cache::entries`] reported — an entry at the old
     /// location is material this build cannot read but can still remove. See
-    /// [`Cache::below`].
+    /// `Cache::below`.
     ///
     /// # Errors
     ///

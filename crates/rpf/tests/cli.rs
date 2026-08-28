@@ -1393,6 +1393,30 @@ fn info_of_something_that_is_not_an_archive_is_refused_rather_than_summarised() 
     let (code, message) = run_err(&["info", &archive, "data"]);
     assert_eq!(code, 6, "{message}");
     assert!(message.contains("directory"), "{message}");
+    // Naming the path the caller gave, not the index the archive happens to
+    // hold it at: an entry index is a fact about this archive's table and not
+    // something a caller asked with or can act on.
+    assert!(
+        message.contains("\"data\""),
+        "the refusal names the path: {message}",
+    );
+    assert!(
+        !message.contains("entry 1"),
+        "the refusal should not name an entry index: {message}",
+    );
+
+    // And through nesting, where the two spellings genuinely differ: the entry
+    // is `data` inside `x64/inner.rpf`, and what the caller typed is the whole
+    // path. Naming the entry's own path would send the caller looking in the
+    // wrong archive.
+    let (outer_path, _) = make_nested(dir.path());
+    let outer = outer_path.display().to_string();
+    let (code, message) = run_err(&["info", &outer, "x64/inner.rpf/data"]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains("\"x64/inner.rpf/data\""),
+        "the refusal names the whole path: {message}",
+    );
 }
 
 #[test]
@@ -1869,12 +1893,20 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_tree() {
         "{report}"
     );
     assert_eq!(report["against"], serde_json::json!(tree_str), "{report}");
+    // One object per problem, the same shape the daemon answers: a reason
+    // carries colons of its own — "entry 0: payload did not inflate" — so a
+    // consumer cannot split "path: reason" back apart. DR-027.
     let problems = report["problems"].as_array().expect("an array");
     assert_eq!(problems.len(), 1, "{report}");
+    assert_eq!(
+        problems[0]["path"],
+        serde_json::json!("stored.bin"),
+        "{report}",
+    );
     assert!(
-        problems[0]
+        problems[0]["reason"]
             .as_str()
-            .is_some_and(|problem| problem.starts_with("stored.bin:")),
+            .is_some_and(|reason| reason.contains("digest")),
         "{report}",
     );
 }
@@ -2010,4 +2042,239 @@ fn a_tree_whose_manifest_records_no_checksum_is_refused_rather_than_passed() {
         "the refusal was: {message}",
     );
     assert!(message.contains("nothing was checked"), "{message}");
+}
+
+// --- R4.10: adding, deleting and renaming an entry --------------------------
+
+/// Every path an archive holds, as `ls -R` reports them.
+fn listing(archive: &Path) -> Vec<String> {
+    let (code, out) = run(&["--json", "ls", &archive.display().to_string(), "", "-R"]);
+    assert_eq!(code, 0, "ls -R");
+    let rows: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    rows.as_array()
+        .expect("an array")
+        .iter()
+        .map(|row| row["path"].as_str().expect("path").to_owned())
+        .collect()
+}
+
+#[test]
+fn put_creates_an_entry_when_it_is_asked_to() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let source = dir.path().join("added.txt");
+    fs::write(&source, b"brand new").expect("writable");
+    let source = source.display().to_string();
+
+    // Without --create it is still not found, which is exit 3.
+    let (code, message) = run_err(&["put", &archive_str, "data/added.txt", &source]);
+    assert_eq!(code, 3, "{message}");
+
+    let (code, out) = run(&[
+        "--json",
+        "put",
+        &archive_str,
+        "data/added.txt",
+        &source,
+        "--create",
+    ]);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+    let report: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(report["method"], serde_json::json!("rebuild"), "{report}");
+
+    assert!(
+        listing(&archive).contains(&"data/added.txt".to_owned()),
+        "{:?}",
+        listing(&archive),
+    );
+    let (code, bytes) = run(&["cat", &archive_str, "data/added.txt"]);
+    assert_eq!(code, 0);
+    assert_eq!(bytes, b"brand new".to_vec());
+    assert_eq!(run(&["verify", &archive_str]).0, 0, "verify");
+}
+
+#[test]
+fn rm_removes_an_entry_and_refuses_a_directory_that_holds_something() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let (code, message) = run_err(&["rm", &archive_str, "data"]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains("not empty"), "{message}");
+
+    let (code, out) = run(&["--json", "rm", &archive_str, "data", "--recursive"]);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+    assert_eq!(listing(&archive), vec!["stored.bin".to_owned()]);
+    assert_eq!(run(&["verify", &archive_str]).0, 0, "verify");
+}
+
+#[test]
+fn mv_renames_an_entry_and_refuses_an_occupied_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let contents = make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let (code, message) = run_err(&["mv", &archive_str, "stored.bin", "data/greeting.txt"]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains("already in the archive"), "{message}");
+
+    assert_eq!(
+        run(&["mv", &archive_str, "stored.bin", "data/moved.bin"]).0,
+        0,
+    );
+    assert_eq!(
+        listing(&archive),
+        vec![
+            "data".to_owned(),
+            "data/greeting.txt".to_owned(),
+            "data/moved.bin".to_owned(),
+        ],
+    );
+    let (code, bytes) = run(&["cat", &archive_str, "data/moved.bin"]);
+    assert_eq!(code, 0);
+    assert_eq!(bytes, contents["stored.bin"]);
+    assert_eq!(run(&["verify", &archive_str]).0, 0, "verify");
+}
+
+#[test]
+fn mkdir_adds_a_directory_that_holds_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    assert_eq!(run(&["mkdir", &archive_str, "empty"]).0, 0);
+    assert!(
+        listing(&archive).contains(&"empty".to_owned()),
+        "{:?}",
+        listing(&archive),
+    );
+
+    let (code, message) = run_err(&["mkdir", &archive_str, "empty"]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains("already in the archive"), "{message}");
+}
+
+#[test]
+fn a_structural_dry_run_says_what_it_would_do_and_writes_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+    let before = fs::read(&archive).expect("readable");
+
+    let (code, out) = run(&["--json", "rm", &archive_str, "stored.bin", "--dry-run"]);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+    let report: serde_json::Value = serde_json::from_slice(&out).expect("json");
+    assert_eq!(report["method"], serde_json::json!("rebuild"), "{report}");
+    assert_eq!(report["path"], serde_json::json!("stored.bin"), "{report}");
+    assert_eq!(
+        report["structural"],
+        serde_json::json!("removes an entry"),
+        "{report}"
+    );
+    assert_eq!(report["dry_run"], serde_json::json!(true), "{report}");
+    assert_eq!(fs::read(&archive).expect("readable"), before, "it wrote");
+}
+
+#[test]
+fn every_structural_command_refuses_a_game_installation() {
+    // The invariant `AGENTS.md` states, asked of each new verb rather than of
+    // one of them: a tool refuses to write into a detected install unless it is
+    // told to. Each is a separate entry point and each has to ask.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let install = dir.path().join("Grand Theft Auto V");
+    fs::create_dir_all(&install).expect("creatable");
+    fs::write(install.join("GTA5.exe"), b"not really").expect("writable");
+    let archive = install.join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    for args in [
+        vec!["rm", archive_str.as_str(), "stored.bin"],
+        vec!["mv", archive_str.as_str(), "stored.bin", "moved.bin"],
+        vec!["mkdir", archive_str.as_str(), "made"],
+    ] {
+        let (code, message) = run_err(&args);
+        assert_eq!(code, 6, "{args:?}: {message}");
+        assert!(message.contains("--force"), "{args:?}: {message}");
+    }
+}
+
+/// `extract` refuses a target that already holds something, and `--overwrite`
+/// is the way through. DR-029.
+#[test]
+fn extract_refuses_a_target_that_already_holds_something() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let tree = dir.path().join("tree");
+    let tree_str = tree.display().to_string();
+
+    // A target that is not there yet is created, as it always was.
+    assert_eq!(run(&["extract", &archive_str, &tree_str]).0, 0, "first");
+
+    // A second extraction into the same tree is refused, and names what is
+    // already there.
+    let (code, message) = run_err(&["extract", &archive_str, &tree_str]);
+    assert_eq!(code, 6, "{message}");
+    assert!(message.contains("already holds"), "{message}");
+    assert!(message.contains("--overwrite"), "{message}");
+
+    // And `--overwrite` is the way through.
+    assert_eq!(
+        run(&["extract", &archive_str, &tree_str, "--overwrite"]).0,
+        0,
+        "--overwrite",
+    );
+
+    // An empty directory is not "already holding something".
+    let empty = dir.path().join("empty");
+    fs::create_dir(&empty).expect("creatable");
+    assert_eq!(
+        run(&["extract", &archive_str, &empty.display().to_string()]).0,
+        0,
+        "an empty directory",
+    );
+}
+
+/// The refusal happens before anything is written, so a target that was refused
+/// is exactly as it was.
+#[test]
+fn a_refused_extraction_writes_nothing_at_all() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+
+    let tree = dir.path().join("tree");
+    fs::create_dir(&tree).expect("creatable");
+    fs::write(tree.join("mine.txt"), b"not the archive's").expect("writable");
+
+    let (code, _) = run_err(&[
+        "extract",
+        &archive.display().to_string(),
+        &tree.display().to_string(),
+    ]);
+    assert_eq!(code, 6);
+
+    let mut left: Vec<String> = fs::read_dir(&tree)
+        .expect("readable")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    left.sort();
+    assert_eq!(left, vec!["mine.txt".to_owned()], "it wrote something");
 }

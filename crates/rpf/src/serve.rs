@@ -28,7 +28,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use rpf_core::{Archive, EntryKind, Flow, Step, Watch};
+use rpf_core::{Archive, Change, Changes, EntryKind, Flow, Step, Watch};
 use serde_json::{Value, json};
 
 use crate::{commands, exit::Failure, install};
@@ -172,7 +172,10 @@ struct Session {
     id: FileId,
     file: fs::File,
     archive: Archive,
-    pending: BTreeMap<String, Vec<u8>>,
+    /// What has been changed and not committed: new contents for an entry, and
+    /// since DR-026 an entry added, removed or renamed as well. `commit`
+    /// decides between patching and rebuilding for the whole set of them.
+    pending: Changes,
 }
 
 /// Everything the daemon holds between requests.
@@ -975,6 +978,9 @@ fn dispatch(
         "list" => list(state, params),
         "read" => read(state, params),
         "write" => write(state, params),
+        "delete" => delete(state, params),
+        "rename" => rename(state, params),
+        "mkdir" => mkdir(state, params),
         "pending" => pending(state, params),
         "discard" => discard(state, params),
         "info" => info(state, params),
@@ -1088,7 +1094,7 @@ fn open(state: &mut State, params: &Value) -> Answered {
             id,
             file,
             archive,
-            pending: BTreeMap::new(),
+            pending: Changes::new(),
         },
     );
 
@@ -1155,6 +1161,37 @@ fn inside_of(params: &Value) -> String {
 }
 
 /// `list` — the entries at a path, optionally recursively.
+///
+/// **It doubles as a `stat`, and there is no other method that does.** `path`
+/// naming a directory answers its children; naming a nested archive answers
+/// what is inside it, because a nested archive is a directory as far as a path
+/// is concerned; and naming an ordinary **file** answers exactly one row, for
+/// that file, rather than an error. An empty directory answers `[]`.
+///
+/// So a caller tells "this is a file" from "this directory holds one child" by
+/// comparing the row's `path` with the one it asked for: equal means the path
+/// named that entry, different means it named the directory the entry sits in.
+/// The comparison is exact rather than a heuristic — a child's path is its
+/// parent's plus a separator and a name, so it can never equal its parent's —
+/// and `[]` is unambiguous, because a file always answers one row. DR-028.
+///
+/// **A row's `path` is the whole in-archive path, not a name.** `list` of
+/// `x64/inner.rpf` answers rows whose `path` is `x64/inner.rpf/art.yft`, so a
+/// row addresses `read`, `write` and `list` as it stands, and a client that
+/// joined it onto the path it asked for would build
+/// `x64/inner.rpf/x64/inner.rpf/art.yft`. The rows are addressed **from the
+/// path that was asked for**, in the caller's own spelling of it: components
+/// resolve case-insensitively, so a caller that asked for `X64/INNER.RPF` gets
+/// rows spelled that way. DR-028.
+///
+/// **A listing is the archive on disk.** Buffered changes are not in it, and
+/// that is the same rule every method but `read` follows — nothing on disk
+/// changes until `commit`, and a listing that showed an entry no archive holds
+/// would be describing something that does not exist yet. `read` is the one
+/// exception, because an editor that wrote a buffer and read it back must see
+/// what it wrote. A client that wants to show a buffered addition or removal
+/// keeps that view itself, from what it asked for, and `pending` is what it
+/// asks the daemon to confirm it against.
 fn list(state: &mut State, params: &Value) -> Answered {
     let inside = inside_of(params);
     let recursive = flag(params, "recursive")?;
@@ -1174,7 +1211,7 @@ fn read(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let session = session(state, params)?;
 
-    if let Some(buffered) = session.pending.get(&inside) {
+    if let Some(buffered) = session.pending.contents_at(&inside) {
         return Ok(json!({
             "path": inside,
             "len": buffered.len(),
@@ -1200,36 +1237,131 @@ fn read(state: &mut State, params: &Value) -> Answered {
 }
 
 /// `write` — buffer an edit. Nothing on disk changes until `commit`.
+///
+/// `create: true` lets it be a path the archive does not hold yet, which is an
+/// entry added and therefore a rebuild. Without it a path that is not there is
+/// [`rpf_core::Error::NotFound`], which is what a write has always answered:
+/// creating an entry a caller merely misspelled is the failure that guards
+/// against. DR-026.
 fn write(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let encoded = string(params, "bytes")?;
+    let create = flag(params, "create")?;
     let bytes = BASE64
         .decode(encoded.as_bytes())
         .map_err(|_| invalid_params("\"bytes\" is not base64".to_owned()))?;
+    let is_resource_payload = bytes.get(0..4) == Some(&rpf_core::format::resource::MAGIC_RSC7);
+    let change = Change::Write {
+        contents: bytes,
+        create,
+    };
     let session = session(state, params)?;
 
     // Resolved now rather than at commit, while the caller can still act on a
     // refusal.
-    let (holder, index) = session.archive.locate(&mut session.file, &inside)?;
-    if holder.entry(index)?.is_directory() {
-        return Err(Failure::Refused {
-            reason: format!("{inside} is a directory"),
+    let located = session.archive.locate(&mut session.file, &inside);
+    match located {
+        Ok((holder, index)) => {
+            if holder.entry(index)?.is_directory() {
+                return Err(Failure::Refused {
+                    reason: format!("{inside} is a directory"),
+                }
+                .into());
+            }
+            // R6.6: a resource entry takes an RSC7 payload and nothing else.
+            if matches!(holder.entry(index)?.kind, EntryKind::Resource { .. })
+                && !is_resource_payload
+            {
+                return Err(Failure::Refused {
+                    reason: format!(
+                        "{inside} is a resource entry; its payload must begin with RSC7"
+                    ),
+                }
+                .into());
+            }
+            Ok(record(session, &inside, change))
         }
-        .into());
-    }
-    // R6.6: a resource entry takes an RSC7 payload and nothing else.
-    if matches!(holder.entry(index)?.kind, EntryKind::Resource { .. })
-        && bytes.get(0..4) != Some(&rpf_core::format::resource::MAGIC_RSC7)
-    {
-        return Err(Failure::Refused {
-            reason: format!("{inside} is a resource entry; its payload must begin with RSC7"),
+        // A path being created has no entry to check against, so the whole
+        // change is resolved instead. Only here: `allows` walks the entry
+        // table, and a write to an entry that exists is what an editor sends
+        // once per save.
+        Err(rpf_core::Error::NotFound { .. }) if create => {
+            rpf_core::allows(&mut session.file, &session.archive, &inside, &change)?;
+            Ok(record(session, &inside, change))
         }
-        .into());
+        Err(other) => Err(Failure::Container(other).into()),
     }
+}
 
-    let len = bytes.len();
-    session.pending.insert(inside.clone(), bytes);
-    Ok(json!({ "path": inside, "len": len, "pending": session.pending.len() }))
+/// `delete` — buffer a removal. Nothing on disk changes until `commit`.
+///
+/// `recursive: true` takes a directory's children with it; without it a
+/// directory that holds anything is refused. The shape every editor's `delete`
+/// already has, and the shape `rpf rm` has for the same reason. DR-026.
+///
+/// `list` goes on reporting the entry until the commit: a listing is the
+/// archive on disk. See [`list`].
+fn delete(state: &mut State, params: &Value) -> Answered {
+    let inside = string(params, "path")?;
+    let recursive = flag(params, "recursive")?;
+    buffer(state, params, &inside, Change::Remove { recursive })
+}
+
+/// `rename` — buffer a move to another path in the same archive.
+///
+/// `to` is a whole in-archive path, spelled the way `from` is, so a rename
+/// moves between directories as well as changing a name. A destination the
+/// archive already holds is refused rather than replaced: `delete` it in the
+/// same session, which says the same thing out loud. DR-026.
+fn rename(state: &mut State, params: &Value) -> Answered {
+    let from = string(params, "from")?;
+    let to = string(params, "to")?;
+    let session = session(state, params)?;
+    let change = Change::RenameTo(to.clone());
+    rpf_core::allows(&mut session.file, &session.archive, &from, &change)?;
+    session.pending.set(from.clone(), change);
+    Ok(json!({
+        "from": from,
+        "to": to,
+        "pending": session.pending.len(),
+    }))
+}
+
+/// `mkdir` — buffer a directory, and whatever above it is missing.
+fn mkdir(state: &mut State, params: &Value) -> Answered {
+    let inside = string(params, "path")?;
+    buffer(state, params, &inside, Change::MakeDirectory)
+}
+
+/// Records one change against a session, once the archive has agreed to it.
+///
+/// The agreement is `rpf_core::allows`, which runs the resolution a commit runs
+/// and throws the result away — so a change buffered here is one the commit
+/// will not refuse for the same reason, and the rules are stated once rather
+/// than once in the library and once on the wire (§1). What it cannot see is a
+/// change that only collides with another change in the same session; the
+/// commit has the set and answers that.
+fn buffer(state: &mut State, params: &Value, inside: &str, change: Change) -> Answered {
+    let session = session(state, params)?;
+    rpf_core::allows(&mut session.file, &session.archive, inside, &change)?;
+    Ok(record(session, inside, change))
+}
+
+/// Records one change against a session, and reports what is buffered.
+///
+/// One shape for every method that buffers, so a client reads one answer. `len`
+/// is the payload's, and `null` for a change that carries none.
+fn record(session: &mut Session, inside: &str, change: Change) -> Value {
+    let len = match change {
+        Change::Write { ref contents, .. } => Some(contents.len()),
+        _ => None,
+    };
+    session.pending.set(inside, change);
+    json!({
+        "path": inside,
+        "len": len,
+        "pending": session.pending.len(),
+    })
 }
 
 /// `info` — the header, and what the entries add up to.
@@ -1302,7 +1434,7 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
         .verified
         .problems
         .iter()
-        .map(|problem| json!({ "path": problem.path, "reason": problem.error.to_string() }))
+        .map(commands::verify_problem)
         .collect();
     Ok(commands::verify_report(&session.path, &checked, &problems))
 }
@@ -1319,7 +1451,11 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 /// written where they are — a tree is not replaced by rename the way an archive
 /// is, and DR-014 says so rather than leaving it to be discovered.
 ///
-/// Two things it refuses, both before anything is written.
+/// `overwrite: true` lets it write into a directory that already holds
+/// something, which is refused without it — the same rule and the same way
+/// through the command line's `--overwrite` gives. DR-029.
+///
+/// Three things it refuses, all before anything is written.
 ///
 /// **A session with buffered edits.** `read` prefers a pending edit to what is
 /// on disk; `extract` read past them and reported success, so `write`,
@@ -1336,6 +1472,7 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let handle = handle_of(params)?;
     let into = PathBuf::from(string(params, "into")?);
+    let existing = crate::existing(flag(params, "overwrite")?);
     let wanted = wants_progress(params)?;
     let name = name_of(request);
 
@@ -1369,6 +1506,7 @@ fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> A
         &mut src,
         &session.archive,
         &into,
+        existing,
         &|target| {
             state
                 .holder_of(target, identity_of(target))
@@ -1393,8 +1531,8 @@ fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> A
 /// It names them, because committing or discarding them is what the caller has
 /// to do, and a refusal that does not say which is one the client has to guess
 /// at.
-fn extracting_with_edits(pending: &BTreeMap<String, Vec<u8>>) -> Failure {
-    let paths: Vec<&str> = pending.keys().map(String::as_str).collect();
+fn extracting_with_edits(pending: &Changes) -> Failure {
+    let paths: Vec<&str> = pending.paths().collect();
     Failure::Refused {
         reason: format!(
             "{} buffered {} not been committed ({}). An extracted tree is the archive as it \
@@ -1565,7 +1703,7 @@ fn keys_invalidate(params: &Value) -> Answered {
 /// `pending` — what has been written but not committed.
 fn pending(state: &mut State, params: &Value) -> Answered {
     let session = session(state, params)?;
-    let paths: Vec<&String> = session.pending.keys().collect();
+    let paths: Vec<&str> = session.pending.paths().collect();
     Ok(json!({ "paths": paths }))
 }
 
@@ -1795,6 +1933,21 @@ fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
                 "rejected": rejected,
             }))
         }
+        // Nothing in place can add, remove or rename an entry, so the commit
+        // will rebuild whatever else is in the set. Reported as what it is
+        // rather than as a payload that would not fit. DR-026.
+        rpf_core::Plan::Structural(structural) => {
+            let structural: Vec<Value> = structural
+                .iter()
+                .map(|change| json!({ "path": change.path, "structural": change.what }))
+                .collect();
+            Ok(json!({
+                "committed": 0,
+                "dry_run": true,
+                "method": "rebuild",
+                "structural": structural,
+            }))
+        }
     }
 }
 
@@ -1823,7 +1976,7 @@ fn rebuild(session: &mut Session, wire: &Wire, asked: &Asked<'_>) -> crate::exit
     // Intermediates go where the rebuilt archive is going, which is the answer
     // for a daemon precisely because there is nobody to ask for another one.
     // DR-022.
-    let outcome = rpf_core::replace_many(
+    let outcome = rpf_core::rewrite(
         &mut session.file,
         &session.archive,
         &session.pending,
@@ -1906,7 +2059,13 @@ mod tests {
             id,
             file,
             archive,
-            pending: BTreeMap::from([("a.txt".to_owned(), b"replaced".to_vec())]),
+            pending: Changes::one(
+                "a.txt",
+                Change::Write {
+                    contents: b"replaced".to_vec(),
+                    create: false,
+                },
+            ),
         };
 
         // A wire whose standard output has already stopped accepting anything,

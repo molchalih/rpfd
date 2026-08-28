@@ -1,0 +1,33 @@
+#!/bin/sh
+# Enforces the commit rule AGENTS.md states: one line, no body,
+# `type(scope): what changed`, lower case, no trailing full stop, 72 at most.
+#
+# A rule that is only written down is a rule that is only sometimes followed.
+# Enable it once per clone:  git config core.hooksPath .githooks
+
+set -e
+
+subject=$(sed -n '1p' "$1")
+body=$(sed '1d' "$1" | grep -v '^#' | grep -v '^[[:space:]]*$' || true)
+
+die() {
+    echo "commit refused: $1" >&2
+    echo "  subject: $subject" >&2
+    echo "  the rule: type(scope): what changed — one line, lower case," >&2
+    echo "            no trailing full stop, 72 characters at most" >&2
+    echo "  types:   feat fix docs style refactor perf test build ci chore" >&2
+    echo "  scopes:  core cli serve client, or none" >&2
+    echo "  why:     AGENTS.md. Reasoning belongs in docs/, which can be" >&2
+    echo "           corrected; a commit message cannot" >&2
+    exit 1
+}
+
+[ -n "$body" ] && die "a commit message has no body"
+[ ${#subject} -le 72 ] || die "the subject is ${#subject} characters, over 72"
+case "$subject" in
+    *.) die "the subject ends in a full stop" ;;
+esac
+echo "$subject" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\((core|cli|serve|client)\))?: [a-z0-9]' \
+    || die "the subject does not read as type(scope): what changed, lower case"
+
+exit 0

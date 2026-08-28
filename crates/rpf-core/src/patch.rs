@@ -23,7 +23,6 @@
 //! price of not rewriting gigabytes, and it is why `verify` exists.
 
 use std::{
-    collections::BTreeMap,
     fmt,
     io::{Cursor, Read, Seek, SeekFrom, Write},
 };
@@ -31,6 +30,7 @@ use std::{
 use crate::{
     archive::Archive,
     build::{file_row, kind_of, store},
+    edit::{Change, Changes, Structural},
     error::{Error, Result},
     format::Row,
 };
@@ -149,6 +149,15 @@ pub enum Plan {
     /// written, and **no** edit in the set was applied, including those that
     /// would have fitted.
     DoesNotFit(Vec<TooLarge>),
+    /// At least one change alters what the archive **holds** rather than what
+    /// an entry holds, and no patch can express that.
+    ///
+    /// An entry added or removed changes the entry count, which moves the names
+    /// blob and the floor every payload sits above; a rename moves the names
+    /// blob the same way. So it is decided for the whole set here, before
+    /// anything is compressed, rather than found one entry at a time. R4.10,
+    /// DR-026.
+    Structural(Vec<Structural>),
 }
 
 /// The bytes one edit claims: the room its payload sits in, and its entry row.
@@ -171,16 +180,24 @@ impl Claim {
     }
 }
 
-/// Decides what patching every edit would do, without writing anything.
+/// Decides what patching every change would do, without writing anything.
 ///
-/// `edits` maps a path to the file as it exists outside the archive: for a
+/// A [`Change::Write`] to a path the archive holds is the one thing a patch can
+/// do: the payload goes where the old one sat, in the storage the entry already
+/// carries. Everything else — a path created, an entry removed, an entry
+/// renamed, a directory added — is [`Plan::Structural`], because each of them
+/// changes the entry count or the names blob and therefore every offset after
+/// it. That verdict is reached for the whole set before any payload is
+/// compressed.
+///
+/// A write's contents are the file as it exists outside the archive: for a
 /// resource, its `RSC7` header and still-deflated body. A path may address
 /// through nested archives in one string. Patching inside one needs **no
 /// rebuild of any ancestor**: the nested archive's own length is unchanged, so
 /// the payload its parent describes is unchanged, so there is nothing above to
 /// update. That is the whole reason this is worth having.
 ///
-/// Returns [`Plan::DoesNotFit`] naming every edit that is too large, so a
+/// Returns [`Plan::DoesNotFit`] naming every write that is too large, so a
 /// caller reporting a dry run can show all of them rather than the first. Too
 /// large for the *entry's room*, that is: a payload too large for the entry's
 /// fields to describe at all is an error rather than a rejection, and the same
@@ -188,20 +205,29 @@ impl Claim {
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] for a path that does not resolve,
-/// [`Error::WrongKind`] for a directory, [`Error::NotAResource`] for a resource
-/// given a payload that is not one, [`Error::FieldOverflow`] for one no entry
-/// row can describe, [`Error::Overlapping`] for two edits that claim the same
-/// bytes, and [`Error::Io`] from the archive.
-pub fn plan<F>(file: &mut F, archive: &Archive, edits: &BTreeMap<String, Vec<u8>>) -> Result<Plan>
+/// [`Error::NotFound`] for a path that does not resolve and was not asked to be
+/// created, [`Error::WrongKind`] for a directory, [`Error::NotAResource`] for a
+/// resource given a payload that is not one, [`Error::FieldOverflow`] for one no
+/// entry row can describe, [`Error::Overlapping`] for two edits that claim the
+/// same bytes, and [`Error::Io`] from the archive.
+pub fn plan<F>(file: &mut F, archive: &Archive, changes: &Changes) -> Result<Plan>
 where
     F: Read + Seek,
 {
+    let structural = structural_in(file, archive, changes)?;
+    if !structural.is_empty() {
+        return Ok(Plan::Structural(structural));
+    }
+
     let mut ready = Vec::new();
     let mut rejected = Vec::new();
     let mut claims: Vec<(&str, Claim)> = Vec::new();
 
-    for (path, contents) in edits {
+    for (path, change) in changes {
+        // Everything else was structural, and structural returned above.
+        let Change::Write { ref contents, .. } = *change else {
+            continue;
+        };
         let (holder, index) = archive.locate(file, path)?;
         let entry = *holder.entry(index)?;
 
@@ -221,8 +247,8 @@ where
         let written = store(
             holder.version(),
             path,
-            kind_of(index, &entry)?,
-            &mut Cursor::new(contents.clone()),
+            kind_of(path, &entry)?,
+            &mut Cursor::new(contents.as_slice()),
             &mut buffer,
         )?;
         let mut payload = buffer.into_inner();
@@ -265,10 +291,10 @@ where
         ] {
             if let Some((other, _)) = claims
                 .iter()
-                .find(|(other, staked)| *other != path.as_str() && staked.overlaps(&claim))
+                .find(|(other, staked)| *other != path && staked.overlaps(&claim))
             {
                 return Err(Error::Overlapping {
-                    path: path.clone(),
+                    path: path.to_owned(),
                     other: (*other).to_owned(),
                 });
             }
@@ -277,7 +303,7 @@ where
 
         if needed > allocation {
             rejected.push(TooLarge {
-                path: path.clone(),
+                path: path.to_owned(),
                 allocation,
                 needed,
             });
@@ -286,7 +312,7 @@ where
 
         ready.push(Ready {
             planned: Planned {
-                path: path.clone(),
+                path: path.to_owned(),
                 at,
                 len: needed,
                 allocation,
@@ -302,4 +328,36 @@ where
     } else {
         Ok(Plan::DoesNotFit(rejected))
     }
+}
+
+/// Every change in the set that no patch can express.
+///
+/// A write is the one that depends on the archive rather than on itself, so it
+/// is resolved here: a path the archive holds is a patch, and a path it does
+/// not is either an addition or [`Error::NotFound`], depending on what the
+/// caller asked for. Nothing is compressed on the way.
+fn structural_in<F>(file: &mut F, archive: &Archive, changes: &Changes) -> Result<Vec<Structural>>
+where
+    F: Read + Seek,
+{
+    let mut structural = Vec::new();
+    for (path, change) in changes {
+        let exists = match *change {
+            Change::Write { create, .. } => match archive.locate(file, path) {
+                Ok(_) => true,
+                Err(error @ Error::NotFound { .. }) => {
+                    if !create {
+                        return Err(error);
+                    }
+                    false
+                }
+                Err(other) => return Err(other),
+            },
+            _ => false,
+        };
+        if let Some(one) = Structural::of(path, change, exists) {
+            structural.push(one);
+        }
+    }
+    Ok(structural)
 }

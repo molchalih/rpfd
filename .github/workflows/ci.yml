@@ -9,6 +9,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A rule that is only written down is a rule that is only sometimes followed.
+  # `.githooks/commit-msg` refuses a malformed message before it is made, but a
+  # hook lives in one clone and is opt-in; this is the backstop that holds for
+  # everyone. AGENTS.md states the rule; both readers of it are mechanical.
+  commits:
+    name: commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The hook is asked of every commit this push or pull request adds, so
+          # the range has to be reachable.
+          fetch-depth: 0
+      - name: check every commit this change adds
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            range="${{ github.event.pull_request.base.sha }}..HEAD"
+          elif [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+            range="HEAD~1..HEAD"
+          else
+            range="${{ github.event.before }}..HEAD"
+          fi
+          echo "checking $range"
+          fail=0
+          for sha in $(git rev-list "$range"); do
+            git log -1 --format=%B "$sha" > /tmp/message
+            if ! .githooks/commit-msg /tmp/message; then
+              echo "  ^ $sha"
+              fail=1
+            fi
+          done
+          exit $fail
+
   # macOS, Linux and Windows are one target (docs/approach.md), and until this
   # matrix existed only one of them had ever been built. DR-012: a behaviour
   # that differs by platform and has no test is a defect waiting for its first
@@ -73,8 +107,28 @@ jobs:
           cargo test --all 2>&1 | tee suite.log
           skipped=$(grep -c 'ignored, no RPF_CORPUS' suite.log || true)
           grep 'ignored, no RPF_CORPUS' suite.log || true
-          test "$skipped" -eq 10 \
-            || { echo "expected 10 corpus tests to report themselves skipped, got $skipped"; exit 1; }
+          test "$skipped" -eq 12 \
+            || { echo "expected 12 corpus tests to report themselves skipped, got $skipped"; exit 1; }
+
+  # `missing_docs` is on, so every public item has a doc comment, and a doc
+  # comment is where a reader looks for a contract. A broken link in one is
+  # prose that says something untrue about the code beside it, and `cargo doc`
+  # says so and is not read: it emitted eight warnings for months, one of them
+  # naming an `Error::Corrupt` that has never existed.
+  #
+  # Resolved once rather than per platform: nothing about a doc link varies by
+  # runner, which is the same reason `deny` is asked once.
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+      - run: cargo doc --no-deps --workspace
 
   # Licences and advisories are a property of Cargo.lock rather than of a
   # runner, so this is asked once. docs/conventions.md §15.

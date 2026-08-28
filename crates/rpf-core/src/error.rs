@@ -66,7 +66,7 @@ pub enum Error {
 
     /// The archive is encrypted and no key material is available.
     ///
-    /// Distinct from [`Error::Corrupt`] on purpose: the archive is fine, we
+    /// Distinct from [`Category::Corrupt`] on purpose: the archive is fine, we
     /// simply cannot open it here. R2 and R6.3.
     #[error("archive is encrypted (tag {tag:#010x}); no key material available")]
     NeedsKey {
@@ -302,9 +302,12 @@ pub enum Error {
     /// reasonable question and the answer is that the archive's bytes are not
     /// the bytes they were. DR-010.
     ///
-    /// Identifies the entry by index, as every other per-entry failure in this
-    /// enum does. The path is `crate::Problem`'s to carry, and repeating it
+    /// Identifies the entry by index, as every failure about the archive's own
+    /// bytes does. The path is `crate::Problem`'s to carry, and repeating it
     /// here would be the same string twice in one sentence.
+    /// [`Error::WrongKind`] names a path instead, and the reason it differs is
+    /// stated there: it is a fact about the request rather than about the
+    /// bytes.
     #[error("entry {entry}: contents digest {found}, not the recorded {recorded}")]
     ChecksumMismatch {
         /// Index of the offending entry.
@@ -399,6 +402,23 @@ pub enum Error {
         other: String,
     },
 
+    /// A path a change would create is already in the archive.
+    ///
+    /// The counterpart of [`Error::NotFound`], and a refusal rather than a
+    /// corruption: nothing about the archive is wrong, and what the caller has
+    /// to do is pick another name or remove what is there. It exists as its own
+    /// variant because a client mapping this onto an editor's filesystem has a
+    /// distinct answer for it, which "invalid path" would not reach.
+    ///
+    /// A rename onto an occupied path and a directory created twice are the two
+    /// that raise it. A **write** does not: replacing what is at a path is what
+    /// a write has always meant here, and DR-026 keeps it that way.
+    #[error("{path:?} is already in the archive")]
+    AlreadyExists {
+        /// The path that is taken, from the archive's root.
+        path: String,
+    },
+
     /// A path cannot be turned into entries.
     #[error("invalid path {path:?}: {reason}")]
     BadPath {
@@ -457,10 +477,26 @@ pub enum Error {
     },
 
     /// The entry exists but is not the kind the operation needs.
-    #[error("entry {entry} is a {found}, expected a {wanted}")]
+    ///
+    /// **Named by path, not by index**, unlike the per-entry failures above it.
+    /// Those are all facts about the archive's own bytes, which a caller reads
+    /// alongside an entry table; this one is a fact about the *request* — the
+    /// caller named something, and it was the wrong kind of thing — and what it
+    /// named was a path. `rpf info a.rpf data` reported `entry 1 is a
+    /// directory, expected a file`, which says nothing a caller can act on
+    /// without first working out what entry 1 is.
+    ///
+    /// The path is spelled as the caller spelled it wherever there is a caller
+    /// to ask: [`crate::Summary::of`] refills it with the path it was given, so
+    /// an entry inside a nested archive names the whole path rather than its
+    /// path within that archive. Where there is no caller — a walk that reached
+    /// the entry on its own — it is `Archive::path`, falling back to the
+    /// index when the tree does not resolve, which is the one case where
+    /// nothing better exists.
+    #[error("{path:?} is a {found}, expected a {wanted}")]
     WrongKind {
-        /// Index of the entry.
-        entry: u32,
+        /// The entry, by path from the archive that holds it.
+        path: String,
         /// What it actually is.
         found: &'static str,
         /// What the operation needed.
@@ -527,6 +563,7 @@ impl Error {
             | Self::FieldOverflow { .. }
             | Self::NotAResource { .. }
             | Self::BadPath { .. }
+            | Self::AlreadyExists { .. }
             | Self::NameCollision { .. }
             | Self::WrongKind { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
@@ -570,7 +607,7 @@ mod tests {
     /// The match is exhaustive, so a variant added later stops this module
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 27;
+    const VARIANTS: usize = 28;
 
     /// The variant's own name, for a test that has to say which one it means.
     fn name(error: &Error) -> &'static str {
@@ -599,6 +636,7 @@ mod tests {
             Error::NotAResource { .. } => "NotAResource",
             Error::NameCollision { .. } => "NameCollision",
             Error::BadPath { .. } => "BadPath",
+            Error::AlreadyExists { .. } => "AlreadyExists",
             Error::Overlapping { .. } => "Overlapping",
             Error::Cancelled { .. } => "Cancelled",
             Error::WrongKind { .. } => "WrongKind",
@@ -712,6 +750,12 @@ mod tests {
                 path: "../escape".to_owned(),
                 reason: "leaves the archive",
             },
+            // A path a change would create and something is already at. The
+            // archive is intact; what the caller asked for cannot be done.
+            // DR-026.
+            Error::AlreadyExists {
+                path: "data/notes.txt".to_owned(),
+            },
             Error::NameCollision {
                 path: "data/NOTES.TXT".to_owned(),
                 other: "data/notes.txt".to_owned(),
@@ -721,7 +765,7 @@ mod tests {
                 other: "b".to_owned(),
             },
             Error::WrongKind {
-                entry: 0,
+                path: "data".to_owned(),
                 found: "directory",
                 wanted: "file",
             },
