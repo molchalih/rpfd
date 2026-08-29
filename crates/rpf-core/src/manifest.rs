@@ -117,6 +117,33 @@ impl Checksum {
     pub fn of(contents: &[u8]) -> Self {
         Self(Sha256::digest(contents).into())
     }
+
+    /// [`Checksum::of`], over contents that go past rather than contents in
+    /// hand.
+    ///
+    /// The same digest of the same bytes — [`Archive::extracted`] is what a
+    /// caller streams into it — and the difference is only that nothing holds
+    /// the entry. It is the form anything digesting a whole archive uses, since
+    /// the largest entry is exactly what a caller must not have to size for.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the stream fails with, as the [`Error`] it really was.
+    pub fn of_stream<S: Read>(contents: &mut S) -> Result<Self> {
+        let mut digest = Sha256::new();
+        // The same width `std::io::copy` uses, and on the stack: this is
+        // reached once per entry from a walk that is already recursive.
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = contents
+                .read(&mut buffer)
+                .map_err(|source| Error::recovered(0, source))?;
+            if read == 0 {
+                return Ok(Self(digest.finalize().into()));
+            }
+            digest.update(buffer.get(..read).unwrap_or_default());
+        }
+    }
 }
 
 impl fmt::Display for Checksum {
@@ -271,11 +298,14 @@ impl Manifest {
         let mut done = 0_u32;
         let mut bytes = 0_u64;
         for (spec, index) in &specs {
-            let contents = archive.extract(src, *index)?;
-            recorded.insert(spec.path.clone(), Checksum::of(&contents));
+            // Streamed, not held: this reads every entry of the archive, and
+            // the largest of them is not a size the caller chose. R3.9.
+            let mut contents = archive.extracted(&mut *src, *index)?;
+            let len = contents.len();
+            recorded.insert(spec.path.clone(), Checksum::of_stream(&mut contents)?);
 
             done = done.saturating_add(1);
-            bytes = bytes.saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+            bytes = bytes.saturating_add(len);
             if watch.step(Step {
                 path: &spec.path,
                 done,

@@ -67,7 +67,7 @@ fn archive_bytes() -> Vec<u8> {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |wanted| {
+        |wanted: &str| {
             Ok(Cursor::new(match wanted {
                 "art.yft" => resource(0xAA),
                 "raw.bin" => vec![3_u8; 200],
@@ -302,7 +302,7 @@ fn two_edits_that_claim_the_same_bytes_are_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(inner.clone())),
+        |_: &str| Ok(Cursor::new(inner.clone())),
         &mut Unwatched,
     )
     .expect("outer builds");
@@ -346,7 +346,7 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(inner.clone())),
+        |_: &str| Ok(Cursor::new(inner.clone())),
         &mut Unwatched,
     )
     .expect("outer builds");
@@ -462,7 +462,7 @@ fn roomy_resource_archive() -> Vec<u8> {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(resource(0xAA))),
+        |_: &str| Ok(Cursor::new(resource(0xAA))),
         &mut Unwatched,
     )
     .expect("builds");
@@ -522,7 +522,7 @@ fn a_build_and_a_patch_refuse_the_same_oversized_resource() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(payload.clone())),
+        |_: &str| Ok(Cursor::new(payload.clone())),
         &mut Unwatched,
     );
     match refused {

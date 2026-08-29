@@ -220,7 +220,7 @@ fn a_rebuilt_archive_holds_the_same_contents() {
         rpf_core::Version::Rpf7,
         &files,
         &directories,
-        |wanted| {
+        |wanted: &str| {
             let index = *by_path.get(wanted).expect("path came from this archive");
             original.extract(&mut source, index).map(Cursor::new)
         },
@@ -332,7 +332,7 @@ fn an_injected_corruption_is_caught() {
         rpf_core::Version::Rpf7,
         &files,
         &directories,
-        |wanted| {
+        |wanted: &str| {
             let index = *by_path.get(wanted).expect("known path");
             original.extract(&mut source, index).map(Cursor::new)
         },
@@ -493,7 +493,7 @@ fn a_structural_change_to_the_sample_reads_back() {
     changes.set(
         format!("{INSIDE}/added.meta"),
         rpf_core::Change::Write {
-            contents: b"<added/>".to_vec(),
+            contents: std::sync::Arc::new(b"<added/>".to_vec()),
             create: true,
         },
     );
@@ -659,7 +659,7 @@ fn an_archive_is_written_at_the_version_it_was_asked_for() {
             version,
             &[stored("a.txt")],
             &[],
-            |_| Ok(Cursor::new(b"contents".to_vec())),
+            |_: &str| Ok(Cursor::new(b"contents".to_vec())),
             &mut Unwatched,
         )
         .expect("builds");
@@ -690,7 +690,7 @@ fn a_rebuild_writes_the_version_the_original_was_read_at() {
             version,
             &[stored("a.txt")],
             &[],
-            |_| Ok(Cursor::new(b"contents".to_vec())),
+            |_: &str| Ok(Cursor::new(b"contents".to_vec())),
             &mut Unwatched,
         )
         .expect("builds");
@@ -764,7 +764,7 @@ where
         rpf_core::Version::Rpf7,
         files,
         directories,
-        |wanted| fetch(wanted).map(Cursor::new),
+        |wanted: &str| fetch(wanted).map(Cursor::new),
         &mut Unwatched,
     )
     .expect("builds");
@@ -877,7 +877,7 @@ fn an_archive_with_no_files_is_still_a_whole_number_of_blocks() {
 #[test]
 fn a_zero_length_last_payload_does_not_truncate_the_archive() {
     let files = [stored("a.txt"), stored("z-empty.txt")];
-    let (report, bytes) = build_on_disk(&files, &[], |wanted| {
+    let (report, bytes) = build_on_disk(&files, &[], |wanted: &str| {
         Ok(if wanted == "a.txt" {
             b"abcd".to_vec()
         } else {
@@ -912,7 +912,7 @@ fn deflating_an_empty_file_does_not_truncate_the_archive() {
         },
     };
     let files = [deflated("a.txt"), deflated("z-empty.txt")];
-    let (report, bytes) = build_on_disk(&files, &[], |wanted| {
+    let (report, bytes) = build_on_disk(&files, &[], |wanted: &str| {
         Ok(if wanted == "a.txt" {
             vec![b'x'; 4096]
         } else {
@@ -977,7 +977,7 @@ fn a_file_name_offset_past_sixteen_bits_is_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"x".to_vec())),
+        |_: &str| Ok(Cursor::new(b"x".to_vec())),
         &mut Unwatched,
     );
 
@@ -1200,7 +1200,7 @@ fn two_directories_differing_only_in_case_are_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"contents".to_vec())),
+        |_: &str| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     // Matching only the variant would accept any pair against any archive, and
@@ -1219,7 +1219,7 @@ fn two_files_in_one_directory_differing_only_in_case_are_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"contents".to_vec())),
+        |_: &str| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     collision(refused, "data/NOTES.TXT", "data/notes.txt");
@@ -1235,7 +1235,7 @@ fn a_named_directory_colliding_with_a_path_is_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &["x64".to_owned()],
-        |_| Ok(Cursor::new(b"contents".to_vec())),
+        |_: &str| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     // The named directories are claimed first, so `x64` is the spelling that
@@ -1257,7 +1257,7 @@ fn one_path_listed_twice_is_refused_as_a_duplicate() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"contents".to_vec())),
+        |_: &str| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     refusal(refused, "data/notes.txt", "is named twice in one directory");
@@ -1275,7 +1275,7 @@ fn a_file_and_a_directory_sharing_one_name_are_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"contents".to_vec())),
+        |_: &str| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
     refusal(
@@ -1300,7 +1300,7 @@ fn a_named_directory_that_climbs_out_of_the_tree_is_refused() {
             rpf_core::Version::Rpf7,
             &[],
             &[directory.to_owned()],
-            |_| Ok(Cursor::new(b"contents".to_vec())),
+            |_: &str| Ok(Cursor::new(b"contents".to_vec())),
             &mut Unwatched,
         );
         assert!(

@@ -24,9 +24,10 @@ pub mod patch;
 pub mod scratch;
 pub mod watch;
 
-pub use archive::{Archive, MAX_DEPTH};
+pub use archive::{Archive, Extracted, MAX_DEPTH};
 pub use build::{
-    FileKind, FileSpec, Payload, Report, Storage, build, directories_of, rebuild, rewrite, specs_of,
+    Fetch, FileKind, FileSpec, Payload, Report, Storage, build, directories_of, rebuild, rewrite,
+    specs_of,
 };
 pub use edit::{Change, Changes, Structural, allows};
 pub use entry::{Entry, EntryKind};

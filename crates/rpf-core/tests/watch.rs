@@ -68,7 +68,7 @@ fn a_build_reports_every_entry_it_writes() {
         rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
+        |wanted: &str| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut watch,
     )
     .expect("builds");
@@ -102,7 +102,7 @@ fn stopping_a_build_stops_it_and_says_so() {
         rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
+        |wanted: &str| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut watch,
     );
 
@@ -124,7 +124,7 @@ fn a_cancellation_is_its_own_category() {
         rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
+        |wanted: &str| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut watch,
     )
     .expect_err("stops");
@@ -141,7 +141,7 @@ fn a_caller_that_does_not_care_says_so() {
         rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
+        |wanted: &str| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut Unwatched,
     )
     .expect("builds");
@@ -158,7 +158,7 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
         rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
+        |wanted: &str| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut Unwatched,
     )
     .expect("inner builds");
@@ -177,7 +177,7 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
         rpf_core::Version::Rpf7,
         &outer_specs,
         &[],
-        |_| Ok(Cursor::new(inner.clone())),
+        |_: &str| Ok(Cursor::new(inner.clone())),
         &mut Unwatched,
     )
     .expect("outer builds");
@@ -219,7 +219,7 @@ fn a_verify_reports_every_entry_it_reads_and_stops_when_told_to() {
         rpf_core::Version::Rpf7,
         &specs(),
         &[],
-        |wanted| Ok(Cursor::new(vec![b'x'; wanted.len()])),
+        |wanted: &str| Ok(Cursor::new(vec![b'x'; wanted.len()])),
         &mut Unwatched,
     )
     .expect("builds");

@@ -64,7 +64,7 @@ fn make_archive(at: &Path) -> Vec<u8> {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |wanted| {
+        |wanted: &str| {
             Ok(Cursor::new(if wanted == "art.yft" {
                 payload.clone()
             } else {
@@ -97,7 +97,7 @@ fn make_colliding_archive(at: &Path) -> Vec<u8> {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"payload".to_vec())),
+        |_: &str| Ok(Cursor::new(b"payload".to_vec())),
         &mut Unwatched,
     )
     .expect("two distinct names build");
@@ -716,7 +716,7 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(bulk.clone())),
+        |_: &str| Ok(Cursor::new(bulk.clone())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -813,7 +813,7 @@ fn make_bulk_archive(at: &Path, entries: u32, payload: usize) {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(bytes.clone())),
+        |_: &str| Ok(Cursor::new(bytes.clone())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -965,7 +965,7 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(bulk.clone())),
+        |_: &str| Ok(Cursor::new(bulk.clone())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -1644,7 +1644,7 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(bulk.clone())),
+        |_: &str| Ok(Cursor::new(bulk.clone())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -2152,7 +2152,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(bulk.clone())),
+        |_: &str| Ok(Cursor::new(bulk.clone())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -2622,7 +2622,7 @@ fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(inner.clone())),
+        |_: &str| Ok(Cursor::new(inner.clone())),
         &mut Unwatched,
     )
     .expect("outer builds");
@@ -2971,7 +2971,7 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"not an archive".to_vec())),
+        |_: &str| Ok(Cursor::new(b"not an archive".to_vec())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -3337,7 +3337,7 @@ fn make_other_archive(at: &Path) {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(vec![3_u8; 64])),
+        |_: &str| Ok(Cursor::new(vec![3_u8; 64])),
         &mut Unwatched,
     )
     .expect("builds");

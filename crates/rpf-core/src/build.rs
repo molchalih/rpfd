@@ -350,6 +350,51 @@ pub trait Payload: Read + Seek {}
 
 impl<T: Read + Seek> Payload for T {}
 
+/// Where [`build`] takes each payload from, at the moment it writes it.
+///
+/// Asked once per file, in entry-table order, and given the path from the
+/// [`FileSpec`]. What it answers is a [`Payload`] — a reader, read from its
+/// start — and the bytes go straight through to the sink, so neither a file nor
+/// the archive is resident.
+///
+/// **The answer may borrow what it is read out of**, and that is the whole
+/// reason this is a trait rather than a closure: a `FnMut` cannot return a
+/// value borrowing what it captured, so a rebuild handed one had to extract
+/// each entry into a buffer before it could hand it over. That buffer was
+/// R3.9's remaining term.
+///
+/// A caller whose payloads own themselves never names this: every
+/// `FnMut(&str) -> Result<impl Payload>` is a [`Fetch`], which is what `pack`
+/// opening a file per path still writes.
+pub trait Fetch {
+    /// One payload, borrowing this source for as long as it is read.
+    type Payload<'a>: Payload
+    where
+        Self: 'a;
+
+    /// The payload for `path`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source cannot answer for that path.
+    fn payload(&mut self, path: &str) -> Result<Self::Payload<'_>>;
+}
+
+impl<F, P> Fetch for F
+where
+    F: FnMut(&str) -> Result<P>,
+    P: Payload,
+{
+    type Payload<'a>
+        = P
+    where
+        Self: 'a;
+
+    fn payload(&mut self, path: &str) -> Result<P> {
+        self(path)
+    }
+}
+
 /// One payload as it went into the archive, and the fields describing it.
 ///
 /// `compressed_len` is left wide on purpose. Narrowing it to whatever width the
@@ -660,7 +705,7 @@ struct Layout<'a> {
 /// bytes in it moves it.
 ///
 /// `watch` is stepped once per file written, and can stop the write. DR-008.
-fn write_payloads<W, P, F>(
+fn write_payloads<W, F>(
     out: &mut W,
     layout: &Layout<'_>,
     cursor: &mut u64,
@@ -669,8 +714,7 @@ fn write_payloads<W, P, F>(
 ) -> Result<(Vec<Row>, u64)>
 where
     W: Write + Seek,
-    P: Payload,
-    F: FnMut(&str) -> Result<P>,
+    F: Fetch,
 {
     let Layout {
         version,
@@ -705,7 +749,8 @@ where
         let at = *cursor;
         out.seek(SeekFrom::Start(at))
             .map_err(|source| Error::Io { offset: at, source })?;
-        let written = store(version, &spec.path, spec.kind, &mut fetch(&spec.path)?, out)?;
+        let mut payload = fetch.payload(&spec.path)?;
+        let written = store(version, &spec.path, spec.kind, &mut payload, out)?;
 
         // The row is built after the payload rather than before it, because a
         // streamed payload's length is not known until it has been streamed.
@@ -750,11 +795,11 @@ where
 /// Writes an archive containing `files`, taking each one's contents from
 /// `fetch` at the moment it is written.
 ///
-/// `fetch` is called once per file, in entry-table order, and is given the
-/// path from the [`FileSpec`]. What it answers is a [`Payload`] — a reader,
-/// read from its start — and the bytes go straight through to `out`, so
-/// neither a file nor the archive is resident. A caller holding bytes hands
-/// back a [`Cursor`] over them.
+/// `fetch` is a [`Fetch`] — asked once per file, in entry-table order, for a
+/// reader over that path's payload — and the bytes go straight through to
+/// `out`, so neither a file nor the archive is resident. A caller holding bytes
+/// hands back a [`Cursor`] over them from a closure, which is a [`Fetch`] like
+/// any other.
 ///
 /// `version` is what the archive is written as, and it is the caller's: a
 /// rebuild takes it from the archive it is rebuilding and `pack` takes it from
@@ -768,7 +813,7 @@ where
 /// [`Error::NotAResource`] for a resource whose payload is not one,
 /// [`Error::FieldOverflow`] when a value will not fit the format's field, and
 /// [`Error::Io`] from the sink or from `fetch`.
-pub fn build<W, P, F>(
+pub fn build<W, F>(
     out: &mut W,
     version: Version,
     files: &[FileSpec],
@@ -778,8 +823,7 @@ pub fn build<W, P, F>(
 ) -> Result<Report>
 where
     W: Write + Seek,
-    P: Payload,
-    F: FnMut(&str) -> Result<P>,
+    F: Fetch,
 {
     let arena = plan_tree(files, directories)?;
     let planned = plan_entries(&arena)?;
@@ -971,11 +1015,16 @@ pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
 /// resolved and refused; nothing about them is decided here.
 ///
 /// An override is the file **as it exists outside the archive** — the same form
-/// [`Archive::extract`] returns, so a resource keeps its `RSC7` header. That is
-/// the form [`build`]'s `fetch` is defined in, and using one form throughout is
-/// what keeps a replaced resource from losing its flags. Overrides are keyed by
-/// the entry index they replace, which is what makes them survive a rename: the
-/// entry moves, and the bytes a cascade rebuilt for it move with it.
+/// [`Archive::extracted`] streams, so a resource keeps its `RSC7` header. That
+/// is the form [`build`]'s [`Fetch`] is defined in, and using one form
+/// throughout is what keeps a replaced resource from losing its flags.
+/// Overrides are keyed by the entry index they replace, which is what makes
+/// them survive a rename: the entry moves, and the bytes a cascade rebuilt for
+/// it move with it.
+///
+/// **An entry the overrides do not cover is streamed out of `src` as it is
+/// written**, never held: what a rebuild costs is its buffers, not its largest
+/// entry. R3.9.
 ///
 /// The map is taken by value and each override is **moved out of it** as its
 /// entry is written, because an override may be a whole rebuilt ancestor and
@@ -995,7 +1044,7 @@ pub fn rebuild<'p, R, W>(
     archive: &Archive,
     changes: &'p Changes,
     out: &mut W,
-    mut overrides: BTreeMap<u32, Box<dyn Payload + 'p>>,
+    overrides: BTreeMap<u32, Box<dyn Payload + 'p>>,
     watch: &mut impl Watch,
 ) -> Result<Report>
 where
@@ -1004,34 +1053,69 @@ where
 {
     let tree = edit::tree_of(archive, changes)?;
     let files = tree.files();
-    let sources = tree.sources();
+    let fetch = FromArchive {
+        src,
+        archive,
+        changes,
+        sources: tree.sources(),
+        overrides,
+    };
 
     build(
         out,
         archive.version(),
         &files,
         &tree.directories,
-        |wanted| {
-            let source = sources.get(wanted).ok_or_else(|| Error::BadPath {
-                path: wanted.to_owned(),
-                reason: "not an entry of this archive",
-            })?;
-            match **source {
-                edit::Source::Entry(index) => match overrides.remove(&index) {
-                    Some(payload) => Ok(payload),
-                    None => Ok(Box::new(Cursor::new(archive.extract(src, index)?))),
-                },
-                edit::Source::Written(ref at) => {
-                    let contents = changes.contents_at(at).ok_or_else(|| Error::BadPath {
-                        path: wanted.to_owned(),
-                        reason: "has no contents to write",
-                    })?;
-                    Ok(Box::new(Cursor::new(contents)))
-                }
-            }
-        },
+        fetch,
         watch,
     )
+}
+
+/// Where a [`rebuild`] takes each payload from: an override the caller
+/// supplied, contents a change carries, or the archive itself.
+///
+/// A struct rather than a closure because the third of those **borrows the
+/// archive's source for as long as it is read**, which is what [`Fetch`] exists
+/// to allow: a closure would have to extract the entry into a buffer to hand it
+/// over, and that buffer is what R3.9 is about.
+struct FromArchive<'a, R> {
+    src: &'a mut R,
+    archive: &'a Archive,
+    changes: &'a Changes,
+    /// Where each file of the rebuilt tree gets its bytes, by the path it will
+    /// be written at.
+    sources: BTreeMap<&'a str, &'a edit::Source>,
+    /// Taken by value, and each one **moved out** as its entry is written: an
+    /// override may be a whole rebuilt ancestor, and copying one to hand it
+    /// over is the cost R4.13 exists to remove.
+    overrides: BTreeMap<u32, Box<dyn Payload + 'a>>,
+}
+
+impl<R: Read + Seek> Fetch for FromArchive<'_, R> {
+    type Payload<'a>
+        = Box<dyn Payload + 'a>
+    where
+        Self: 'a;
+
+    fn payload(&mut self, wanted: &str) -> Result<Box<dyn Payload + '_>> {
+        let source = *self.sources.get(wanted).ok_or_else(|| Error::BadPath {
+            path: wanted.to_owned(),
+            reason: "not an entry of this archive",
+        })?;
+        match *source {
+            edit::Source::Entry(index) => match self.overrides.remove(&index) {
+                Some(payload) => Ok(payload),
+                None => Ok(Box::new(self.archive.extracted(&mut *self.src, index)?)),
+            },
+            edit::Source::Written(ref at) => {
+                let contents = self.changes.contents_at(at).ok_or_else(|| Error::BadPath {
+                    path: wanted.to_owned(),
+                    reason: "has no contents to write",
+                })?;
+                Ok(Box::new(Cursor::new(contents)))
+            }
+        }
+    }
 }
 
 /// Rebuilds `archive` into `out` with a set of changes, **cascading through

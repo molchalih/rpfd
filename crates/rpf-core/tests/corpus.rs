@@ -513,9 +513,12 @@ fn the_sample_verifies_against_a_manifest_of_itself() {
     // entry of the outer archive, and its checksum is over the whole of it.
     //
     // Cost, measured on this 145 MB sample, `--release`, three rounds warm:
-    // `Verified::of` 84 ms, `Verified::against` 102 ms, `Manifest::of_contents`
-    // 22 ms. So the whole of what a checksum adds to a `verify` of the sample
-    // is 18 ms against a walk that already inflates 65 MB.
+    // `Verified::of` 83 ms, `Verified::against` 106 ms, `Manifest::of_contents`
+    // 24 ms. So the whole of what a checksum adds to a `verify` of the sample
+    // is 23 ms against a walk that already inflates 65 MB. Since DR-033 the
+    // walk holds no contents to digest, so every recorded entry is read a
+    // second time as a stream rather than only a resource — 5 ms of the 23 on
+    // this sample, whose recorded 65 MB is mostly one stored payload.
     let Some((path, _)) = corpus_archive("the_sample_verifies_against_a_manifest_of_itself") else {
         return;
     };

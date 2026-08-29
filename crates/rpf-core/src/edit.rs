@@ -22,6 +22,7 @@
 use std::{
     collections::BTreeMap,
     io::{Read, Seek},
+    sync::Arc,
 };
 
 use crate::{
@@ -44,7 +45,14 @@ pub enum Change {
         /// The file as it exists **outside** the archive: for a resource, its
         /// `RSC7` header and still-deflated body. The same form
         /// [`Archive::extract`] returns.
-        contents: Vec<u8>,
+        ///
+        /// Shared rather than owned, because `split` divides a set into one
+        /// set per nested archive and a cascading rebuild splits again at every
+        /// level: a payload owned here is one copy of it per level. Measured
+        /// 2026-08-29, before this was shared — an 11 MB donor through `rpf
+        /// put` peaked at 33.5 MB of live heap, and a rebuild of a payload
+        /// 6 MB larger added 12 MB to its own peak. DR-032.
+        contents: Arc<Vec<u8>>,
         /// Whether a path the archive does not hold is created rather than
         /// refused. Without it a write to a path that is not there is
         /// [`Error::NotFound`], which is what it has always been: creating an
@@ -155,7 +163,7 @@ impl Changes {
                     (
                         path,
                         Change::Write {
-                            contents,
+                            contents: Arc::new(contents),
                             create: false,
                         },
                     )
@@ -183,7 +191,7 @@ impl Changes {
     #[must_use]
     pub fn contents_at(&self, path: &str) -> Option<&[u8]> {
         match self.at.get(path) {
-            Some(Change::Write { contents, .. }) => Some(contents),
+            Some(Change::Write { contents, .. }) => Some(contents.as_slice()),
             _ => None,
         }
     }

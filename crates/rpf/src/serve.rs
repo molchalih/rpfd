@@ -1252,7 +1252,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
         .map_err(|_| invalid_params("\"bytes\" is not base64".to_owned()))?;
     let is_resource_payload = bytes.get(0..4) == Some(&rpf_core::format::resource::MAGIC_RSC7);
     let change = Change::Write {
-        contents: bytes,
+        contents: std::sync::Arc::new(bytes),
         create,
     };
     let session = session(state, params)?;
@@ -2046,7 +2046,7 @@ mod tests {
             rpf_core::Version::Rpf7,
             &files,
             &[],
-            |_| Ok(std::io::Cursor::new(b"contents".to_vec())),
+            |_: &str| Ok(std::io::Cursor::new(b"contents".to_vec())),
             &mut rpf_core::Unwatched,
         )
         .expect("builds");
@@ -2062,7 +2062,7 @@ mod tests {
             pending: Changes::one(
                 "a.txt",
                 Change::Write {
-                    contents: b"replaced".to_vec(),
+                    contents: std::sync::Arc::new(b"replaced".to_vec()),
                     create: false,
                 },
             ),

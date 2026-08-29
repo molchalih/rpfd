@@ -48,7 +48,7 @@ fn built(files: &[FileSpec], directories: &[String], contents: &[u8]) -> Vec<u8>
         rpf_core::Version::Rpf7,
         files,
         directories,
-        |_| Ok(Cursor::new(contents.to_vec())),
+        |_: &str| Ok(Cursor::new(contents.to_vec())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -107,7 +107,7 @@ fn contents(bytes: &[u8], path: &str) -> Vec<u8> {
 /// A write that creates the path it names.
 fn adding(contents: &[u8]) -> Change {
     Change::Write {
-        contents: contents.to_vec(),
+        contents: std::sync::Arc::new(contents.to_vec()),
         create: true,
     }
 }
@@ -200,7 +200,7 @@ fn a_write_that_did_not_ask_to_create_is_still_not_found() {
     let changes = Changes::one(
         "b.txt",
         Change::Write {
-            contents: b"second".to_vec(),
+            contents: std::sync::Arc::new(b"second".to_vec()),
             create: false,
         },
     );

@@ -591,6 +591,33 @@ impl Error {
             | Self::VerifyFailed { .. } => Category::Corrupt,
         }
     }
+
+    /// The container failure an [`io::Error`] is carrying, if it is one.
+    ///
+    /// A streaming read can only fail as an [`io::Error`] — that is what
+    /// [`std::io::Read`] returns — so [`crate::archive::Extracted`] packs the
+    /// failure it really had inside one, and this is where it comes back out.
+    ///
+    /// # Errors
+    ///
+    /// The [`io::Error`] itself, unchanged, when it is not carrying one. A
+    /// caller copying an entry into a sink of its own gets a container failure
+    /// back for a failure of the **read** and its own error for a failure of
+    /// the **write**, which is what lets it name the file it could not write.
+    pub fn carried(source: io::Error) -> std::result::Result<Self, io::Error> {
+        source.downcast::<Self>()
+    }
+
+    /// This failure as the [`io::Error`] a [`std::io::Read`] can return.
+    pub(crate) fn into_io(self) -> io::Error {
+        io::Error::other(self)
+    }
+
+    /// [`Error::carried`], for a caller whose sink cannot fail on its own: a
+    /// failure carrying nothing is the source's, at `offset`.
+    pub(crate) fn recovered(offset: u64, source: io::Error) -> Self {
+        Self::carried(source).unwrap_or_else(|source| Self::Io { offset, source })
+    }
 }
 
 /// Result of a container operation.

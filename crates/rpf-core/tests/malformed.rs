@@ -25,7 +25,7 @@
 use std::io::{Cursor, Write as _};
 
 use rpf_core::{
-    Archive, Category, Error, MAX_DEPTH, Manifest, Summary, Unwatched, Verified,
+    Archive, Category, Checksum, Error, MAX_DEPTH, Manifest, Summary, Unwatched, Verified,
     format::{
         Version,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
@@ -1543,6 +1543,47 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_manifest() {
     .expect("the walk itself does not fail");
     assert!(verified.problems.is_empty(), "{:?}", verified.problems);
     assert_eq!(verified.contents_checked, 1);
+}
+
+#[test]
+fn a_resource_is_checked_against_the_file_it_is_outside_the_archive() {
+    // The one entry kind whose two forms differ: a read inflates the `RSC7`
+    // body, and the file the entry is on disk keeps the 16-byte header and
+    // leaves the body deflated. DR-023 records the second, so that a manifest
+    // can be checked against an extracted tree with `sha256sum`.
+    //
+    // Pinned because the walk no longer has contents in hand to digest — it
+    // asks `Archive::extracted` for every kind, which is the form the record
+    // is over. Nothing about which bytes are digested may move with that.
+    // DR-033.
+    let payload = resource_payload();
+    let declared = payload.len() as u32;
+    let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+
+    let manifest = Manifest::of_contents(&mut Cursor::new(bytes.clone()), &archive, &mut Unwatched)
+        .expect("digests every entry");
+    let recorded = *manifest.checksums().get("a").expect("recorded");
+
+    let file = archive
+        .extract(&mut Cursor::new(bytes.clone()), 1)
+        .expect("extracts");
+    let contents = archive
+        .read(&mut Cursor::new(bytes.clone()), 1)
+        .expect("reads");
+    assert_ne!(file, contents, "a resource's two forms are different bytes");
+    assert_eq!(
+        recorded,
+        Checksum::of(&file),
+        "the file, as `extract` gives it"
+    );
+    assert_ne!(recorded, Checksum::of(&contents), "not the inflated body");
+
+    // And the walk checks it against exactly that value.
+    let verified = Verified::against(&mut Cursor::new(bytes), &archive, &manifest, &mut Unwatched)
+        .expect("the walk itself does not fail");
+    assert!(verified.problems.is_empty(), "{:?}", verified.problems);
+    assert_eq!((verified.checked, verified.contents_checked), (1, 1));
 }
 
 #[test]

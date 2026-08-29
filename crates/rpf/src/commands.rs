@@ -239,8 +239,31 @@ pub fn cat(path: &Path, inside: &str) -> Result<()> {
     // `rpf cat … > f && rpf put … f` would fail on every resource. For a binary
     // entry the two are identical; for a resource `extract` keeps the RSC7
     // header, which is what the file is outside the archive.
-    let bytes = holder.extract(&mut file, index)?;
     let out = std::io::stdout();
+
+    // Into a pipe or a file the entry goes straight through and is never held:
+    // `cat` of a multi-gigabyte entry is one of the things §7 is about. A
+    // terminal is the one case that has to see the bytes before it writes any
+    // of them, and it is also the case where they are small.
+    if !out.is_terminal() {
+        let mut contents = holder.extracted(&mut file, index)?;
+        // Buffered for the reason [`stream_file`] gives, and measured the same
+        // way: standard output is line-buffered, which is a 1 KiB buffer that
+        // `io::copy` declines to use.
+        let mut sink = std::io::BufWriter::with_capacity(64 * 1024, out.lock());
+        let failing = |source: std::io::Error| {
+            rpf_core::Error::carried(source).map_or_else(
+                |source| Failure::Io {
+                    path: "<stdout>".to_owned(),
+                    source,
+                },
+                Failure::Container,
+            )
+        };
+        std::io::copy(&mut contents, &mut sink).map_err(failing)?;
+        return sink.flush().map_err(failing);
+    }
+
     // Refused at this tool's own boundary rather than at the platform's. On
     // Windows the standard library's console writer declines bytes that are not
     // UTF-8 — so `cat` of a resource inside a terminal failed with a sentence
@@ -248,7 +271,8 @@ pub fn cat(path: &Path, inside: &str) -> Result<()> {
     // same command on macOS filled the terminal with a resource. One rule
     // instead, the same on all three: a terminal takes text, and anything else
     // goes to a file or a pipe. R10.7.
-    if !goes_to(&bytes, out.is_terminal()) {
+    let bytes = holder.extract(&mut file, index)?;
+    if !goes_to(&bytes, true) {
         return Err(Failure::Refused {
             reason: format!(
                 "{inside} is not text and standard output is a terminal; \
@@ -330,7 +354,7 @@ pub fn put(
         &Changes::one(
             inside,
             Change::Write {
-                contents,
+                contents: std::sync::Arc::new(contents),
                 create: options.create,
             },
         ),
@@ -824,11 +848,17 @@ pub fn extract_into<R: std::io::Read + std::io::Seek>(
         if let Some(parent) = target.parent() {
             create_dir(parent)?;
         }
-        let contents = archive.extract(src, *index)?;
-        write_file(&target, &contents)?;
+        // Streamed from the archive into the file rather than read and then
+        // written, so an extraction costs its buffer rather than its largest
+        // entry (§7). What that changes if a read fails part-way is that the
+        // entry's file is there and short, where before it was not there at
+        // all — an extraction that failed already left the entries before it,
+        // and this is the same kind of leftover one entry later.
+        let mut contents = archive.extracted(&mut *src, *index)?;
+        let moved = stream_file(&target, &mut contents)?;
 
         done = done.saturating_add(1);
-        bytes = bytes.saturating_add(u64::try_from(contents.len()).unwrap_or(u64::MAX));
+        bytes = bytes.saturating_add(moved);
         if watch.step(Step {
             path: &spec.path,
             done,
@@ -911,7 +941,7 @@ pub fn pack_from(
         manifest.version,
         &specs,
         &manifest.directories,
-        |wanted| {
+        |wanted: &str| {
             let source_path = from.join(wanted);
             match fs::File::open(&source_path) {
                 Ok(handle) => Ok(handle),
@@ -995,6 +1025,42 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
         path: path.display().to_string(),
         source,
     })
+}
+
+/// Writes a file as its contents stream out of wherever they come from, and
+/// answers how many bytes moved.
+///
+/// The two sides fail differently and are reported differently: what the
+/// **read** fails with is the container's, recovered by `Error::carried`, so a
+/// corrupt entry stays exit 4 naming the entry; what the **write** fails with
+/// is this frontend's, and names the file it could not write.
+fn stream_file<S: std::io::Read>(path: &Path, contents: &mut S) -> Result<u64> {
+    let named = || path.display().to_string();
+    let file = fs::File::create(path).map_err(|source| Failure::Io {
+        path: named(),
+        source,
+    })?;
+    // Buffered because `io::copy` moves in the sink's own buffer when the sink
+    // has one, and in 8 KiB steps when it does not. Measured on the 145 MB
+    // sample: `rpf extract` is 0.03 s buffered against 0.05 s unbuffered, three
+    // warm rounds each, which is the whole of what streaming cost.
+    let mut target = std::io::BufWriter::with_capacity(64 * 1024, file);
+    let moved = std::io::copy(contents, &mut target).map_err(|source| {
+        rpf_core::Error::carried(source).map_or_else(
+            |source| Failure::Io {
+                path: named(),
+                source,
+            },
+            Failure::Container,
+        )
+    })?;
+    // Flushed here rather than left to the drop, which has nowhere to report a
+    // failure: the last write of the file is as able to fail as any other.
+    target.flush().map_err(|source| Failure::Io {
+        path: named(),
+        source,
+    })?;
+    Ok(moved)
 }
 
 /// Refuses to write into a detected game installation, or below a directory

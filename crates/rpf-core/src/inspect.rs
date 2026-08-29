@@ -339,6 +339,10 @@ impl Verified {
     /// DR-008. `done` and `total` count the archive being read now rather than
     /// the whole nesting, for the reason a cascading rebuild does the same.
     ///
+    /// It is unbounded work and a **bounded** amount of memory: every entry is
+    /// read past rather than into memory, so a walk over an archive costs a
+    /// buffer per entry rather than the largest entry in it. R3.9, DR-033.
+    ///
     /// # Errors
     ///
     /// [`Error::Cancelled`] when the watcher stops it, and as
@@ -441,7 +445,7 @@ impl Verified {
             // that passed made "1 of 26 entries failed" out of 27. R6.9.
             self.checked = self.checked.saturating_add(1);
             done = done.saturating_add(1);
-            let outcome = archive.read_payload(reading.src, index);
+            let outcome = archive.read_back(reading.src, index);
             if let Ok(ref payload) = outcome {
                 reading.bytes = reading.bytes.saturating_add(payload.len());
             }
@@ -474,7 +478,7 @@ impl Verified {
                     path: path.clone(),
                     error,
                 }),
-                Ok(contents) => self.check_contents(reading, archive, index, &path, &contents)?,
+                Ok(()) => self.check_contents(reading, archive, index, &path)?,
             }
             if let Some(nested) = archive.nested_at(reading.src, index)? {
                 self.walk(reading, &nested, &path)?;
@@ -486,33 +490,34 @@ impl Verified {
     /// One entry's contents against the checksum recorded for its path, when
     /// one was.
     ///
-    /// `contents` is what the read already produced, so a binary entry costs
-    /// nothing more than the digest. A **resource** is the one kind where the
-    /// two forms differ — a read inflates it, and the file it is outside the
-    /// archive keeps its `RSC7` header and its deflated body — and the recorded
-    /// digest is over that second form, so this reads its payload once more.
-    /// [`Checksum`] is where that choice is argued; it is what makes the value
-    /// survive a rebuild and match `sha256sum` over an extracted tree.
+    /// What is digested is [`Archive::extracted`]'s answer — the entry as the
+    /// file it is outside the archive — which is [`Checksum`]'s own definition
+    /// and what makes the value survive a rebuild and match `sha256sum` over an
+    /// extracted tree. DR-023.
+    ///
+    /// That is a second reading of the payload, and a streaming one: the walk
+    /// holds no contents to digest, and for a **resource** the two forms differ
+    /// anyway — a read inflates it, and the file it is outside the archive
+    /// keeps its `RSC7` header and its deflated body. Asking `extracted` for
+    /// every kind is one statement of what a recorded checksum is over rather
+    /// than two agreeing ones (§3), and it costs the digest rather than the
+    /// entry. DR-033.
     ///
     /// # Errors
     ///
-    /// As [`Archive::extract`] for a resource whose payload does not read back
-    /// the second time.
+    /// As [`Archive::extracted`] for a payload that does not read back the
+    /// second time.
     fn check_contents<R: Read + Seek, W: Watch>(
         &mut self,
         reading: &mut Reading<'_, R, W>,
         archive: &Archive,
         index: u32,
         path: &str,
-        contents: &[u8],
     ) -> Result<()> {
         let Some(&recorded) = reading.recorded.get(path) else {
             return Ok(());
         };
-        let found = match archive.entry(index)?.kind {
-            EntryKind::Resource { .. } => Checksum::of(&archive.extract(reading.src, index)?),
-            _ => Checksum::of(contents),
-        };
+        let found = Checksum::of_stream(&mut archive.extracted(&mut *reading.src, index)?)?;
         self.contents_checked = self.contents_checked.saturating_add(1);
         if found != recorded {
             self.problems.push(Problem {
@@ -642,7 +647,7 @@ mod tests {
             Version::Rpf7,
             &files,
             &[],
-            |wanted| {
+            |wanted: &str| {
                 Ok(Cursor::new(if wanted == "art.yft" {
                     resource()
                 } else {

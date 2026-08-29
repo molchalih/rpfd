@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashMap,
-    io::{Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek, SeekFrom},
 };
 
 use crate::{
@@ -66,42 +66,31 @@ fn read_vec_at<R: Read + Seek>(src: &mut R, offset: u64, len: u64) -> Result<Vec
     Ok(buf)
 }
 
-/// One entry's contents, and how much of the payload they came out of.
+/// What a read of one entry found out about the payload it came out of.
 ///
-/// The two lengths are the **payload's**, not the contents': `declared` is how
-/// many bytes on disk the entry table gives the stream, and `used` is how many
-/// of them the stream turned out to occupy. They can differ without anything
-/// failing to inflate, because a deflate stream carries its own end and
-/// whatever follows it is never looked at — which is the whole of R6.10 and
-/// what [`Payload::checked`] is for.
+/// It holds no contents, only their length: a read that keeps them is
+/// [`Archive::read`], and this is what the read that does not keep them can
+/// still say. The two other lengths are the **payload's**, not the contents':
+/// `declared` is how many bytes on disk the entry table gives the stream, and
+/// `used` is how many of them the stream turned out to occupy. They can differ
+/// without anything failing to inflate, because a deflate stream carries its
+/// own end and whatever follows it is never looked at — which is the whole of
+/// R6.10 and what [`Payload::checked`] is for.
 pub(crate) struct Payload {
     entry: u32,
-    contents: Vec<u8>,
+    len: u64,
     declared: u64,
     used: u64,
 }
 
 impl Payload {
-    /// A payload written as it is, which has no stream to end early.
-    fn stored(entry: u32, contents: Vec<u8>) -> Self {
-        let len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
-        Self {
-            entry,
-            contents,
-            declared: len,
-            used: len,
-        }
-    }
-
     /// How many bytes the entry holds, for a caller counting progress rather
-    /// than reading. The contents themselves come out of [`Payload::checked`]
-    /// and nowhere else (§4).
-    pub(crate) fn len(&self) -> u64 {
-        u64::try_from(self.contents.len()).unwrap_or(u64::MAX)
+    /// than reading.
+    pub(crate) const fn len(&self) -> u64 {
+        self.len
     }
 
-    /// The contents, unless the payload declares bytes the stream never
-    /// reached.
+    /// Whether the stream reached the end of the payload it was given.
     ///
     /// The one place that fact is decided. `docs/rpf-format.md`, Resource page
     /// flags, `verified`: every resource in the sample ends its stream exactly
@@ -110,7 +99,7 @@ impl Payload {
     /// # Errors
     ///
     /// [`Error::TrailingBytes`], with both lengths.
-    pub(crate) fn checked(self) -> Result<Vec<u8>> {
+    pub(crate) fn checked(&self) -> Result<()> {
         if self.used < self.declared {
             return Err(Error::TrailingBytes {
                 entry: self.entry,
@@ -118,44 +107,377 @@ impl Payload {
                 used: self.used,
             });
         }
-        Ok(self.contents)
+        Ok(())
     }
 }
 
-/// Raw deflate, with the output length the archive promised.
+/// A seek target from a base and a signed offset.
+fn shift(base: u64, delta: i64) -> io::Result<u64> {
+    let target = if delta < 0 {
+        base.checked_sub(delta.unsigned_abs())
+    } else {
+        base.checked_add(delta.unsigned_abs())
+    };
+    target.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek out of range"))
+}
+
+/// A failure of the source, on its way out through a [`Read`].
+fn source_failed(at: u64, source: io::Error) -> io::Error {
+    Error::Io { offset: at, source }.into_io()
+}
+
+/// A window on the source: `len` bytes from `at`, addressed from its own start.
 ///
-/// Bounded by `expected` on purpose: a declared length is attacker-controlled,
-/// so it caps the read rather than sizing an allocation up front.
-fn inflate(entry: u32, raw: &[u8], expected: u64) -> Result<Payload> {
-    let limit = expected.checked_add(1).ok_or(Error::LengthMismatch {
-        entry,
-        expected,
-        actual: u64::MAX,
-    })?;
+/// Every read is clamped to it, so a payload whose deflate stream does not end
+/// where the entry says cannot read past the entry it belongs to (§6). The
+/// source is seeked to before the first read and after every seek of the
+/// window, and nothing else may touch it in between — which is what taking it
+/// by value is for.
+#[derive(Debug)]
+struct Region<S> {
+    src: S,
+    at: u64,
+    len: u64,
+    pos: u64,
+    /// Whether `src` is where the next read wants it.
+    positioned: bool,
+}
 
-    let mut out = Vec::new();
-    let mut stream = flate2::read::DeflateDecoder::new(raw);
-    (&mut stream)
-        .take(limit)
-        .read_to_end(&mut out)
-        .map_err(|source| Error::Inflate { entry, source })?;
-
-    let actual = u64::try_from(out.len()).unwrap_or(u64::MAX);
-    if actual != expected {
-        return Err(Error::LengthMismatch {
-            entry,
-            expected,
-            actual,
-        });
+impl<S> Region<S> {
+    const fn new(src: S, at: u64, len: u64) -> Self {
+        Self {
+            src,
+            at,
+            len,
+            pos: 0,
+            positioned: false,
+        }
     }
-    Ok(Payload {
-        entry,
-        contents: out,
-        declared: u64::try_from(raw.len()).unwrap_or(u64::MAX),
-        // What the decompressor took, rather than what it was handed: that is
-        // where the stream ends, and the bytes after it belong to nothing.
-        used: stream.total_in(),
-    })
+}
+
+impl<S: Read + Seek> Read for Region<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.len.saturating_sub(self.pos);
+        if left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let at = self.at;
+        if !self.positioned {
+            self.src
+                .seek(SeekFrom::Start(at.saturating_add(self.pos)))
+                .map_err(|source| source_failed(at, source))?;
+            self.positioned = true;
+        }
+        let want = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+        let window = buf.get_mut(..want).unwrap_or_default();
+        let read = self
+            .src
+            .read(window)
+            .map_err(|source| source_failed(at, source))?;
+        if read == 0 {
+            // The window is inside the archive's own declared extent, so these
+            // bytes exist unless the file is shorter than the archive says.
+            // `read_exact` reported that as `Error::Io` at the window's start,
+            // and so does this.
+            return Err(source_failed(at, io::ErrorKind::UnexpectedEof.into()));
+        }
+        self.pos = self.pos.saturating_add(u64::try_from(read).unwrap_or(0));
+        Ok(read)
+    }
+}
+
+impl<S: Read + Seek> Seek for Region<S> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(at) => at,
+            SeekFrom::End(delta) => shift(self.len, delta)?,
+            SeekFrom::Current(delta) => shift(self.pos, delta)?,
+        };
+        self.pos = target;
+        self.positioned = false;
+        Ok(target)
+    }
+}
+
+/// Which of the two forms an entry is read in.
+///
+/// They differ for a **resource** and only for a resource: the file it is
+/// outside the archive is its `RSC7` header and its body as they sit on disk,
+/// and its contents are what that body inflates to. Passthrough is why the
+/// first exists — `docs/approach.md` — and DR-023 digests it.
+#[derive(Debug, Clone, Copy)]
+enum Form {
+    /// The file it is outside the archive. [`Archive::extracted`].
+    File,
+    /// What the file means, with no container framing left on it.
+    /// [`Archive::read`].
+    Contents,
+}
+
+/// How an entry's bytes come out of its payload.
+#[derive(Debug)]
+enum Stream<S> {
+    /// As they sit on disk.
+    Stored(Region<S>),
+    /// Inflated as they are read.
+    ///
+    /// Buffered because the decompressor asks for input a little at a time and
+    /// the window under it seeks the source. The buffer is the decoder's own,
+    /// which is what makes it discardable on a restart: seeking it throws away
+    /// what it read ahead, which a fresh decompressor has to see again.
+    Deflated(flate2::bufread::DeflateDecoder<BufReader<Region<S>>>),
+}
+
+/// One entry as a stream of the bytes it is made of.
+///
+/// The one place a payload becomes bytes, in either of the two framings the
+/// container has (§3): [`Archive::extracted`] gives the file as it is outside
+/// the archive, and [`Archive::read`] gives the contents. They differ for a
+/// **resource** and only for a resource — the first keeps its `RSC7` header and
+/// leaves the body deflated, the second inflates that body.
+///
+/// Nothing larger than the caller's own buffer is held, which is what lets one
+/// entry out of a multi-gigabyte archive cost its buffer rather than its
+/// length. R3.9.
+///
+/// **What a stream reports, it reports where it ends.** A payload that inflates
+/// to more or fewer bytes than the entry promises is [`Error::LengthMismatch`]
+/// at the end of the read, as it was when this read into a buffer; a caller
+/// that stops early has not asked. Every failure comes out as an
+/// [`std::io::Error`] carrying the [`Error`] it really was — [`Error::carried`]
+/// is where it comes back out.
+#[derive(Debug)]
+pub struct Extracted<S> {
+    entry: u32,
+    /// Where the bytes this yields begin in the source, for a failure to name.
+    at: u64,
+    /// How many bytes the entry says this yields in full.
+    len: u64,
+    /// How many it has yielded.
+    pos: u64,
+    /// How many bytes on disk the entry gives the stream.
+    declared: u64,
+    stream: Stream<S>,
+}
+
+impl<S: Read + Seek> Extracted<S> {
+    /// A payload read as it sits on disk.
+    fn stored(entry: u32, src: S, at: u64, len: u64) -> Self {
+        Self {
+            entry,
+            at,
+            len,
+            pos: 0,
+            declared: len,
+            stream: Stream::Stored(Region::new(src, at, len)),
+        }
+    }
+
+    /// A deflated payload, inflated to the `expected` length the entry claims.
+    fn deflated(entry: u32, src: S, at: u64, on_disk: u64, expected: u64) -> Self {
+        Self {
+            entry,
+            at,
+            len: expected,
+            pos: 0,
+            declared: on_disk,
+            stream: Stream::Deflated(flate2::bufread::DeflateDecoder::new(BufReader::new(
+                Region::new(src, at, on_disk),
+            ))),
+        }
+    }
+
+    /// How many bytes this yields in full.
+    ///
+    /// Known before anything is read: it is what the entry declares, and a
+    /// stream that does not match it is a failure rather than a shorter answer.
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the entry holds nothing.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// How many bytes on disk the entry gives the stream, and how many of them
+    /// the stream turned out to occupy. Meaningful once it has been read to the
+    /// end; before that, `used` is how far it has got.
+    fn extent(&self) -> (u64, u64) {
+        let used = match self.stream {
+            Stream::Stored(ref region) => region.pos,
+            // What the decompressor took, rather than what it was handed: that
+            // is where the stream ends, and the bytes after it belong to
+            // nothing.
+            Stream::Deflated(ref decoder) => decoder.total_in(),
+        };
+        (self.declared, used)
+    }
+
+    /// How much to reserve for [`Extracted::whole`].
+    ///
+    /// A stored payload's length is the entry's own extent, already
+    /// bounds-checked against the archive, so reserving it is one allocation.
+    /// A deflated payload's is what the entry *claims* it inflates to, which is
+    /// attacker-controlled, so it caps the read rather than sizing an
+    /// allocation up front.
+    fn reserve(&self) -> usize {
+        match self.stream {
+            Stream::Stored(_) => usize::try_from(self.len).unwrap_or_default(),
+            Stream::Deflated(_) => 0,
+        }
+    }
+
+    /// The whole of it, in memory.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the stream fails with, as the [`Error`] it really was.
+    fn whole(&mut self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.reserve());
+        let at = self.at;
+        self.read_to_end(&mut out)
+            .map_err(|source| Error::recovered(at, source))?;
+        Ok(out)
+    }
+
+    /// All of it, kept nowhere, and how many bytes that was.
+    ///
+    /// The read that checks an entry rather than using it: every byte goes
+    /// through the decompressor and none of them is held, so reading a whole
+    /// archive back costs a buffer rather than its largest entry. R3.9.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the stream fails with, as the [`Error`] it really was.
+    fn drained(&mut self) -> Result<u64> {
+        let at = self.at;
+        io::copy(self, &mut io::sink()).map_err(|source| Error::recovered(at, source))
+    }
+
+    /// Puts a deflated stream back at its start, which means inflating it
+    /// again from there.
+    fn restart(&mut self) -> io::Result<()> {
+        if let Stream::Deflated(ref mut decoder) = self.stream {
+            decoder.reset_data();
+            decoder.get_mut().seek(SeekFrom::Start(0))?;
+        }
+        self.pos = 0;
+        Ok(())
+    }
+}
+
+/// A failure out of the decompressor, unless it is the source's own coming
+/// back through it.
+fn inflating(entry: u32, source: io::Error) -> io::Error {
+    match Error::carried(source) {
+        Ok(carried) => carried.into_io(),
+        Err(source) => Error::Inflate { entry, source }.into_io(),
+    }
+}
+
+impl<S: Read + Seek> Read for Extracted<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (entry, expected) = (self.entry, self.len);
+        let read = match self.stream {
+            Stream::Stored(ref mut region) => region.read(buf)?,
+            Stream::Deflated(ref mut decoder) => {
+                // One byte past what the entry promises, so a payload that
+                // inflates to more than that is caught rather than truncated
+                // to it.
+                let limit = expected.checked_add(1).ok_or_else(|| {
+                    Error::LengthMismatch {
+                        entry,
+                        expected,
+                        actual: u64::MAX,
+                    }
+                    .into_io()
+                })?;
+                let room = limit.saturating_sub(self.pos);
+                let want = usize::try_from(room).unwrap_or(usize::MAX).min(buf.len());
+                let window = buf.get_mut(..want).unwrap_or_default();
+                if window.is_empty() {
+                    return Ok(0);
+                }
+                decoder
+                    .read(window)
+                    .map_err(|source| inflating(entry, source))?
+            }
+        };
+
+        // Both checks are the deflated stream's: a stored payload ends where
+        // its window does, and a window that ends early has already failed.
+        if read == 0 {
+            if self.pos < expected {
+                return Err(Error::LengthMismatch {
+                    entry,
+                    expected,
+                    actual: self.pos,
+                }
+                .into_io());
+            }
+            return Ok(0);
+        }
+        self.pos = self.pos.saturating_add(u64::try_from(read).unwrap_or(0));
+        if self.pos > expected {
+            return Err(Error::LengthMismatch {
+                entry,
+                expected,
+                actual: self.pos,
+            }
+            .into_io());
+        }
+        Ok(read)
+    }
+}
+
+impl<S: Read + Seek> Seek for Extracted<S> {
+    /// Seeks within the entry, whose length is known without reading it.
+    ///
+    /// A stored payload seeks its source and costs nothing. **A deflated one
+    /// has no position but the one it has inflated to**: seeking backwards
+    /// starts the stream again and seeking forwards inflates what it passes
+    /// over and throws it away. [`crate::Payload`] asks for [`Seek`] because
+    /// [`crate::build()`] reads a payload twice in one case, and that case is a
+    /// rewind.
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(at) => at,
+            SeekFrom::End(delta) => shift(self.len, delta)?,
+            SeekFrom::Current(delta) => shift(self.pos, delta)?,
+        };
+        if let Stream::Stored(ref mut region) = self.stream {
+            region.seek(SeekFrom::Start(target))?;
+            self.pos = target;
+            return Ok(target);
+        }
+
+        if target < self.pos {
+            self.restart()?;
+        }
+        // Forward by inflating and discarding, bounded by the entry's own
+        // length: past that there is nothing to inflate, and a read answers
+        // empty exactly as it does past the end of a file.
+        let mut left = self.len.min(target).saturating_sub(self.pos);
+        let mut discarded = [0_u8; 8 * 1024];
+        while left > 0 {
+            let want = usize::try_from(left)
+                .unwrap_or(usize::MAX)
+                .min(discarded.len());
+            let read = self.read(discarded.get_mut(..want).unwrap_or_default())?;
+            if read == 0 {
+                break;
+            }
+            left = left.saturating_sub(u64::try_from(read).unwrap_or(0));
+        }
+        self.pos = target;
+        Ok(target)
+    }
 }
 
 /// The table of contents of one archive.
@@ -711,16 +1033,56 @@ impl Archive {
     /// that does not fit, and [`Error::Inflate`] or [`Error::LengthMismatch`]
     /// when the payload does not decompress as promised.
     pub fn read<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Vec<u8>> {
-        Ok(self.read_payload(src, index)?.contents)
+        self.opened(src, index, Form::Contents)?.whole()
     }
 
-    /// [`Archive::read`], keeping what the read learned about the payload it
-    /// came out of.
+    /// [`Archive::read`] for a caller checking an entry rather than using it:
+    /// the contents go past and only what the read learned about the payload
+    /// comes back.
+    ///
+    /// The same machine as [`Archive::read`] and the same two lengths, so
+    /// [`Error::TrailingBytes`] rests on one accounting rather than two (§3).
+    /// Nothing is held, so [`crate::Verified`] costs a buffer per entry rather
+    /// than the archive's largest one. R3.9.
     ///
     /// # Errors
     ///
     /// As [`Archive::read`].
-    pub(crate) fn read_payload<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Payload> {
+    pub(crate) fn read_back<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Payload> {
+        let mut stream = self.opened(src, index, Form::Contents)?;
+        let len = stream.drained()?;
+        let (declared, used) = stream.extent();
+        Ok(Payload {
+            entry: index,
+            len,
+            declared,
+            used,
+        })
+    }
+
+    /// One entry as a stream of the file it is **outside the archive**.
+    ///
+    /// The streaming form of [`Archive::extract`], and the one the bytes come
+    /// out of: a caller writing an entry into a sink, digesting it, or handing
+    /// it to [`crate::build()`] as a payload never holds it. One entry out of a
+    /// multi-gigabyte archive costs its own buffer. R3.9.
+    ///
+    /// `src` is taken by value and read from wherever the stream needs it, so
+    /// nothing else may read it until the stream is dropped — a `&mut R` is
+    /// what a caller normally hands over.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongKind`] for a directory, [`Error::ResourceTooSmall`] for a
+    /// resource that cannot hold its own header, and the bounds variants for a
+    /// payload that does not fit. What the *stream* fails with is
+    /// [`Extracted`]'s.
+    pub fn extracted<S: Read + Seek>(&self, src: S, index: u32) -> Result<Extracted<S>> {
+        self.opened(src, index, Form::File)
+    }
+
+    /// The one place a payload becomes a stream, in either framing (§3).
+    fn opened<S: Read + Seek>(&self, src: S, index: u32, form: Form) -> Result<Extracted<S>> {
         let (offset, on_disk) = self.payload_span(index)?;
         let entry = self.entry(index)?;
 
@@ -731,40 +1093,57 @@ impl Archive {
                 wanted: "file",
             }),
 
+            // Compression is what decides a binary entry, and the same answer
+            // serves both framings: what a binary file is outside the archive
+            // is what it means.
             EntryKind::Binary {
                 compressed_len,
                 uncompressed_len,
                 ..
-            } => {
-                let raw = read_vec_at(src, offset, on_disk)?;
-                if compressed_len == 0 {
-                    return Ok(Payload::stored(index, raw));
-                }
-                inflate(index, &raw, u64::from(uncompressed_len))
-            }
+            } => Ok(if compressed_len == 0 {
+                Extracted::stored(index, src, offset, on_disk)
+            } else {
+                Extracted::deflated(index, src, offset, on_disk, u64::from(uncompressed_len))
+            }),
 
             EntryKind::Resource {
                 compressed_len,
                 system_flags,
                 graphics_flags,
                 ..
-            } => {
-                let stream_len = u64::from(compressed_len)
-                    .checked_sub(RESOURCE_HEADER_LEN)
-                    .ok_or(Error::ResourceTooSmall {
-                        entry: index,
-                        compressed_len,
-                    })?;
-                let at =
-                    offset
-                        .checked_add(RESOURCE_HEADER_LEN)
+            } => match form {
+                Form::File => {
+                    if u64::from(compressed_len) < RESOURCE_HEADER_LEN {
+                        return Err(Error::ResourceTooSmall {
+                            entry: index,
+                            compressed_len,
+                        });
+                    }
+                    Ok(Extracted::stored(index, src, offset, on_disk))
+                }
+                Form::Contents => {
+                    let stream_len = u64::from(compressed_len)
+                        .checked_sub(RESOURCE_HEADER_LEN)
                         .ok_or(Error::ResourceTooSmall {
                             entry: index,
                             compressed_len,
                         })?;
-                let raw = read_vec_at(src, at, stream_len)?;
-                inflate(index, &raw, resource_len(system_flags, graphics_flags))
-            }
+                    let at =
+                        offset
+                            .checked_add(RESOURCE_HEADER_LEN)
+                            .ok_or(Error::ResourceTooSmall {
+                                entry: index,
+                                compressed_len,
+                            })?;
+                    Ok(Extracted::deflated(
+                        index,
+                        src,
+                        at,
+                        stream_len,
+                        resource_len(system_flags, graphics_flags),
+                    ))
+                }
+            },
         }
     }
 
@@ -775,22 +1154,17 @@ impl Archive {
     /// a `.yft` on disk is. Passthrough is a commitment — an entry we cannot
     /// interpret still round-trips byte for byte. `docs/approach.md`.
     ///
+    /// [`Archive::extracted`] is the same read as a stream, and this is the
+    /// convenience over it for a caller that wants the bytes — a checksum, a
+    /// 200-byte `.meta`, a `cat` into a pipe. It holds the whole entry, which
+    /// for a multi-gigabyte one is the caller's choice to make rather than the
+    /// signature's (§7).
+    ///
     /// # Errors
     ///
     /// As [`Archive::read`].
     pub fn extract<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Vec<u8>> {
-        let entry = self.entry(index)?;
-        if let EntryKind::Resource { compressed_len, .. } = entry.kind {
-            let (offset, _) = self.payload_span(index)?;
-            if u64::from(compressed_len) < RESOURCE_HEADER_LEN {
-                return Err(Error::ResourceTooSmall {
-                    entry: index,
-                    compressed_len,
-                });
-            }
-            return read_vec_at(src, offset, u64::from(compressed_len));
-        }
-        self.read(src, index)
+        self.extracted(src, index)?.whole()
     }
 
     /// Whether an entry's payload begins with the `RSC7` magic.

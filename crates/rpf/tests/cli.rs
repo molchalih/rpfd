@@ -49,7 +49,7 @@ fn make_archive(at: &Path) -> BTreeMap<String, Vec<u8>> {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |wanted| {
+        |wanted: &str| {
             Ok(Cursor::new(
                 contents.get(wanted).cloned().unwrap_or_default(),
             ))
@@ -335,7 +335,7 @@ fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(inner.clone())),
+        |_: &str| Ok(Cursor::new(inner.clone())),
         &mut Unwatched,
     )
     .expect("outer builds");
@@ -479,7 +479,7 @@ fn an_empty_directory_survives_extract_and_pack() {
         rpf_core::Version::Rpf7,
         &files,
         &["x64/empty".to_owned()],
-        |_| Ok(Cursor::new(b"hello".to_vec())),
+        |_: &str| Ok(Cursor::new(b"hello".to_vec())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -643,7 +643,7 @@ fn a_put_that_fits_patches_in_place_rather_than_rebuilding() {
         rpf_core::Version::Rpf7,
         &[stored("big.bin"), stored("tail.bin")],
         &[],
-        |wanted| {
+        |wanted: &str| {
             Ok(Cursor::new(if wanted == "big.bin" {
                 vec![0xAB_u8; 4096]
             } else {
@@ -942,7 +942,7 @@ fn archive_named(at: &Path, names: &[&str], placeholder: &str, actual: &str) {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(b"payload".to_vec())),
+        |_: &str| Ok(Cursor::new(b"payload".to_vec())),
         &mut Unwatched,
     )
     .expect("legal names build");
@@ -1471,7 +1471,7 @@ fn an_extraction_that_would_write_over_the_archive_it_is_reading_is_refused() {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| {
+        |_: &str| {
             Ok(Cursor::new(
                 b"an entry that shares the archive's own name".to_vec(),
             ))
@@ -1843,7 +1843,7 @@ fn make_other_archive(at: &Path) {
         rpf_core::Version::Rpf7,
         &files,
         &[],
-        |_| Ok(Cursor::new(vec![3_u8; 64])),
+        |_: &str| Ok(Cursor::new(vec![3_u8; 64])),
         &mut Unwatched,
     )
     .expect("archive builds");

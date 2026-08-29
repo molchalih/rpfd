@@ -70,7 +70,7 @@ fn built(files: &[FileSpec], contents: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
         rpf_core::Version::Rpf7,
         files,
         &[],
-        |path| {
+        |path: &str| {
             Ok(Cursor::new(
                 contents
                     .get(path)
