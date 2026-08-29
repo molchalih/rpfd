@@ -419,6 +419,28 @@ pub enum Error {
         path: String,
     },
 
+    /// A change set already holds a change at this path, and the one offered
+    /// would replace it rather than join it.
+    ///
+    /// A set holds one change per path ([`crate::Change`]), so a second change
+    /// at a path silently drops the first. Measured over the wire on
+    /// 2026-08-29: a buffered rename followed by a write of the same entry was
+    /// answered `pending: 1`, and the commit renamed nothing. Two **writes** are
+    /// not this — saving one file twice is what an editor does, and the later
+    /// contents are what it means — and neither is the same change offered
+    /// again.
+    ///
+    /// A refusal rather than a corruption: what the caller has to do is take
+    /// the change it no longer wants back out of the set. DR-032.
+    #[error("{path:?} already has {held} in this change set, which holds one change per path")]
+    Claimed {
+        /// The path both changes are at.
+        path: String,
+        /// What the change already there is: `"a write"`, `"a removal"`,
+        /// `"a rename"` or `"a new directory"`.
+        held: &'static str,
+    },
+
     /// A path cannot be turned into entries.
     #[error("invalid path {path:?}: {reason}")]
     BadPath {
@@ -564,6 +586,7 @@ impl Error {
             | Self::NotAResource { .. }
             | Self::BadPath { .. }
             | Self::AlreadyExists { .. }
+            | Self::Claimed { .. }
             | Self::NameCollision { .. }
             | Self::WrongKind { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
@@ -589,6 +612,57 @@ impl Error {
             | Self::TrailingBytes { .. }
             | Self::ChecksumMismatch { .. }
             | Self::VerifyFailed { .. } => Category::Corrupt,
+        }
+    }
+
+    /// This variant's own name, as a stable symbol.
+    ///
+    /// The category ([`Error::category`]) says who has to act and is what the
+    /// exit code is derived from; this says **which** failure it was, for a
+    /// caller that has a distinct answer for one of them. An editor's
+    /// filesystem has `FileExists` for [`Error::AlreadyExists`] and nothing for
+    /// the rest of [`Category::Refused`], and picking it out by reading the
+    /// rendered sentence is what §10 forbids — so the name goes on the wire
+    /// beside the number rather than the client parsing English. DR-030 asked
+    /// for it; DR-032 is where it was decided and where what it commits to is
+    /// written down.
+    ///
+    /// **These names are part of the contract.** Renaming a variant changes
+    /// them, so it is a breaking change to the daemon's wire in the same way
+    /// remapping an exit code is. Adding a variant is not: a caller that does
+    /// not know a name has the number, which is what it had before.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match *self {
+            Self::Io { .. } => "Io",
+            Self::NotAnArchive { .. } => "NotAnArchive",
+            Self::UnsupportedVersion { .. } => "UnsupportedVersion",
+            Self::UnrecognisedExecutable { .. } => "UnrecognisedExecutable",
+            Self::NeedsKey { .. } => "NeedsKey",
+            Self::OutOfBounds { .. } => "OutOfBounds",
+            Self::BadName { .. } => "BadName",
+            Self::BadChildRange { .. } => "BadChildRange",
+            Self::CyclicTree { .. } => "CyclicTree",
+            Self::ClaimedTwice { .. } => "ClaimedTwice",
+            Self::TooDeep { .. } => "TooDeep",
+            Self::PayloadUnderflow { .. } => "PayloadUnderflow",
+            Self::ResourceTooSmall { .. } => "ResourceTooSmall",
+            Self::Inflate { .. } => "Inflate",
+            Self::LengthMismatch { .. } => "LengthMismatch",
+            Self::TrailingBytes { .. } => "TrailingBytes",
+            Self::ChecksumMismatch { .. } => "ChecksumMismatch",
+            Self::VerifyFailed { .. } => "VerifyFailed",
+            Self::NoSuchEntry { .. } => "NoSuchEntry",
+            Self::NotFound { .. } => "NotFound",
+            Self::FieldOverflow { .. } => "FieldOverflow",
+            Self::NotAResource { .. } => "NotAResource",
+            Self::NameCollision { .. } => "NameCollision",
+            Self::AlreadyExists { .. } => "AlreadyExists",
+            Self::Claimed { .. } => "Claimed",
+            Self::BadPath { .. } => "BadPath",
+            Self::Overlapping { .. } => "Overlapping",
+            Self::Cancelled { .. } => "Cancelled",
+            Self::WrongKind { .. } => "WrongKind",
         }
     }
 
@@ -629,45 +703,19 @@ mod tests {
 
     use super::{Category, Error};
 
-    /// How many variants [`Error`] has, which is what the match below counts.
+    /// How many variants [`Error`] has, which is what [`Error::name`] counts.
     ///
-    /// The match is exhaustive, so a variant added later stops this module
+    /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 28;
+    const VARIANTS: usize = 29;
 
     /// The variant's own name, for a test that has to say which one it means.
+    ///
+    /// [`Error::name`] itself, so that what the tables below enumerate is the
+    /// contract rather than a copy of it.
     fn name(error: &Error) -> &'static str {
-        match *error {
-            Error::Io { .. } => "Io",
-            Error::NotAnArchive { .. } => "NotAnArchive",
-            Error::UnsupportedVersion { .. } => "UnsupportedVersion",
-            Error::UnrecognisedExecutable { .. } => "UnrecognisedExecutable",
-            Error::NeedsKey { .. } => "NeedsKey",
-            Error::OutOfBounds { .. } => "OutOfBounds",
-            Error::BadName { .. } => "BadName",
-            Error::BadChildRange { .. } => "BadChildRange",
-            Error::CyclicTree { .. } => "CyclicTree",
-            Error::ClaimedTwice { .. } => "ClaimedTwice",
-            Error::TooDeep { .. } => "TooDeep",
-            Error::PayloadUnderflow { .. } => "PayloadUnderflow",
-            Error::ResourceTooSmall { .. } => "ResourceTooSmall",
-            Error::Inflate { .. } => "Inflate",
-            Error::LengthMismatch { .. } => "LengthMismatch",
-            Error::TrailingBytes { .. } => "TrailingBytes",
-            Error::ChecksumMismatch { .. } => "ChecksumMismatch",
-            Error::VerifyFailed { .. } => "VerifyFailed",
-            Error::NoSuchEntry { .. } => "NoSuchEntry",
-            Error::NotFound { .. } => "NotFound",
-            Error::FieldOverflow { .. } => "FieldOverflow",
-            Error::NotAResource { .. } => "NotAResource",
-            Error::NameCollision { .. } => "NameCollision",
-            Error::BadPath { .. } => "BadPath",
-            Error::AlreadyExists { .. } => "AlreadyExists",
-            Error::Overlapping { .. } => "Overlapping",
-            Error::Cancelled { .. } => "Cancelled",
-            Error::WrongKind { .. } => "WrongKind",
-        }
+        error.name()
     }
 
     /// A stand-in for whatever the source or the decompressor reported.
@@ -782,6 +830,12 @@ mod tests {
             // DR-026.
             Error::AlreadyExists {
                 path: "data/notes.txt".to_owned(),
+            },
+            // A second change at one path of a set that holds one per path.
+            // DR-032.
+            Error::Claimed {
+                path: "data/notes.txt".to_owned(),
+                held: "a rename",
             },
             Error::NameCollision {
                 path: "data/NOTES.TXT".to_owned(),

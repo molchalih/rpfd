@@ -25,6 +25,16 @@ export interface WireError {
     /** Negative is JSON-RPC's own; positive is the exit code. DR-008, DR-010. */
     code: number;
     message: string;
+    /**
+     * Where the protocol puts anything more than a code and a sentence.
+     *
+     * `reason` is the failure's own name — an `rpf_core::Error` variant, one of
+     * the daemon's own, or JSON-RPC's — and is on every error object the daemon
+     * writes. It is a finer classification within a code and never a
+     * replacement for one: DR-010 makes the number the contract, and that is
+     * unchanged. DR-032 §5.
+     */
+    data?: { reason?: string };
 }
 
 /** One response. */
@@ -186,4 +196,18 @@ export interface Pending {
 /** What `discard` answers. */
 export interface Discarded {
     discarded: number;
+}
+
+/**
+ * What `forget` answers: one change out of the buffer, and what is left.
+ *
+ * `forgotten` is false for a path nothing was buffered at, which is not a
+ * failure — a client withdrawing a gesture it may never have sent should not
+ * have to track that, and `paths` says what is there either way. DR-032 §4.
+ */
+export interface Forgotten {
+    path: string;
+    forgotten: boolean;
+    pending: number;
+    paths: string[];
 }

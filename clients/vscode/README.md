@@ -24,14 +24,15 @@ the entry table parsed once and kept warm.
 
 ## What it does not do
 
-- **A rename has no overwrite.** Renaming onto a path the archive already holds
-  is refused with no way through: delete that entry, save the archive, and then
-  rename. The library takes a change set that says both at once; the wire
-  resolves each change against the archive on disk, where the target is still
-  there.
+- **A rename does not replace a folder that holds anything.** Renaming onto an
+  entry replaces it — the target is removed in the same change set, which is
+  how the library says "I meant to replace that", and the entry keeps its
+  storage class because it is still a rename. A directory with entries under it
+  is not: delete it deliberately first.
 - **One change per entry until you save.** An entry with a rename buffered
-  against it cannot also be edited, and a directory being renamed cannot hold
-  another rename. Save the archive, then make the second change.
+  against it cannot also be edited, nor an edited one renamed, and a directory
+  being renamed cannot hold another rename. Save the archive, then make the
+  second change.
 - **A nested archive is a folder, not a file.** You can descend into it; you
   cannot read its raw bytes through the folder view.
 - **It does not convert metadata.** Presenting `.ymt`/`.meta` as XML is R7.4,

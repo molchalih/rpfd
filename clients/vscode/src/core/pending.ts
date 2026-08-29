@@ -20,19 +20,31 @@
  * `data/greeting.txt` for as long as it is buffered, and {@link Pending.address}
  * is what turns the path a user sees back into the one the daemon takes.
  *
+ * **A set holds one change per path, and a second change of another kind is
+ * refused rather than applied.** `Changes::admits` is where the daemon says so
+ * — `Error::Claimed`, exit 6 — and {@link Pending.admits} is the same rule
+ * here, because a model that quietly replaced where the daemon refuses would
+ * be a model of a set the daemon does not hold. DR-032. What composes two
+ * gestures into one set is {@link Pending.plan}, which withdraws before it
+ * offers.
+ *
  * Nothing here folds case. Two paths differing only in case are one name to the
  * container and two strings here, and the daemon refuses that collision when
  * the change is offered — so this file compares paths exactly and leaves the
  * answer to the side that knows the format. `docs/conventions.md` §1.
  */
 
+import { Refused } from './errors.js';
 import type { Listed } from './protocol.js';
 import { normalise } from './uri.js';
 
 /**
  * One buffered change, as `rpf_core::edit::Change` spells it.
  *
- * A rename carries only its destination, because the source is the key.
+ * A rename carries only its destination, because the source is the key. A write
+ * carries its contents because a gesture can move the key it is buffered at —
+ * renaming an entry this session created re-keys the change that created it —
+ * and because a plan that failed part-way puts back what it withdrew.
  */
 export type Change =
     | { readonly kind: 'write'; readonly contents: Uint8Array; readonly create: boolean }
@@ -40,16 +52,30 @@ export type Change =
     | { readonly kind: 'rename'; readonly to: string }
     | { readonly kind: 'mkdir' };
 
+/** One change, at the path the archive holds it at. */
+export type Offer = readonly [path: string, change: Change];
+
 /**
- * What recording a change did to the set.
+ * What the daemon's buffer has to be told for its set to become this one.
  *
- * `one` means the daemon's set becomes this one by buffering this single
- * change, which is what buffering it does anyway. `resync` means a key was
- * withdrawn or moved, and the daemon's buffer has no method for either — it
- * takes a change at a path and never takes one away — so the set has to be
- * discarded and sent again. DR-030.
+ * A gesture is not always one change: deleting a file this session created
+ * takes a change **out** of the set, and renaming a directory this session made
+ * moves the changes inside it to other keys. `forget` is what expresses both —
+ * one request each, where a buffer with no way to take a change back left only
+ * `discard` and a replay of everything else. DR-032 §4.
+ *
+ * Withdrawals come first, because the daemon refuses a second change at a path
+ * its set already holds.
  */
-export type Recorded = 'one' | 'resync';
+export interface Plan {
+    /** Paths whose buffered change is taken back, before anything is offered. */
+    readonly forget: readonly string[];
+    /** What to offer afterwards, in the order a commit applies them. */
+    readonly offer: readonly Offer[];
+}
+
+/** The order a commit applies a set's changes in. DR-026, `edit::tree_of`. */
+const ORDER: Change['kind'][] = ['remove', 'rename', 'write', 'mkdir'];
 
 /** Whether `path` is `under`, or is `under` itself. Component-wise. */
 export function atOrUnder(path: string, under: string): boolean {
@@ -66,6 +92,25 @@ function creates(change: Change): boolean {
     return change.kind === 'mkdir' || (change.kind === 'write' && change.create);
 }
 
+/** What a change already in a set is, for a refusal that has to name it. */
+function does(change: Change): string {
+    switch (change.kind) {
+        case 'write':
+            return 'a write';
+        case 'remove':
+            return 'a removal';
+        case 'rename':
+            return 'a rename';
+        case 'mkdir':
+            return 'a new directory';
+    }
+}
+
+/** Offers in the order a commit applies them, so a set is assembled as it means. */
+function inCommitOrder(offers: readonly Offer[]): Offer[] {
+    return ORDER.flatMap((kind) => offers.filter(([, change]) => change.kind === kind));
+}
+
 /** A set of buffered changes, at most one per path. */
 export class Pending {
     private readonly changes = new Map<string, Change>();
@@ -78,16 +123,6 @@ export class Pending {
     /** Every path a change is recorded at, in order. */
     paths(): string[] {
         return [...this.changes.keys()].sort();
-    }
-
-    /** Every change, by its path, in the order a commit applies them. */
-    ordered(): [string, Change][] {
-        const order: Change['kind'][] = ['remove', 'rename', 'write', 'mkdir'];
-        return order.flatMap((kind) =>
-            this.paths()
-                .map((path): [string, Change] => [path, this.changes.get(path) as Change])
-                .filter(([, change]) => change.kind === kind),
-        );
     }
 
     /** The change buffered at a path, if there is one. */
@@ -122,12 +157,27 @@ export class Pending {
     }
 
     /**
-     * Whether nothing on disk holds this path yet, so a write to it has to
-     * carry `create` and a removal of it is a withdrawal rather than a change.
+     * Why a second change cannot be recorded at a path beside the one already
+     * there, or `undefined` when it can.
+     *
+     * `rpf_core::edit::Changes::admits`, in the same two exceptions: two
+     * **writes** replace, because saving one file twice is what an editor does
+     * and the later contents are what it means; and the same change offered
+     * again is not a second change. Anything else is `Error::Claimed` on the
+     * wire, so anything else is a refusal here.
      */
-    isCreated(held: string): boolean {
-        const change = this.changes.get(held);
-        return change !== undefined && creates(change);
+    admits(path: string, change: Change): string | undefined {
+        const held = this.changes.get(path);
+        if (held === undefined) {
+            return undefined;
+        }
+        if (held.kind === 'write' && change.kind === 'write') {
+            return undefined;
+        }
+        if (same(held, change)) {
+            return undefined;
+        }
+        return `${path} already has ${does(held)} in this change set, which holds one change per path`;
     }
 
     /**
@@ -156,21 +206,57 @@ export class Pending {
     }
 
     /**
-     * Buffers a change at the path the archive holds it at, composing it with
-     * whatever was buffered there already.
+     * What the daemon has to be told for its set to hold this change beside the
+     * ones already there.
      *
-     * @returns whether the daemon's set can follow with one request, or has to
-     * be discarded and sent again. See {@link Recorded}.
+     * Composition rather than replacement: a gesture that withdraws a change
+     * withdraws it on both sides, and one that re-keys a change forgets it and
+     * offers it at the key it moves to. Nothing here changes this set — the
+     * daemon is asked first, and {@link Pending.apply} is what records the
+     * answer.
+     *
+     * @param held the path the archive holds the entry at, which is the key.
+     * @param visible the path the user sees it at, which is the key a change
+     * this session created is buffered under.
+     * @throws Refused when one set cannot hold both changes, naming the one in
+     * the way. The daemon says the same thing — `Error::Claimed` — and this
+     * says it before the request rather than after. DR-032 §3.
      */
-    record(held: string, change: Change): Recorded {
+    plan(held: string, visible: string, change: Change): Plan {
         if (change.kind === 'remove') {
-            return this.recordRemoval(held, change);
+            return this.planRemoval(held, change);
         }
         if (change.kind === 'rename') {
-            return this.recordRename(held, change.to);
+            return this.planRename(held, visible, change.to);
         }
-        this.changes.set(held, change);
-        return 'one';
+        // Putting a path back that a buffered removal takes out is not two
+        // changes: "gone, and then these contents" is those contents, which is
+        // the one change a set holds at that key. Only a write can say it — a
+        // directory over a removed file, or a file over a removed directory,
+        // needs two sets and the caller is told so by the refusal below.
+        if (change.kind === 'write' && this.changes.get(held)?.kind === 'remove') {
+            return { forget: [held], offer: [[held, change]] };
+        }
+        this.refuseUnlessAdmitted(held, change);
+        return { forget: [], offer: [[held, change]] };
+    }
+
+    /** Records what the daemon has accepted. */
+    apply(plan: Plan): void {
+        for (const path of plan.forget) {
+            this.changes.delete(path);
+        }
+        for (const [path, change] of plan.offer) {
+            this.changes.set(path, change);
+        }
+    }
+
+    /** Two plans as one, so a gesture that is two changes is carried out once. */
+    static merged(plans: readonly Plan[]): Plan {
+        return {
+            forget: plans.flatMap((plan) => [...plan.forget]),
+            offer: inCommitOrder(plans.flatMap((plan) => [...plan.offer])),
+        };
     }
 
     /**
@@ -223,54 +309,82 @@ export class Pending {
      * something only a buffered change put there withdraws that change instead
      * of recording anything.
      *
-     * Withdrawing is the one thing the daemon's buffer cannot be told, which is
-     * why this is where `resync` comes from.
+     * Whatever was buffered at the path itself goes too: the entry is leaving,
+     * so an edit or a rename of it is void, and a set holding both would be
+     * refused. Both are `forget` now, where each used to be the whole set
+     * discarded and offered again. DR-030 §3, DR-032 §4.
      */
-    private recordRemoval(held: string, change: Change): Recorded {
+    private planRemoval(held: string, change: Change): Plan {
         const there = this.changes.get(held);
-        let withdrew = false;
-        for (const key of [...this.changes.keys()]) {
-            if (key !== held && atOrUnder(key, held)) {
-                this.changes.delete(key);
-                withdrew = true;
-            }
-        }
+        const beneath = [...this.changes.keys()].filter(
+            (key) => key !== held && atOrUnder(key, held),
+        );
+        const forget = there === undefined ? beneath : [...beneath, held];
         if (there !== undefined && creates(there)) {
-            this.changes.delete(held);
-            return 'resync';
+            return { forget, offer: [] };
         }
-        this.changes.set(held, change);
-        return withdrew ? 'resync' : 'one';
+        return { forget, offer: [[held, change]] };
     }
 
     /**
-     * A rename over a path a buffered change already created or moved is
-     * composed rather than stacked: every change is resolved against the
-     * archive on disk, so a set holding both would name a path no archive has.
+     * A rename of something a buffered change put there moves that change to
+     * the key it will be found under, and a rename back to where an entry
+     * started withdraws the one that moved it.
+     *
+     * A change this session created is keyed by the path it is **visible** at,
+     * so that is the prefix the move is computed from; everything else is keyed
+     * by the path the archive holds it at.
      */
-    private recordRename(held: string, to: string): Recorded {
+    private planRename(held: string, visible: string, to: string): Plan {
+        const moving = [...this.changes].filter(
+            ([key, change]) => creates(change) && atOrUnder(key, visible),
+        );
+        const forget = moving.map(([key]) => key);
+        const offer: Offer[] = moving.map(([key, change]) => [moved(key, visible, to), change]);
         const there = this.changes.get(held);
-        let rekeyed = false;
-        for (const [key, change] of [...this.changes]) {
-            if (atOrUnder(key, held) && creates(change)) {
-                this.changes.delete(key);
-                this.changes.set(moved(key, held, to), change);
-                rekeyed = true;
-            }
-        }
         // Nothing on disk holds it, so moving the change that created it is the
-        // whole of the rename and there is nothing left to record.
+        // whole of the rename and there is no rename to offer.
         if (there !== undefined && creates(there)) {
-            return 'resync';
+            return { forget, offer: inCommitOrder(offer) };
+        }
+        if (there !== undefined && there.kind !== 'rename') {
+            throw new Refused(
+                'refused',
+                visible,
+                `${held} already has ${does(there)} in this change set, which holds one change per path. Save the archive, then rename it.`,
+            );
+        }
+        if (there !== undefined) {
+            forget.push(held);
         }
         // A rename back to where the entry started is the withdrawal of the one
         // that moved it: recording `a → a` would be refused, since a rename's
         // destination may not be inside the entry being renamed.
-        if (there !== undefined && to === held) {
-            this.changes.delete(held);
-            return 'resync';
+        if (to !== held) {
+            offer.push([held, { kind: 'rename', to }]);
         }
-        this.changes.set(held, { kind: 'rename', to });
-        return rekeyed ? 'resync' : 'one';
+        return { forget, offer: inCommitOrder(offer) };
+    }
+
+    /** Refuses a change the set cannot hold beside the one already at its path. */
+    private refuseUnlessAdmitted(path: string, change: Change): void {
+        const claimed = this.admits(path, change);
+        if (claimed !== undefined) {
+            throw new Refused('refused', path, `${claimed}. Save the archive, then make this change.`);
+        }
+    }
+}
+
+/** Whether two changes are the same change, which is not a second one. */
+function same(held: Change, change: Change): boolean {
+    switch (held.kind) {
+        case 'remove':
+            return change.kind === 'remove' && change.recursive === held.recursive;
+        case 'rename':
+            return change.kind === 'rename' && change.to === held.to;
+        case 'mkdir':
+            return change.kind === 'mkdir';
+        case 'write':
+            return false;
     }
 }

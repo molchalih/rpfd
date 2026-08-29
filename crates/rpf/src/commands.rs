@@ -572,7 +572,7 @@ fn in_place(
                 let asked = changes.at(&change.path).ok_or_else(|| Failure::Refused {
                     reason: format!("{} is not a change that was asked for", change.path),
                 })?;
-                rpf_core::allows(&mut file, &archive, &change.path, asked)?;
+                rpf_core::allows(&mut file, &archive, changes, &change.path, asked)?;
             }
             if options.change.dry_run {
                 for change in &structural {

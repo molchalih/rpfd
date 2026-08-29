@@ -296,7 +296,7 @@ export class Daemon {
         if (failure && typeof failure === 'object' && !Array.isArray(failure)) {
             const code = typeof failure.code === 'number' ? failure.code : 1;
             const reason = typeof failure.message === 'string' ? failure.message : line;
-            waiting.fail(new DaemonError(waiting.method, code, reason));
+            waiting.fail(new DaemonError(waiting.method, code, reason, Daemon.nameOf(failure)));
             return;
         }
         waiting.settle(object.result ?? null);
@@ -325,6 +325,23 @@ export class Daemon {
             return;
         }
         waiting.onProgress(progress);
+    }
+
+    /**
+     * The failure's own name, out of the error object's `data`.
+     *
+     * Empty when there is none, which this daemon never writes — DR-032 §5 puts
+     * it on every error object — and which an older one would. Read here rather
+     * than in `errors.ts` because this file is the one that knows the wire's
+     * shapes.
+     */
+    private static nameOf(failure: Record<string, Json>): string {
+        const data = failure.data;
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+            return '';
+        }
+        const reason = (data as Record<string, Json>).reason;
+        return typeof reason === 'string' ? reason : '';
     }
 
     private stop(failure: TransportError): void {

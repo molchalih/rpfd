@@ -127,6 +127,27 @@ impl Failure {
     }
 }
 
+impl Failure {
+    /// This failure's own name, as a stable symbol.
+    ///
+    /// The exit code says who has to act; this says which failure it was, for a
+    /// caller that has a distinct answer for one of them and would otherwise
+    /// have to read the sentence to find out (§10). The daemon puts it beside
+    /// `error.code`; the command line has no JSON error object to put it in and
+    /// DR-010 already decided what a process gets, which is the number.
+    /// DR-032.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match *self {
+            Self::Container(ref error) => error.name(),
+            Self::Io { .. } => "Io",
+            Self::Refused { .. } => "Refused",
+            Self::GameInstall { .. } => "GameInstall",
+            Self::UncertainInstall { .. } => "UncertainInstall",
+        }
+    }
+}
+
 /// Result of a command.
 pub type Result<T> = std::result::Result<T, Failure>;
 

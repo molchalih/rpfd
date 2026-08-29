@@ -142,11 +142,12 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
     /**
      * Buffers a rename.
      *
-     * `overwrite` has no answer here and is refused rather than approximated:
-     * DR-026 gives a rename no override, because removing the target in the
-     * same change set says the same thing out loud and shows up in the plan —
-     * and the wire cannot carry even that, since a rename is resolved against
-     * the archive on disk. DR-030.
+     * `overwrite` is carried out rather than refused or approximated: the
+     * session removes the target **in the same change set**, which is DR-026's
+     * own answer to "I mean to replace that" and is a set the wire could not
+     * carry until DR-032. It is not a delete and a create — that would change
+     * the entry's storage class and its kind behind the user's back — and it is
+     * not a second flag on `rename`, which DR-026 refused and still refuses.
      */
     async rename(from: vscode.Uri, to: vscode.Uri, options: { overwrite: boolean }): Promise<void> {
         const source = this.locate(from);
@@ -159,21 +160,20 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
         if (!source.mount.session.tree.at(source.address.inside)) {
             throw vscode.FileSystemError.FileNotFound(from);
         }
-        if (source.mount.session.tree.at(target.address.inside)) {
-            throw options.overwrite
-                ? vscode.FileSystemError.NoPermissions(
-                      `${target.address.inside} is already in the archive. A rename inside an archive has no overwrite: delete that entry, save the archive, then rename.`,
-                  )
-                : vscode.FileSystemError.FileExists(to);
+        const occupied = source.mount.session.tree.at(target.address.inside) !== undefined;
+        if (occupied && !options.overwrite) {
+            throw vscode.FileSystemError.FileExists(to);
         }
         this.requireDirectory(to, target.address.inside);
         try {
-            await source.mount.session.rename(source.address.inside, target.address.inside);
+            await source.mount.session.rename(source.address.inside, target.address.inside, {
+                overwrite: options.overwrite,
+            });
         } catch (failure) {
             throw asFileSystemError(failure, to);
         }
         this.announce(source.address.archive, source.address.inside, 'deleted');
-        this.announce(target.address.archive, target.address.inside, 'created');
+        this.announce(target.address.archive, target.address.inside, occupied ? 'changed' : 'created');
     }
 
     /** Buffers a directory. DR-026. */

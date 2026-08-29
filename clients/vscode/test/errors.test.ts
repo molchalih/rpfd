@@ -125,6 +125,34 @@ describe('what a failure means', () => {
         }
     });
 
+    it('tells three refusals apart by the failure\'s own name, inside the one code', () => {
+        // DR-030 measured that DR-026's stated reason for `AlreadyExists` being
+        // its own variant — a client mapping it onto an editor's filesystem has
+        // a distinct answer for it — did not survive the wire, because exit 6
+        // is every refusal there is at once. DR-032 §5 put the name beside the
+        // number, and this is the client collecting on it. The number stays the
+        // contract: a name nobody here knows falls back to it.
+        const expected: [string, FileSystemWord][] = [
+            ['AlreadyExists', 'exists'],
+            ['NameCollision', 'exists'],
+            ['WrongKind', 'is-a-directory'],
+            ['Claimed', 'no-permissions'],
+            ['BadPath', 'no-permissions'],
+            ['SomethingAddedLater', 'no-permissions'],
+            ['', 'no-permissions'],
+        ];
+        for (const [named, word] of expected) {
+            const failure = new DaemonError('rename', EXIT.refused, 'because', named);
+            assert.equal(failure.failure, named);
+            assert.equal(fileSystemWordFor(failure), word, named || 'no name at all');
+        }
+        assert.equal(
+            fileSystemWordFor(new DaemonError('read', EXIT.notFound, 'x', 'NotFound')),
+            'not-found',
+            'a name that agrees with its number changes nothing',
+        );
+    });
+
     it('gives every kind a headline and an instruction', () => {
         const kinds: Kind[] = [
             'protocol',

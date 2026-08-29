@@ -492,7 +492,8 @@ impl Wire {
 /// Renders one object, or something that says it could not be rendered.
 fn render(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| {
-        r#"{"jsonrpc":"2.0","id":null,"error":{"code":1,"message":"unrenderable"}}"#.to_owned()
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":1,"message":"unrenderable","data":{"reason":"Internal"}}}"#
+            .to_owned()
     })
 }
 
@@ -878,17 +879,23 @@ fn answer_cancel(line: &str, cancel: &Cancellation) -> Seen {
         (Some(id), Ok(result)) => {
             Seen::Cancel(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
         }
-        (Some(id), Err(message)) => Seen::Cancel(error_of(id, INVALID_PARAMS, &message)),
+        (Some(id), Err(message)) => Seen::Cancel(error_of(id, &invalid_params(message))),
     }
 }
 
 /// Turns one request line into one response object, or into none.
 fn respond(state: &mut State, line: &str, wire: &Wire) -> Option<Value> {
     let Ok(request) = serde_json::from_str::<Value>(line) else {
-        return Some(error_of(&Value::Null, PARSE_ERROR, "not JSON"));
+        return Some(error_of(
+            &Value::Null,
+            &protocol(PARSE_ERROR, "not JSON".to_owned()),
+        ));
     };
     let Some(method) = request.get("method").and_then(Value::as_str) else {
-        return Some(error_of(&Value::Null, INVALID_REQUEST, "no method"));
+        return Some(error_of(
+            &Value::Null,
+            &protocol(INVALID_REQUEST, "no method".to_owned()),
+        ));
     };
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
     let id = request.get("id").cloned();
@@ -900,13 +907,33 @@ fn respond(state: &mut State, line: &str, wire: &Wire) -> Option<Value> {
     let id = id?;
     Some(match outcome {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(rejected) => error_of(&id, rejected.code(), &rejected.message()),
+        Err(rejected) => error_of(&id, &rejected),
     })
 }
 
-/// A JSON-RPC error object.
-fn error_of(id: &Value, code: i64, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+/// A JSON-RPC error object: a number, a sentence, and the failure's own name.
+///
+/// `data` is where the protocol puts anything more than a code and a message,
+/// and `reason` there is a stable symbol — an `rpf_core::Error` variant's name,
+/// or one of the frontend's own. It is on **every** error object this daemon
+/// writes, so a client never has to ask whether it is there.
+/// [`Rejected::reason`] says why it is there at all.
+fn error_of(id: &Value, rejected: &Rejected) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": rejected.code(),
+            "message": rejected.message(),
+            "data": { "reason": rejected.reason() },
+        },
+    })
+}
+
+/// A request that did not follow the protocol, under one of JSON-RPC's own
+/// codes.
+fn protocol(code: i64, message: String) -> Rejected {
+    Rejected::Protocol { code, message }
 }
 
 /// Why a call produced no result.
@@ -924,6 +951,26 @@ impl Rejected {
         match *self {
             Self::Protocol { code, .. } => code,
             Self::Failed(ref failure) => failure.code() as i64,
+        }
+    }
+
+    /// The name that goes beside the number.
+    ///
+    /// A code classifies who has to act and is shared by every refusal there
+    /// is, so a client mapping this onto an editor's filesystem — where
+    /// `AlreadyExists` is `FileExists` and nothing else is — had only the
+    /// rendered sentence to tell them apart, which §10 and R7.6 forbid reading.
+    /// DR-030 asked for this; DR-032 decided it. Additive: the number is
+    /// unchanged and is still the contract DR-010 states.
+    fn reason(&self) -> &'static str {
+        match *self {
+            Self::Protocol { code, .. } => match code {
+                PARSE_ERROR => "ParseError",
+                INVALID_REQUEST => "InvalidRequest",
+                METHOD_NOT_FOUND => "MethodNotFound",
+                _ => "InvalidParams",
+            },
+            Self::Failed(ref failure) => failure.name(),
         }
     }
 
@@ -958,10 +1005,7 @@ type Answered = Answer<Value>;
 
 /// A parameter that is missing, or is not of the type the method takes.
 fn invalid_params(message: String) -> Rejected {
-    Rejected::Protocol {
-        code: INVALID_PARAMS,
-        message,
-    }
+    protocol(INVALID_PARAMS, message)
 }
 
 /// Routes one call.
@@ -983,6 +1027,7 @@ fn dispatch(
         "mkdir" => mkdir(state, params),
         "pending" => pending(state, params),
         "discard" => discard(state, params),
+        "forget" => forget(state, params),
         "info" => info(state, params),
         "verify" => verify(state, params, wire, request),
         "extract" => extract(state, params, wire, request),
@@ -991,10 +1036,7 @@ fn dispatch(
         "keys.extract" => keys_extract(params),
         "keys.cache" => keys_cache(params),
         "keys.invalidate" => keys_invalidate(params),
-        other => Err(Rejected::Protocol {
-            code: METHOD_NOT_FOUND,
-            message: format!("no method {other:?}"),
-        }),
+        other => Err(protocol(METHOD_NOT_FOUND, format!("no method {other:?}"))),
     }
 }
 
@@ -1279,6 +1321,23 @@ fn write(state: &mut State, params: &Value) -> Answered {
                 }
                 .into());
             }
+            // The archive's own answer is the whole of it only while nothing
+            // buffered has moved the entry: a removal or a rename above this
+            // path leaves the commit writing to something that will not be
+            // there. `bears_on` answers that from the set alone, so the walk of
+            // the entry table below is paid for a write that could actually
+            // collide and not for the four thousand an editor sends that
+            // cannot. DR-032.
+            session.pending.admits(&inside, &change)?;
+            if session.pending.bears_on(&inside) {
+                rpf_core::allows(
+                    &mut session.file,
+                    &session.archive,
+                    &session.pending,
+                    &inside,
+                    &change,
+                )?;
+            }
             Ok(record(session, &inside, change))
         }
         // A path being created has no entry to check against, so the whole
@@ -1286,7 +1345,13 @@ fn write(state: &mut State, params: &Value) -> Answered {
         // table, and a write to an entry that exists is what an editor sends
         // once per save.
         Err(rpf_core::Error::NotFound { .. }) if create => {
-            rpf_core::allows(&mut session.file, &session.archive, &inside, &change)?;
+            rpf_core::allows(
+                &mut session.file,
+                &session.archive,
+                &session.pending,
+                &inside,
+                &change,
+            )?;
             Ok(record(session, &inside, change))
         }
         Err(other) => Err(Failure::Container(other).into()),
@@ -1318,7 +1383,13 @@ fn rename(state: &mut State, params: &Value) -> Answered {
     let to = string(params, "to")?;
     let session = session(state, params)?;
     let change = Change::RenameTo(to.clone());
-    rpf_core::allows(&mut session.file, &session.archive, &from, &change)?;
+    rpf_core::allows(
+        &mut session.file,
+        &session.archive,
+        &session.pending,
+        &from,
+        &change,
+    )?;
     session.pending.set(from.clone(), change);
     Ok(json!({
         "from": from,
@@ -1338,12 +1409,20 @@ fn mkdir(state: &mut State, params: &Value) -> Answered {
 /// The agreement is `rpf_core::allows`, which runs the resolution a commit runs
 /// and throws the result away — so a change buffered here is one the commit
 /// will not refuse for the same reason, and the rules are stated once rather
-/// than once in the library and once on the wire (§1). What it cannot see is a
-/// change that only collides with another change in the same session; the
-/// commit has the set and answers that.
+/// than once in the library and once on the wire (§1). It is given **the
+/// session's own buffer**, so a change that collides only with another change
+/// of the same session is refused here too, and a change the buffer makes
+/// possible — a rename onto a path a buffered removal frees — is accepted here
+/// too. DR-032.
 fn buffer(state: &mut State, params: &Value, inside: &str, change: Change) -> Answered {
     let session = session(state, params)?;
-    rpf_core::allows(&mut session.file, &session.archive, inside, &change)?;
+    rpf_core::allows(
+        &mut session.file,
+        &session.archive,
+        &session.pending,
+        inside,
+        &change,
+    )?;
     Ok(record(session, inside, change))
 }
 
@@ -1713,6 +1792,31 @@ fn discard(state: &mut State, params: &Value) -> Answered {
     let dropped = session.pending.len();
     session.pending.clear();
     Ok(json!({ "discarded": dropped }))
+}
+
+/// `forget` — take one buffered change back, and say what is left.
+///
+/// Three ordinary editor gestures **remove** a change rather than adding one:
+/// create a file and then delete it, make a folder and then delete it, rename
+/// an entry back to the name it started with. Without this the only way to
+/// reach the set those leave was `discard` and a replay of everything else,
+/// which is why a client had to retain every buffered payload to send it again.
+/// DR-030 asked for it; DR-032 is where it was decided.
+///
+/// `forgotten` is false for a path nothing is buffered at, which is not a
+/// failure: a client withdrawing a gesture it may never have sent should not
+/// have to track that, and `paths` says what is actually there either way.
+fn forget(state: &mut State, params: &Value) -> Answered {
+    let inside = string(params, "path")?;
+    let session = session(state, params)?;
+    let forgotten = session.pending.forget(&inside).is_some();
+    let paths: Vec<&str> = session.pending.paths().collect();
+    Ok(json!({
+        "path": inside,
+        "forgotten": forgotten,
+        "pending": paths.len(),
+        "paths": paths,
+    }))
 }
 
 /// Which of the two ways a commit will go, decided without writing anything.

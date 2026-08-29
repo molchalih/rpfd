@@ -162,6 +162,14 @@ describe('the daemon client', { skip: SKIP }, () => {
             .catch((error: unknown) => error);
         assert.ok(illTyped instanceof DaemonError);
         assert.equal(illTyped.code, PROTOCOL.invalidParams);
+
+        // And every one of them names itself beside its number, whichever
+        // numbering scheme it belongs to: `error.data.reason` is on every error
+        // object the daemon writes, so a client never has to ask whether it is
+        // there. DR-032 §5.
+        assert.equal(unknown.failure, 'MethodNotFound');
+        assert.equal(illTyped.failure, 'InvalidParams');
+        assert.equal(missing.failure, 'Refused');
     });
 
     it('carries an entry far bigger than one pipe chunk in each direction', async () => {

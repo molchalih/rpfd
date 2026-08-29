@@ -153,6 +153,14 @@ The daemon reports the same numbers as a JSON-RPC `error.code`. A negative code
 there is JSON-RPC's own — `-32601` for an unknown method, `-32602` for a bad
 parameter — so the two schemes read apart on sight.
 
+Beside the number, every error the daemon writes carries
+`error.data.reason`: the failure's own name, as a stable symbol —
+`AlreadyExists`, `NotFound`, `NeedsKey`, `MethodNotFound`. The number says who
+has to act and is shared by everything in its class; the name says which
+failure it was, for a client that has a distinct answer for one of them and
+would otherwise have to read the sentence. The number is unchanged and is still
+the contract.
+
 An edit that fits where its entry already sits is written in place: `put` does
 it for one file and `commit` for a whole set of buffered ones, deciding for the
 set before writing any of it. Two small edits to a 145 MB archive cost 92 bytes
@@ -175,6 +183,15 @@ until `commit` like any other edit. A rename onto a path the archive already
 holds is refused rather than replacing it — remove that path in the same set,
 which says the same thing out loud — and a directory that holds anything needs
 `-r`, or `"recursive": true`, before it takes its children with it.
+
+Each change the daemon buffers is judged against the archive **and against the
+changes already buffered over it**, so the set a session is building is one the
+commit will accept: a rename onto a path a buffered removal frees is allowed,
+and a rename onto a path another buffered rename claims is refused at the
+request that asks for it rather than at the save. A set holds one change per
+path, so a second change of another kind at one path is refused too, rather
+than the second quietly replacing the first — `forget` takes one change back
+out of the buffer and answers what is left, and `discard` takes all of them.
 
 **One thing about that is unverified, and it is the important one.** A rebuilt
 archive with a different entry count parses, verifies and reads back here, and

@@ -60,13 +60,25 @@ export class DaemonError extends Error {
     readonly method: string;
     /** What the daemon said, unaltered. */
     readonly reason: string;
+    /**
+     * The failure's own name, as `error.data.reason` carries it: an
+     * `rpf_core::Error` variant, one of the daemon's own, or JSON-RPC's.
+     *
+     * Empty for an error object that carried none, which this daemon never
+     * writes — DR-032 §5 puts it on every one — and which an older one would.
+     * A name is a finer classification within {@link code} and never a
+     * replacement for it, so nothing here decides anything the number alone
+     * could not; it decides it more exactly.
+     */
+    readonly failure: string;
 
-    constructor(method: string, code: number, reason: string) {
+    constructor(method: string, code: number, reason: string, failure = '') {
         super(`rpf ${method}: ${reason}`);
         this.name = 'DaemonError';
         this.code = code;
         this.method = method;
         this.reason = reason;
+        this.failure = failure;
     }
 }
 
@@ -275,8 +287,11 @@ export function advise(failure: unknown): Advice {
  * editor: this is the whole of R7.6 for the filesystem surface, and an adapter
  * that decided it would be the one place nothing tests. A {@link Refused} says
  * which word it means, because the client's own view is what decided it; a
- * {@link DaemonError} reaches one through DR-010's classification, and nothing
- * about its sentence is parsed.
+ * {@link DaemonError} reaches one through the failure's own name and, failing
+ * that, through DR-010's classification. Nothing about its sentence is parsed —
+ * that is what {@link DaemonError.failure} is for, and what DR-030 asked the
+ * wire for because exit 6 is `AlreadyExists`, "is a directory that is not
+ * empty" and every other refusal at once.
  */
 export type FileSystemWord =
     | 'exists'
@@ -285,6 +300,21 @@ export type FileSystemWord =
     | 'no-permissions'
     | 'unavailable'
     | 'other';
+
+/**
+ * The failures whose own name says more than their number does.
+ *
+ * Only those: a name that reaches the same word the code reaches is a second
+ * spelling of one fact (`docs/conventions.md` §3), and every failure not named
+ * here is classified by DR-010's number exactly as it was. All three of these
+ * are exit 6, which an editor can only render as "no permissions" — which is
+ * the measurement DR-030 §5 made and DR-032 §5 answered.
+ */
+const WORD_FOR: Record<string, FileSystemWord> = {
+    AlreadyExists: 'exists',
+    NameCollision: 'exists',
+    WrongKind: 'is-a-directory',
+};
 
 /** Which of an editor's filesystem failures this one is. */
 export function fileSystemWordFor(failure: unknown): FileSystemWord {
@@ -295,6 +325,10 @@ export function fileSystemWordFor(failure: unknown): FileSystemWord {
         return 'unavailable';
     }
     if (failure instanceof DaemonError) {
+        const named = WORD_FOR[failure.failure];
+        if (named !== undefined) {
+            return named;
+        }
         switch (failure.code) {
             case EXIT.notFound:
                 return 'not-found';

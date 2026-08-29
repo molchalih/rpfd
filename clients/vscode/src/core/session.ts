@@ -16,6 +16,12 @@
  * archive's shape is answered from the listing **with the set applied** —
  * otherwise a created entry would be invisible until the save. DR-030.
  *
+ * **A gesture is a plan, and the daemon is asked for all of it or none.** A set
+ * holds one change per path and the daemon refuses a second — `Error::Claimed`
+ * — so a gesture that supersedes or re-keys a buffered change takes it back
+ * with `forget` before it offers what it means. Both sides then hold the same
+ * set, which is the whole argument for keeping one here at all. DR-032.
+ *
  * **One writer per archive.** DR-009: an archive is open in one session at a
  * time and the second `open` is refused, so this class is the unit a client
  * counts. Nothing here opens an archive twice, and `close` is what releases the
@@ -25,12 +31,13 @@
 
 import type { Daemon } from './daemon.js';
 import { Refused } from './errors.js';
-import { type Change, Pending } from './pending.js';
+import { type Change, type Offer, Pending, type Plan } from './pending.js';
 import type {
     Cancelled,
     Committed,
     Discarded,
     Extracted,
+    Forgotten,
     Listed,
     Opened,
     Progress,
@@ -38,7 +45,6 @@ import type {
     Structural,
     Summary,
     Verified,
-    Wrote,
 } from './protocol.js';
 import { Tree, isDirectory } from './tree.js';
 import { normalise } from './uri.js';
@@ -96,6 +102,20 @@ export interface WriteOptions {
 export interface RemoveOptions {
     /** Whether a directory takes its children with it. */
     recursive?: boolean;
+}
+
+/** How a rename was asked for. */
+export interface RenameOptions {
+    /**
+     * Whether an entry the destination already holds is removed to make room.
+     *
+     * DR-026's own answer to "I mean to replace that": the target is removed
+     * **in the same change set**, and removals are applied before renames for
+     * exactly that reason. It is not a second flag on the rename and it is not
+     * a delete and a create — the entry keeps its storage class and its kind,
+     * because it is still a rename. DR-032 §3 is what made the set assemblable.
+     */
+    overwrite?: boolean;
 }
 
 /** An archive held open by the daemon, with its buffered changes. */
@@ -229,19 +249,32 @@ export class ArchiveSession {
      * entry added, and therefore a rebuild. Without it such a path is exit 3,
      * because creating an entry a caller merely misspelled is the failure that
      * guards against.
+     *
+     * A write over a path this set removes is the removal withdrawn and these
+     * contents in its place, which is the one change the set holds there.
      */
     async write(inside: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
         const visible = normalise(inside);
         const held = this.pending.address(visible);
+        const there = this.pending.at(held);
         // A rename and a write are two changes at one path, and a set holds at
         // most one — so buffering this would silently drop the rename.
         // `edit::Changes` is keyed by path and has no change that does both, so
-        // there is no set that expresses it either. DR-030.
-        if (this.pending.at(held)?.kind === 'rename') {
+        // there is no set that expresses it either. DR-030, DR-032 §3.
+        if (there?.kind === 'rename') {
             throw new Refused(
                 'refused',
                 visible,
                 `${visible} has a rename buffered against it, and one change set holds one change per entry. Save the archive, then edit it.`,
+            );
+        }
+        // A directory the archive holds is the daemon's own refusal and is left
+        // to it; a directory only this session made is one it cannot see.
+        if (there?.kind === 'mkdir') {
+            throw new Refused(
+                'is-a-directory',
+                visible,
+                `${visible} is a directory this change set makes`,
             );
         }
         // A creation is applied after the renames, so it is addressed by the
@@ -250,21 +283,28 @@ export class ArchiveSession {
         const known = this.onDisk.at(held) !== undefined;
         const path = known ? held : visible;
         const create = !known && options.create === true;
-        await this.daemon.request<Wrote>('write', {
-            handle: this.handle,
-            path,
-            bytes: Buffer.from(bytes).toString('base64'),
-            create,
-        });
-        await this.buffer(path, { kind: 'write', contents: bytes, create });
+        // Writing where a buffered removal is about to take a directory out is
+        // not one change: the set would have to hold the removal and the write
+        // at one path. Only a file can be replaced this way, and that is the
+        // write on its own.
+        const gone = this.committed.at(path);
+        if (this.pending.at(path)?.kind === 'remove' && gone !== undefined && isDirectory(gone)) {
+            throw new Refused(
+                'is-a-directory',
+                visible,
+                `${visible} is a directory this change set removes; a file cannot take its place in one set. Save the archive, then write it.`,
+            );
+        }
+        await this.carry(this.pending.plan(path, visible, { kind: 'write', contents: bytes, create }));
     }
 
     /**
      * Buffers a removal. Nothing on disk changes until {@link save}.
      *
      * A removal of something only a buffered change put there is that change
-     * withdrawn, and the daemon has no method for withdrawing one — so the set
-     * is discarded and sent again. DR-030.
+     * withdrawn — `forget`, one request, where the buffer used to have to be
+     * discarded and offered again. The same is true of a directory removed over
+     * the changes buffered inside it. DR-032 §4.
      */
     async remove(inside: string, options: RemoveOptions = {}): Promise<void> {
         const visible = normalise(inside);
@@ -286,23 +326,21 @@ export class ArchiveSession {
             );
         }
         const held = this.pending.address(visible);
-        if (!this.pending.isCreated(held)) {
-            await this.daemon.request('delete', { handle: this.handle, path: held, recursive });
-        }
-        await this.buffer(held, { kind: 'remove', recursive });
+        await this.carry(this.pending.plan(held, visible, { kind: 'remove', recursive }));
     }
 
     /**
      * Buffers a rename. Nothing on disk changes until {@link save}.
      *
-     * A destination the archive already holds is refused with no way through:
-     * DR-026 has no `overwrite`, because removing the target in the same set
-     * says the same thing out loud and shows up in the plan. What that record
-     * does not say, and what is true, is that the wire cannot carry it — the
-     * daemon resolves a rename against the archive **on disk**, where a target
-     * a buffered removal is about to free is still occupied. DR-030.
+     * A destination the view already holds is refused unless `overwrite` says
+     * to replace it, and replacing it is DR-026's own answer rather than an
+     * override: the target is **removed in the same change set**, where
+     * removals are applied before renames for exactly that reason. That set
+     * could not be assembled through the wire until DR-032 made `allows` judge
+     * a change against the changes buffered beside it; now it can, and the
+     * entry keeps its storage class and its kind because it is still a rename.
      */
-    async rename(from: string, to: string): Promise<void> {
+    async rename(from: string, to: string, options: RenameOptions = {}): Promise<void> {
         const source = normalise(from);
         const target = normalise(to);
         if (source === target) {
@@ -311,20 +349,11 @@ export class ArchiveSession {
         if (!this.listing.at(source)) {
             throw new Refused('not-found', source, `${source} is not in the archive`);
         }
-        if (this.listing.at(target)) {
+        const occupied = this.listing.at(target);
+        if (occupied && options.overwrite !== true) {
             throw new Refused('exists', target, `${target} is already in the archive`);
         }
         const held = this.pending.address(source);
-        // Putting an entry back where it came from is the withdrawal of the
-        // rename that moved it, so the archive on disk holding that path is the
-        // reason it is allowed rather than a reason to refuse.
-        if (this.committed.at(target) && held !== target) {
-            throw new Refused(
-                'exists',
-                target,
-                `${target} is still in the archive on disk, and a rename is resolved against that rather than against what is buffered. Save the archive, then rename.`,
-            );
-        }
         const blocked = this.pending.blocksRename(held);
         if (blocked !== undefined) {
             throw new Refused(
@@ -333,16 +362,27 @@ export class ArchiveSession {
                 `${blocked}. Save the archive, then rename this one.`,
             );
         }
-        // Neither of these is a rename the daemon can be asked for: one moves a
-        // change that put something there, and one takes a change away. Both
-        // are the set being rewritten, which is what `resync` is for.
-        const rewriting =
-            this.pending.isCreated(held) ||
-            (held === target && this.pending.at(held)?.kind === 'rename');
-        if (!rewriting) {
-            await this.daemon.request('rename', { handle: this.handle, from: held, to: target });
+        const plans: Plan[] = [];
+        if (occupied) {
+            // A directory with entries under it is not what "replace this" is
+            // asked about, and taking it recursively is a deletion the user did
+            // not ask for. DR-026 §4 wants that said out loud, as its own act.
+            if (isDirectory(occupied) && occupied.children.size > 0) {
+                throw new Refused(
+                    'refused',
+                    target,
+                    `${target} is a directory that is not empty. Delete it first, then rename over it.`,
+                );
+            }
+            plans.push(
+                this.pending.plan(this.pending.address(target), target, {
+                    kind: 'remove',
+                    recursive: false,
+                }),
+            );
         }
-        await this.buffer(held, { kind: 'rename', to: target });
+        plans.push(this.pending.plan(held, source, { kind: 'rename', to: target }));
+        await this.carry(Pending.merged(plans));
     }
 
     /** Buffers a directory. Nothing on disk changes until {@link save}. */
@@ -351,8 +391,7 @@ export class ArchiveSession {
         if (this.listing.at(visible)) {
             throw new Refused('exists', visible, `${visible} is already in the archive`);
         }
-        await this.daemon.request('mkdir', { handle: this.handle, path: visible });
-        await this.buffer(visible, { kind: 'mkdir' });
+        await this.carry(this.pending.plan(visible, visible, { kind: 'mkdir' }));
     }
 
     /** Drops every buffered change, on both sides. */
@@ -504,36 +543,69 @@ export class ArchiveSession {
     }
 
     /**
-     * Records a change the daemon has already accepted, and brings the daemon's
-     * own set back in line when composing it withdrew or moved a key.
+     * Asks the daemon for a gesture's whole plan, and records it once the
+     * daemon has taken all of it.
      *
-     * The daemon's buffer takes a change at a path and has no method for taking
-     * one away, so the only way to withdraw one is to discard the set and send
-     * what is left. DR-030 says what that costs and what would remove it.
+     * Withdrawals go first, because the daemon refuses a second change at a
+     * path its set already holds — `Error::Claimed`, exit 6, which is DR-032
+     * making the one-change-per-path rule a thing the wire says rather than a
+     * thing each client enforces while the daemon silently dropped one. Each is
+     * one `forget`, where the same withdrawal used to cost a `discard` and a
+     * replay of everything that was left. DR-030 §3 recorded that as a
+     * workaround for a missing method; this is the method.
+     *
+     * A plan is all of it or none of it: a refusal part-way puts back what was
+     * withdrawn, so a gesture the daemon declines costs the gesture and never
+     * the buffer.
      */
-    private async buffer(held: string, change: Change): Promise<void> {
-        if (this.pending.record(held, change) === 'resync') {
-            await this.resync();
+    private async carry(plan: Plan): Promise<void> {
+        const withdrawn: Offer[] = [];
+        const offered: string[] = [];
+        try {
+            for (const path of plan.forget) {
+                const change = this.pending.at(path);
+                await this.daemon.request<Forgotten>('forget', { handle: this.handle, path });
+                if (change !== undefined) {
+                    withdrawn.push([path, change]);
+                }
+            }
+            for (const [path, change] of plan.offer) {
+                await this.offer(path, change);
+                offered.push(path);
+            }
+        } catch (failure) {
+            await this.putBack(withdrawn, offered);
+            throw failure;
         }
+        this.pending.apply(plan);
         this.reshape();
         this.touch(this.pending.size === 0 ? 'clean' : 'dirty');
     }
 
-    /** Discards the daemon's set and sends this one, in the commit's own order. */
-    private async resync(): Promise<void> {
-        await this.daemon.request<Discarded>('discard', { handle: this.handle });
+    /**
+     * Undoes as much of a plan as the daemon took, so that the two sets agree
+     * on the one this session still holds.
+     *
+     * The changes put back were in the daemon's set moments ago and are offered
+     * again unchanged. If even that is refused the two sets are discarded
+     * instead: a set the daemon half holds is worse than no set, because the
+     * save would write it.
+     */
+    private async putBack(withdrawn: readonly Offer[], offered: readonly string[]): Promise<void> {
         try {
-            for (const [path, change] of this.pending.ordered()) {
+            for (const path of offered) {
+                await this.daemon.request<Forgotten>('forget', { handle: this.handle, path });
+            }
+            for (const [path, change] of withdrawn) {
                 await this.offer(path, change);
             }
-        } catch (failure) {
-            // Both sides end empty rather than disagreeing: a set the daemon
-            // half holds is worse than no set, because the save would write it.
+        } catch {
             this.pending.clear();
             await this.daemon
                 .request<Discarded>('discard', { handle: this.handle })
                 .catch(() => undefined);
-            throw failure;
+            this.reshape();
+            this.touch('clean');
         }
     }
 

@@ -442,27 +442,206 @@ fn a_change_is_refused_when_it_is_offered() {
     let mut src = Cursor::new(source);
     let archive = Archive::open(&mut src).expect("parses");
 
+    let nothing = Changes::new();
     rpf_core::allows(
         &mut src,
         &archive,
+        &nothing,
         "data/a.txt",
         &Change::Remove { recursive: false },
     )
     .expect("removing a file is allowed");
 
-    match rpf_core::allows(&mut src, &archive, "data", &Change::MakeDirectory) {
+    match rpf_core::allows(&mut src, &archive, &nothing, "data", &Change::MakeDirectory) {
         Err(Error::AlreadyExists { path }) => assert_eq!(path, "data"),
         other => panic!("expected a refusal, got {other:?}"),
     }
     match rpf_core::allows(
         &mut src,
         &archive,
+        &nothing,
         "nowhere",
         &Change::Remove { recursive: false },
     ) {
         Err(Error::NotFound { path, .. }) => assert_eq!(path, "nowhere"),
         other => panic!("expected not found, got {other:?}"),
     }
+}
+
+/// A change is resolved against the changes already buffered, not only against
+/// the archive on disk — so a set the commit accepts can be assembled one
+/// request at a time, and a set it does not is refused at the request that
+/// makes it so.
+///
+/// Every arm here is one row of DR-030's table, measured against a live daemon
+/// on 2026-08-29 and answered by DR-032.
+#[test]
+fn a_change_is_judged_against_the_changes_already_buffered() {
+    let source = built(&[stored("data/a.txt"), stored("readme.txt")], &[], b"first");
+    let mut src = Cursor::new(source);
+    let archive = Archive::open(&mut src).expect("parses");
+
+    // DR-026 §5: a caller that means to replace the target removes it in the
+    // same set, and removals are applied before renames for exactly that
+    // reason. Resolved against the archive alone this was `AlreadyExists`, so
+    // no order of requests could assemble the set the library accepts.
+    let mut buffered = Changes::new();
+    buffered.set("readme.txt", Change::Remove { recursive: false });
+    rpf_core::allows(
+        &mut src,
+        &archive,
+        &buffered,
+        "data/a.txt",
+        &Change::RenameTo("readme.txt".to_owned()),
+    )
+    .expect("a buffered removal frees the path a rename moves onto");
+
+    // And the other direction: a rename has claimed the path, so a creation
+    // there is refused now rather than at the commit.
+    let mut buffered = Changes::new();
+    buffered.set("readme.txt", Change::RenameTo("moved.txt".to_owned()));
+    match rpf_core::allows(
+        &mut src,
+        &archive,
+        &buffered,
+        "moved.txt",
+        &adding(b"second"),
+    ) {
+        Err(Error::AlreadyExists { path }) => assert_eq!(path, "moved.txt"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // A rename of a directory takes what is inside it with it, so a change
+    // addressing through the old name no longer resolves. The commit answered
+    // this and the offer did not.
+    let mut buffered = Changes::new();
+    buffered.set("data", Change::RenameTo("info".to_owned()));
+    match rpf_core::allows(
+        &mut src,
+        &archive,
+        &buffered,
+        "data/a.txt",
+        &Change::RenameTo("data/b.txt".to_owned()),
+    ) {
+        Err(Error::NotFound { path, .. }) => assert_eq!(path, "data/a.txt"),
+        other => panic!("expected not found, got {other:?}"),
+    }
+
+    // A buffered write is left with nothing to write to when what holds it is
+    // removed.
+    let mut buffered = Changes::new();
+    buffered.set(
+        "data/a.txt",
+        Change::Write {
+            contents: std::sync::Arc::new(b"second".to_vec()),
+            create: false,
+        },
+    );
+    match rpf_core::allows(
+        &mut src,
+        &archive,
+        &buffered,
+        "data",
+        &Change::Remove { recursive: true },
+    ) {
+        Err(Error::NotFound { path, .. }) => assert_eq!(path, "data/a.txt"),
+        other => panic!("expected not found, got {other:?}"),
+    }
+
+    // And a change that reaches none of the buffered ones is decided by the
+    // archive alone, exactly as before.
+    let mut buffered = Changes::new();
+    buffered.set("readme.txt", Change::Remove { recursive: false });
+    rpf_core::allows(
+        &mut src,
+        &archive,
+        &buffered,
+        "data/a.txt",
+        &Change::RenameTo("data/b.txt".to_owned()),
+    )
+    .expect("an unrelated removal decides nothing about this rename");
+}
+
+/// A set holds one change per path, so a second change of another kind at one
+/// path is refused rather than quietly replacing the first.
+///
+/// Measured over the wire on 2026-08-29: `rename readme.txt -> moved.txt`
+/// followed by `write readme.txt` answered `pending: 1` and the commit renamed
+/// nothing. Two writes are not this — saving one file twice is what an editor
+/// does. DR-032.
+#[test]
+fn a_second_change_of_another_kind_at_one_path_is_refused() {
+    let mut buffered = Changes::new();
+    buffered.set("readme.txt", Change::RenameTo("moved.txt".to_owned()));
+
+    match buffered.admits("readme.txt", &adding(b"second")) {
+        Err(Error::Claimed { path, held }) => {
+            assert_eq!(path, "readme.txt");
+            assert_eq!(held, "a rename");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    buffered
+        .admits("readme.txt", &Change::RenameTo("moved.txt".to_owned()))
+        .expect("the same change offered again is not a second change");
+
+    let mut writes = Changes::new();
+    writes.set("readme.txt", adding(b"first"));
+    writes
+        .admits("readme.txt", &adding(b"second"))
+        .expect("saving one file twice is what an editor does");
+
+    writes
+        .admits("elsewhere.txt", &Change::MakeDirectory)
+        .expect("another path is not claimed");
+}
+
+/// The index of changes that restructure is an index over the set and never a
+/// second fact about it.
+#[test]
+fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
+    let mut changes = Changes::new();
+    changes.set(
+        "plain.txt",
+        Change::Write {
+            contents: std::sync::Arc::new(b"x".to_vec()),
+            create: false,
+        },
+    );
+    assert!(
+        !changes.bears_on("plain.txt"),
+        "a plain write cannot move anything"
+    );
+
+    changes.set("data", Change::Remove { recursive: true });
+    assert!(changes.bears_on("data/a.txt"), "a removal reaches below it");
+    assert!(changes.bears_on("data"), "and reaches itself");
+    assert!(
+        !changes.bears_on("elsewhere.txt"),
+        "and reaches nothing else"
+    );
+
+    // Replaced by a plain write, the removal is no longer in the index.
+    changes.set(
+        "data",
+        Change::Write {
+            contents: std::sync::Arc::new(b"x".to_vec()),
+            create: false,
+        },
+    );
+    assert!(!changes.bears_on("data/a.txt"));
+
+    // A rename reaches the path it moves onto as well as the one it moves.
+    changes.set("readme.txt", Change::RenameTo("moved.txt".to_owned()));
+    assert!(changes.bears_on("moved.txt"));
+
+    changes.forget("readme.txt");
+    assert!(
+        !changes.bears_on("moved.txt"),
+        "a forgotten change reaches nothing"
+    );
+    assert_eq!(changes.len(), 2);
 }
 
 /// The root is not an entry a caller may remove or rename: an archive without

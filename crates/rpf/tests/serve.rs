@@ -819,6 +819,378 @@ fn make_bulk_archive(at: &Path, entries: u32, payload: usize) {
     .expect("builds");
 }
 
+/// A change that collides only with another buffered change is refused when it
+/// is offered, rather than accepted and failed at the commit.
+///
+/// Both arms were measured against a live daemon on 2026-08-29 and are rows of
+/// DR-030's table. `allows` resolved each change against the archive on disk
+/// alone, so neither collision was visible until the commit had already
+/// decided everything else. DR-032.
+#[test]
+fn a_change_that_collides_only_with_a_buffered_one_is_refused_when_it_is_offered() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    // `rename a -> b` then `write b {create: true}`: accepted, `pending: 2`,
+    // and the commit answered `AlreadyExists`.
+    let claimed = dir.path().join("claimed.rpf");
+    make_archive(&claimed);
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": claimed.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"moved.yft"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"moved.yft","bytes": BASE64.encode(b"anything"),"create":true}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"commit","params":{"handle":1}}),
+    ]);
+    assert_eq!(answer(&responses, 3)["error"]["code"], json!(6));
+    assert_eq!(
+        answer(&responses, 3)["error"]["data"]["reason"],
+        json!("AlreadyExists"),
+    );
+    assert_eq!(answer(&responses, 4)["result"]["paths"], json!(["art.yft"]));
+    assert_eq!(
+        answer(&responses, 5)["result"]["committed"],
+        json!(1),
+        "the rename that was accepted did not commit: {:?}",
+        answer(&responses, 5),
+    );
+
+    // Renaming a directory and then something inside it: accepted twice, and
+    // the commit answered exit 3, because `tree_of` applies renames in path
+    // order and the directory's runs first.
+    let inside = dir.path().join("inside.rpf");
+    make_archive(&inside);
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": inside.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"rename","params":{
+            "handle":1,"from":"data","to":"info"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"rename","params":{
+            "handle":1,"from":"data/greeting.txt","to":"data/hello.txt"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1}}),
+    ]);
+    assert_eq!(
+        answer(&responses, 3)["error"]["code"],
+        json!(3),
+        "the second rename was accepted: {:?}",
+        answer(&responses, 3),
+    );
+    assert_eq!(answer(&responses, 4)["result"]["committed"], json!(1));
+    let listed = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": inside.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"list","params":{"handle":1,"recursive":true}}),
+    ]);
+    let paths: Vec<&str> = answer(&listed, 2)["result"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["path"].as_str().expect("a path"))
+        .collect();
+    assert!(paths.contains(&"info/greeting.txt"), "{paths:?}");
+}
+
+/// DR-026's replacing rename can be assembled over the wire: a removal in the
+/// same session frees the path a rename moves onto.
+///
+/// The record says a caller that means to replace the target removes it in the
+/// same change set, which is why removals are applied before renames. The
+/// library accepted that set and no order of requests could build it — `delete
+/// readme.txt` then `rename x -> readme.txt` was exit 6, `"readme.txt" is
+/// already in the archive`, measured 2026-08-29. DR-032.
+#[test]
+fn a_removal_in_the_same_session_frees_the_path_a_rename_moves_onto() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("replace.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{
+            "handle":1,"path":"art.yft"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"rename","params":{
+            "handle":1,"from":"data/greeting.txt","to":"art.yft"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"read","params":{"handle":1,"path":"art.yft"}}),
+    ]);
+
+    assert!(
+        answer(&responses, 3)["error"].is_null(),
+        "the rename onto the removed path was refused: {:?}",
+        answer(&responses, 3),
+    );
+    assert_eq!(answer(&responses, 4)["result"]["committed"], json!(2));
+    let bytes = BASE64
+        .decode(
+            answer(&responses, 5)["result"]["bytes"]
+                .as_str()
+                .expect("bytes"),
+        )
+        .expect("base64");
+    assert_eq!(
+        bytes, b"hello there",
+        "the renamed entry did not land on the removed path"
+    );
+}
+
+/// A second change of another kind at one path is refused rather than quietly
+/// replacing the first.
+///
+/// Measured 2026-08-29: `rename art.yft -> moved.yft` then `write art.yft`
+/// answered `pending: 1`, and the commit renamed nothing — the rename left the
+/// buffer with an `Ok` and no client could tell. A set holds one change per
+/// path and that is not changing; what changes is that the wire says so.
+/// DR-032.
+#[test]
+fn a_second_change_of_another_kind_at_one_path_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("claimed.rpf");
+    let resource = make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"moved.yft"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"art.yft","bytes": BASE64.encode(&resource)}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
+        // Two writes at one path are not this: an editor saves one file twice.
+        json!({"jsonrpc":"2.0","id":5,"method":"write","params":{
+            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"once")}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"write","params":{
+            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"twice")}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"read","params":{
+            "handle":1,"path":"data/greeting.txt"}}),
+    ]);
+
+    assert_eq!(answer(&responses, 3)["error"]["code"], json!(6));
+    assert_eq!(
+        answer(&responses, 3)["error"]["data"]["reason"],
+        json!("Claimed"),
+    );
+    assert_eq!(
+        answer(&responses, 4)["result"]["paths"],
+        json!(["art.yft"]),
+        "the rename was replaced by the write it refused",
+    );
+    assert!(
+        answer(&responses, 6)["error"].is_null(),
+        "a re-save was refused"
+    );
+    let bytes = BASE64
+        .decode(
+            answer(&responses, 7)["result"]["bytes"]
+                .as_str()
+                .expect("bytes"),
+        )
+        .expect("base64");
+    assert_eq!(bytes, b"twice", "the second save is what the buffer holds");
+}
+
+/// `forget` takes one buffered change back and says what is left.
+///
+/// Withdrawing a gesture — create a file and delete it, rename an entry back to
+/// the name it started with — used to cost a `discard` and a replay of
+/// everything else, so a client had to retain every buffered payload in order
+/// to send it again. DR-030 asked for this; DR-032 decided it.
+#[test]
+fn one_buffered_change_can_be_taken_back_without_discarding_the_rest() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("forget.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+    let before = fs::read(&archive).expect("readable");
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"kept")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"scratch.txt","bytes": BASE64.encode(b"gone"),"create":true}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"forget","params":{
+            "handle":1,"path":"scratch.txt"}}),
+        // A path nothing is buffered at is not a failure, and says so.
+        json!({"jsonrpc":"2.0","id":5,"method":"forget","params":{
+            "handle":1,"path":"scratch.txt"}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"pending","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":8,"method":"list","params":{"handle":1,"recursive":true}}),
+    ]);
+
+    assert_eq!(answer(&responses, 4)["result"]["forgotten"], json!(true));
+    assert_eq!(answer(&responses, 4)["result"]["pending"], json!(1));
+    assert_eq!(
+        answer(&responses, 4)["result"]["paths"],
+        json!(["data/greeting.txt"]),
+    );
+    assert_eq!(answer(&responses, 5)["result"]["forgotten"], json!(false));
+    assert_eq!(
+        answer(&responses, 6)["result"]["paths"],
+        json!(["data/greeting.txt"]),
+    );
+    // The creation is gone, so the commit is a patch rather than a rebuild.
+    assert_eq!(answer(&responses, 7)["result"]["method"], json!("patch"));
+    assert_eq!(answer(&responses, 7)["result"]["committed"], json!(1));
+    let paths: Vec<&str> = answer(&responses, 8)["result"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["path"].as_str().expect("a path"))
+        .collect();
+    assert!(!paths.contains(&"scratch.txt"), "{paths:?}");
+    assert_ne!(fs::read(&archive).expect("readable"), before);
+}
+
+/// Withdrawing a rename lets the path be changed again, which is the gesture
+/// the wire had no way to express: the buffer took a change at a path and had
+/// no way to take one away.
+#[test]
+fn a_rename_taken_back_frees_the_path_for_another_change() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("again.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"first.yft"}}),
+        // Without taking the first back, this is one change replacing another.
+        json!({"jsonrpc":"2.0","id":3,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"second.yft"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"forget","params":{
+            "handle":1,"path":"art.yft"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"rename","params":{
+            "handle":1,"from":"art.yft","to":"second.yft"}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"list","params":{"handle":1,"recursive":true}}),
+    ]);
+
+    assert_eq!(answer(&responses, 3)["error"]["code"], json!(6));
+    assert_eq!(
+        answer(&responses, 3)["error"]["data"]["reason"],
+        json!("Claimed"),
+    );
+    assert_eq!(answer(&responses, 4)["result"]["pending"], json!(0));
+    assert!(
+        answer(&responses, 5)["error"].is_null(),
+        "{:?}",
+        answer(&responses, 5)
+    );
+    assert_eq!(answer(&responses, 6)["result"]["committed"], json!(1));
+    let paths: Vec<&str> = answer(&responses, 7)["result"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["path"].as_str().expect("a path"))
+        .collect();
+    assert!(paths.contains(&"second.yft"), "{paths:?}");
+}
+
+/// A buffered structural change does not turn every later write into a walk of
+/// the entry table.
+///
+/// The shape this guards is the one that was measured to time out: `allows`
+/// walks the entry table, and asking it per change over a four-thousand-entry
+/// archive with four thousand buffered writes is quadratic. Judging a change
+/// against the buffered set could have reintroduced exactly that, so the
+/// question "could anything buffered have moved this path" is answered from the
+/// set alone, and only a `true` costs the walk. Measured with the question
+/// forced to `true`: 1.5 seconds becomes 34. DR-032.
+#[test]
+fn writes_beside_a_buffered_removal_do_not_each_walk_the_entry_table() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("many.rpf");
+    make_bulk_archive(&archive, 4000, 512);
+
+    let mut requests = vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        // One structural change buffered, which is what makes every write
+        // afterwards a candidate for the whole-set resolution.
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{
+            "handle":1,"path":"bulk/3999.bin"}}),
+    ];
+    for index in 0..3999_u64 {
+        requests.push(
+            json!({"jsonrpc":"2.0","id": 100 + index,"method":"write","params":{
+            "handle":1,"path": format!("bulk/{index:04}.bin"),
+            "bytes": BASE64.encode(vec![9_u8; 512])}}),
+        );
+    }
+    requests.push(json!({"jsonrpc":"2.0","id":9,"method":"pending","params":{"handle":1}}));
+
+    let responses = talk(&requests);
+    assert!(answer(&responses, 2)["error"].is_null());
+    assert_eq!(
+        answer(&responses, 9)["result"]["paths"]
+            .as_array()
+            .expect("paths")
+            .len(),
+        4000,
+        "not every write was buffered",
+    );
+    // And the one write the removal really does reach is refused, which is the
+    // whole reason the question is asked.
+    let reached = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"delete","params":{
+            "handle":1,"path":"bulk","recursive":true}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"bulk/0000.bin","bytes": BASE64.encode(b"late")}}),
+    ]);
+    assert_eq!(
+        answer(&reached, 3)["error"]["code"],
+        json!(3),
+        "{:?}",
+        answer(&reached, 3),
+    );
+}
+
+/// Every error object carries the failure's own name beside its number, so a
+/// client tells `AlreadyExists` from every other refusal without reading the
+/// sentence.
+///
+/// DR-026 made `AlreadyExists` its own variant *because* a client mapping it
+/// onto an editor's filesystem has a distinct answer for it (`FileExists`), and
+/// the wire carried only `code: 6`, shared with every refusal there is — so the
+/// stated reason for the variant was not true over the wire. DR-030 found that;
+/// DR-032 answers it. The number is unchanged and is still what DR-010 says it
+/// is.
+#[test]
+fn an_error_names_the_failure_beside_the_number() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("named.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        // Two refusals that share exit 6 and have nothing else in common.
+        json!({"jsonrpc":"2.0","id":2,"method":"mkdir","params":{"handle":1,"path":"data"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"delete","params":{"handle":1,"path":"data"}}),
+        // And one that is not a refusal at all.
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{"handle":1,"path":"nowhere"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"nonesuch","params":{}}),
+    ]);
+
+    for (id, code, reason) in [
+        (2_u64, 6_i64, "AlreadyExists"),
+        (3, 6, "BadPath"),
+        (4, 3, "NotFound"),
+        (5, -32601, "MethodNotFound"),
+    ] {
+        let object = answer(&responses, id);
+        assert_eq!(object["error"]["code"], json!(code), "{object}");
+        assert_eq!(object["error"]["data"]["reason"], json!(reason), "{object}");
+    }
+}
+
 #[test]
 fn a_second_session_on_one_archive_is_refused_rather_than_detected_later() {
     // Two sessions on one archive is the shape all three demonstrated
