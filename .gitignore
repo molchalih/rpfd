@@ -30,4 +30,13 @@ node_modules/
 dist/
 *.vsix
 
+# A VS Code downloaded to run the editor tests in. Hundreds of megabytes, and
+# re-downloaded on demand.
+.vscode-test/
+
 .DS_Store
+
+# Scratch worktrees, made beside the checkout by tooling that works on a copy.
+# Narrow rather than the whole directory, so a shared `.claude/settings.json`
+# stays trackable if this project ever wants one.
+.claude/worktrees/

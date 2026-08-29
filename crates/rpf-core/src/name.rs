@@ -122,6 +122,20 @@ pub fn check_tree(path: &str) -> Result<()> {
                 "has a component holding \\, which is a separator on Windows",
             );
         }
+        // A name in the blob ends at its first NUL — `docs/rpf-format.md`, the
+        // names blob — so a NUL inside one is not a name this format can hold.
+        // Found by fuzzing, 2026-08-30: it was accepted, written, and read back
+        // truncated at the NUL, so `mkdir "a\0b"` silently produced `a`; and
+        // two paths differing only after a NUL both became `a`, which `build`'s
+        // collision check could not see because it compares the names it was
+        // asked for. This build wrote an archive this build refuses to read.
+        // DR-039.
+        if component.contains('\0') {
+            return refuse(
+                path,
+                "has a component holding a NUL, which ends a name in the blob",
+            );
+        }
     }
     Ok(())
 }
@@ -268,6 +282,27 @@ mod tests {
             tree("./a.txt"),
             Some("navigates with . or .. rather than naming a file"),
         );
+    }
+
+    #[test]
+    fn a_component_holding_a_nul_is_refused() {
+        // Found by fuzzing, 2026-08-30, and it is a tree rule rather than a
+        // host one: a name in the blob ends at its first NUL, so a NUL inside
+        // one is not a name RPF7 can hold on any platform. Reproduced before
+        // this was refused — `mkdir "dir\0b"` produced an entry named `dir`,
+        // and `mkdir "dir\0b"` beside `mkdir "dir\0c"` produced two entries
+        // both named `dir` in one archive, written at exit 0 and refused by
+        // this build's own reader. DR-039.
+        for path in ["a\u{0}b", "\u{0}", "x64/a\u{0}.ytd", "a\u{0}/b"] {
+            let refused = check_tree(path).expect_err("a NUL cannot be in a name");
+            match refused {
+                Error::BadPath { reason, .. } => assert!(reason.contains("NUL"), "{reason}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // And the byte is only refused inside a name, not as a description of
+        // one: nothing here objects to the word.
+        check_tree("nul.txt").expect("a file called nul.txt is a name");
     }
 
     #[test]

@@ -12,7 +12,7 @@ the entry table parsed once and kept warm.
 
 | | |
 |---|---|
-| Mount an archive as a workspace folder | `RPF: Mount Archive as Folder`. Files below it are `rpf:` URIs |
+| Mount an archive as a workspace folder | `RPF: Mount Archive as Folder`, or the same item on a `.rpf` in the explorer, which mounts the one you clicked. Files below it are `rpf:` URIs |
 | Read and edit entries, through nesting | An archive inside an archive is a folder inside a folder; the path addresses through it in one string |
 | Add, delete and rename entries | New File, New Folder, Delete and Rename in the explorer. Each buffers like an edit, and the archive is written by the same one act |
 | Hold changes until you say so | Saving a document buffers the edit. `RPF: Save Archive` writes the archive |
@@ -44,7 +44,9 @@ the entry table parsed once and kept warm.
 Looked for in this order, and each candidate is proved by running
 `rpf --version`:
 
-1. The `rpf.binaryPath` setting.
+1. The `rpf.binaryPath` setting. It is **machine-scoped**: a workspace cannot
+   set it, because a repository that could name the executable this extension
+   runs would be a repository that runs anything it likes.
 2. `bin/<platform>-<arch>/rpf` inside the extension, if one was bundled.
 3. The first `rpf` on `PATH`.
 
@@ -76,8 +78,9 @@ out of scope and stated rather than half-guarded.
 
 ```
 npm install
-npm run check     # type-check only
-npm test          # build, then run the suite
+npm run check       # type-check only
+npm test            # build, then run the suite against a live daemon
+npm run test:editor # build, then run the same client inside a real VS Code
 ```
 
 The suite spawns a real `rpf serve --stdio` and drives it. It looks for the
@@ -91,13 +94,23 @@ anyone lets it — measured here at over fifteen minutes, twice, in a suite whos
 whole run is under a second. A limit turns that into a failure, which is the
 difference that matters in continuous integration.
 
-The line between what is tested and what is not is the same line as the one in
-the source:
+`npm run test:editor` downloads a VS Code into `.vscode-test/` (about 300 MB,
+once) and launches it with this directory as an extension under development. It
+mounts an archive through the command a person runs, walks the explorer into a
+nested archive, edits a file and saves it, and creates, renames and deletes
+entries — and then checks every result with `rpf ls`, `rpf cat` and `rpf verify`
+**from outside the editor**, so a pass means the bytes landed rather than that
+the client believes they did. It runs on an archive it packs itself; set
+`RPF_CORPUS` and it runs the same workflow on the sample archive as well, after
+confirming the `sha256` the fixture records. Without it that half **skips and
+says so**, and `RPF_REQUIRE_CORPUS=1` turns the skip into a failure.
+
+Two lines in the source are the two suites:
 
 | | |
 |---|---|
-| `src/core/` | No editor is imported. Framing, request correlation, progress, cancellation, error mapping, the `rpf:` URI, the archive tree, the buffered-edit state machine, binary discovery, hand-off. All of it is exercised against a live daemon |
-| `src/vscode/`, `src/extension.ts` | The editor's own API. Nothing here can be exercised without a running VS Code, so as little as possible is here |
+| `src/core/` | No editor is imported. Framing, request correlation, progress, cancellation, error mapping, the `rpf:` URI, the archive tree, the buffered-edit state machine, binary discovery, hand-off. All of it is exercised against a live daemon, by `npm test` |
+| `src/vscode/`, `src/extension.ts` | The editor's own API, and as little as possible is here. It cannot be exercised without a running VS Code, so `npm run test:editor` runs one |
 
 ## Packaging
 

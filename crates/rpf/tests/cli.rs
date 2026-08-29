@@ -2315,3 +2315,70 @@ fn a_rebuild_replaces_an_archive_something_holds_open() {
     );
     assert_eq!(run(&["verify", &archive_str]).0, 0, "verify");
 }
+
+/// A donor that is not there names itself and says what was wrong with it.
+///
+/// `Change::Write` names a source rather than carrying bytes (DR-036), so the
+/// failure comes back out of the library rather than off the `fs::read` that
+/// used to happen first. A review of that change measured what it had cost: a
+/// missing donor, a permission-denied one and a directory all rendered as
+/// `i/o failure at offset 0`, with the path gone.
+#[test]
+fn a_donor_that_is_not_there_is_named_and_so_is_the_reason() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let missing = dir.path().join("nope.txt");
+
+    let (code, message) = run_err(&[
+        "put",
+        &archive.display().to_string(),
+        "data/greeting.txt",
+        &missing.display().to_string(),
+    ]);
+    assert_eq!(code, 7, "{message}");
+    assert!(message.contains("nope.txt"), "{message}");
+    assert!(
+        message.contains("No such file") || message.contains("cannot find"),
+        "{message}",
+    );
+}
+
+/// A donor that cannot be reopened or seeked is still accepted.
+///
+/// DR-036 opens a regular file when the library wants it, which a FIFO cannot
+/// answer twice. `rpf put … <(gzip -dc x)` is the shape that would otherwise
+/// have stopped working, so a donor that is not a regular file is read once and
+/// held — the cost every donor used to pay.
+#[test]
+#[cfg(unix)]
+fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let fifo = dir.path().join("pipe");
+
+    let made = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "mkfifo");
+
+    let writing = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        fs::write(&writing, b"through a pipe").expect("the pipe takes it");
+    });
+
+    let (code, out) = run(&[
+        "put",
+        &archive.display().to_string(),
+        "data/greeting.txt",
+        &fifo.display().to_string(),
+    ]);
+    writer.join().expect("the writer finishes");
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+
+    let (code, bytes) = run(&["cat", &archive.display().to_string(), "data/greeting.txt"]);
+    assert_eq!(code, 0);
+    assert_eq!(bytes, b"through a pipe".to_vec());
+}

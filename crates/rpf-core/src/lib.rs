@@ -29,7 +29,7 @@ pub use build::{
     Fetch, FileKind, FileSpec, Payload, Report, Storage, build, directories_of, rebuild, rewrite,
     specs_of,
 };
-pub use edit::{Change, Changes, Structural, allows};
+pub use edit::{Bytes, Change, Changes, Contents, Structural, allows};
 pub use entry::{Entry, EntryKind};
 pub use error::{Category, Error, Result};
 pub use format::{Codec, Version};

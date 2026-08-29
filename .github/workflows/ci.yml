@@ -73,9 +73,11 @@ jobs:
       # exists to prevent and this is what notices when it has not. R10.8.
       - run: cargo fmt --all -- --check
 
-      # Per platform rather than once: the findings differ. There is a
-      # `#[cfg(not(unix))]` file-identity fallback in `serve.rs`, and with the
-      # Unix arm compiled out it produced three findings that Linux never sees.
+      # Per platform rather than once: the findings differ. `serve.rs`'s
+      # `FileId` has three arms and no platform compiles more than two — the
+      # `#[cfg(not(unix))]` fallback plus, on Windows, its own identity arm —
+      # and with the Unix arm compiled out it produced three findings Linux
+      # never sees. DR-037.
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
       # No corpus is present here, and none ever will be: DR-006 keeps game
@@ -90,11 +92,12 @@ jobs:
       # gating one that should have run, fails here rather than going unnoticed.
       #
       # **One number for all three platforms, and that is not an oversight.**
-      # The tests that vary by platform are `#[cfg(unix)]`, so off Unix they are
-      # not compiled at all rather than reported as ignored: they change the
-      # total the suite runs and not the count of corpus skips. Every
-      # corpus-gated test is unconditional. If that ever stops being true this
-      # step is what says so.
+      # The tests that vary by platform are gated by `#[cfg]` — `unix`, and
+      # `any(unix, windows)` for the two that carry DR-009's file identity — so
+      # where they do not apply they are not compiled at all rather than
+      # reported as ignored: they change the total the suite runs and not the
+      # count of corpus skips. Every corpus-gated test is unconditional. If that
+      # ever stops being true this step is what says so.
       #
       # `shell: bash` because the default on the Windows runner is PowerShell,
       # where none of this is even syntax. `pipefail` because bash's own default

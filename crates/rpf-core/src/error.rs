@@ -26,6 +26,22 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// A source of contents the caller supplied could not be read.
+    ///
+    /// [`crate::Contents`] is answered by the frontend, so this crate cannot
+    /// say what the source was — the implementation names it, and this carries
+    /// that name back out unchanged. Distinct from [`Error::Io`], which is
+    /// about the archive and names an offset in it; a donor file has no offset
+    /// in the archive, and what the caller needs is which file. DR-036.
+    #[error("{name}: {source}")]
+    Contents {
+        /// The source, as the frontend that supplied it names it.
+        name: String,
+        /// The underlying failure.
+        #[source]
+        source: io::Error,
+    },
+
     /// The bytes at the archive's base are not an RPF7 header.
     ///
     /// **Its category is decided by `found`.** The four bytes are the only
@@ -600,7 +616,7 @@ impl Error {
     #[must_use]
     pub fn category(&self) -> Category {
         match *self {
-            Self::Io { .. } => Category::Io,
+            Self::Io { .. } | Self::Contents { .. } => Category::Io,
             Self::NeedsKey { .. } => Category::NeedsKey,
             Self::UnsupportedVersion { .. } | Self::UnrecognisedExecutable { .. } => {
                 Category::Unsupported
@@ -661,6 +677,7 @@ impl Error {
     pub fn name(&self) -> &'static str {
         match *self {
             Self::Io { .. } => "Io",
+            Self::Contents { .. } => "Contents",
             Self::NotAnArchive { .. } => "NotAnArchive",
             Self::UnsupportedVersion { .. } => "UnsupportedVersion",
             Self::UnrecognisedExecutable { .. } => "UnrecognisedExecutable",
@@ -735,7 +752,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 30;
+    const VARIANTS: usize = 31;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -891,6 +908,13 @@ mod tests {
             (
                 Error::Io {
                     offset: 0,
+                    source: io(),
+                },
+                Category::Io,
+            ),
+            (
+                Error::Contents {
+                    name: "donor.bin".to_owned(),
                     source: io(),
                 },
                 Category::Io,

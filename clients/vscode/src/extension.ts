@@ -39,7 +39,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
     );
 
-    register(context, 'rpf.mountArchive', () => mount(archives, files));
+    register(context, 'rpf.mountArchive', (uri?: vscode.Uri) => mount(archives, files, uri));
     register(context, 'rpf.unmountArchive', () => unmount(archives));
     register(context, 'rpf.saveArchive', () => save(archives, files));
     register(context, 'rpf.previewSave', () => preview(archives));
@@ -59,6 +59,15 @@ export function deactivate(): void {
     // Nothing: `Archives.dispose` is a subscription.
 }
 
+/**
+ * One command, with whatever it throws turned into something to act on.
+ *
+ * The report is not awaited: it ends in an error notification carrying a
+ * button, and a notification with a button is on screen until the user answers
+ * it. Awaiting one here would make the command finish when the user
+ * acknowledged the failure rather than when the failure happened — and a
+ * command invoked by another command would wait just as long.
+ */
 function register(
     context: vscode.ExtensionContext,
     id: string,
@@ -69,7 +78,7 @@ function register(
             try {
                 await run(...args);
             } catch (failure) {
-                await report(failure, id);
+                void report(failure, id);
             }
         }),
     );
@@ -89,15 +98,27 @@ async function remount(archives: Archives): Promise<void> {
     }
 }
 
-/** R7.2 — an archive as a folder in the explorer. */
-async function mount(archives: Archives, files: RpfFileSystem): Promise<void> {
-    const picked = await vscode.window.showOpenDialog({
-        canSelectMany: false,
-        openLabel: 'Mount',
-        filters: { 'RAGE archives': ['rpf'] },
-    });
-    const chosen = picked?.[0];
+/**
+ * R7.2 — an archive as a folder in the explorer.
+ *
+ * The archive is the one the command was given: the explorer context menu
+ * passes the file that was right-clicked, and a command that asked again would
+ * be ignoring what the user had already said. Only an invocation with nothing
+ * to go on — the command palette — opens a dialog.
+ */
+async function mount(
+    archives: Archives,
+    files: RpfFileSystem,
+    given?: vscode.Uri,
+): Promise<void> {
+    const chosen = given ?? (await ask());
     if (!chosen) {
+        return;
+    }
+    if (chosen.scheme !== 'file') {
+        void vscode.window.showErrorMessage(
+            `${chosen.toString()} is not a file on this machine. An archive is opened by its own path.`,
+        );
         return;
     }
     const mounted = await archives.mount(chosen.fsPath);
@@ -117,11 +138,21 @@ async function mount(archives: Archives, files: RpfFileSystem): Promise<void> {
         { uri: root, name },
     );
     if (!added) {
-        await vscode.window.showErrorMessage(
+        void vscode.window.showErrorMessage(
             `${name} could not be added to the workspace. Opening the folder directly instead.`,
         );
         await vscode.commands.executeCommand('vscode.openFolder', root, { forceNewWindow: true });
     }
+}
+
+/** Which archive to mount, when the invocation did not name one. */
+async function ask(): Promise<vscode.Uri | undefined> {
+    const picked = await vscode.window.showOpenDialog({
+        canSelectMany: false,
+        openLabel: 'Mount',
+        filters: { 'RAGE archives': ['rpf'] },
+    });
+    return picked?.[0];
 }
 
 /** Closes an archive, which is what releases the daemon's claim on it. */
@@ -158,7 +189,7 @@ async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
     }
     const { session } = mount;
     if (session.state === 'clean') {
-        await vscode.window.showInformationMessage(
+        void vscode.window.showInformationMessage(
             `${basename(session.path)} has no buffered edits.`,
         );
         return;
@@ -189,7 +220,7 @@ async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
         return;
     }
     const how = saved.method === 'patch' ? 'patched in place' : 'rebuilt';
-    await vscode.window.showInformationMessage(
+    void vscode.window.showInformationMessage(
         `${basename(session.path)}: ${saved.committed} edit(s) ${how}; ${saved.entries} entries, ${saved.len} bytes.`,
     );
 }
@@ -201,7 +232,7 @@ async function preview(archives: Archives): Promise<void> {
         return;
     }
     if (mount.session.state === 'clean') {
-        await vscode.window.showInformationMessage('There are no buffered edits to preview.');
+        void vscode.window.showInformationMessage('There are no buffered edits to preview.');
         return;
     }
     const planned = await mount.session.preview();
@@ -223,7 +254,7 @@ async function preview(archives: Archives): Promise<void> {
         planned.structural.length > 0
             ? `${planned.structural.length} change(s) alter what the archive holds`
             : `${planned.rejected.length} edit(s) do not fit where they are`;
-    await vscode.window.showInformationMessage(
+    void vscode.window.showInformationMessage(
         planned.method === 'patch'
             ? 'A save would patch every edit in place.'
             : `A save would rebuild the archive: ${why}.`,
@@ -246,7 +277,7 @@ async function discard(archives: Archives, files: RpfFileSystem): Promise<void> 
     }
     const dropped = await mount.session.discard();
     files.changed(mount.session.path);
-    await vscode.window.showInformationMessage(`Discarded ${dropped} edit(s).`);
+    void vscode.window.showInformationMessage(`Discarded ${dropped} edit(s).`);
 }
 
 /** Reads every entry back and reports what did not check out. */
@@ -265,7 +296,7 @@ async function verify(archives: Archives): Promise<void> {
             mount.session.verify((step) => progress.report(reported(step))),
     );
     if (verified.problems.length === 0) {
-        await vscode.window.showInformationMessage(
+        void vscode.window.showInformationMessage(
             `${verified.entries_checked} entries verified, no problems.`,
         );
         return;
@@ -275,7 +306,7 @@ async function verify(archives: Archives): Promise<void> {
         log().appendLine(`  ${problem.path}: ${problem.reason}`);
     }
     log().show(true);
-    await vscode.window.showWarningMessage(
+    void vscode.window.showWarningMessage(
         `${verified.problems.length} of ${verified.entries_checked} entries did not read back.`,
     );
 }
@@ -284,14 +315,14 @@ async function verify(archives: Archives): Promise<void> {
 async function handOff(archives: Archives, uri?: vscode.Uri): Promise<void> {
     const chosen = uri ?? vscode.window.activeTextEditor?.document.uri;
     if (!chosen || chosen.scheme !== SCHEME) {
-        await vscode.window.showInformationMessage(
+        void vscode.window.showInformationMessage(
             'Select a file inside a mounted archive first.',
         );
         return;
     }
     const mount = archives.at(chosen.query);
     if (!mount) {
-        await vscode.window.showInformationMessage(`${chosen.query} is not mounted.`);
+        void vscode.window.showInformationMessage(`${chosen.query} is not mounted.`);
         return;
     }
     const inside = chosen.path.replace(/^\/+/, '');
@@ -313,7 +344,7 @@ async function endHandOff(archives: Archives): Promise<void> {
     }
     const outstanding = mount.handoff.outstanding().length;
     mount.handoff.dispose();
-    await vscode.window.showInformationMessage(`Stopped watching ${outstanding} file(s).`);
+    void vscode.window.showInformationMessage(`Stopped watching ${outstanding} file(s).`);
 }
 
 /** One of the mounted archives, asked for when there is more than one. */
@@ -321,7 +352,7 @@ async function choose(archives: Archives, title: string): Promise<Mounted | unde
     const open = archives.all();
     const only = open[0];
     if (only === undefined) {
-        await vscode.window.showInformationMessage(
+        void vscode.window.showInformationMessage(
             'No archive is mounted. Run "RPF: Mount Archive as Folder".',
         );
         return undefined;

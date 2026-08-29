@@ -15,6 +15,12 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 tempfile = "3"
 thiserror = "2.0"
 
+# The file identity DR-009's claim is taken on. `MetadataExt::volume_serial_number`
+# and `::file_index` are unstable, and §11 does not want the FFI call written
+# here. docs/conventions.md §14, DR-037.
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1"
+
 [dev-dependencies]
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 tempfile = "3"

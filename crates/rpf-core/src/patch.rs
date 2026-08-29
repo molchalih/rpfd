@@ -247,11 +247,12 @@ where
         // one. So the sink here is a buffer, and `store` is still the one place
         // the rule is applied.
         let mut buffer = Cursor::new(Vec::new());
+        let mut opened = contents.open()?;
         let written = store(
             holder.version(),
             path,
             kind_of(path, &entry)?,
-            &mut Cursor::new(contents.as_slice()),
+            &mut opened,
             &mut buffer,
         )?;
         let mut payload = buffer.into_inner();

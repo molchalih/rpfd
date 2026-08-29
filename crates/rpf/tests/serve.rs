@@ -2290,13 +2290,28 @@ fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn a_second_name_for_one_file_is_the_same_archive() {
-    // A hard link is a second directory entry for one inode, and both spellings
+    // A hard link is a second directory entry for one file, and both spellings
     // canonicalise to themselves, so a claim keyed on the canonical path
     // accepted both. That is two sessions on one archive — the state DR-009
     // exists to make unreachable — and after either one rebuilds, the other
     // holds an entry table describing bytes that have moved.
+    //
+    // `#[cfg(any(unix, windows))]` rather than no gate: `FileId` still has an
+    // identity-less arm, and a refusal is something it can never produce, so
+    // this asserts nothing a third platform could pass. On Windows
+    // `fs::hard_link` is `CreateHardLinkW` and the identity is the volume
+    // serial and file index, so this is the same test against the same
+    // filesystem feature; it ran only on Unix until R10.5, and it failed on
+    // Windows before that. DR-037.
+    //
+    // **It requires a volume that names its files**, which every NTFS volume
+    // does and the temporary directory is on in both places this suite runs. A
+    // volume that answers with a zero serial — a redirector, measured in
+    // DR-037 — leaves DR-009's claim on the path alone, and there is nothing
+    // here to catch. That is the same NTFS-shaped assumption DR-035 already
+    // makes about `fs::rename`, stated rather than discovered.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2379,13 +2394,16 @@ fn a_firmlink_spelling_is_the_same_archive() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn a_session_still_holds_its_archive_after_its_own_rebuild() {
     // A rebuild replaces the archive by rename, so the file the session holds
-    // afterwards is a different inode from the one it opened. A claim that kept
-    // the inode it first saw would go on claiming a file nobody has and stop
-    // recognising the one it does have — and a second session on that is the
-    // corruption again.
+    // afterwards is not the file it opened — a different inode on Unix, a
+    // different file index on Windows. A claim that kept the identity it first
+    // saw would go on claiming a file nobody has and stop recognising the one
+    // it does have — and a second session on that is the corruption again.
+    //
+    // Gated and preconditioned exactly as the hard-link test above is, and for
+    // the same two reasons.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);

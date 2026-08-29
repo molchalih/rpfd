@@ -21,38 +21,107 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{Read, Seek},
+    fmt,
+    io::{self, Cursor, Read, Seek},
     sync::Arc,
 };
 
 use crate::{
     archive::Archive,
-    build::{FileKind, FileSpec, Storage, directories_of, kind_of, specs_of},
+    build::{FileKind, FileSpec, Payload, Storage, directories_of, kind_of, specs_of},
     error::{Error, Result},
     format::{folded, resource::MAGIC_RSC7, same_name},
     name,
 };
+
+/// Where a [`Change::Write`]'s bytes come from, opened whenever they are
+/// wanted.
+///
+/// A seam the library asks and the frontend answers, exactly as [`Scratch`]
+/// is for scratch space — DR-022's shape, and the reason paths do not appear
+/// inside this crate (`docs/conventions.md` §7). The command line answers with
+/// the donor file it was given, so the bytes are never resident; the daemon
+/// answers with [`Bytes`], because a payload that arrived over a pipe is
+/// already in hand and reopening it would mean asking the client for it again.
+///
+/// **Opened more than once, and that is the point.** `tree_of` reads four
+/// bytes to decide a new entry's kind, `plan` reads the whole payload to
+/// compress it and measure the result, and a rebuild reads it again to write
+/// it — so this answers a fresh stream each time rather than one the callers
+/// have to rewind between them.
+///
+/// `Send + Sync` because [`Change`] carried an `Arc<Vec<u8>>` and was both, and
+/// a trait object silently taking that away from a public type is a break with
+/// no deprecation for any consumer that moves a set into a thread.
+///
+/// [`Scratch`]: crate::Scratch
+pub trait Contents: fmt::Debug + Send + Sync {
+    /// The bytes, from their start.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source cannot be opened as.
+    fn open(&self) -> Result<Box<dyn Payload + '_>>;
+
+    /// How many bytes there are, without reading them.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the source cannot be measured with.
+    fn len(&self) -> Result<u64>;
+
+    /// Whether there are none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Contents::len`], which is what it asks.
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
+/// Contents a caller already holds.
+///
+/// Shared rather than owned, because `split` divides a set into one set per
+/// nested archive and a cascading rebuild splits again at every level: a
+/// payload owned here would be one copy of it per level. Measured 2026-08-29,
+/// before this was shared — an 11 MB donor through `rpf put` peaked at 33.5 MB
+/// of live heap, and a rebuild of a payload 6 MB larger added 12 MB to its own
+/// peak. DR-032.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bytes(Arc<Vec<u8>>);
+
+impl Bytes {
+    /// Holds `contents`.
+    #[must_use]
+    pub fn new(contents: Vec<u8>) -> Self {
+        Self(Arc::new(contents))
+    }
+}
+
+impl Contents for Bytes {
+    fn open(&self) -> Result<Box<dyn Payload + '_>> {
+        Ok(Box::new(Cursor::new(self.0.as_slice())))
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(u64::try_from(self.0.len()).unwrap_or(u64::MAX))
+    }
+}
 
 /// One change to what an archive holds.
 ///
 /// Keyed by the path it is about, which is why a rename carries only its
 /// destination: the source is the key. At most one change per path, so a set
 /// cannot ask for two things at one address (§5).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Change {
     /// New contents for a path.
     Write {
         /// The file as it exists **outside** the archive: for a resource, its
         /// `RSC7` header and still-deflated body. The same form
         /// [`Archive::extract`] returns.
-        ///
-        /// Shared rather than owned, because `split` divides a set into one
-        /// set per nested archive and a cascading rebuild splits again at every
-        /// level: a payload owned here is one copy of it per level. Measured
-        /// 2026-08-29, before this was shared — an 11 MB donor through `rpf
-        /// put` peaked at 33.5 MB of live heap, and a rebuild of a payload
-        /// 6 MB larger added 12 MB to its own peak. DR-032.
-        contents: Arc<Vec<u8>>,
+        contents: Arc<dyn Contents>,
         /// Whether a path the archive does not hold is created rather than
         /// refused. Without it a write to a path that is not there is
         /// [`Error::NotFound`], which is what it has always been: creating an
@@ -132,7 +201,7 @@ impl Structural {
 /// Ordered by path, so the same set always reaches the same archive: an entry
 /// table is laid out from the tree, and a tree assembled in a different order
 /// is a different archive.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Changes {
     at: BTreeMap<String, Change>,
     /// The keys of `at` whose changes are not plain writes, which is an index
@@ -225,7 +294,7 @@ impl Changes {
                     (
                         path,
                         Change::Write {
-                            contents: Arc::new(contents),
+                            contents: Arc::new(Bytes::new(contents)),
                             create: false,
                         },
                     )
@@ -284,9 +353,21 @@ impl Changes {
         let Some(held) = self.at.get(path) else {
             return Ok(());
         };
-        if held == change
-            || matches!(*held, Change::Write { .. }) && matches!(*change, Change::Write { .. })
-        {
+        // Spelled out rather than derived: a write's contents may be a file
+        // this crate never reads until it is asked to, so two of them cannot be
+        // compared — and never needed to be. Two writes at one path are the
+        // case the record calls a replacement (DR-032); everything else is the
+        // same change offered twice.
+        let same = match (held, change) {
+            (Change::Write { .. }, Change::Write { .. })
+            | (Change::MakeDirectory, Change::MakeDirectory) => true,
+            (Change::Remove { recursive: held }, Change::Remove { recursive: asked }) => {
+                held == asked
+            }
+            (Change::RenameTo(held), Change::RenameTo(asked)) => held == asked,
+            _ => false,
+        };
+        if same {
             return Ok(());
         }
         Err(Error::Claimed {
@@ -322,15 +403,16 @@ impl Changes {
         self.at.get(path)
     }
 
-    /// The contents a [`Change::Write`] at `path` carries.
+    /// The contents a [`Change::Write`] at `path` carries, unopened.
     ///
     /// What a reader asks when it wants what was written rather than what is on
     /// disk. `None` for a path with no change, and for a change that is not a
-    /// write.
+    /// write. The bytes are not read here — [`Contents::open`] is what reads
+    /// them, and a caller that only wants the length asks [`Contents::len`].
     #[must_use]
-    pub fn contents_at(&self, path: &str) -> Option<&[u8]> {
+    pub fn contents_at(&self, path: &str) -> Option<&dyn Contents> {
         match self.at.get(path) {
-            Some(Change::Write { contents, .. }) => Some(contents.as_slice()),
+            Some(Change::Write { contents, .. }) => Some(&**contents),
             _ => None,
         }
     }
@@ -466,6 +548,26 @@ fn moved(path: &str, from: &str, to: &str) -> String {
     }
 }
 
+/// Reads up to `into.len()` bytes, tolerating a source that answers in pieces.
+///
+/// A payload shorter than the buffer is not a failure: it is a file that is not
+/// a resource.
+fn fill(from: &mut dyn Read, into: &mut [u8]) -> Result<usize> {
+    let mut filled = 0_usize;
+    while filled < into.len() {
+        let Some(rest) = into.get_mut(filled..) else {
+            break;
+        };
+        match from.read(rest) {
+            Ok(0) => break,
+            Ok(read) => filled = filled.saturating_add(read),
+            Err(ref error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Error::recovered(0, error)),
+        }
+    }
+    Ok(filled)
+}
+
 /// The kind of entry a payload has to be written as.
 ///
 /// The payload decides, because for a new entry there is no entry to ask. A
@@ -474,15 +576,23 @@ fn moved(path: &str, from: &str, to: &str) -> String {
 /// which is what `build` does with every file `pack` gives it. DR-026, and Q7
 /// is why this is safe on the evidence there is: 27 entries of the sample, zero
 /// disagreements between the resource bit and the payload's own magic.
-fn kind_for(contents: &[u8]) -> FileKind {
-    if contents.get(0..4) == Some(&MAGIC_RSC7) {
+///
+/// # Errors
+///
+/// Whatever the payload's own source fails to open or read with.
+fn kind_for(contents: &dyn Contents) -> Result<FileKind> {
+    // Four bytes off the front, not the payload: a 2.9 GB donor decides its own
+    // kind for the price of one read.
+    let mut magic = [0_u8; MAGIC_RSC7.len()];
+    let read = fill(&mut *contents.open()?, &mut magic)?;
+    Ok(if magic.get(..read) == Some(MAGIC_RSC7.as_slice()) {
         FileKind::Resource
     } else {
         FileKind::Binary {
             storage: Storage::Deflate,
             encryption: 0,
         }
-    }
+    })
 }
 
 /// The entry `path` names in `archive`, refusing the root.
@@ -537,7 +647,7 @@ pub(crate) fn tree_of(archive: &Archive, changes: &Changes) -> Result<Tree> {
         let Change::Remove { recursive } = *change else {
             continue;
         };
-        remove(archive, &mut tree, path, recursive)?;
+        remove(archive, &mut tree, changes, path, recursive)?;
     }
     for (path, change) in changes {
         let Change::RenameTo(ref to) = *change else {
@@ -553,10 +663,10 @@ pub(crate) fn tree_of(archive: &Archive, changes: &Changes) -> Result<Tree> {
         else {
             continue;
         };
-        write(archive, &mut tree, path, contents, create)?;
+        write(archive, &mut tree, path, &**contents, create)?;
     }
     for (path, change) in changes {
-        if *change != Change::MakeDirectory {
+        if !matches!(*change, Change::MakeDirectory) {
             continue;
         }
         make_directory(&mut tree, path)?;
@@ -589,9 +699,41 @@ fn check_one_each(archive: &Archive, changes: &Changes) -> Result<()> {
     Ok(())
 }
 
+/// Whether `changes` puts anything below `held` that is not there yet.
+///
+/// A directory the set is about to write into is not empty, whatever the
+/// archive says. Asked because [`tree_of`] applies removals before writes, so a
+/// removal on its own sees only what is on disk. DR-038.
+fn arrives_under(changes: &Changes, held: &str) -> bool {
+    // The restructuring index, not the whole set: every arm below is a
+    // restructuring change, so this is the same answer over a strictly smaller
+    // walk — and DR-032 added that index precisely so a removal does not scan
+    // four thousand plain writes to match none of them.
+    changes
+        .restructuring_changes()
+        .any(|(at, change)| match *change {
+            // A write to a path that already exists needs no room made for it,
+            // and the tree already counts it. Only a creation adds one. The
+            // path *at* `held` is the replacing case DR-026 allows, so it is
+            // not an arrival — compared by name rather than by bytes, because
+            // in this module two spellings of one name are one path.
+            Change::Write { create: true, .. } | Change::MakeDirectory => {
+                !same_name(at, held) && at_or_under(at, held)
+            }
+            Change::RenameTo(ref to) => !same_name(to, held) && at_or_under(to, held),
+            _ => false,
+        })
+}
+
 /// Takes the entry at `path` out of the tree, with its children when it is a
 /// directory and `recursive`.
-fn remove(archive: &Archive, tree: &mut Tree, path: &str, recursive: bool) -> Result<()> {
+fn remove(
+    archive: &Archive,
+    tree: &mut Tree,
+    changes: &Changes,
+    path: &str,
+    recursive: bool,
+) -> Result<()> {
     let index = entry_at(archive, path)?;
     let held = archive.path(index)?;
     if !archive.entry(index)?.is_directory() {
@@ -608,7 +750,7 @@ fn remove(archive: &Archive, tree: &mut Tree, path: &str, recursive: bool) -> Re
         .filter(|inside| *inside != held.as_str())
         .filter(|inside| at_or_under(inside, &held))
         .count();
-    if children > 0 && !recursive {
+    if !recursive && (children > 0 || arrives_under(changes, &held)) {
         return Err(Error::BadPath {
             path: held,
             reason: "is a directory that is not empty",
@@ -664,7 +806,7 @@ fn write(
     archive: &Archive,
     tree: &mut Tree,
     path: &str,
-    contents: &[u8],
+    contents: &dyn Contents,
     create: bool,
 ) -> Result<()> {
     match archive.find(path) {
@@ -704,7 +846,7 @@ fn write(
             tree.nodes.push(Node {
                 spec: FileSpec {
                     path: path.to_owned(),
-                    kind: kind_for(contents),
+                    kind: kind_for(contents)?,
                 },
                 source: Source::Written(path.to_owned()),
             });

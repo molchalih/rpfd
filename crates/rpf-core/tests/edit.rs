@@ -107,7 +107,7 @@ fn contents(bytes: &[u8], path: &str) -> Vec<u8> {
 /// A write that creates the path it names.
 fn adding(contents: &[u8]) -> Change {
     Change::Write {
-        contents: std::sync::Arc::new(contents.to_vec()),
+        contents: std::sync::Arc::new(rpf_core::Bytes::new(contents.to_vec())),
         create: true,
     }
 }
@@ -200,7 +200,7 @@ fn a_write_that_did_not_ask_to_create_is_still_not_found() {
     let changes = Changes::one(
         "b.txt",
         Change::Write {
-            contents: std::sync::Arc::new(b"second".to_vec()),
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"second".to_vec())),
             create: false,
         },
     );
@@ -533,7 +533,7 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
     buffered.set(
         "data/a.txt",
         Change::Write {
-            contents: std::sync::Arc::new(b"second".to_vec()),
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"second".to_vec())),
             create: false,
         },
     );
@@ -605,7 +605,7 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
     changes.set(
         "plain.txt",
         Change::Write {
-            contents: std::sync::Arc::new(b"x".to_vec()),
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"x".to_vec())),
             create: false,
         },
     );
@@ -626,7 +626,7 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
     changes.set(
         "data",
         Change::Write {
-            contents: std::sync::Arc::new(b"x".to_vec()),
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"x".to_vec())),
             create: false,
         },
     );
@@ -693,4 +693,165 @@ fn the_entry_count_and_names_blob_follow_the_change() {
     // this repository can prove about it. DR-026.
     let verified = rpf_core::Verified::of(&mut handle, &after, &mut Unwatched).expect("verifies");
     verified.outcome().expect("reads back clean");
+}
+
+/// A change set can still cross a thread.
+///
+/// `Change::Write` carried an `Arc<Vec<u8>>` and was `Send + Sync` by
+/// derivation; DR-036 made it a trait object, which takes both away unless the
+/// trait asks for them. Silently losing them on a public type is a break with
+/// no deprecation for any consumer that moves a set into a thread, and nothing
+/// in this workspace threads, so nothing else would notice.
+#[test]
+fn a_change_set_is_still_send_and_sync() {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+
+    assert_send::<rpf_core::Changes>();
+    assert_sync::<rpf_core::Changes>();
+    assert_send::<rpf_core::Change>();
+    assert_sync::<rpf_core::Change>();
+}
+
+/// A directory the same set is about to put something into is not empty, and a
+/// removal that did not say `recursive` is refused.
+///
+/// `tree_of` applies removals before writes, so without this the removal sees
+/// the archive's empty directory, takes it out, and the write implies it back:
+/// the set is self-consistent, exit 0, and the directory the caller said to
+/// delete is still there holding a file. Measured 2026-08-29 and recorded in
+/// DR-034 as accepted; this is where it stops being. It is DR-032's rule one
+/// level further in — a change is judged against the buffered set, not against
+/// the archive alone.
+#[test]
+fn a_directory_the_set_writes_into_is_not_empty_either() {
+    let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
+    assert_eq!(paths(&source), vec!["c.txt", "empty"]);
+
+    let mut changes = Changes::new();
+    changes.set(
+        "empty/fresh.txt",
+        Change::Write {
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
+            create: true,
+        },
+    );
+    changes.set("empty", Change::Remove { recursive: false });
+
+    match rewriting(&source, &changes) {
+        Err(Error::BadPath { path, reason }) => {
+            assert_eq!(path, "empty");
+            assert_eq!(reason, "is a directory that is not empty");
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|b| b.len())),
+    }
+}
+
+/// The same set with `recursive` says what it means and is allowed.
+///
+/// Not a refusal of the combination — a caller may genuinely want the old
+/// directory gone and a new one implied by the write. `recursive` is how that
+/// is said out loud, which is the shape DR-026 chose for a replacing rename.
+#[test]
+fn saying_recursive_allows_the_directory_to_be_rebuilt_by_the_write() {
+    let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
+
+    let mut changes = Changes::new();
+    changes.set(
+        "empty/fresh.txt",
+        Change::Write {
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
+            create: true,
+        },
+    );
+    changes.set("empty", Change::Remove { recursive: true });
+
+    let rebuilt = rewritten(&source, &changes);
+    assert_eq!(paths(&rebuilt), vec!["c.txt", "empty", "empty/fresh.txt"]);
+}
+
+/// The daemon refuses it too, because `allows` asks the same question.
+///
+/// The wire is where this was found: `write empty/fresh.txt {create:true}` then
+/// `delete empty {recursive:false}` came back `pending: 2` and committed to a
+/// directory that was supposed to be gone. `allows` resolves the offered change
+/// against the buffered set through `tree_of`, so the rule lands in one place
+/// and both frontends get it. DR-038.
+#[test]
+fn the_wire_refuses_the_removal_the_set_has_already_filled() {
+    let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
+    let mut src = std::io::Cursor::new(source.clone());
+    let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+
+    let mut buffered = Changes::new();
+    buffered.set(
+        "empty/fresh.txt",
+        Change::Write {
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
+            create: true,
+        },
+    );
+
+    let offered = Change::Remove { recursive: false };
+    match rpf_core::allows(&mut src, &archive, &buffered, "empty", &offered) {
+        Err(Error::BadPath { path, reason }) => {
+            assert_eq!(path, "empty");
+            assert_eq!(reason, "is a directory that is not empty");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // And with `recursive`, which is how a caller says it meant both.
+    let said = Change::Remove { recursive: true };
+    rpf_core::allows(&mut src, &archive, &buffered, "empty", &said).expect("recursive is allowed");
+}
+
+/// A replacing rename spelled with different capitalisation is still a
+/// replacement.
+///
+/// `arrives_under` asks whether the set puts something *below* a directory
+/// being removed, and the path *at* it is the replacing case DR-026 allows.
+/// Comparing those two by bytes made the allowance depend on the caller
+/// spelling the directory exactly as the archive does, in a module where
+/// `at_or_under` folds case and two spellings of one name are one path — so
+/// `EMPTY` was read as arriving under `empty` and refused with a reason that
+/// was not true. DR-038.
+#[test]
+fn a_replacing_rename_holds_however_the_caller_spells_it() {
+    for spelling in ["empty", "EMPTY", "Empty"] {
+        let source = built(&[stored("a.txt")], &["empty".to_owned()], b"same");
+        let mut changes = Changes::new();
+        changes.set("empty", Change::Remove { recursive: false });
+        changes.set("a.txt", Change::RenameTo((*spelling).to_owned()));
+
+        let rebuilt = rewriting(&source, &changes)
+            .unwrap_or_else(|error| panic!("{spelling} was refused: {error:?}"));
+        let mut src = std::io::Cursor::new(rebuilt);
+        let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+        assert_eq!(archive.entries().len(), 2, "root and the renamed entry");
+    }
+}
+
+/// A NUL inside a path is refused, because the names blob cannot hold one.
+///
+/// Found by fuzzing, 2026-08-30. `name::check_tree` accepted it; the names blob
+/// is NUL-terminated, so `a\0b` was written and read back as `a`. One such path
+/// is already a silent rename. Two of them differing only after the NUL both
+/// collapsed to `a`, and `build`'s collision check compares the names it was
+/// *asked* for, which differ, so it did not refuse: **this build wrote an
+/// archive this build will not read**, which is the stated top risk arriving
+/// exactly as described. Not reachable through argv, which cannot carry a NUL,
+/// but a JSON string spells it with an escape.
+#[test]
+fn a_nul_inside_a_path_is_refused_rather_than_silently_truncating_it() {
+    let source = built(&[stored("a.txt")], &[], b"same");
+
+    let mut changes = Changes::new();
+    changes.set("dir\u{0}b", Change::MakeDirectory);
+    changes.set("dir\u{0}c", Change::MakeDirectory);
+
+    match rewriting(&source, &changes) {
+        Err(Error::BadPath { path, .. }) => assert!(path.contains('\u{0}'), "{path:?}"),
+        other => panic!("expected a refusal, got {:?}", other.map(|b| b.len())),
+    }
 }

@@ -20,6 +20,13 @@
   "activationEvents": [
     "onFileSystem:rpf"
   ],
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Mounting an archive starts the rpf binary on the archives this folder holds."
+    }
+  },
   "contributes": {
     "commands": [
       {
@@ -67,7 +74,7 @@
       "explorer/context": [
         {
           "command": "rpf.mountArchive",
-          "when": "resourceExtname == .rpf",
+          "when": "resourceScheme == file && resourceExtname == .rpf",
           "group": "navigation@50"
         },
         {
@@ -83,6 +90,7 @@
         "rpf.binaryPath": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "markdownDescription": "Absolute path to the `rpf` binary. Empty means: use the one bundled with this extension if there is one, otherwise the first `rpf` on `PATH`."
         },
         "rpf.handOff.extensions": {
@@ -107,6 +115,7 @@
         "rpf.handOff.directory": {
           "type": "string",
           "default": "",
+          "scope": "machine",
           "markdownDescription": "Where handed-off files are written. Empty means a directory under the system temporary directory."
         }
       }
@@ -116,11 +125,13 @@
     "build": "tsc -p .",
     "check": "tsc -p . --noEmit",
     "test": "npm run build && node --test --test-timeout=60000 dist/test/*.test.js",
+    "test:editor": "npm run build && node dist/test/editor/run.js",
     "package": "npm run build && node dist/scripts/vsix.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "^2.5.2",
     "typescript": "^5.9.0"
   }
 }

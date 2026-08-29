@@ -493,7 +493,7 @@ fn a_structural_change_to_the_sample_reads_back() {
     changes.set(
         format!("{INSIDE}/added.meta"),
         rpf_core::Change::Write {
-            contents: std::sync::Arc::new(b"<added/>".to_vec()),
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"<added/>".to_vec())),
             create: true,
         },
     );

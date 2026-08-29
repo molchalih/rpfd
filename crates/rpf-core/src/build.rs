@@ -12,7 +12,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
 };
 
 use flate2::{Compression, write::DeflateEncoder};
@@ -342,7 +342,7 @@ fn plan_entries(arena: &[Dir]) -> Result<Vec<Planned>> {
 /// [`build`] takes its payloads as readers rather than as buffers, so that a
 /// cascading rebuild can hand it an ancestor sitting in scratch space instead
 /// of one sitting in memory. R4.13, DR-022. Anything that is both [`Read`] and
-/// [`Seek`] is one; a caller holding bytes wraps them in a [`Cursor`].
+/// [`Seek`] is one; a caller holding bytes wraps them in a [`std::io::Cursor`].
 ///
 /// Seekable because `store` reads a payload twice in one case — the deflated
 /// form that did not pay for itself, which is then written as it came.
@@ -798,7 +798,8 @@ where
 /// `fetch` is a [`Fetch`] — asked once per file, in entry-table order, for a
 /// reader over that path's payload — and the bytes go straight through to
 /// `out`, so neither a file nor the archive is resident. A caller holding bytes
-/// hands back a [`Cursor`] over them from a closure, which is a [`Fetch`] like
+/// hands back a [`std::io::Cursor`] over them from a closure, which is a
+/// [`Fetch`] like
 /// any other.
 ///
 /// `version` is what the archive is written as, and it is the caller's: a
@@ -1116,7 +1117,7 @@ impl<R: Read + Seek> Fetch for FromArchive<'_, R> {
                     path: wanted.to_owned(),
                     reason: "has no contents to write",
                 })?;
-                Ok(Box::new(Cursor::new(contents)))
+                contents.open()
             }
         }
     }

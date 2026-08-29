@@ -344,23 +344,68 @@ pub fn put(
     options: WriteOptions,
     json_out: bool,
 ) -> Result<()> {
-    let contents = fs::read(from).map_err(|source| Failure::Io {
-        path: from.display().to_string(),
-        source,
-    })?;
+    // A regular file is opened when the library wants it, so a donor of any
+    // size costs a buffer rather than its length. Anything else — a FIFO, a
+    // process substitution, `/dev/stdin` — can be neither reopened nor seeked,
+    // and the only thing to be done with it is to read it once and hold it,
+    // which is what this did for every donor before. DR-036.
+    let contents: std::sync::Arc<dyn rpf_core::Contents> = match fs::metadata(from) {
+        Ok(found) if found.is_file() => std::sync::Arc::new(Donor::at(from)),
+        _ => {
+            let read = fs::read(from).map_err(|source| Failure::Io {
+                path: from.display().to_string(),
+                source,
+            })?;
+            std::sync::Arc::new(rpf_core::Bytes::new(read))
+        }
+    };
     apply(
         path,
         inside,
         &Changes::one(
             inside,
             Change::Write {
-                contents: std::sync::Arc::new(contents),
+                contents,
                 create: options.create,
             },
         ),
         options,
         json_out,
     )
+}
+
+/// A file on this machine, offered to the library as the contents of a write.
+///
+/// The command line's answer to [`rpf_core::Contents`], and the reason a path
+/// does not have to travel inward (`docs/conventions.md` §7): the library opens
+/// this when it wants the bytes and never holds them, so `rpf put` of a donor
+/// costs a buffer rather than the donor. DR-036.
+#[derive(Debug)]
+pub struct Donor(PathBuf);
+
+impl Donor {
+    /// The file at `path`, which is not opened until it is asked for.
+    #[must_use]
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
+
+impl rpf_core::Contents for Donor {
+    // `offset: 0` for the reason `ScratchIn` gives: the source is not the
+    // archive, so there is no offset in it to name. The path is named where
+    // this surfaces, which is the frontend that owns it.
+    fn open(&self) -> rpf_core::Result<Box<dyn rpf_core::Payload + '_>> {
+        let file =
+            fs::File::open(&self.0).map_err(|source| rpf_core::Error::Io { offset: 0, source })?;
+        Ok(Box::new(file))
+    }
+
+    fn len(&self) -> rpf_core::Result<u64> {
+        let found =
+            fs::metadata(&self.0).map_err(|source| rpf_core::Error::Io { offset: 0, source })?;
+        Ok(found.len())
+    }
 }
 
 /// `rm` — remove an entry, and its children when it is a directory and

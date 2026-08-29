@@ -2,8 +2,9 @@
 //!
 //! Framing is one JSON object per line. Writes are buffered until `commit`,
 //! which decides once for every pending edit rather than once per edit. An
-//! archive is open in one session at a time, claimed by device and inode as
-//! well as by path: DR-009.
+//! archive is open in one session at a time, claimed by the name the operating
+//! system gives the open file — where it gives one — as well as by path:
+//! DR-009, DR-037.
 //!
 //! **Three threads, and each one blocks on exactly one thing.** Standard input
 //! is read on its own thread so a `cancel` arrives while there is still
@@ -85,10 +86,16 @@ const DRAIN_FLOOR: usize = 20 * 1024;
 ///
 /// A resolved path is not a file identity: a hard link, and a firmlinked macOS
 /// volume, both give one file two true canonical paths. DR-009.
-/// **Each variant exists only on the platforms it is true of**, which is what
-/// keeps the two halves honest: a claim taken where files are named cannot be
-/// missing an identity, and a platform that cannot name one cannot silently
-/// produce a `Named` that means nothing.
+///
+/// **Whether a file can be named is not settled in the same place everywhere.**
+/// On Unix the platform settles it and the answer is always yes. On Windows the
+/// volume and the transport settle it, at runtime: NTFS answers with a volume
+/// serial and a file index, and a redirector answers with a zero volume serial,
+/// which names nothing. So `Unnamed` is reachable there, and what keeps
+/// the two halves honest is not the `#[cfg]` but the thing the `#[cfg]` was
+/// standing in for — **an unnamed file is equal to nothing, itself included**,
+/// so an identity that could not be read makes the claim fall back to the path
+/// and can never manufacture a match. DR-037.
 #[derive(Clone, Copy)]
 enum FileId {
     /// The device and inode the operating system named.
@@ -99,7 +106,16 @@ enum FileId {
         /// Which file on it.
         inode: u64,
     },
-    /// This platform names files only by their paths.
+    /// The volume serial number and file index the operating system named.
+    #[cfg(windows)]
+    Named {
+        /// Which volume.
+        volume: u64,
+        /// Which file on it.
+        index: u64,
+    },
+    /// This file is named by nothing but its path — because the platform
+    /// names none, or because the volume it is on does not.
     #[cfg(not(unix))]
     Unnamed,
 }
@@ -107,42 +123,79 @@ enum FileId {
 impl FileId {
     /// What the operating system calls the file behind an open handle.
     ///
-    /// The handle is statted on every platform, including one that has no name
-    /// to read out of the result: DR-009 says the claim is taken whole or not
-    /// taken, and a session that could not stat the file it is holding has not
-    /// opened it. What differs by platform is only what the metadata says.
+    /// The handle is asked on every platform, including one that has no name to
+    /// answer with. What differs by platform is which call is made, what it
+    /// answers, and whether not answering is a failure: on Unix an `fstat` that
+    /// fails means the handle is broken, and DR-009 says a session that could
+    /// not stat the file it is holding has not opened it; on Windows not
+    /// answering is a property of the volume rather than of the handle, and it
+    /// is `Unnamed` instead. DR-037.
     ///
     /// # Errors
     ///
-    /// [`Failure::Io`] if the open handle cannot be statted.
+    /// [`Failure::Io`] where the platform's identity call can fail — on Unix,
+    /// if the open handle cannot be statted.
     fn of(file: &fs::File, path: &Path) -> crate::exit::Result<Self> {
-        let named = file.metadata().map_err(|source| Failure::Io {
+        Self::named_by(file).map_err(|source| Failure::Io {
             path: path.display().to_string(),
             source,
-        })?;
-        Ok(Self::named_by(&named))
+        })
     }
 
-    /// The identity in an open handle's metadata, where the platform puts one
-    /// there.
+    /// The identity behind an open handle: the device and inode `fstat` gives.
     #[cfg(unix)]
-    fn named_by(metadata: &fs::Metadata) -> Self {
+    fn named_by(file: &fs::File) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
-        Self::Named {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
+        let named = file.metadata()?;
+        Ok(Self::Named {
+            device: named.dev(),
+            inode: named.ino(),
+        })
     }
 
-    /// The identity in an open handle's metadata: on this platform, none.
+    /// The identity behind an open handle: the volume serial number and file
+    /// index `GetFileInformationByHandle` gives, where the volume gives them.
     ///
-    /// Windows has one — the volume serial and the file index — and reading it
-    /// is R10.5, which needs a Windows machine to measure on. Until then
-    /// DR-009's claim degrades to path equality here, which its own second
-    /// amendment shows is not enough.
-    #[cfg(not(unix))]
-    const fn named_by(_metadata: &fs::Metadata) -> Self {
-        Self::Unnamed
+    /// `std::os::windows::fs::MetadataExt` names both and both are behind
+    /// `windows_by_handle`, which the stable channel `rust-toolchain.toml` pins
+    /// does not have, so the call is made rather than read out of a
+    /// [`fs::Metadata`]. `winapi-util` owns it: §11 expects no `unsafe` here and
+    /// §14 has a row for the crate. DR-037.
+    ///
+    /// **Both halves have to be non-zero, and the call failing is not an error
+    /// here.** A zero in either half is the volume saying it does not name its
+    /// files, and taking it at face value would make every file on that volume
+    /// equal to every other — a second `open` refused against a handle holding
+    /// something else, and `pack` and `extract` refusing unrelated paths.
+    /// Measured: the `\\wsl.localhost` redirector answers with volume serial
+    /// zero. A failed call is the same fact arriving as an error instead of as
+    /// a zero, so it reads the same way rather than refusing the archive.
+    #[cfg(windows)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the fallible signature is the seam all three arms share, and \
+                  on this one nothing fails: not answering is Unnamed rather \
+                  than an error. Narrowing the return type here alone would put \
+                  a #[cfg] inside FileId::of and give one operation two \
+                  spellings. docs/conventions.md §4"
+    )]
+    fn named_by(file: &fs::File) -> io::Result<Self> {
+        let Ok(named) = winapi_util::file::information(file) else {
+            return Ok(Self::Unnamed);
+        };
+        let (volume, index) = (named.volume_serial_number(), named.file_index());
+        Ok(if volume == 0 || index == 0 {
+            Self::Unnamed
+        } else {
+            Self::Named { volume, index }
+        })
+    }
+
+    /// The identity behind an open handle: on this platform, none. The handle
+    /// is statted anyway, because a file that cannot be statted is not held.
+    #[cfg(not(any(unix, windows)))]
+    fn named_by(file: &fs::File) -> io::Result<Self> {
+        file.metadata().map(|_| Self::Unnamed)
     }
 
     /// Whether these are one file. Always false where files are unnamed: an
@@ -157,6 +210,14 @@ impl FileId {
                     inode: file,
                 },
             ) => device == volume && inode == file,
+            #[cfg(windows)]
+            (
+                Self::Named { volume, index },
+                Self::Named {
+                    volume: disk,
+                    index: file,
+                },
+            ) => volume == disk && index == file,
             #[cfg(not(unix))]
             _ => false,
         }
@@ -1254,11 +1315,24 @@ fn read(state: &mut State, params: &Value) -> Answered {
     let session = session(state, params)?;
 
     if let Some(buffered) = session.pending.contents_at(&inside) {
+        // Read out of the source rather than out of a buffer the session kept:
+        // what a `write` handed over may be a file on this machine, and the
+        // daemon's own writes are `Bytes`, which opens over what it already
+        // holds. Encoded **as it is read**, so the answer costs the encoded
+        // form and not a copy of the payload beside it — which is what a first
+        // cut of this did, and is the wrong direction on a change whose whole
+        // subject is peak memory. DR-036.
+        let len = buffered.len()?;
+        let mut encoder = base64::write::EncoderStringWriter::new(&BASE64);
+        io::copy(&mut buffered.open()?, &mut encoder).map_err(|source| Failure::Io {
+            path: inside.clone(),
+            source,
+        })?;
         return Ok(json!({
             "path": inside,
-            "len": buffered.len(),
+            "len": len,
             "pending": true,
-            "bytes": BASE64.encode(buffered),
+            "bytes": encoder.into_inner(),
         }));
     }
 
@@ -1294,7 +1368,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
         .map_err(|_| invalid_params("\"bytes\" is not base64".to_owned()))?;
     let is_resource_payload = bytes.get(0..4) == Some(&rpf_core::format::resource::MAGIC_RSC7);
     let change = Change::Write {
-        contents: std::sync::Arc::new(bytes),
+        contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
         create,
     };
     let session = session(state, params)?;
@@ -1338,7 +1412,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
                     &change,
                 )?;
             }
-            Ok(record(session, &inside, change))
+            record(session, &inside, change).map_err(Into::into)
         }
         // A path being created has no entry to check against, so the whole
         // change is resolved instead. Only here: `allows` walks the entry
@@ -1352,7 +1426,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
                 &inside,
                 &change,
             )?;
-            Ok(record(session, &inside, change))
+            record(session, &inside, change).map_err(Into::into)
         }
         Err(other) => Err(Failure::Container(other).into()),
     }
@@ -1423,24 +1497,29 @@ fn buffer(state: &mut State, params: &Value, inside: &str, change: Change) -> An
         inside,
         &change,
     )?;
-    Ok(record(session, inside, change))
+    record(session, inside, change).map_err(Into::into)
 }
 
 /// Records one change against a session, and reports what is buffered.
 ///
 /// One shape for every method that buffers, so a client reads one answer. `len`
 /// is the payload's, and `null` for a change that carries none.
-fn record(session: &mut Session, inside: &str, change: Change) -> Value {
+///
+/// # Errors
+///
+/// Whatever the payload cannot be measured with — a `write` names a source
+/// rather than carrying bytes, so asking its length can fail. DR-036.
+fn record(session: &mut Session, inside: &str, change: Change) -> crate::exit::Result<Value> {
     let len = match change {
-        Change::Write { ref contents, .. } => Some(contents.len()),
+        Change::Write { ref contents, .. } => Some(contents.len()?),
         _ => None,
     };
     session.pending.set(inside, change);
-    json!({
+    Ok(json!({
         "path": inside,
         "len": len,
         "pending": session.pending.len(),
-    })
+    }))
 }
 
 /// `info` — the header, and what the entries add up to.
@@ -2166,7 +2245,7 @@ mod tests {
             pending: Changes::one(
                 "a.txt",
                 Change::Write {
-                    contents: std::sync::Arc::new(b"replaced".to_vec()),
+                    contents: std::sync::Arc::new(rpf_core::Bytes::new(b"replaced".to_vec())),
                     create: false,
                 },
             ),
