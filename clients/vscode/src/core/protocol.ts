@@ -79,12 +79,37 @@ export interface ReadEntry {
     bytes: string;
 }
 
-/** What `write` answers. */
+/**
+ * What `write`, `delete` and `mkdir` answer. One shape for every method that
+ * buffers a change, so a client reads one answer. DR-026.
+ */
 export interface Wrote {
     path: string;
-    len: number;
-    /** How many edits are now buffered in the session. */
+    /** The payload's length, and `null` for a change that carries none. */
+    len: number | null;
+    /** How many changes are now buffered in the session. */
     pending: number;
+}
+
+/** What `rename` answers. */
+export interface Renamed {
+    from: string;
+    to: string;
+    pending: number;
+}
+
+/**
+ * One change no in-place patch can express, and what it does.
+ *
+ * A structural change is always a rebuild — an entry added or removed moves the
+ * entry table, which moves the names blob, which moves the floor every payload
+ * sits above — and the verdict is reached for the whole set before anything is
+ * compressed. DR-026.
+ */
+export interface Structural {
+    path: string;
+    /** What the change does that no patch can, in the library's own words. */
+    structural: string;
 }
 
 /** What `commit` answers when there was something to commit. */
@@ -97,6 +122,7 @@ export interface Committed {
     dry_run?: boolean;
     planned?: { path: string; at: number; len: number; allocation: number }[];
     rejected?: { path: string; needed: number; allocation: number }[];
+    structural?: Structural[];
 }
 
 /** What `verify` answers, whatever it finds. DR-008's fourth amendment. */

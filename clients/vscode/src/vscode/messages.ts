@@ -8,7 +8,7 @@
 
 import * as vscode from 'vscode';
 
-import { type Advice, DaemonError, EXIT, advise, render } from '../core/errors.js';
+import { type Advice, advise, fileSystemWordFor, render } from '../core/errors.js';
 
 /** Where a failure is written out in full, whatever else the user is shown. */
 let channel: vscode.OutputChannel | undefined;
@@ -51,21 +51,27 @@ export async function report(failure: unknown, doing: string): Promise<Advice> {
  * in places a notification cannot reach — a failed save, a hover in the
  * explorer — so the categories that have a counterpart are given one, and the
  * message is the actionable text either way.
+ *
+ * Which word a failure is is decided by `core/errors.ts`, where it can be
+ * checked without an editor; this function is the one place those words become
+ * the editor's own type.
  */
 export function asFileSystemError(failure: unknown, uri: vscode.Uri): vscode.FileSystemError {
     const advice = advise(failure);
     const message = `${advice.headline} ${advice.reason} ${advice.action}`;
-    if (failure instanceof DaemonError) {
-        switch (failure.code) {
-            case EXIT.notFound:
-                return vscode.FileSystemError.FileNotFound(message);
-            case EXIT.refused:
-                return vscode.FileSystemError.NoPermissions(message);
-            case EXIT.io:
-                return vscode.FileSystemError.Unavailable(message);
-            default:
-                break;
-        }
+    switch (fileSystemWordFor(failure)) {
+        case 'exists':
+            return vscode.FileSystemError.FileExists(message);
+        case 'not-found':
+            return vscode.FileSystemError.FileNotFound(message);
+        case 'is-a-directory':
+            return vscode.FileSystemError.FileIsADirectory(message);
+        case 'no-permissions':
+            return vscode.FileSystemError.NoPermissions(message);
+        case 'unavailable':
+            return vscode.FileSystemError.Unavailable(message);
+        default:
+            break;
     }
     note(`${uri.toString()}: ${render(advice)}`);
     return new vscode.FileSystemError(message);

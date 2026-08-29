@@ -4,10 +4,13 @@ import { describe, it } from 'node:test';
 import {
     DaemonError,
     EXIT,
+    type FileSystemWord,
     type Kind,
     PROTOCOL,
+    Refused,
     TransportError,
     advise,
+    fileSystemWordFor,
     kindOf,
     render,
 } from '../src/core/errors.js';
@@ -88,6 +91,40 @@ describe('what a failure means', () => {
         assert.match(advice.reason, /cannot read properties/);
     });
 
+    it('tells the user a refused change is about what is buffered, not about the archive', () => {
+        // A refusal this client decided is not a fault of the daemon and not a
+        // fault of the archive, and saying either would send the user looking
+        // in the wrong place. R7.6.
+        const advice = advise(new Refused('exists', 'a.txt', 'a.txt is already in the archive'));
+        assert.equal(advice.kind, 'pending');
+        assert.equal(advice.code, null);
+        assert.equal(advice.reason, 'a.txt is already in the archive');
+        assert.match(advice.action, /Save the archive|discard/);
+        assert.ok(!/stack|trace/i.test(render(advice)));
+    });
+
+    it('picks the editor filesystem word from the classification, never from the sentence', () => {
+        // R7.6's point: an editor shows these in places a notification cannot
+        // reach, and the word is what decides which. Checked here rather than
+        // in the editor adapter, because the adapter cannot be run without an
+        // editor.
+        const expected: [unknown, FileSystemWord][] = [
+            [new Refused('exists', 'a', 'x'), 'exists'],
+            [new Refused('not-found', 'a', 'x'), 'not-found'],
+            [new Refused('is-a-directory', 'a', 'x'), 'is-a-directory'],
+            [new Refused('refused', 'a', 'x'), 'no-permissions'],
+            [new DaemonError('m', EXIT.notFound, 'x'), 'not-found'],
+            [new DaemonError('m', EXIT.refused, 'x'), 'no-permissions'],
+            [new DaemonError('m', EXIT.io, 'x'), 'unavailable'],
+            [new DaemonError('m', EXIT.corrupt, 'x'), 'other'],
+            [new TransportError('gone'), 'unavailable'],
+            [new Error('a fault of this extension'), 'other'],
+        ];
+        for (const [failure, word] of expected) {
+            assert.equal(fileSystemWordFor(failure), word, String(failure));
+        }
+    });
+
     it('gives every kind a headline and an instruction', () => {
         const kinds: Kind[] = [
             'protocol',
@@ -102,6 +139,7 @@ describe('what a failure means', () => {
             'unsupported',
             'unknown',
         ];
+        assert.ok(advise(new Refused('refused', 'a', 'x')).headline.length > 0, 'pending');
         for (const kind of kinds) {
             const code = kind === 'protocol' ? -32600 : codeFor(kind);
             const advice = advise(new DaemonError('m', code, 'because'));

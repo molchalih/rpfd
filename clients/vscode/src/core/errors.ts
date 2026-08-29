@@ -38,6 +38,7 @@ export const PROTOCOL = {
 
 /** Which class of failure this is, and therefore who has to act. */
 export type Kind =
+    | 'pending'
     | 'protocol'
     | 'internal'
     | 'usage'
@@ -66,6 +67,38 @@ export class DaemonError extends Error {
         this.code = code;
         this.method = method;
         this.reason = reason;
+    }
+}
+
+/**
+ * What a caller has to do about a change this client declined to offer.
+ *
+ * A category rather than a rendered sentence, for `docs/conventions.md` §10's
+ * reason: an editor has its own small vocabulary for filesystem failures and
+ * picks from it by this, while the message is what a person reads.
+ */
+export type RefusalKind = 'exists' | 'not-found' | 'is-a-directory' | 'refused';
+
+/**
+ * A change the client's own view of the archive refuses before the daemon is
+ * asked for it.
+ *
+ * Its own type because the daemon cannot answer it: every buffered change is
+ * resolved against the archive **on disk**, so a path a buffered change created
+ * is not there to be found and a path a buffered removal freed is still
+ * occupied. The client is the only side that holds both. DR-030.
+ */
+export class Refused extends Error {
+    /** Which answer an editor's filesystem vocabulary has for this. */
+    readonly kind: RefusalKind;
+    /** The path inside the archive the refusal is about. */
+    readonly path: string;
+
+    constructor(kind: RefusalKind, path: string, message: string) {
+        super(message);
+        this.name = 'Refused';
+        this.kind = kind;
+        this.path = path;
     }
 }
 
@@ -132,6 +165,10 @@ export function kindOf(code: number): Kind {
 
 /** The headline and the instruction each kind carries. */
 const COUNSEL: Record<Kind, { headline: string; action: string }> = {
+    pending: {
+        headline: 'This change cannot be buffered beside the ones already waiting to be saved.',
+        action: 'Save the archive, or discard the buffered changes, and then make this one. The archive on disk is untouched either way.',
+    },
     protocol: {
         headline: 'The extension sent a request the daemon could not accept.',
         action: 'This is a fault in the extension rather than in the archive. Report it with the daemon log; nothing you change about the archive will help.',
@@ -190,6 +227,16 @@ const COUNSEL: Record<Kind, { headline: string; action: string }> = {
  * as an archive problem.
  */
 export function advise(failure: unknown): Advice {
+    if (failure instanceof Refused) {
+        const counsel = COUNSEL.pending;
+        return {
+            kind: 'pending',
+            code: null,
+            headline: counsel.headline,
+            action: counsel.action,
+            reason: failure.message,
+        };
+    }
     if (failure instanceof DaemonError) {
         const kind = kindOf(failure.code);
         const counsel = COUNSEL[kind];
@@ -219,6 +266,47 @@ export function advise(failure: unknown): Advice {
         action: counsel.action,
         reason: failure instanceof Error ? failure.message : String(failure),
     };
+}
+
+/**
+ * Which of an editor filesystem's own failures a failure is.
+ *
+ * Here rather than in the editor adapter so it can be checked without an
+ * editor: this is the whole of R7.6 for the filesystem surface, and an adapter
+ * that decided it would be the one place nothing tests. A {@link Refused} says
+ * which word it means, because the client's own view is what decided it; a
+ * {@link DaemonError} reaches one through DR-010's classification, and nothing
+ * about its sentence is parsed.
+ */
+export type FileSystemWord =
+    | 'exists'
+    | 'not-found'
+    | 'is-a-directory'
+    | 'no-permissions'
+    | 'unavailable'
+    | 'other';
+
+/** Which of an editor's filesystem failures this one is. */
+export function fileSystemWordFor(failure: unknown): FileSystemWord {
+    if (failure instanceof Refused) {
+        return failure.kind === 'refused' ? 'no-permissions' : failure.kind;
+    }
+    if (failure instanceof TransportError) {
+        return 'unavailable';
+    }
+    if (failure instanceof DaemonError) {
+        switch (failure.code) {
+            case EXIT.notFound:
+                return 'not-found';
+            case EXIT.refused:
+                return 'no-permissions';
+            case EXIT.io:
+                return 'unavailable';
+            default:
+                return 'other';
+        }
+    }
+    return 'other';
 }
 
 /** The advice as one block of text, for a notification or a log line. */

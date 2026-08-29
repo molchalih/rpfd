@@ -212,11 +212,21 @@ async function preview(archives: Archives): Promise<void> {
     for (const entry of planned.rejected) {
         log().appendLine(`  will not fit: ${entry.path} needs ${entry.needed}, has ${entry.allocation}`);
     }
+    for (const entry of planned.structural) {
+        log().appendLine(`  ${entry.path} ${entry.structural}, which no patch can express`);
+    }
     log().show(true);
+    // A structural change is a rebuild whatever else is in the set, and saying
+    // so first is the difference between a report about the set and a report
+    // about one entry that did not fit. DR-026.
+    const why =
+        planned.structural.length > 0
+            ? `${planned.structural.length} change(s) alter what the archive holds`
+            : `${planned.rejected.length} edit(s) do not fit where they are`;
     await vscode.window.showInformationMessage(
         planned.method === 'patch'
             ? 'A save would patch every edit in place.'
-            : `A save would rebuild the archive: ${planned.rejected.length} edit(s) do not fit where they are.`,
+            : `A save would rebuild the archive: ${why}.`,
     );
 }
 

@@ -2,27 +2,29 @@
  * The `rpf:` filesystem, as the editor asks about one. R7.1.
  *
  * A thin adapter and nothing else: every question is answered out of
- * `core/session.ts` and `core/tree.ts`, which are tested against a live daemon,
- * and every failure is rendered by `core/errors.ts`. What is here that is not
- * there is exactly the editor's own vocabulary.
+ * `core/session.ts`, `core/pending.ts` and `core/tree.ts`, which are tested
+ * against a live daemon, and every failure is rendered by `core/errors.ts`.
+ * What is here that is not there is exactly the editor's own vocabulary.
  *
- * **A write buffers.** `writeFile` is what the editor calls when a document is
- * saved, and it does not write the archive: it buffers the edit, and the
- * archive is written by the explicit `RPF: Save Archive` command. R7.3, and
- * DR-008's reason for it — a save decides between patching in place and
- * rebuilding for the whole set of edits, and a rebuild is unbounded work.
+ * **A change buffers.** `writeFile`, `delete`, `rename` and `createDirectory`
+ * do not write the archive: they buffer, and the archive is written by the
+ * explicit `RPF: Save Archive` command. R7.3, DR-026, and DR-008's reason for
+ * it — a save decides between patching in place and rebuilding for the whole
+ * set of changes, and a rebuild is unbounded work.
+ *
+ * **The explorer is shown the session's view, not the daemon's listing.**
+ * DR-028: `list` answers the archive on disk, so a provider that forwarded it
+ * would show a created entry as absent and a deleted one as present until the
+ * save. The session models the buffered structure itself, and this file fires
+ * the events that make the editor ask again. DR-030.
  */
 
 import * as vscode from 'vscode';
 
 import { type Node, isDirectory } from '../core/tree.js';
-import { addressOf, uriOf } from '../core/uri.js';
+import { addressOf, split, uriOf } from '../core/uri.js';
 import type { Archives, Mounted } from './archives.js';
 import { asFileSystemError } from './messages.js';
-
-/** Adding, deleting and renaming entries, which the daemon has no method for. */
-const NO_ENTRY_CHANGES =
-    'This extension can change what is in an entry, and cannot add, remove or rename one: the daemon has no method for it. Extract the archive, change the tree, and pack it again.';
 
 /** The editor's view of an archive. */
 export class RpfFileSystem implements vscode.FileSystemProvider {
@@ -39,8 +41,8 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
      * Nothing is watched.
      *
      * The archive is the daemon's, one session at a time (DR-009), and nothing
-     * else in this window can change it. What does change it — a save — fires
-     * {@link changed} for itself.
+     * else in this window can change it. What does change it — a buffered
+     * change, or a save — fires {@link changed} or its own event for itself.
      */
     watch(): vscode.Disposable {
         return new vscode.Disposable(() => undefined);
@@ -62,12 +64,11 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
 
     async stat(uri: vscode.Uri): Promise<vscode.FileStat> {
         const { mount, node } = await this.reach(uri);
-        const buffered = mount.session.lengthOf(node.path);
         return {
             type: isDirectory(node) ? vscode.FileType.Directory : vscode.FileType.File,
             ctime: 0,
             mtime: mount.session.changedAt,
-            size: isDirectory(node) ? 0 : (buffered ?? node.len),
+            size: isDirectory(node) ? 0 : node.len,
         };
     }
 
@@ -96,7 +97,7 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
         }
     }
 
-    /** Buffers an edit. The archive is written by an explicit save. R7.3. */
+    /** Buffers a write, creating the entry when asked to. R7.3, DR-026. */
     async writeFile(
         uri: vscode.Uri,
         content: Uint8Array,
@@ -104,40 +105,135 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
     ): Promise<void> {
         const { mount, address } = this.locate(uri);
         const node = mount.session.tree.at(address.inside);
-        if (!node) {
-            throw vscode.FileSystemError.NoPermissions(
-                options.create ? NO_ENTRY_CHANGES : `${uri.toString()} is not in the archive`,
-            );
-        }
-        if (isDirectory(node)) {
+        if (node && isDirectory(node)) {
             throw vscode.FileSystemError.FileIsADirectory(uri);
         }
+        if (!node && !options.create) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        if (node && !options.overwrite) {
+            throw vscode.FileSystemError.FileExists(uri);
+        }
+        if (!node) {
+            this.requireDirectory(uri, address.inside);
+        }
         try {
-            await mount.session.write(node.path, content);
+            await mount.session.write(address.inside, content, { create: options.create });
         } catch (failure) {
             throw asFileSystemError(failure, uri);
         }
-        this.changes.fire([{ type: vscode.FileChangeType.Changed, uri }]);
+        this.announce(address.archive, address.inside, node ? 'changed' : 'created');
     }
 
-    /** Refused: the daemon has no method that changes the entry table. */
-    delete(): void {
-        throw vscode.FileSystemError.NoPermissions(NO_ENTRY_CHANGES);
+    /** Buffers a removal. The archive is written by an explicit save. DR-026. */
+    async delete(uri: vscode.Uri, options: { recursive: boolean }): Promise<void> {
+        const { mount, address } = this.locate(uri);
+        if (!mount.session.tree.at(address.inside)) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        try {
+            await mount.session.remove(address.inside, { recursive: options.recursive });
+        } catch (failure) {
+            throw asFileSystemError(failure, uri);
+        }
+        this.announce(address.archive, address.inside, 'deleted');
     }
 
-    /** Refused, for the reason {@link delete} is. */
-    rename(): void {
-        throw vscode.FileSystemError.NoPermissions(NO_ENTRY_CHANGES);
+    /**
+     * Buffers a rename.
+     *
+     * `overwrite` has no answer here and is refused rather than approximated:
+     * DR-026 gives a rename no override, because removing the target in the
+     * same change set says the same thing out loud and shows up in the plan —
+     * and the wire cannot carry even that, since a rename is resolved against
+     * the archive on disk. DR-030.
+     */
+    async rename(from: vscode.Uri, to: vscode.Uri, options: { overwrite: boolean }): Promise<void> {
+        const source = this.locate(from);
+        const target = this.locate(to);
+        if (source.address.archive !== target.address.archive) {
+            throw vscode.FileSystemError.NoPermissions(
+                'An entry can only be moved within the archive that holds it.',
+            );
+        }
+        if (!source.mount.session.tree.at(source.address.inside)) {
+            throw vscode.FileSystemError.FileNotFound(from);
+        }
+        if (source.mount.session.tree.at(target.address.inside)) {
+            throw options.overwrite
+                ? vscode.FileSystemError.NoPermissions(
+                      `${target.address.inside} is already in the archive. A rename inside an archive has no overwrite: delete that entry, save the archive, then rename.`,
+                  )
+                : vscode.FileSystemError.FileExists(to);
+        }
+        this.requireDirectory(to, target.address.inside);
+        try {
+            await source.mount.session.rename(source.address.inside, target.address.inside);
+        } catch (failure) {
+            throw asFileSystemError(failure, to);
+        }
+        this.announce(source.address.archive, source.address.inside, 'deleted');
+        this.announce(target.address.archive, target.address.inside, 'created');
     }
 
-    /** Refused, for the reason {@link delete} is. */
-    createDirectory(): void {
-        throw vscode.FileSystemError.NoPermissions(NO_ENTRY_CHANGES);
+    /** Buffers a directory. DR-026. */
+    async createDirectory(uri: vscode.Uri): Promise<void> {
+        const { mount, address } = this.locate(uri);
+        if (mount.session.tree.at(address.inside)) {
+            throw vscode.FileSystemError.FileExists(uri);
+        }
+        this.requireDirectory(uri, address.inside);
+        try {
+            await mount.session.makeDirectory(address.inside);
+        } catch (failure) {
+            throw asFileSystemError(failure, uri);
+        }
+        this.announce(address.archive, address.inside, 'created');
     }
 
     /** The URI of one entry inside a mounted archive. */
     uriFor(archive: string, inside: string): vscode.Uri {
         return vscode.Uri.from(uriOf({ archive, inside }));
+    }
+
+    /**
+     * Says a path appeared, went, or changed, and that its parent listing did.
+     *
+     * The parent as well as the path itself: an explorer asks a directory for
+     * its children again when the directory changes, and a creation is a change
+     * to the directory that now holds it.
+     */
+    private announce(archive: string, inside: string, what: 'created' | 'deleted' | 'changed'): void {
+        const type =
+            what === 'created'
+                ? vscode.FileChangeType.Created
+                : what === 'deleted'
+                  ? vscode.FileChangeType.Deleted
+                  : vscode.FileChangeType.Changed;
+        const events: vscode.FileChangeEvent[] = [{ type, uri: this.uriFor(archive, inside) }];
+        if (what !== 'changed') {
+            events.push({
+                type: vscode.FileChangeType.Changed,
+                uri: this.uriFor(archive, split(inside).parent),
+            });
+        }
+        this.changes.fire(events);
+    }
+
+    /** Refuses a path whose parent is not a directory this archive holds. */
+    private requireDirectory(uri: vscode.Uri, inside: string): void {
+        const { parent } = split(inside);
+        if (parent.length === 0) {
+            return;
+        }
+        const { mount } = this.locate(uri);
+        const node = mount.session.tree.at(parent);
+        if (!node) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        if (!isDirectory(node)) {
+            throw vscode.FileSystemError.FileNotADirectory(uri);
+        }
     }
 
     /** Which mounted archive and which entry a URI names. */

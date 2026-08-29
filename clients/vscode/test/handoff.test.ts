@@ -143,6 +143,29 @@ describe('handing an entry over and taking it back', { skip: SKIP }, () => {
         assert.deepEqual(session.dirtyPaths(), ['art.yft']);
     });
 
+    it('notices a change the directory watch never reported', async () => {
+        // On macOS every `fs.watch` in a process shares one FSEvents stream and
+        // arming another rebuilds it, so a write during the rebuild reaches
+        // nobody — measured at 39 losses in 150 with four watchers already
+        // armed. The directory watch is closed here to reproduce that exactly,
+        // rather than by racing it.
+        const { session, handoff } = await open('missed');
+        const handed = await handoff.begin('art.yft');
+        const watchers = (handoff as unknown as { watchers: Map<string, { close: () => void }> })
+            .watchers;
+        watchers.get('art.yft')?.close();
+        watchers.delete('art.yft');
+
+        const imported = new Promise<void>((seen) => {
+            handoff.onImported(() => seen());
+        });
+        const changed = resourceBytes();
+        changed.writeUInt32LE(165, 4);
+        fs.writeFileSync(handed.file, changed);
+        await imported;
+        assert.deepEqual(session.dirtyPaths(), ['art.yft']);
+    });
+
     it('stops watching when told, and leaves the file where it is', async () => {
         const { session, handoff } = await open('stop');
         const handed = await handoff.begin('art.yft');

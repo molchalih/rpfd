@@ -115,7 +115,7 @@
   "scripts": {
     "build": "tsc -p .",
     "check": "tsc -p . --noEmit",
-    "test": "npm run build && node --test dist/test/*.test.js",
+    "test": "npm run build && node --test --test-timeout=60000 dist/test/*.test.js",
     "package": "npm run build && node dist/scripts/vsix.js"
   },
   "devDependencies": {
