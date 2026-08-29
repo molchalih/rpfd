@@ -932,7 +932,11 @@ where
 ///
 /// # Errors
 ///
-/// [`Error::FieldOverflow`] for a value the row cannot represent.
+/// [`Error::FieldOverflow`] for a value the row cannot represent, and
+/// [`Error::ArchiveTooLarge`] for a payload laid out past what the version
+/// addresses. Only a rebuild reaches the second: an in-place patch's block
+/// comes back out of the entry it is patching, so it is already inside the
+/// field it is about to be written into.
 pub(crate) fn file_row(
     version: Version,
     path: &str,

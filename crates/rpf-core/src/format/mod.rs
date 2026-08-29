@@ -251,7 +251,8 @@ impl Version {
     /// # Errors
     ///
     /// [`Error::FieldOverflow`] for a value this version's row cannot
-    /// represent.
+    /// represent, and [`Error::ArchiveTooLarge`] for a payload laid out past
+    /// what this version addresses.
     pub fn file_row(self, path: &str, fields: &FileFields) -> Result<Row> {
         match self {
             Self::Rpf7 => Ok(Row(RowBytes::Rpf7(rpf7::file_row(path, fields)?))),

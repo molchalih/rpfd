@@ -10,7 +10,7 @@
 //! user's own configuration directory, and [`Cache::platform`] is what finds it.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
@@ -522,12 +522,24 @@ impl Environment {
     }
 }
 
+/// Whether `$XDG_CONFIG_HOME` names an absolute path **by the specification's
+/// rule**, which is a leading `/`.
+///
+/// Not `Path::is_absolute`, which answers the question the platform this was
+/// compiled for asks: on Windows `/elsewhere/config` is relative, so the
+/// `Platform::Xdg` arm — a Unix convention, and live code on every platform by
+/// `docs/conventions.md` §14 — silently fell through to `$HOME/.config` there.
+/// Found by the suite's first run on Windows.
+fn xdg_absolute(configured: &OsStr) -> bool {
+    configured.as_encoded_bytes().first() == Some(&b'/')
+}
+
 /// The cache directory for a platform and an environment, if that environment
 /// says where it is.
 fn root(platform: Platform, environment: &Environment) -> Option<PathBuf> {
     let base = match platform {
         Platform::Xdg => match environment.xdg_config_home.as_ref() {
-            Some(configured) if Path::new(configured).is_absolute() => PathBuf::from(configured),
+            Some(configured) if xdg_absolute(configured) => PathBuf::from(configured),
             _ => PathBuf::from(environment.home.as_ref()?).join(".config"),
         },
         Platform::Apple => PathBuf::from(environment.home.as_ref()?)
@@ -544,7 +556,7 @@ mod tests {
 
     use super::{
         APPLICATION, Cache, Environment, KEYS, MAGIC, PAYLOAD_AT, Platform, SUFFIX, SourceDigest,
-        TEMPORARY, decode, encode, root,
+        TEMPORARY, decode, encode, root, xdg_absolute,
     };
     use crate::keys::{AES_KEY_LEN, HASH_LUT_LEN, Keys};
 
@@ -986,6 +998,20 @@ mod tests {
             root(Platform::Xdg, &relative).unwrap(),
             std::path::Path::new("/home/p/.config").join(APPLICATION)
         );
+    }
+
+    #[test]
+    fn the_xdg_rule_is_a_leading_slash_and_not_the_host_s_idea_of_absolute() {
+        // Asserted against the rule rather than through `root`, because through
+        // `root` it is only ever wrong on one platform: `Path::is_absolute`
+        // agrees with this on Unix and disagrees on Windows, where it called
+        // `/elsewhere/config` relative and sent the cache to `$HOME/.config`.
+        // `docs/conventions.md` §14 claims all three arms are live everywhere,
+        // and this is what makes that testable from anywhere.
+        assert!(xdg_absolute(std::ffi::OsStr::new("/elsewhere/config")));
+        assert!(!xdg_absolute(std::ffi::OsStr::new("C:\\config")));
+        assert!(!xdg_absolute(std::ffi::OsStr::new("config")));
+        assert!(!xdg_absolute(std::ffi::OsStr::new("")));
     }
 
     #[test]

@@ -171,8 +171,23 @@ durability, since a rebuild is atomic and a patch is not.
 "Atomic" here means the archive is never left half-written under its own name:
 the rebuild goes to a scratch file in the same directory and replaces the
 original in one step. It is not a claim about surviving power loss — the replace
-is not followed by a sync — and it is measured on macOS and Linux, not yet on
-Windows.
+is not followed by a sync.
+
+Measured on macOS, Linux and Windows as of 2026-08-29, on NTFS, and **Windows
+refuses the replace in two cases the others allow**. A destination that is
+marked read-only cannot be replaced; nor can one another program holds open
+without granting delete sharing. Both come back as an I/O failure naming the
+archive, the archive is left exactly as it was, and there is nothing this tool
+can do about either from its side. A destination this process holds open —
+which every rebuild does, because it is reading the archive it replaces — is
+fine on all three.
+
+Read "on NTFS" as a real qualification rather than a hedge. The replace goes
+through the standard library's rename, which uses POSIX semantics where the
+volume supports them and falls back to `MoveFileEx` where it does not — and on
+that fallback the third case joins the other two, so a rebuild on a FAT32 or
+exFAT drive, or across some network redirectors, fails where the same rebuild
+on NTFS succeeds. That path is unmeasured here; the two cases above are not.
 
 Adding, removing and renaming an entry always rebuild, and the tool says so
 before it starts: each of them changes the entry count or the names blob, so

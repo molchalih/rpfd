@@ -2278,3 +2278,40 @@ fn a_refused_extraction_writes_nothing_at_all() {
     left.sort();
     assert_eq!(left, vec!["mine.txt".to_owned()], "it wrote something");
 }
+
+/// A rebuild replaces an archive this process still holds open, which is what
+/// every rebuild does: the read handle on the archive lives until the rewrite
+/// that reads it is finished, and the replace happens after that.
+///
+/// The condition is invisible on Unix and was the whole of Windows' first test
+/// run: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` refuses a destination anything
+/// holds open, so five rebuild tests failed there with `Access is denied`.
+/// DR-035.
+#[test]
+fn a_rebuild_replaces_an_archive_something_holds_open() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let source = dir.path().join("added.txt");
+    fs::write(&source, b"brand new").expect("writable");
+
+    let held = fs::File::open(&archive).expect("the archive opens");
+    let (code, message) = run(&[
+        "put",
+        &archive_str,
+        "data/added.txt",
+        &source.display().to_string(),
+        "--create",
+    ]);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&message));
+    drop(held);
+
+    assert!(
+        listing(&archive).contains(&"data/added.txt".to_owned()),
+        "{:?}",
+        listing(&archive),
+    );
+    assert_eq!(run(&["verify", &archive_str]).0, 0, "verify");
+}

@@ -209,7 +209,10 @@ impl Claim {
 /// created, [`Error::WrongKind`] for a directory, [`Error::NotAResource`] for a
 /// resource given a payload that is not one, [`Error::FieldOverflow`] for one no
 /// entry row can describe, [`Error::Overlapping`] for two edits that claim the
-/// same bytes, and [`Error::Io`] from the archive.
+/// same bytes, and [`Error::Io`] from the archive. Not
+/// [`Error::ArchiveTooLarge`], which the same row builder can raise: the block
+/// this hands it was decoded out of the entry it is patching, so it already
+/// fits the field.
 pub fn plan<F>(file: &mut F, archive: &Archive, changes: &Changes) -> Result<Plan>
 where
     F: Read + Seek,

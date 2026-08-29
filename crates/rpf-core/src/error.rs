@@ -356,6 +356,31 @@ pub enum Error {
         limit: u64,
     },
 
+    /// The layout ran past the largest payload offset the version can address.
+    ///
+    /// A version stores a payload's offset in a narrow field, so it has a size
+    /// ceiling: RPF7 counts 512-byte blocks in 23 bits, which is 4,294,966,784
+    /// bytes. `docs/rpf-format.md`, Entry table.
+    ///
+    /// Not a [`Error::FieldOverflow`], although it is noticed in the same
+    /// place. Every other narrow field is a fact about the entry that
+    /// overflowed it and is fixed by changing that entry; this is a fact about
+    /// the **archive**, and the entry named is only where the layout first ran
+    /// past the end — which is not the entry the caller added, and is nothing
+    /// the caller chose.
+    #[error(
+        "the archive is too large: this version addresses {limit} bytes \
+         and the layout reached {reached} (at {path:?})"
+    )]
+    ArchiveTooLarge {
+        /// The entry the layout was placing when it ran past the limit.
+        path: String,
+        /// The offset it reached, in bytes.
+        reached: u64,
+        /// The largest offset this version addresses, in bytes.
+        limit: u64,
+    },
+
     /// An entry was declared a resource but its payload is not one.
     #[error("{path:?}: declared a resource, but the payload does not begin with RSC7")]
     NotAResource {
@@ -583,6 +608,7 @@ impl Error {
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
+            | Self::ArchiveTooLarge { .. }
             | Self::NotAResource { .. }
             | Self::BadPath { .. }
             | Self::AlreadyExists { .. }
@@ -655,6 +681,7 @@ impl Error {
             Self::NoSuchEntry { .. } => "NoSuchEntry",
             Self::NotFound { .. } => "NotFound",
             Self::FieldOverflow { .. } => "FieldOverflow",
+            Self::ArchiveTooLarge { .. } => "ArchiveTooLarge",
             Self::NotAResource { .. } => "NotAResource",
             Self::NameCollision { .. } => "NameCollision",
             Self::AlreadyExists { .. } => "AlreadyExists",
@@ -708,7 +735,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 29;
+    const VARIANTS: usize = 30;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -817,6 +844,11 @@ mod tests {
                 what: "compressed size",
                 len: 1 << 24,
                 limit: (1 << 24) - 1,
+            },
+            Error::ArchiveTooLarge {
+                path: "data/vehicles.meta".to_owned(),
+                reached: 4_294_967_296,
+                limit: 4_294_966_784,
             },
             Error::NotAResource {
                 path: "x.ytd".to_owned(),

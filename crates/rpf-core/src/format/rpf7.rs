@@ -74,8 +74,13 @@ pub const RESOURCE_FLAG: u32 = 0x0080_0000;
 /// Largest value the 24-bit compressed-size field holds.
 const MAX_SIZE_24: u64 = 0x00FF_FFFF;
 
-/// Largest block index the 24-bit offset field holds, the resource bit
-/// excluded.
+/// Largest block index an entry's offset field holds, the resource bit excluded
+/// — so the largest offset this version addresses is this times [`BLOCK_LEN`],
+/// 4,294,966,784 bytes.
+///
+/// `docs/rpf-format.md`, Entry table, `verified`: it follows from the field's
+/// 23 usable bits, and 358 Rockstar archives across both GTA V installs sit
+/// under it, the largest at 3,981,039,616.
 const MAX_BLOCK: u64 = 0x007F_FFFF;
 
 /// Largest name offset a **file** entry holds. Directories get a full word.
@@ -205,7 +210,9 @@ pub(super) fn directory_row(name_offset: u32, first_child: u32, child_count: u32
 ///
 /// # Errors
 ///
-/// [`Error::FieldOverflow`] for a value the row cannot represent.
+/// [`Error::FieldOverflow`] for a value the row cannot represent, and
+/// [`Error::ArchiveTooLarge`] for a block offset past the end of what this
+/// version addresses — which is the archive's size rather than this entry's.
 pub(super) fn file_row(path: &str, fields: &FileFields) -> Result<[u8; ROW_LEN]> {
     check(
         path,
@@ -214,7 +221,16 @@ pub(super) fn file_row(path: &str, fields: &FileFields) -> Result<[u8; ROW_LEN]>
         MAX_FILE_NAME_OFFSET,
     )?;
     check(path, "compressed size", fields.compressed_len, MAX_SIZE_24)?;
-    check(path, "block offset", fields.block, MAX_BLOCK)?;
+    // Not `check`: a block offset past the end is the archive's size and not
+    // this entry's, and reporting it as this entry's names whichever payload
+    // the layout happened to place first past the ceiling.
+    if fields.block > MAX_BLOCK {
+        return Err(Error::ArchiveTooLarge {
+            path: path.to_owned(),
+            reached: fields.block.saturating_mul(BLOCK_LEN),
+            limit: MAX_BLOCK.saturating_mul(BLOCK_LEN),
+        });
+    }
 
     let (word_at_8, word_at_12, resource) = match fields.content {
         Content::Binary {
@@ -472,7 +488,6 @@ mod tests {
         for (what, spec) in [
             ("file name offset", fields(0x0001_0000, 0, 0)),
             ("compressed size", fields(0, 0, 0x0100_0000)),
-            ("block offset", fields(0, 0x0080_0000, 0)),
         ] {
             let error = file_row("a.txt", &spec).expect_err("does not fit");
             assert!(
@@ -482,6 +497,32 @@ mod tests {
         }
         // And the largest value each field *does* hold is still written.
         assert!(file_row("a.txt", &fields(0xFFFF, MAX_BLOCK, MAX_SIZE_24)).is_ok());
+    }
+
+    #[test]
+    fn a_block_offset_past_the_end_is_the_archive_being_too_large() {
+        // Measured 2026-08-29 on a 2,965,617,664-byte archive built for the
+        // purpose: adding a further 1.5 GB entry reported `"data/vehicles.meta":
+        // block offset is 8594217, over the format's limit of 8388607` — an
+        // entry the caller never named, which is the first one the layout put
+        // past the ceiling. The fact is the archive's size, so the failure is.
+        let past = FileFields {
+            name_offset: 0,
+            block: MAX_BLOCK.saturating_add(1),
+            compressed_len: 0,
+            content: Content::Binary {
+                uncompressed_len: 0,
+                encryption: 0,
+            },
+        };
+        let error = file_row("data/vehicles.meta", &past).expect_err("does not fit");
+        let Error::ArchiveTooLarge { reached, limit, .. } = error else {
+            panic!("{error:?}");
+        };
+        // 8,388,607 blocks of 512 bytes: just under 4 GiB, and the reason no
+        // archive in either GTA V install exceeds it. docs/corpus.md.
+        assert_eq!(limit, 4_294_966_784);
+        assert_eq!(reached, 4_294_967_296);
     }
 
     #[test]

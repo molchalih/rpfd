@@ -1080,6 +1080,20 @@ fn refuse_game_install(path: &Path, force: bool) -> Result<()> {
 
 /// Moves a freshly written archive into place, keeping any permissions the
 /// file it replaces already had.
+///
+/// The replace is atomic in the sense that no reader sees a torn file at the
+/// destination name; it is not a promise about power loss. On Windows and NTFS
+/// it is refused for a read-only destination, and for one another program holds
+/// open without allowing deletion — and on a volume that cannot do a
+/// POSIX-semantics rename at all, a destination *this* process holds open is
+/// refused too. DR-035.
+///
+/// # Errors
+///
+/// [`Failure::Io`] naming the archive if the scratch file cannot be flushed or
+/// moved into place. Also if the replaced file's permissions cannot be put back
+/// on afterwards, which is the one failure that leaves the **new archive in
+/// place** — correct, complete, and carrying the scratch file's own mode.
 pub fn persist(scratch: tempfile::NamedTempFile, path: &Path) -> Result<()> {
     let mut scratch = scratch;
     scratch
@@ -1090,21 +1104,44 @@ pub fn persist(scratch: tempfile::NamedTempFile, path: &Path) -> Result<()> {
             source,
         })?;
 
-    // A temporary file is created 0600. Silently tightening a file we replaced
-    // would be a surprise the caller never asked for.
-    if let Ok(existing) = fs::metadata(path) {
-        fs::set_permissions(scratch.path(), existing.permissions()).map_err(|source| {
-            Failure::Io {
-                path: scratch.path().display().to_string(),
-                source,
-            }
-        })?;
-    }
+    // Read before the replace and applied after it. A temporary file is created
+    // 0600, and silently tightening a file we replaced would be a surprise the
+    // caller never asked for — but putting the mode on the *scratch* first
+    // hands a read-only destination's own read-only bit to the file we may then
+    // have to delete, and Windows refuses to delete one of those. Between the
+    // two, the archive briefly carries 0600, which is the safe direction.
+    let replaced = fs::metadata(path)
+        .ok()
+        .map(|existing| existing.permissions());
 
-    scratch.persist(path).map_err(|error| Failure::Io {
+    // `fs::rename` rather than `NamedTempFile::persist`, which is
+    // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows and refuses to
+    // replace a destination *anything* holds open — including this process,
+    // which holds the archive it is rebuilding. Measured on Windows 11
+    // 10.0.26200.9168, NTFS: `MoveFileExW` REFUSED (os error 5) with the
+    // destination open through `File::open`, where `fs::rename` succeeded.
+    // DR-035.
+    let (file, scratch_path) = scratch.keep().map_err(|error| Failure::Io {
         path: path.display().to_string(),
         source: error.error,
     })?;
+    drop(file);
+    fs::rename(&scratch_path, path).map_err(|source| {
+        // `keep` disarmed the delete-on-drop, so without this a failed replace
+        // leaves the scratch beside the archive it did not become.
+        drop(fs::remove_file(&scratch_path));
+        Failure::Io {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+
+    if let Some(permissions) = replaced {
+        fs::set_permissions(path, permissions).map_err(|source| Failure::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
     Ok(())
 }
 
