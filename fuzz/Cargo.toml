@@ -1,0 +1,57 @@
+# Its own workspace, and excluded from the root one, because `cargo-fuzz` needs
+# a nightly compiler and `rust-toolchain.toml` pins the workspace to stable.
+# Nothing here is built by a default build, by `cargo test --all`, or by
+# continuous integration. docs/conventions.md §14, the fuzzing row.
+[workspace]
+
+[package]
+name = "rpf-fuzz"
+version = "0.0.0"
+publish = false
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.98"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# docs/conventions.md §14, the fuzzing row: `cargo-fuzz` with `arbitrary` 1.4.
+arbitrary = { version = "1.4", features = ["derive"] }
+libfuzzer-sys = "0.4"
+rpf-core = { path = "../crates/rpf-core" }
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "locate"
+path = "fuzz_targets/locate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extracted"
+path = "fuzz_targets/extracted.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false

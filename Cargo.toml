@@ -5,7 +5,12 @@ members = ["crates/rpf-core", "crates/rpf"]
 # appear in a default build, in continuous integration, or in anything shipped.
 # It is built deliberately, run once per corpus change, and what gets committed
 # is its output. tools/oracle/README.md says how to run it.
-exclude = ["tools/oracle"]
+#
+# `fuzz` is excluded for a different reason: `cargo-fuzz` needs a nightly
+# compiler, and `rust-toolchain.toml` pins this workspace to stable so that
+# `-D warnings` means one thing for everyone (§15). Excluding it keeps that pin
+# untouched. fuzz/Cargo.toml says what the targets assert.
+exclude = ["tools/oracle", "fuzz"]
 
 [workspace.package]
 edition = "2024"
