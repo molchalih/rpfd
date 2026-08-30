@@ -21,7 +21,9 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
-use rpf_core::{Archive, Checksum, Error, FileKind, FileSpec, Storage, Unwatched, Version};
+use rpf_core::{
+    Archive, Checksum, EntryKind, Error, FileKind, FileSpec, Storage, Unwatched, Version,
+};
 
 /// Bytes deflate cannot make smaller, so that the resource below is longer
 /// than the reads these tests do into it.
@@ -233,6 +235,72 @@ fn a_stream_knows_where_its_end_is_without_reading_to_it() {
         stream.read_to_end(&mut tail).expect("reads");
         assert_eq!(tail.len(), 16, "the last sixteen bytes");
         assert_eq!(stream.stream_position().expect("tells"), len);
+    }
+}
+
+/// A forward seek in a deflated entry lands on the bytes it claims to.
+///
+/// Seeking forward has no shortcut: the stream inflates what it passes over
+/// and throws it away, in pieces, and then records the destination as its
+/// position. Stopping that walk early still records the destination, so the
+/// stream's real position and its reported one disagree and **every later read
+/// answers from the wrong place** — with no error anywhere, which is what
+/// makes it worth a test rather than a comment.
+///
+/// Nothing compared what a forward seek landed on. The test above seeks to the
+/// last sixteen bytes and asserts that they are sixteen bytes, never that they
+/// are the last sixteen; the one test that does compare bytes seeks
+/// *backwards*, which restarts the stream and takes the other branch.
+///
+/// The payload is deliberately longer than one piece of the walk, so that
+/// reaching the destination takes several: an entry small enough to be passed
+/// over in one go cannot tell a loop that runs once from a loop that runs
+/// until it is done.
+#[test]
+fn a_forward_seek_in_a_deflated_entry_lands_on_the_right_bytes() {
+    // Compressible, so `build` really does deflate it, and periodic with a
+    // period that is not a power of two, so no two offsets in the archive hold
+    // the same window of bytes by accident.
+    let plain: Vec<u8> = (0..96_000_u32).map(|byte| (byte % 251) as u8).collect();
+    let files = vec![FileSpec {
+        path: "long.bin".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Deflate,
+            encryption: 0,
+        },
+    }];
+    let mut out = Vec::new();
+    rpf_core::build(
+        &mut Cursor::new(&mut out),
+        Version::Rpf7,
+        &files,
+        &[],
+        |_: &str| Ok(Cursor::new(plain.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+
+    let mut src = Cursor::new(out.clone());
+    let parsed = Archive::open(&mut src).expect("parses");
+    let index = parsed.find("long.bin").expect("resolves");
+    match parsed.entry(index).expect("in range").kind {
+        EntryKind::Binary { compressed_len, .. } => assert!(
+            compressed_len > 0,
+            "the entry is meant to be deflated, not stored"
+        ),
+        other => panic!("expected a binary entry, got {other:?}"),
+    }
+
+    let mut src = Cursor::new(out);
+    let mut stream = parsed.extracted(&mut src, index).expect("opens");
+    for at in [40_000_usize, 60_000, 95_900] {
+        assert_eq!(
+            stream.seek(SeekFrom::Start(at as u64)).expect("seeks"),
+            at as u64
+        );
+        let mut got = vec![0_u8; 100.min(plain.len() - at)];
+        stream.read_exact(&mut got).expect("reads");
+        assert_eq!(got, plain[at..at + got.len()], "read after a seek to {at}");
     }
 }
 

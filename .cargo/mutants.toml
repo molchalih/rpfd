@@ -1,0 +1,74 @@
+# cargo-mutants: how a mutation sweep of this workspace is run, and what a
+# survivor from it is allowed to mean. `docs/mutants.md` reports the sweeps.
+#
+# The tool is here because reading has twice missed what it found. Three bounds
+# checks were disabled and all 58 tests stayed green; a 16-bit name-offset check
+# was deleted and the whole suite stayed green while the build produced archives
+# where 550 of 4,000 entries carried the wrong name, parsing and verifying
+# clean. Four readers had looked at both. §12 asks that every `verified` row of
+# `docs/rpf-format.md` have a test that fails when the fact stops being true;
+# this is the only thing that checks whether such a test exists.
+#
+# Run it from the workspace root, with the corpus and the executables in place:
+#
+#   RPF_CORPUS=$PWD/assets RPF_REQUIRE_CORPUS=1 \
+#   RPF_GAME_EXE=$PWD/bin RPF_REQUIRE_GAME_EXE=1 \
+#   cargo mutants -p rpf-core -j 8
+#
+# Both pairs matter. A skipped test kills nothing, so a run without them reports
+# survivors the real suite catches — the same green-suite-that-tested-nothing
+# §12 names as the most expensive possible bug, arriving as a false finding
+# instead of a false pass. The executable-gated half of `tests/keys.rs` costs
+# about six minutes of every mutant on a debug build, which is most of the wall
+# clock; that is the price of the keys module being measured at all.
+
+# Every mutant is judged by the whole workspace's tests, not by the mutated
+# package's alone. Measured: eleven mutations of `rpf-core` that its own suite
+# leaves alive are killed by `crates/rpf`'s — nine accessors on `Changes` that
+# only the daemon calls, `Verified::outcome`, and the resource arm of
+# `Manifest::derive`. Scoped to the package, the sweep would have reported all
+# eleven as gaps in a library that is in fact tested through its one client.
+#
+# `test_workspace` is the setting that ought to say this. With `-p rpf-core` on
+# the command line, cargo-mutants 27.1.0 still passes `--package=rpf-core` and
+# nothing else to `cargo test`, so the flag is added here instead, where cargo
+# honours it.
+additional_cargo_args = ["--workspace"]
+
+# The one test excluded, and the only exclusion in this file.
+#
+# `serve::a_cancel_during_a_commit_that_patches_is_told_why_it_cannot` spins on
+# 125-microsecond sleeps. It fails on unmodified `main` on a 32-core machine at
+# load 76 and passes at load 35, so it is the machine and not the change. A
+# mutation run is where that costs the most: a test that fails on its own makes
+# cargo-mutants record the mutant as caught, so an intermittent test does not
+# add noise — it reports a clean line exactly where a real gap is, which is the
+# one error direction that makes a sweep worse than not running one. Skipped by
+# name until it no longer depends on the machine it runs on.
+additional_cargo_test_args = ["--", "--skip", "a_cancel_during_a_commit_that_patches_is_told_why_it_cannot"]
+
+# No source file is excluded, and that is a finding rather than an omission.
+# 840 mutants over `rpf-core` is not a flood, and the four places that looked
+# untestable on inspection are not:
+#
+#   `keys/anchors.rs` generates none at all — it is 1,529 lines of `const`
+#   arrays, and cargo-mutants mutates function bodies.
+#
+#   The platform branches in `keys/cache.rs` are testable from any one platform
+#   and `tests/keys.rs` already tests all three from one, which `Cache::at`
+#   exists to allow.
+#
+#   The hand-written `Debug` impls hide key material, which is a property a test
+#   can assert and `an_extracted_key_never_prints_itself` does assert; the one
+#   that survives does so because nothing asserts it, not because nothing could.
+#
+#   `Extracted::reserve` and the two buffer sizes are equivalent-to-original,
+#   which is a survivor to explain in the report and not a file to hide.
+
+# A mutant that hangs must be told apart from a machine that is busy. The suite
+# runs in about 20 seconds with the executables absent, so the auto-set timeout
+# — five times the baseline — lands near 100 seconds, and this box has taken
+# five times that for the same tests while a fuzz run had all 32 cores. One real
+# hang costs five minutes of one job; a false timeout costs a wrong line in the
+# report.
+minimum_test_timeout = 300

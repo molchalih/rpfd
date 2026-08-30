@@ -806,6 +806,145 @@ fn the_wire_refuses_the_removal_the_set_has_already_filled() {
     rpf_core::allows(&mut src, &archive, &buffered, "empty", &said).expect("recursive is allowed");
 }
 
+/// A rename landing under the directory fills it as surely as a write does.
+///
+/// `tree_of` removes before it renames, so the removal on its own sees the
+/// archive's empty directory, takes it out, and the rename implies it back
+/// holding the moved file — the same self-consistent exit 0 DR-038 refused for
+/// a write, arriving by the other door. A rename is one of the two ways a set
+/// puts something somewhere it is not yet, and both have to count.
+#[test]
+fn a_directory_the_set_renames_into_is_not_empty_either() {
+    let source = built(&[stored("a.txt")], &["empty".to_owned()], b"same");
+    assert_eq!(paths(&source), vec!["a.txt", "empty"]);
+
+    let mut changes = Changes::new();
+    changes.set("a.txt", Change::RenameTo("empty/moved.txt".to_owned()));
+    changes.set("empty", Change::Remove { recursive: false });
+
+    match rewriting(&source, &changes) {
+        Err(Error::BadPath { path, reason }) => {
+            assert_eq!(path, "empty");
+            assert_eq!(reason, "is a directory that is not empty");
+        }
+        other => panic!("expected a refusal, got {:?}", other.map(|b| b.len())),
+    }
+
+    // The daemon asks the same question, and the destination is what makes the
+    // rename bear on the removal at all.
+    let mut src = std::io::Cursor::new(source.clone());
+    let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+    let mut buffered = Changes::new();
+    buffered.set("a.txt", Change::RenameTo("empty/moved.txt".to_owned()));
+    let offered = Change::Remove { recursive: false };
+    match rpf_core::allows(&mut src, &archive, &buffered, "empty", &offered) {
+        Err(Error::BadPath { path, reason }) => {
+            assert_eq!(path, "empty");
+            assert_eq!(reason, "is a directory that is not empty");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A change buffered somewhere else does not fill the directory.
+///
+/// The other half of the same rule, and the half nothing reached: every test
+/// of `arrives_under` buffers a change that *is* under the directory, so
+/// nothing told "arrives under this directory" from "exists anywhere". Losing
+/// that distinction makes an empty directory undeletable for as long as any
+/// unrelated creation is buffered, which is a refusal with a reason that is
+/// not true — the shape DR-038 was written to stop.
+#[test]
+fn a_creation_outside_the_directory_leaves_it_empty() {
+    let source = built(&[stored("a.txt")], &["empty".to_owned()], b"same");
+
+    let mut changes = Changes::new();
+    changes.set("elsewhere/new.txt", adding(b"new"));
+    changes.set("empty", Change::Remove { recursive: false });
+
+    let rebuilt = rewritten(&source, &changes);
+    assert_eq!(
+        paths(&rebuilt),
+        vec!["a.txt", "elsewhere", "elsewhere/new.txt"],
+        "the empty directory outlived a removal that named it"
+    );
+
+    // And a new directory named outside it is no more of an arrival than a
+    // file is: the same arm decides both.
+    let mut changes = Changes::new();
+    changes.set("elsewhere", Change::MakeDirectory);
+    changes.set("empty", Change::Remove { recursive: false });
+    let rebuilt = rewritten(&source, &changes);
+    assert_eq!(paths(&rebuilt), vec!["a.txt", "elsewhere"]);
+}
+
+/// A removal is answered against the buffered changes that reach it, and
+/// against no others.
+///
+/// DR-032's rule: two changes with no path in common decide nothing about each
+/// other, so `bearing_on` resolves the offered change against the subset that
+/// could and leaves the rest out. Widening either half of the condition that
+/// picks that subset stages the whole set instead, and then a buffered change
+/// that has gone stale somewhere else answers a question that was not about it
+/// — the caller asks whether it may delete one directory and is told a
+/// different path already exists. R7.6 wants a message the caller can act on,
+/// and a refusal naming a path the caller did not mention is not one.
+///
+/// Both halves below are reachable, the first through the daemon's own verbs.
+#[test]
+fn a_removal_is_answered_against_the_changes_that_reach_it() {
+    let source = built(
+        &[stored("a.txt"), stored("other.txt")],
+        &["empty".to_owned()],
+        b"same",
+    );
+    let mut src = std::io::Cursor::new(source);
+    let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+
+    // `delete other.txt`, then `rename a.txt other.txt` — which DR-030 records
+    // as the rename a buffered removal legitimately frees — then `forget
+    // other.txt`, which puts the freed path back and leaves the rename in the
+    // set claiming a path that exists again.
+    let mut buffered = Changes::new();
+    buffered.set("other.txt", Change::Remove { recursive: false });
+    buffered.set("a.txt", Change::RenameTo("other.txt".to_owned()));
+    assert!(
+        buffered.forget("other.txt").is_some(),
+        "nothing was buffered"
+    );
+
+    let unrelated = Change::Remove { recursive: false };
+    rpf_core::allows(&mut src, &archive, &buffered, "empty", &unrelated)
+        .expect("an empty directory is still empty");
+
+    // The rename really has gone stale, which is what makes the answer above
+    // an answer rather than an accident.
+    let again = Change::RenameTo("other.txt".to_owned());
+    assert!(
+        matches!(
+            rpf_core::allows(&mut src, &archive, &buffered, "a.txt", &again),
+            Err(Error::AlreadyExists { .. })
+        ),
+        "the rename should now be refused on its own account"
+    );
+
+    // A plain write the archive cannot resolve is the same story for the other
+    // half of the condition. `allows` would not have admitted this one, so the
+    // set is built directly; what is asserted is that the removal is decided
+    // without it, and that the write's own problem is reported against the
+    // write.
+    let mut buffered = Changes::new();
+    buffered.set(
+        "missing.txt",
+        Change::Write {
+            contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
+            create: false,
+        },
+    );
+    rpf_core::allows(&mut src, &archive, &buffered, "empty", &unrelated)
+        .expect("a write elsewhere does not decide this removal");
+}
+
 /// A replacing rename spelled with different capitalisation is still a
 /// replacement.
 ///

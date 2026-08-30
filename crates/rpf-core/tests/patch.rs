@@ -533,3 +533,72 @@ fn a_build_and_a_patch_refuse_the_same_oversized_resource() {
         other => panic!("expected the size field to refuse it, got {other:?}"),
     }
 }
+
+/// Largest a resource's `RSC7` header is, and the least a resource payload can
+/// be. `docs/rpf-format.md`, Compression.
+///
+/// Spelled out here rather than imported for `MAX_SIZE_24`'s reason: a test
+/// that took the width from the code it checks would agree with whatever the
+/// code came to believe.
+const RESOURCE_HEADER_LEN: usize = 16;
+
+/// A payload with the right magic and a truncated header is not a resource.
+///
+/// The magic check catches a payload that is not a resource at all; this one
+/// is refused a step earlier, for being shorter than the header whose two flag
+/// words the entry duplicates. The read is a `take(16)`, so its length can
+/// never be *above* sixteen — which means the guard goes inert if the
+/// comparison is turned around, and nothing noticed: no test offered either
+/// write path a resource payload shorter than its own header, and one that
+/// begins `RSC7` walks straight past the magic check behind it.
+///
+/// `docs/rpf-format.md`, Resource entries: the flags at offsets 8 and 12 of
+/// the header are the ones the entry row carries, so a header that is not all
+/// there is an entry whose flags would be invented.
+#[test]
+fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
+    let mut truncated = b"RSC7".to_vec();
+    truncated.extend_from_slice(&162_u32.to_le_bytes());
+    truncated.extend_from_slice(&0x8000_0010_u32.to_le_bytes());
+    assert!(
+        truncated.len() < RESOURCE_HEADER_LEN,
+        "the payload is meant to be short of a whole header"
+    );
+
+    let files = vec![FileSpec {
+        path: "art.yft".to_owned(),
+        kind: FileKind::Resource,
+    }];
+    let mut out = Cursor::new(Vec::new());
+    let refused = rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_: &str| Ok(Cursor::new(truncated.clone())),
+        &mut Unwatched,
+    );
+    match refused {
+        Err(rpf_core::Error::NotAResource { ref path }) => assert_eq!(path, "art.yft"),
+        other => panic!("expected a truncated header to be refused, got {other:?}"),
+    }
+    assert!(
+        out.into_inner().is_empty(),
+        "nothing may be written for a refused resource"
+    );
+
+    // And the patch path, which applies the same rule through `store`.
+    let before = archive_bytes();
+    let mut file = Cursor::new(before.clone());
+    let archive = Archive::open(&mut file).expect("parses");
+    let refused = rpf_core::plan(&mut file, &archive, &edits(&[("art.yft", truncated)]));
+    assert!(
+        matches!(refused, Err(rpf_core::Error::NotAResource { .. })),
+        "got {refused:?}",
+    );
+    assert_eq!(
+        file.get_ref(),
+        &before,
+        "a refused plan still wrote something"
+    );
+}

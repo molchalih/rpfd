@@ -135,6 +135,103 @@ mod tests {
         }
     }
 
+    /// What each of a flag word's 32 bits is worth in pages, transcribed from
+    /// the `pages(f)` definition in `docs/rpf-format.md`, Resource page flags.
+    ///
+    /// **Every** bit, not one per field. A table with one entry per term pins
+    /// where each field begins and leaves its width unpinned, which is this
+    /// module's own gap one level up: the first version of this table asserted
+    /// bits 27, 26, 25, 24, 17, 11, 7, 5 and 4, and narrowing
+    /// `(f >> 17) & 0x7F` to `0x3F`, `(f >> 11) & 0x3F` to `0x1F` and
+    /// `(f >> 7) & 0xF` to `0x7` each still passed the whole suite. A field is
+    /// a range, so what pins it is a range.
+    ///
+    /// The low nibble is the base page size and the high one is the version,
+    /// so neither is worth any pages — listed rather than left out, because a
+    /// mask that grew would take its pages from exactly there.
+    const PAGE_BITS: &[(u32, u32)] = &[
+        // 0..=3: the base page size, `0x200 << (f & 0xF)`.
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        // 4: `((f >> 4) & 0x01) << 8`.
+        (4, 256),
+        // 5..=6: `((f >> 5) & 0x03) << 7`.
+        (5, 128),
+        (6, 256),
+        // 7..=10: `((f >> 7) & 0x0F) << 6`.
+        (7, 64),
+        (8, 128),
+        (9, 256),
+        (10, 512),
+        // 11..=16: `((f >> 11) & 0x3F) << 5`.
+        (11, 32),
+        (12, 64),
+        (13, 128),
+        (14, 256),
+        (15, 512),
+        (16, 1_024),
+        // 17..=23: `((f >> 17) & 0x7F) << 4`.
+        (17, 16),
+        (18, 32),
+        (19, 64),
+        (20, 128),
+        (21, 256),
+        (22, 512),
+        (23, 1_024),
+        // 24..=27: four single bits, worth 8, 4, 2 and 1.
+        (24, 8),
+        (25, 4),
+        (26, 2),
+        (27, 1),
+        // 28..=31: the version nibble, which a page count does not read.
+        (28, 0),
+        (29, 0),
+        (30, 0),
+        (31, 0),
+    ];
+
+    /// The decode is checked against the format document as well as against
+    /// the sample, because the sample cannot reach most of the word: nothing
+    /// in `MEASURED` and nothing in the corpus sets bit 26 or bit 25, and the
+    /// three multi-bit fields are reached only as far as bits 18, 11 and 9. A
+    /// term that is always zero cannot be told from a wrong one, and a
+    /// mutation sweep found exactly that — six mutations of the two lines
+    /// decoding bits 26 and 25 survived the whole suite while the same
+    /// mutations of the terms the sample does reach died.
+    ///
+    /// It is worth a synthetic table because `size_from_flags` scales this to
+    /// a resource's uncompressed length and `rebuild` writes that length back
+    /// into the entry row: a resource whose page layout sets a bit no measured
+    /// one sets would pack into an archive that parses and does not load.
+    #[test]
+    fn every_page_count_bit_is_worth_what_the_format_says() {
+        for &(bit, pages) in PAGE_BITS {
+            assert_eq!(page_count(1 << bit), pages, "bit {bit}");
+        }
+    }
+
+    /// The fields are disjoint: none overlaps another and no bit is counted
+    /// twice.
+    ///
+    /// The per-bit table alone does not say this. A mask reaching one bit too
+    /// far gives that bit two homes, and the sum of the parts is what notices.
+    /// It is also the bound `page_count`'s overflow reason states, so the two
+    /// say the same thing in two places on purpose.
+    #[test]
+    fn the_page_count_fields_are_disjoint() {
+        let mut word = 0_u32;
+        let mut pages = 0_u32;
+        for &(bit, worth) in PAGE_BITS {
+            word |= 1 << bit;
+            pages = pages.checked_add(worth).expect("the sum is bounded");
+        }
+        assert_eq!(word, u32::MAX, "the table is meant to cover the whole word");
+        assert_eq!(pages, 5_663, "1+2+4+8+2032+2016+960+384+256");
+        assert_eq!(page_count(word), pages, "flags={word:#010x}");
+    }
+
     #[test]
     fn graphics_half_of_a_model_is_empty() {
         // 0x20000000 sets no page-count bit, so it describes zero bytes rather

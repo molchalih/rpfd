@@ -25,67 +25,17 @@
 use std::io::{Cursor, Write as _};
 
 use rpf_core::{
-    Archive, Category, Checksum, Error, MAX_DEPTH, Manifest, Summary, Unwatched, Verified,
+    Archive, Category, Checksum, EntryKind, Error, MAX_DEPTH, Manifest, Summary, Unwatched,
+    Verified,
     format::{
-        Version,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
-        rpf7::{DIRECTORY_MARKER, ENCRYPTION_OPEN, MAGIC, RESOURCE_FLAG, ROW_LEN},
+        rpf7::{ENCRYPTION_OPEN, MAGIC, RESOURCE_FLAG, ROW_LEN},
     },
 };
 
-/// The version every archive below is assembled at.
-const V: Version = Version::Rpf7;
-/// Its header length, entry-row width and block unit, asked of the seam rather
-/// than restated here.
-const HEADER_LEN: u64 = V.header_len();
-const ENTRY_LEN: u64 = V.row_len();
-const BLOCK_LEN: u64 = V.block_len();
+mod common;
 
-/// One directory row: name offset, the marker, first child, child count.
-fn directory_row(name_offset: u32, first_child: u32, child_count: u32) -> [u8; ROW_LEN] {
-    let mut row = [0u8; ROW_LEN];
-    row[0..4].copy_from_slice(&name_offset.to_le_bytes());
-    row[4..8].copy_from_slice(&DIRECTORY_MARKER.to_le_bytes());
-    row[8..12].copy_from_slice(&first_child.to_le_bytes());
-    row[12..16].copy_from_slice(&child_count.to_le_bytes());
-    row
-}
-
-/// One file row: a 16-bit name offset, a 24-bit compressed size, a 24-bit
-/// block offset carrying the resource bit, and the two words whose meaning
-/// depends on that bit.
-fn file_row(
-    name_offset: u16,
-    compressed_len: u32,
-    block: u32,
-    word8: u32,
-    word12: u32,
-) -> [u8; ROW_LEN] {
-    let mut row = [0u8; ROW_LEN];
-    row[0..2].copy_from_slice(&name_offset.to_le_bytes());
-    row[2..5].copy_from_slice(&compressed_len.to_le_bytes()[..3]);
-    row[5..8].copy_from_slice(&block.to_le_bytes()[..3]);
-    row[8..12].copy_from_slice(&word8.to_le_bytes());
-    row[12..16].copy_from_slice(&word12.to_le_bytes());
-    row
-}
-
-/// Header, entry table, names blob, then zeroes out to `len`.
-fn archive_bytes(rows: &[[u8; ROW_LEN]], names: &[u8], len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(names.len() as u32).to_le_bytes());
-    out.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
-    for row in rows {
-        out.extend_from_slice(row);
-    }
-    out.extend_from_slice(names);
-    if out.len() < len {
-        out.resize(len, 0);
-    }
-    out
-}
+use common::{BLOCK_LEN, ENTRY_LEN, HEADER_LEN, archive_bytes, directory_row, file_row};
 
 /// Raw deflate of `plain`, which is what a binary payload is.
 fn deflate(plain: &[u8]) -> Vec<u8> {
@@ -995,6 +945,150 @@ fn a_resource_declaring_no_compressed_size_is_refused_rather_than_guessed() {
             }
         ),
         "expected the resource to be refused by size, got {error:?}"
+    );
+}
+
+/// A resource too small to hold its own header is refused when it is read as
+/// the **file it is outside the archive**, and not only as contents.
+///
+/// The two forms ask the same question through different arithmetic: contents
+/// subtract the header from the compressed size and fail on the borrow, and
+/// the file form compares the two outright. Only the first was exercised, so
+/// the second could have been made inert without a test noticing — and the
+/// file form is the one `extract` takes for a resource, which makes it the
+/// path that writes bytes to disk.
+#[test]
+fn a_resource_smaller_than_its_own_header_is_refused_by_extract_too() {
+    let rows = [
+        directory_row(0, 1, 1),
+        file_row(1, 8, 1 | RESOURCE_FLAG, ONE_SYSTEM_PAGE, 0),
+    ];
+    let bytes = archive_bytes(&rows, b"\0a\0", 2_048);
+
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let error = archive
+        .extract(&mut Cursor::new(bytes), 1)
+        .expect_err("eight bytes cannot hold a sixteen-byte header");
+    assert!(
+        matches!(
+            error,
+            Error::ResourceTooSmall {
+                entry: 1,
+                compressed_len: 8
+            }
+        ),
+        "expected the resource to be refused by size, got {error:?}"
+    );
+}
+
+/// A resource of exactly its header and nothing else is a resource.
+///
+/// The boundary the guard is on: the header is what a resource must have, not
+/// what it must exceed. Refusing this one would refuse a legal payload on the
+/// path `extract` takes, and the archive is where a payload of exactly sixteen
+/// bytes is decided rather than a matter of taste.
+#[test]
+fn a_resource_of_exactly_its_header_is_extracted_whole() {
+    let header = &resource_payload()[..RESOURCE_HEADER_LEN as usize];
+    let rows = [
+        directory_row(0, 1, 1),
+        file_row(
+            1,
+            RESOURCE_HEADER_LEN as u32,
+            1 | RESOURCE_FLAG,
+            ONE_SYSTEM_PAGE,
+            0,
+        ),
+    ];
+    let mut bytes = archive_bytes(&rows, b"\0a\0", 2_048);
+    bytes[BLOCK_LEN as usize..BLOCK_LEN as usize + header.len()].copy_from_slice(header);
+
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let file = archive
+        .extract(&mut Cursor::new(bytes), 1)
+        .expect("a header is a whole resource file");
+    assert_eq!(file, header, "the file form is the header, byte for byte");
+}
+
+// ----- the resource bit against the magic actually there -------------------
+
+/// One stored binary entry whose payload is `payload`, declaring `declared`
+/// bytes of it.
+///
+/// The resource bit is *not* set, whatever the payload begins with, which is
+/// the disagreement Q7 asks about from the side the corpus cannot show.
+fn one_binary_archive(payload: &[u8], declared: u32) -> Vec<u8> {
+    let rows = [directory_row(0, 1, 1), file_row(1, 0, 1, declared, 0)];
+    let mut bytes = archive_bytes(&rows, b"\0a\0", 2_048);
+    bytes[BLOCK_LEN as usize..BLOCK_LEN as usize + payload.len()].copy_from_slice(payload);
+    bytes
+}
+
+/// `payload_is_resource` says yes when the payload really is one.
+///
+/// Q7 is whether an entry's resource bit and the magic at its payload ever
+/// disagree, and a function only ever asked on archives where the answer is no
+/// cannot answer it: returning `Ok(false)` for every entry in every archive
+/// left the whole suite green. The corpus does not reach this — the sample's
+/// outer archive holds nested archives and a `content.xml`, and not one
+/// resource — so the yes has to be built.
+#[test]
+fn a_payload_that_is_a_resource_is_read_as_one() {
+    let payload = resource_payload();
+    let declared = payload.len() as u32;
+    let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
+
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    assert!(
+        archive
+            .payload_is_resource(&mut Cursor::new(bytes), 1)
+            .expect("the payload is readable"),
+        "an RSC7 payload was not seen as one"
+    );
+}
+
+/// The magic alone is a payload, and the entry carrying it need not be flagged.
+///
+/// Four bytes is the least that can be compared, so this is the guard's own
+/// boundary as well as the disagreement itself: the bit says binary, the bytes
+/// say `RSC7`, and the point of the function is to report the second rather
+/// than the first.
+#[test]
+fn a_payload_of_exactly_the_magic_is_the_magic() {
+    let bytes = one_binary_archive(&MAGIC_RSC7, MAGIC_RSC7.len() as u32);
+
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    assert!(
+        matches!(
+            archive.entry(1).expect("in range").kind,
+            EntryKind::Binary { .. }
+        ),
+        "the entry is meant to be flagged binary"
+    );
+    assert!(
+        archive
+            .payload_is_resource(&mut Cursor::new(bytes), 1)
+            .expect("the payload is readable"),
+        "four bytes of magic are the magic"
+    );
+}
+
+/// A payload too short to hold the magic is not one, whatever follows it.
+///
+/// The bytes after a payload belong to whatever comes next, or to the slack
+/// this format carries a previous pack's leavings in (§6). Reading them to
+/// finish a comparison the payload itself cannot answer would call a
+/// three-byte file a resource because of a byte it does not own.
+#[test]
+fn a_payload_too_short_for_the_magic_is_not_read_past() {
+    let bytes = one_binary_archive(&MAGIC_RSC7, MAGIC_RSC7.len() as u32 - 1);
+
+    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    assert!(
+        !archive
+            .payload_is_resource(&mut Cursor::new(bytes), 1)
+            .expect("the payload is readable"),
+        "three bytes were compared against four"
     );
 }
 

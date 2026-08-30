@@ -645,6 +645,32 @@ mod tests {
         assert_eq!(version.payload_floor(0, 0), version.header_len());
     }
 
+    /// The writer's guard against choosing a deflated form the row cannot
+    /// describe, tested on the side where it says no as well as the side where
+    /// it says yes.
+    ///
+    /// Only the yes was ever asked, so a predicate that agreed to everything
+    /// left the suite green: the fallback to stored storage that keeps a
+    /// 24-bit field from being handed a 25-bit length is the decision this
+    /// makes, and §3's own example is the entry that described a fraction of
+    /// its own payload.
+    ///
+    /// `docs/rpf-format.md`, Entry table: the compressed size is three bytes.
+    #[test]
+    fn the_compressed_size_field_is_three_bytes_wide_in_both_directions() {
+        let version = Version::Rpf7;
+        assert!(version.holds_compressed_len(0));
+        assert!(
+            version.holds_compressed_len(0x00FF_FFFF),
+            "the largest a 24-bit field holds"
+        );
+        assert!(
+            !version.holds_compressed_len(0x0100_0000),
+            "one byte past it does not fit"
+        );
+        assert!(!version.holds_compressed_len(u64::MAX));
+    }
+
     #[test]
     fn a_row_offset_is_the_header_and_the_rows_before_it() {
         let version = Version::Rpf7;
