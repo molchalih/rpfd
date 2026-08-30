@@ -12,7 +12,10 @@
 use crate::{
     entry::{Entry, EntryKind},
     error::{Error, Result},
-    format::{Content, FileFields, Header, NamesPlan, Span, Version, u16_at, u24_at, u32_at},
+    format::{
+        Content, FileFields, Header, NamesPlan, Span, Version, crypto::Scheme, u16_at, u24_at,
+        u32_at,
+    },
 };
 
 /// Archive magic, as it appears on disk.
@@ -62,9 +65,59 @@ pub const DIRECTORY_MARKER: u32 = 0x7FFF_FF00;
 
 /// The encryption tag meaning "not encrypted", ASCII `OPEN`.
 ///
-/// `docs/rpf-format.md`, RPF7 header, `verified`. The other tags in that table
-/// are `secondary` and are deliberately absent here until measured.
+/// `docs/rpf-format.md`, RPF7 header, `verified`.
 pub const ENCRYPTION_OPEN: u32 = 0x4E45_504F;
+
+/// The encryption tag meaning the RAGE AES-256 default.
+///
+/// `docs/rpf-format.md`, RPF7 header, `verified` — 43 archives across both GTA
+/// V installs carry it, every one of them nested inside another archive.
+pub const ENCRYPTION_AES: u32 = 0x0FFF_FFF9;
+
+/// The encryption tag meaning the NG white-box transform.
+///
+/// `docs/rpf-format.md`, RPF7 header, `verified` — 10,743 archives across both
+/// GTA V installs carry it, including every one of the 358 that sit on disk in
+/// their own right.
+pub const ENCRYPTION_NG: u32 = 0x0FEF_FFFF;
+
+/// An encryption tag that occurs, is not "not encrypted", and is opened by
+/// neither transform this build has.
+///
+/// Named because it is a measured fact with a row of its own and because
+/// [`crate::Version::scheme`] answering `None` for it is a decision rather
+/// than an oversight —
+/// not because anything decodes it. The Rockstar Games Launcher's
+/// `Launcher.rpf` carries it and is the one archive of the 359 on that machine
+/// that `rpf ls` does not open.
+///
+/// `docs/rpf-format.md`, RPF7 header, `verified` that it occurs and `verified`
+/// **negative** that neither the 101 NG keys nor AES-256-ECB at any pass count
+/// in either direction opens it.
+pub const ENCRYPTION_UNIDENTIFIED: u32 = 0x0FFF_FFF7;
+
+/// The value a **binary** entry's own encryption field carries when its payload
+/// is stored in the clear.
+///
+/// `docs/rpf-format.md`, Entry table, `verified` — the field takes exactly two
+/// values across both GTA V installs, 0 on 27,276 entries and 1 on 64,300, and
+/// only the second needs the archive's transform to read back. A resource entry
+/// has no such field: offsets 8 and 12 are its two flag words.
+pub const ENTRY_OPEN: u32 = 0;
+
+/// Which transform a tag names, or `None` for a tag this build cannot open.
+///
+/// A tag that is neither [`ENCRYPTION_OPEN`] nor one of these is encrypted
+/// under something nobody here has identified — `docs/rpf-format.md` records
+/// `0x0FFFFFF7` as exactly that — and no key opens it, which is why it is
+/// `None` rather than a third variant.
+pub(super) const fn scheme(tag: u32) -> Option<Scheme> {
+    match tag {
+        ENCRYPTION_AES => Some(Scheme::Aes),
+        ENCRYPTION_NG => Some(Scheme::Ng),
+        _ => None,
+    }
+}
 
 /// Bit set within an entry's offset field marking the entry a resource.
 ///

@@ -15,10 +15,18 @@
 //! names a separate thing: `docs/corpus.md` records that the game executables
 //! are not corpus — none of them is an archive — and key extraction reads them
 //! while nothing else does. R2.
+//!
+//! `RPF_GAME_IMAGE` is a third, for the same reason again. It names one file: a
+//! memory image of a running game, which is the only source the NG material has
+//! ever been found in the clear in. It is separate from `RPF_GAME_EXE` because
+//! the two answer opposite questions — an executable carries none of that
+//! material and an image carries all of it — and a machine can easily have one
+//! and not the other. DR-040.
 
 fn main() {
     gate("RPF_CORPUS", "RPF_REQUIRE_CORPUS", "no_corpus");
     gate("RPF_GAME_EXE", "RPF_REQUIRE_GAME_EXE", "no_executables");
+    gate("RPF_GAME_IMAGE", "RPF_REQUIRE_GAME_IMAGE", "no_game_image");
 }
 
 /// Sets `flag` unless `located` is set, or `required` says it must be there.

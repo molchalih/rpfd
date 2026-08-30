@@ -55,3 +55,17 @@ path = "fuzz_targets/names.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nested"
+path = "fuzz_targets/nested.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "changes"
+path = "fuzz_targets/changes.rs"
+test = false
+doc = false
+bench = false

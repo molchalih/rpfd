@@ -18,7 +18,10 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use super::{AES_KEY_LEN, HASH_LUT_LEN, Keys};
+use super::{
+    AES_KEY_LEN, HASH_LUT_LEN, Keys, Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN,
+    NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
+};
 use crate::error::{Error, Result};
 
 /// Length of the digest an executable is identified by, in bytes.
@@ -50,13 +53,33 @@ const MAGIC: [u8; 8] = *b"RPFKEYS\0";
 
 /// The layout version of a cache file. A file of another schema is a miss, not
 /// a failure: a cache is disposable and re-extraction is the correct answer.
-const SCHEMA: u32 = 1;
+///
+/// Raised to 2 on 2026-08-30, when an entry gained the NG material it may now
+/// carry. An entry this build cannot read is a miss and the next extraction
+/// overwrites it, so nothing migrates. DR-040.
+const SCHEMA: u32 = 2;
 
 /// Offset of the payload within a cache file.
 const PAYLOAD_AT: usize = 48;
 
-/// Length of the payload: the two values and the two offsets they were at.
-const PAYLOAD_LEN: usize = AES_KEY_LEN.saturating_add(HASH_LUT_LEN).saturating_add(16);
+/// Length of the payload of an entry holding only what every source carries:
+/// the two values and the two offsets they were at.
+const BASE_LEN: usize = AES_KEY_LEN.saturating_add(HASH_LUT_LEN).saturating_add(16);
+
+/// How much longer an entry is when it also holds the NG material: the expanded
+/// keys, the decrypt tables, and the two offsets they were at.
+const NG_LEN: usize = NG_EXPANDED_KEY_COUNT
+    .saturating_mul(NG_EXPANDED_KEY_LEN)
+    .saturating_add(NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN))
+    .saturating_add(16);
+
+/// The payload length of an entry that also holds the NG material.
+///
+/// The **length is the discriminator**: an entry is one of exactly two shapes,
+/// and a declared length that is neither is not an entry this build wrote. That
+/// is one fact deciding one thing, rather than a flag byte that could disagree
+/// with the bytes after it (`docs/conventions.md` §5).
+const WITH_NG_LEN: usize = BASE_LEN.saturating_add(NG_LEN);
 
 /// The SHA-256 of a game executable, which is what a cache entry is keyed by.
 ///
@@ -215,7 +238,7 @@ impl Cache {
     /// # Errors
     ///
     /// [`Error::Io`] if the directory exists and the file cannot be read.
-    pub fn load(&self, source: &SourceDigest) -> Result<Option<Keys>> {
+    pub fn load(&self, source: &SourceDigest) -> Result<Option<Material>> {
         let path = self.path_for(source);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -240,7 +263,7 @@ impl Cache {
     /// # Errors
     ///
     /// [`Error::Io`] if the directory cannot be created or the file written.
-    pub fn store(&self, source: &SourceDigest, keys: &Keys) -> Result<()> {
+    pub fn store(&self, source: &SourceDigest, material: &Material) -> Result<()> {
         fs::create_dir_all(&self.directory).map_err(io)?;
 
         let destination = self.path_for(source);
@@ -250,7 +273,7 @@ impl Cache {
             .push(format!(".{}{TEMPORARY}", std::process::id()));
 
         let mut file = create_private(&temporary)?;
-        file.write_all(&encode(keys)).map_err(io)?;
+        file.write_all(&encode(material)).map_err(io)?;
         file.flush().map_err(io)?;
         drop(file);
 
@@ -286,6 +309,33 @@ impl Cache {
             }
         }
         Ok(entries)
+    }
+
+    /// Every material this cache holds, in a stable order.
+    ///
+    /// Entries are read in **digest order** rather than in whatever order the
+    /// directory hands back, so which one opens an archive is the same answer
+    /// on two runs of the same command. An entry that fails its own checksum is
+    /// a miss and is simply not here, which is [`Cache::load`]'s rule and
+    /// DR-017's.
+    ///
+    /// A cache that is not there yet holds nothing, which is not a failure and
+    /// does not create it: a machine that has never needed a key has no cache
+    /// (R2.6).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the directory exists and an entry cannot be read.
+    pub fn materials(&self) -> Result<Vec<Material>> {
+        let mut sources = self.entries()?;
+        sources.sort_unstable_by_key(SourceDigest::hex);
+        let mut held = Vec::with_capacity(sources.len());
+        for source in &sources {
+            if let Some(material) = self.load(source)? {
+                held.push(material);
+            }
+        }
+        Ok(held)
     }
 
     /// Removes everything this cache wrote, and says how many files that was.
@@ -414,12 +464,19 @@ fn create_private(path: &Path) -> Result<fs::File> {
 }
 
 /// The bytes of a cache file holding this material.
-fn encode(keys: &Keys) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(PAYLOAD_LEN);
+fn encode(material: &Material) -> Vec<u8> {
+    let keys = material.keys();
+    let mut payload = Vec::with_capacity(WITH_NG_LEN);
     payload.extend_from_slice(keys.aes_key());
     payload.extend_from_slice(keys.hash_lut());
     payload.extend_from_slice(&keys.aes_key_offset().to_le_bytes());
     payload.extend_from_slice(&keys.hash_lut_offset().to_le_bytes());
+    if let Some(ng) = material.ng() {
+        payload.extend_from_slice(ng.expanded_bytes());
+        payload.extend_from_slice(ng.table_bytes());
+        payload.extend_from_slice(&ng.expanded_keys_offset().to_le_bytes());
+        payload.extend_from_slice(&ng.decrypt_tables_offset().to_le_bytes());
+    }
 
     let checksum: [u8; SOURCE_DIGEST_LEN] = Sha256::digest(&payload).into();
     let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
@@ -434,7 +491,10 @@ fn encode(keys: &Keys) -> Vec<u8> {
 }
 
 /// The material in a cache file, or `None` if it is not one this build wrote.
-fn decode(bytes: &[u8]) -> Option<Keys> {
+///
+/// The declared payload length says which of the two shapes the entry is, and
+/// any other length is not one of ours. See [`WITH_NG_LEN`].
+fn decode(bytes: &[u8]) -> Option<Material> {
     if bytes.get(..MAGIC.len())? != MAGIC {
         return None;
     }
@@ -442,7 +502,7 @@ fn decode(bytes: &[u8]) -> Option<Keys> {
         return None;
     }
     let len = usize::try_from(u32::from_le_bytes(word(bytes, 12)?)).ok()?;
-    if len != PAYLOAD_LEN {
+    if len != BASE_LEN && len != WITH_NG_LEN {
         return None;
     }
     let checksum = bytes.get(16..PAYLOAD_AT)?;
@@ -457,12 +517,37 @@ fn decode(bytes: &[u8]) -> Option<Keys> {
     let aes_at = u64::from_le_bytes(long(payload, lut_end)?);
     let lut_at = u64::from_le_bytes(long(payload, lut_end.checked_add(8)?)?);
 
-    Some(Keys {
+    let keys = Keys {
         aes,
         aes_at,
         lut,
         lut_at,
-    })
+    };
+    let ng = if len == WITH_NG_LEN {
+        Some(decode_ng(payload)?)
+    } else {
+        None
+    };
+    Some(Material::restored(keys, ng))
+}
+
+/// The NG half of a payload that declared itself long enough to hold one.
+///
+/// The three bounds are declared in the order the payload lays them out —
+/// expanded keys, decrypt tables, then the two offsets — so that a reader can
+/// check each against the one before it.
+fn decode_ng(payload: &[u8]) -> Option<NgKeys> {
+    let tables_start =
+        BASE_LEN.checked_add(NG_EXPANDED_KEY_COUNT.checked_mul(NG_EXPANDED_KEY_LEN)?)?;
+    let offsets_start =
+        tables_start.checked_add(NG_DECRYPT_TABLE_COUNT.checked_mul(NG_DECRYPT_TABLE_LEN)?)?;
+
+    let expanded = payload.get(BASE_LEN..tables_start)?.to_vec();
+    let tables = payload.get(tables_start..offsets_start)?.to_vec();
+    let expanded_at = u64::from_le_bytes(long(payload, offsets_start)?);
+    let tables_at = u64::from_le_bytes(long(payload, offsets_start.checked_add(8)?)?);
+
+    NgKeys::restored(expanded, tables, expanded_at, tables_at)
 }
 
 /// Four bytes at `at`, if they are there.
@@ -555,20 +640,41 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        APPLICATION, Cache, Environment, KEYS, MAGIC, PAYLOAD_AT, Platform, SUFFIX, SourceDigest,
-        TEMPORARY, decode, encode, root, xdg_absolute,
+        APPLICATION, BASE_LEN, Cache, Environment, KEYS, MAGIC, PAYLOAD_AT, Platform, SUFFIX,
+        SourceDigest, TEMPORARY, WITH_NG_LEN, decode, encode, root, xdg_absolute,
     };
-    use crate::keys::{AES_KEY_LEN, HASH_LUT_LEN, Keys};
+    use crate::keys::{
+        AES_KEY_LEN, HASH_LUT_LEN, Keys, Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN,
+        NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
+    };
 
-    /// Material that is not key material: two fixed byte patterns and two
-    /// offsets, which is all the file format has to carry.
-    fn material() -> Keys {
+    /// Material that is not key material: fixed byte patterns and offsets,
+    /// which is all the file format has to carry.
+    fn keys_at(aes_at: u64) -> Keys {
         Keys {
             aes: [0x11; AES_KEY_LEN],
-            aes_at: 0x1234_5678,
+            aes_at,
             lut: [0x22; HASH_LUT_LEN],
             lut_at: 0x00AB_CDEF,
         }
+    }
+
+    /// An entry of the shape every source produces: no NG material.
+    fn material() -> Material {
+        Material::restored(keys_at(0x1234_5678), None)
+    }
+
+    /// An entry of the other shape, which only a memory image produces.
+    ///
+    /// The bytes are a pattern rather than anything extracted: DR-006 keeps key
+    /// material out of this repository, and what the file format has to carry
+    /// correctly is a length and a position, not a value.
+    fn material_with_ng() -> Material {
+        let expanded = vec![0x33; NG_EXPANDED_KEY_COUNT * NG_EXPANDED_KEY_LEN];
+        let tables = vec![0x44; NG_DECRYPT_TABLE_COUNT * NG_DECRYPT_TABLE_LEN];
+        let ng = NgKeys::restored(expanded, tables, 0x01E3_3120, 0x01E8_6CE0)
+            .expect("the lengths are the ones the type promises");
+        Material::restored(keys_at(0x1234_5678), Some(ng))
     }
 
     fn digest_of(bytes: &[u8]) -> SourceDigest {
@@ -596,10 +702,82 @@ mod tests {
     fn material_survives_the_file_format_unchanged() {
         let written = encode(&material());
         let read = decode(&written).expect("a file this build wrote reads back");
-        assert_eq!(read.aes_key(), material().aes_key());
-        assert_eq!(read.hash_lut(), material().hash_lut());
-        assert_eq!(read.aes_key_offset(), material().aes_key_offset());
-        assert_eq!(read.hash_lut_offset(), material().hash_lut_offset());
+        let expected = material();
+        assert_eq!(read.keys().aes_key(), expected.keys().aes_key());
+        assert_eq!(read.keys().hash_lut(), expected.keys().hash_lut());
+        assert_eq!(
+            read.keys().aes_key_offset(),
+            expected.keys().aes_key_offset()
+        );
+        assert_eq!(
+            read.keys().hash_lut_offset(),
+            expected.keys().hash_lut_offset()
+        );
+        assert!(read.ng().is_none(), "NG material appeared from nowhere");
+    }
+
+    #[test]
+    fn the_ng_material_survives_the_file_format_and_keeps_its_positions() {
+        // The half the cache gained on 2026-08-30. An entry that carries the NG
+        // material has to read back with every one of its 373 values in the
+        // order they were written, because the index into them *is* how a key
+        // is chosen (`docs/ng-scheme.md`), and a rotation would decrypt nothing
+        // while looking well-formed.
+        let written = encode(&material_with_ng());
+        let read = decode(&written).expect("a file this build wrote reads back");
+        let source = material_with_ng();
+        let (read_ng, source_ng) = (
+            read.ng().expect("the entry carried NG material"),
+            source.ng().expect("as written"),
+        );
+
+        assert_eq!(read.keys().aes_key(), source.keys().aes_key());
+        assert_eq!(
+            read_ng.expanded_keys_offset(),
+            source_ng.expanded_keys_offset()
+        );
+        assert_eq!(
+            read_ng.decrypt_tables_offset(),
+            source_ng.decrypt_tables_offset()
+        );
+        for index in 0..NG_EXPANDED_KEY_COUNT {
+            assert_eq!(
+                read_ng.expanded_key(index),
+                source_ng.expanded_key(index),
+                "expanded key {index}"
+            );
+        }
+        for round in 0..crate::keys::NG_ROUNDS {
+            for column in 0..crate::keys::NG_COLUMNS {
+                assert_eq!(
+                    read_ng.decrypt_table(round, column),
+                    source_ng.decrypt_table(round, column),
+                    "decrypt table {round}/{column}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_shapes_of_an_entry_are_told_apart_by_their_declared_length() {
+        // §5: the length is the discriminator, so there is no flag that could
+        // disagree with the bytes after it. A length that is neither shape is
+        // not an entry this build wrote, and a payload that claims the longer
+        // shape without carrying it is a miss rather than a short read.
+        assert_eq!(encode(&material()).len(), PAYLOAD_AT + BASE_LEN);
+        assert_eq!(encode(&material_with_ng()).len(), PAYLOAD_AT + WITH_NG_LEN);
+        assert_ne!(BASE_LEN, WITH_NG_LEN);
+
+        let mut lying = encode(&material());
+        lying[12..16].copy_from_slice(
+            &u32::try_from(WITH_NG_LEN)
+                .expect("the payload length fits a word")
+                .to_le_bytes(),
+        );
+        assert!(
+            decode(&lying).is_none(),
+            "a short entry claiming to carry NG material was read as one"
+        );
     }
 
     #[test]
@@ -659,8 +837,7 @@ mod tests {
         let source = digest_of(b"an executable");
 
         cache.store(&source, &material()).unwrap();
-        let mut moved = material();
-        moved.aes_at = 0x9999;
+        let moved = Material::restored(keys_at(0x9999), None);
         cache.store(&source, &moved).unwrap();
 
         let files: Vec<_> = std::fs::read_dir(directory.path())
@@ -673,7 +850,12 @@ mod tests {
             "a temporary file was left behind: {files:?}"
         );
         assert_eq!(
-            cache.load(&source).unwrap().unwrap().aes_key_offset(),
+            cache
+                .load(&source)
+                .unwrap()
+                .unwrap()
+                .keys()
+                .aes_key_offset(),
             0x9999
         );
     }

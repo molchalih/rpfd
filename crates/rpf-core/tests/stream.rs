@@ -126,7 +126,7 @@ fn streamed(bytes: &[u8], archive: &Archive, index: u32) -> Vec<u8> {
 fn a_streamed_entry_is_the_bytes_extract_answers() {
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
-    let parsed = Archive::open(&mut src).expect("parses");
+    let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     for (index, path) in [(1_u32, "art.yft"), (2, "deflated.bin"), (3, "stored.bin")] {
         assert_eq!(
@@ -167,7 +167,7 @@ fn a_digest_of_a_stream_is_the_digest_of_the_bytes() {
     // wrong, and silently.
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
-    let parsed = Archive::open(&mut src).expect("parses");
+    let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     for (index, path) in [(1_u32, "art.yft"), (2, "deflated.bin"), (3, "stored.bin")] {
         let held = parsed.extract(&mut src, index).expect("extracts");
@@ -189,7 +189,7 @@ fn a_stream_read_again_from_its_start_is_the_same_stream() {
     // rebuild silently write the tail of an entry.
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
-    let parsed = Archive::open(&mut src).expect("parses");
+    let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     for (index, path) in [(1_u32, "art.yft"), (2, "deflated.bin"), (3, "stored.bin")] {
         let mut src = Cursor::new(bytes.clone());
@@ -218,7 +218,7 @@ fn a_stream_read_again_from_its_start_is_the_same_stream() {
 fn a_stream_knows_where_its_end_is_without_reading_to_it() {
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
-    let parsed = Archive::open(&mut src).expect("parses");
+    let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     for index in 1..=3_u32 {
         let mut src = Cursor::new(bytes.clone());
@@ -281,7 +281,7 @@ fn a_forward_seek_in_a_deflated_entry_lands_on_the_right_bytes() {
     .expect("builds");
 
     let mut src = Cursor::new(out.clone());
-    let parsed = Archive::open(&mut src).expect("parses");
+    let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = parsed.find("long.bin").expect("resolves");
     match parsed.entry(index).expect("in range").kind {
         EntryKind::Binary { compressed_len, .. } => assert!(
@@ -311,12 +311,20 @@ fn a_stream_carries_the_failure_it_really_had() {
     // a corrupt archive as a disk failure — a different exit code, blaming the
     // wrong party. DR-010.
     let mut bytes = archive();
-    let parsed = Archive::open(&mut Cursor::new(bytes.clone())).expect("parses");
+    let parsed = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("parses");
     let (at, _) = parsed.payload_at(2).expect("the deflated entry");
 
     // One byte inside the deflate stream, past its header.
     bytes[at as usize + 6] ^= 0xFF;
-    let parsed = Archive::open(&mut Cursor::new(bytes.clone())).expect("still parses");
+    let parsed = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("still parses");
     let mut src = Cursor::new(bytes);
     let mut stream = parsed.extracted(&mut src, 2).expect("opens");
     let mut out = Vec::new();
@@ -335,7 +343,7 @@ fn a_stream_carries_the_failure_it_really_had() {
 fn a_stream_of_something_that_is_not_a_file_is_refused_before_any_of_it() {
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
-    let parsed = Archive::open(&mut src).expect("parses");
+    let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     // Entry 0 is the root directory, which has no payload to stream.
     let refused = parsed.extracted(&mut src, 0).expect_err("refused");

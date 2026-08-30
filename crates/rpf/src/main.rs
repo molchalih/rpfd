@@ -20,6 +20,16 @@ struct Cli {
     /// Report as JSON, with stable field names.
     #[arg(long, global = true)]
     json: bool,
+    /// Keep extracted key material here rather than in the platform's
+    /// configuration directory, and look for it here when opening an encrypted
+    /// archive.
+    ///
+    /// Global, and it has to be: it is the one way to keep several game
+    /// installs apart, and an archive command that could not name the cache
+    /// would be unable to open what `rpf keys extract --cache-dir` had just
+    /// found. DR-041.
+    #[arg(long, global = true, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -143,7 +153,7 @@ enum Command {
         #[arg(long, value_name = "TREE")]
         against: Option<PathBuf>,
     },
-    /// Find the key material a game executable carries, and manage its cache.
+    /// Find the key material a game source carries, and manage its cache.
     Keys {
         #[command(subcommand)]
         command: KeysCommand,
@@ -158,27 +168,20 @@ enum Command {
 /// report. DR-020.
 #[derive(Debug, Subcommand)]
 enum KeysCommand {
-    /// Find the key material in a game executable, and cache what it found.
+    /// Find the key material in a game source, and cache what it found.
+    ///
+    /// The source is a game executable, or a memory image of one. An executable
+    /// carries the AES key and the hash lookup table; only an image carries the
+    /// NG expanded keys and decrypt tables. DR-040.
     Extract {
-        /// The game executable.
+        /// The game executable, or a memory image of one.
+        #[arg(value_name = "SOURCE")]
         executable: PathBuf,
-        /// Keep the material here rather than in the platform's configuration
-        /// directory.
-        #[arg(long, value_name = "DIR")]
-        cache_dir: Option<PathBuf>,
     },
     /// Show where extracted key material is kept, and how much is there.
-    Cache {
-        /// Ask about this directory rather than the platform's.
-        #[arg(long, value_name = "DIR")]
-        cache_dir: Option<PathBuf>,
-    },
+    Cache,
     /// Remove every cached entry.
-    Invalidate {
-        /// Empty this directory rather than the platform's.
-        #[arg(long, value_name = "DIR")]
-        cache_dir: Option<PathBuf>,
-    },
+    Invalidate,
 }
 
 /// What `--overwrite`, or the wire's `overwrite`, means to an extraction.
@@ -195,49 +198,50 @@ const fn existing(overwrite: bool) -> commands::Existing {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let cache = cli.cache_dir.as_deref();
 
     let outcome = match cli.command {
         Command::Info {
             ref archive,
             ref path,
-        } => commands::info(archive, path, cli.json),
+        } => commands::info(archive, path, cache, cli.json),
         Command::Ls {
             ref archive,
             ref path,
             recursive,
-        } => commands::ls(archive, path, recursive, cli.json),
+        } => commands::ls(archive, path, recursive, cache, cli.json),
         Command::Cat {
             ref archive,
             ref path,
-        } => commands::cat(archive, path),
+        } => commands::cat(archive, path, cache),
         Command::Put {
             ref archive,
             ref path,
             ref from,
             options,
-        } => commands::put(archive, path, from, options, cli.json),
+        } => commands::put(archive, path, from, options, cache, cli.json),
         Command::Rm {
             ref archive,
             ref path,
             recursive,
             options,
-        } => commands::remove(archive, path, recursive, options, cli.json),
+        } => commands::remove(archive, path, recursive, options, cache, cli.json),
         Command::Mv {
             ref archive,
             ref from,
             ref to,
             options,
-        } => commands::rename(archive, from, to, options, cli.json),
+        } => commands::rename(archive, from, to, options, cache, cli.json),
         Command::Mkdir {
             ref archive,
             ref path,
             options,
-        } => commands::make_directory(archive, path, options, cli.json),
+        } => commands::make_directory(archive, path, options, cache, cli.json),
         Command::Extract {
             ref archive,
             ref into,
             overwrite,
-        } => commands::extract(archive, into, existing(overwrite), cli.json),
+        } => commands::extract(archive, into, existing(overwrite), cache, cli.json),
         Command::Pack {
             ref from,
             ref archive,
@@ -245,7 +249,7 @@ fn main() -> ExitCode {
         } => commands::pack(from, archive, force, cli.json),
         Command::Serve { stdio } => {
             if stdio {
-                serve::run()
+                serve::run(cache)
             } else {
                 Err(exit::Failure::Refused {
                     reason: "serve needs --stdio".to_owned(),
@@ -255,18 +259,13 @@ fn main() -> ExitCode {
         Command::Verify {
             ref archive,
             ref against,
-        } => commands::verify(archive, against.as_deref(), cli.json),
+        } => commands::verify(archive, against.as_deref(), cache, cli.json),
         Command::Keys { ref command } => match *command {
-            KeysCommand::Extract {
-                ref executable,
-                ref cache_dir,
-            } => commands::keys_extract(executable, cache_dir.as_deref(), cli.json),
-            KeysCommand::Cache { ref cache_dir } => {
-                commands::keys_cache(cache_dir.as_deref(), cli.json)
+            KeysCommand::Extract { ref executable } => {
+                commands::keys_extract(executable, cache, cli.json)
             }
-            KeysCommand::Invalidate { ref cache_dir } => {
-                commands::keys_invalidate(cache_dir.as_deref(), cli.json)
-            }
+            KeysCommand::Cache => commands::keys_cache(cache, cli.json),
+            KeysCommand::Invalidate => commands::keys_invalidate(cache, cli.json),
         },
     };
 

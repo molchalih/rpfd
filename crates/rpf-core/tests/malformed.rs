@@ -73,7 +73,8 @@ fn a_directory_that_is_its_own_child_is_refused_at_parse() {
     let rows = [directory_row(0, 1, 1), directory_row(0, 1, 1)];
     let bytes = archive_bytes(&rows, &[0, 0, 0], 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("a cycle is not a tree");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("a cycle is not a tree");
     assert!(
         matches!(error, Error::CyclicTree { entry: 1, child: 1 }),
         "expected the self-referential directory to be named, got {error:?}"
@@ -88,7 +89,8 @@ fn two_directories_that_claim_each_other_are_refused_at_parse() {
     let rows = [directory_row(0, 1, 1), directory_row(0, 0, 1)];
     let bytes = archive_bytes(&rows, &[0, 0, 0], 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("a cycle is not a tree");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("a cycle is not a tree");
     assert!(
         matches!(error, Error::CyclicTree { .. }),
         "expected a cycle, got {error:?}"
@@ -116,7 +118,8 @@ fn a_self_claiming_directory_is_refused_even_when_a_later_entry_reclaims_its_chi
     ];
     let bytes = archive_bytes(&rows, &[0, 0, 0], 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("a cycle is not a tree");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("a cycle is not a tree");
     assert!(
         matches!(error, Error::CyclicTree { entry: 1, child: 1 }),
         "expected the self-referential directory to be named, got {error:?}"
@@ -138,7 +141,8 @@ fn two_directories_claiming_one_child_are_refused() {
         .collect();
     let bytes = archive_bytes(&rows, &[0], 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("a lattice is not a forest");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("a lattice is not a forest");
     assert!(
         matches!(
             error,
@@ -174,7 +178,8 @@ fn a_directory_tree_deeper_than_the_limit_is_refused() {
         .next_multiple_of(BLOCK_LEN as usize);
     let bytes = archive_bytes(&rows, &[0], len);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("one level too deep");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("one level too deep");
     assert!(
         matches!(
             error,
@@ -206,7 +211,8 @@ fn a_directory_tree_exactly_at_the_limit_still_opens() {
         .next_multiple_of(BLOCK_LEN as usize);
     let bytes = archive_bytes(&rows, &[0], len);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("exactly at the limit");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("exactly at the limit");
     assert_eq!(archive.entries().len() as u32, MAX_DEPTH + 1);
 }
 
@@ -216,7 +222,8 @@ fn a_child_range_past_the_entry_table_is_still_refused() {
     let rows = [directory_row(0, 1, 9)];
     let bytes = archive_bytes(&rows, &[0], 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("9 children of 1 entry");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("9 children of 1 entry");
     assert!(
         matches!(
             error,
@@ -245,7 +252,8 @@ fn archives_nested_deeper_than_the_limit_are_refused() {
     let bytes = stacked_archives(levels);
 
     let mut src = Cursor::new(bytes);
-    let mut archive = Archive::open(&mut src).expect("the outermost parses");
+    let mut archive =
+        Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("the outermost parses");
     for level in 1..=MAX_DEPTH {
         archive = archive
             .open_nested(&mut src, 1)
@@ -313,7 +321,8 @@ fn a_names_blob_every_entry_shares_does_not_cost_one_copy_each() {
     let bytes = archive_bytes(&rows, &names, len);
     assert_eq!(bytes.len(), 680_016);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("every region fits");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("every region fits");
     let blob = archive.names_blob();
     assert_eq!(blob.len(), NAMES_LEN, "the blob is held once, whole");
 
@@ -341,7 +350,8 @@ fn an_allocation_stops_where_a_payload_sharing_its_block_begins() {
     rows[3] = file_row(5, 0, 8, 16, 0);
     let bytes = archive_bytes(&rows, &names, 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("well formed");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("well formed");
     assert_eq!(
         archive.allocation(1).expect("a.bin has an allocation"),
         0,
@@ -364,7 +374,8 @@ fn an_allocation_never_spans_a_payload_that_began_before_it() {
     rows[2] = file_row(3, 0, 2, 16, 0);
     let bytes = archive_bytes(&rows, &names, 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("well formed");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("well formed");
     assert_eq!(
         archive.allocation(2).expect("b.bin has an allocation"),
         0,
@@ -380,7 +391,8 @@ fn an_allocation_of_an_index_that_does_not_exist_says_so() {
     let (rows, names) = named_root(3);
     let bytes = archive_bytes(&rows, &names, 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("well formed");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("well formed");
     let error = archive.allocation(99).expect_err("there is no entry 99");
     assert!(
         matches!(
@@ -399,7 +411,8 @@ fn an_allocation_of_a_directory_is_a_wrong_kind() {
     let (rows, names) = named_root(3);
     let bytes = archive_bytes(&rows, &names, 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("well formed");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("well formed");
     let error = archive
         .allocation(0)
         .expect_err("entry 0 is the root directory");
@@ -428,7 +441,11 @@ fn a_payload_that_begins_inside_the_table_of_contents_is_refused() {
     let bytes = archive_bytes(&rows, b"\0a\0", 2_048);
     let floor = HEADER_LEN + 2 * ENTRY_LEN + 3;
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("the header is fine");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("the header is fine");
     let error = archive
         .read(&mut Cursor::new(bytes), 1)
         .expect_err("no payload may begin at block 0");
@@ -459,7 +476,11 @@ fn an_entry_offset_past_the_end_is_refused() {
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 100, 64, 0)];
     let bytes = archive_bytes(&rows, b"\0a\0", 2_048);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("the header is fine");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("the header is fine");
     let error = archive
         .read(&mut Cursor::new(bytes), 1)
         .expect_err("block 100 is past the end");
@@ -482,8 +503,11 @@ fn an_entry_offset_past_the_end_is_refused() {
 fn a_file_too_short_to_hold_a_header_is_not_an_archive() {
     // §12's first case. Nothing failed — the bytes are simply not there — so
     // this is not an i/o error.
-    let error = Archive::open(&mut Cursor::new(b"7FPR\x02".to_vec()))
-        .expect_err("five bytes is not an archive");
+    let error = Archive::open(
+        &mut Cursor::new(b"7FPR\x02".to_vec()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect_err("five bytes is not an archive");
     assert!(
         matches!(error, Error::NotAnArchive { base: 0, .. }),
         "expected a refusal to call it an archive, got {error:?}"
@@ -501,7 +525,8 @@ fn an_entry_table_that_does_not_fit_the_archive_is_refused() {
     bytes.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
     bytes.resize(64, 0);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("100 entries do not fit");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("100 entries do not fit");
     assert!(
         matches!(
             error,
@@ -524,7 +549,8 @@ fn a_names_blob_that_does_not_fit_the_archive_is_refused() {
     bytes.extend_from_slice(&ENCRYPTION_OPEN.to_le_bytes());
     bytes.resize(512, 0);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("4 KB of names do not fit");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("4 KB of names do not fit");
     assert!(
         matches!(
             error,
@@ -548,7 +574,8 @@ fn a_name_that_runs_past_the_names_blob_is_refused() {
     let rows = [directory_row(0, 1, 0)];
     let bytes = archive_bytes(&rows, b"abcd", 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("no terminator in the blob");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("no terminator in the blob");
     assert!(
         matches!(
             error,
@@ -567,7 +594,8 @@ fn a_name_offset_past_the_names_blob_is_refused() {
     let rows = [directory_row(9, 1, 0)];
     let bytes = archive_bytes(&rows, b"root\0", 512);
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("offset 9 is outside 5 bytes");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("offset 9 is outside 5 bytes");
     assert!(
         matches!(
             error,
@@ -593,7 +621,8 @@ fn names_are_still_resolved_where_they_overlap() {
     ];
     let bytes = archive_bytes(&rows, b"\0abc\0", 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("well formed");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("well formed");
     assert_eq!(archive.name(0).expect("root"), "");
     assert_eq!(archive.name(1).expect("first"), "abc");
     assert_eq!(archive.name(2).expect("second"), "c");
@@ -613,7 +642,8 @@ fn a_name_that_is_not_utf_8_is_refused_rather_than_repaired() {
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 8, 16, 0)];
     let bytes = archive_bytes(&rows, b"\0\xFF\xFE\0", 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("every region fits");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("every region fits");
     assert_eq!(archive.name(0).expect("the root is empty and valid"), "");
 
     let error = archive.name(1).expect_err("0xFF 0xFE is not UTF-8");
@@ -650,7 +680,11 @@ fn a_deflate_stream_that_lies_about_its_length_is_refused() {
     let mut bytes = archive_bytes(&rows, b"\0a\0", 2_048);
     bytes[BLOCK_LEN as usize..BLOCK_LEN as usize + payload.len()].copy_from_slice(&payload);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     let error = archive
         .read(&mut Cursor::new(bytes), 1)
         .expect_err("64 bytes is not 4,096");
@@ -708,7 +742,11 @@ fn one_file_archive(payload: &[u8], declared: u32, block_flag: u32, word8: u32) 
 
 /// Every problem `verify` reports about an archive, by path and failure.
 fn problems(bytes: &[u8]) -> Vec<(String, Error)> {
-    let archive = Archive::open(&mut Cursor::new(bytes.to_vec())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.to_vec()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     Verified::of(&mut Cursor::new(bytes.to_vec()), &archive, &mut Unwatched)
         .expect("the walk itself does not fail")
         .problems
@@ -743,7 +781,11 @@ fn a_resource_whose_stream_ends_before_its_payload_is_reported_by_verify() {
     let declared = payload.len() as u32 + tail;
     let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     assert_eq!(
         archive
             .read(&mut Cursor::new(bytes.clone()), 1)
@@ -869,7 +911,7 @@ fn a_tail_is_referenced_by_its_entry_and_is_verifys_to_report() {
 
     let summarise = |bytes: &[u8]| {
         let mut src = Cursor::new(bytes.to_vec());
-        let archive = Archive::open(&mut src).expect("well formed");
+        let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("well formed");
         Summary::of(&mut src, &archive, "").expect("summarises")
     };
     let (tidy_summary, tail_summary) = (summarise(&tidy), summarise(&with_tail));
@@ -908,7 +950,11 @@ fn a_payload_that_is_not_deflate_at_all_is_refused() {
     let rows = [directory_row(0, 1, 1), file_row(1, 64, 1, 64, 0)];
     let bytes = archive_bytes(&rows, b"\0a\0", 2_048);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     let error = archive
         .read(&mut Cursor::new(bytes), 1)
         .expect_err("zeroes are not a deflate stream");
@@ -932,7 +978,11 @@ fn a_resource_declaring_no_compressed_size_is_refused_rather_than_guessed() {
     ];
     let bytes = archive_bytes(&rows, b"\0a\0", 2_048);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     let error = archive
         .read(&mut Cursor::new(bytes), 1)
         .expect_err("nothing carries this resource's length");
@@ -965,7 +1015,11 @@ fn a_resource_smaller_than_its_own_header_is_refused_by_extract_too() {
     ];
     let bytes = archive_bytes(&rows, b"\0a\0", 2_048);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     let error = archive
         .extract(&mut Cursor::new(bytes), 1)
         .expect_err("eight bytes cannot hold a sixteen-byte header");
@@ -1003,7 +1057,11 @@ fn a_resource_of_exactly_its_header_is_extracted_whole() {
     let mut bytes = archive_bytes(&rows, b"\0a\0", 2_048);
     bytes[BLOCK_LEN as usize..BLOCK_LEN as usize + header.len()].copy_from_slice(header);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     let file = archive
         .extract(&mut Cursor::new(bytes), 1)
         .expect("a header is a whole resource file");
@@ -1038,7 +1096,11 @@ fn a_payload_that_is_a_resource_is_read_as_one() {
     let declared = payload.len() as u32;
     let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     assert!(
         archive
             .payload_is_resource(&mut Cursor::new(bytes), 1)
@@ -1057,7 +1119,11 @@ fn a_payload_that_is_a_resource_is_read_as_one() {
 fn a_payload_of_exactly_the_magic_is_the_magic() {
     let bytes = one_binary_archive(&MAGIC_RSC7, MAGIC_RSC7.len() as u32);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     assert!(
         matches!(
             archive.entry(1).expect("in range").kind,
@@ -1083,7 +1149,11 @@ fn a_payload_of_exactly_the_magic_is_the_magic() {
 fn a_payload_too_short_for_the_magic_is_not_read_past() {
     let bytes = one_binary_archive(&MAGIC_RSC7, MAGIC_RSC7.len() as u32 - 1);
 
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     assert!(
         !archive
             .payload_is_resource(&mut Cursor::new(bytes), 1)
@@ -1103,8 +1173,8 @@ fn a_name_that_climbs_out_of_the_archive_is_refused_on_read() {
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
     let bytes = archive_bytes(&rows, b"\0../escaped.txt\0", 4_096);
 
-    let archive =
-        Archive::open(&mut Cursor::new(bytes)).expect("the archive itself is well formed");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("the archive itself is well formed");
     assert_eq!(
         archive.path(1).expect("the name reads back"),
         "../escaped.txt",
@@ -1139,8 +1209,8 @@ fn a_directory_whose_name_climbs_out_of_the_archive_is_refused_on_read() {
     ];
     let bytes = archive_bytes(&rows, b"\0..\0a\0", 4_096);
 
-    let archive =
-        Archive::open(&mut Cursor::new(bytes)).expect("the archive itself is well formed");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("the archive itself is well formed");
     let error = rpf_core::directories_of(&archive).expect_err("a directory that leaves the tree");
     assert!(
         matches!(
@@ -1165,7 +1235,8 @@ fn a_name_no_host_can_hold_is_still_one_node_of_a_tree() {
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
     let bytes = archive_bytes(&rows, b"\0aux.ytd\0", 4_096);
     let mut source = Cursor::new(bytes);
-    let archive = Archive::open(&mut source).expect("the archive is well formed");
+    let archive = Archive::open(&mut source, &rpf_core::Unlock::unkeyed())
+        .expect("the archive is well formed");
 
     let specs = rpf_core::specs_of(&archive).expect("a device name is one node of a tree");
     assert_eq!(specs.len(), 1);
@@ -1209,7 +1280,8 @@ fn a_name_windows_would_trim_is_still_one_node_of_a_tree() {
         let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
         let bytes = archive_bytes(&rows, &names, 4_096);
         let mut source = Cursor::new(bytes);
-        let archive = Archive::open(&mut source).expect("the archive is well formed");
+        let archive = Archive::open(&mut source, &rpf_core::Unlock::unkeyed())
+            .expect("the archive is well formed");
 
         let spelling = std::str::from_utf8(name).expect("ascii");
         assert_eq!(
@@ -1274,8 +1346,11 @@ fn an_archive_of_another_version_is_refused_by_its_own_name() {
         (*b"RPF7", 7),
         (*b"8FPR", 8),
     ] {
-        let error = Archive::open(&mut Cursor::new(header_of(magic)))
-            .expect_err("this build reads RPF7 in its 7FPR spelling only");
+        let error = Archive::open(
+            &mut Cursor::new(header_of(magic)),
+            &rpf_core::Unlock::unkeyed(),
+        )
+        .expect_err("this build reads RPF7 in its 7FPR spelling only");
         assert!(
             matches!(
                 error,
@@ -1300,7 +1375,11 @@ fn a_version_this_build_cannot_read_is_its_own_category() {
     // caller's request was fine. It is `NeedsKey`'s shape with a different
     // answer to "who has to act": no key opens it, and the missing part is
     // here. DR-010's amendment.
-    let error = Archive::open(&mut Cursor::new(header_of(*b"RPF2"))).expect_err("not RPF7");
+    let error = Archive::open(
+        &mut Cursor::new(header_of(*b"RPF2")),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect_err("not RPF7");
     assert_eq!(error.category(), rpf_core::Category::Unsupported);
 }
 
@@ -1322,7 +1401,8 @@ fn a_nested_archive_of_another_version_is_named_by_locate_and_invisible_to_info(
     bytes[1_024..1_024 + header.len()].copy_from_slice(&header);
 
     let mut source = Cursor::new(bytes);
-    let archive = Archive::open(&mut source).expect("the outer archive parses");
+    let archive =
+        Archive::open(&mut source, &rpf_core::Unlock::unkeyed()).expect("the outer archive parses");
 
     // Through `locate`, the refusal names the version and where it begins.
     let error = archive
@@ -1354,15 +1434,21 @@ fn bytes_that_are_not_an_rpf_header_at_all_are_still_not_an_archive() {
     // The version arm must not swallow the case it was carved out of: a file
     // that is not an archive is still `NotAnArchive`, and a file too short to
     // hold a header is too, whatever its first four bytes say.
-    let error = Archive::open(&mut Cursor::new(header_of(*b"PK\x03\x04")))
-        .expect_err("a zip is not an archive");
+    let error = Archive::open(
+        &mut Cursor::new(header_of(*b"PK\x03\x04")),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect_err("a zip is not an archive");
     assert!(
         matches!(error, Error::NotAnArchive { base: 0, .. }),
         "expected NotAnArchive, got {error:?}"
     );
 
-    let error = Archive::open(&mut Cursor::new(b"RPF2".to_vec()))
-        .expect_err("four bytes cannot hold a header");
+    let error = Archive::open(
+        &mut Cursor::new(b"RPF2".to_vec()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect_err("four bytes cannot hold a header");
     assert!(
         matches!(error, Error::NotAnArchive { base: 0, .. }),
         "expected a truncated file to be refused as not an archive, got {error:?}"
@@ -1382,7 +1468,8 @@ fn two_children_of_one_directory_that_are_one_name_are_refused_on_read() {
     ];
     let bytes = archive_bytes(&rows, b"\0A.txt\0a.txt\0", 4_096);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("the archive itself parses");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("the archive itself parses");
     // Listing still works: refusing at parse would leave a caller unable to see
     // what is wrong with the archive.
     assert_eq!(archive.name(1).expect("name"), "A.txt");
@@ -1413,7 +1500,8 @@ fn a_collision_between_two_directories_is_refused_on_read() {
     ];
     let bytes = archive_bytes(&rows, b"\0X64\0x64\0", 4_096);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("the archive itself parses");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("the archive itself parses");
     let error = rpf_core::directories_of(&archive).expect_err("one name for two directories");
     assert!(
         matches!(
@@ -1439,7 +1527,8 @@ fn one_name_carried_by_two_entries_is_not_reported_as_a_case_collision() {
         file_row(1, 0, 5, 16, 0),
     ];
     let bytes = archive_bytes(&rows, b"\0aa.txt\0", 4_096);
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("parses");
     let error = rpf_core::specs_of(&archive).expect_err("one name for two entries");
     assert!(
         matches!(
@@ -1460,7 +1549,8 @@ fn one_name_carried_by_two_entries_is_not_reported_as_a_case_collision() {
         directory_row(1, 3, 0),
     ];
     let bytes = archive_bytes(&rows, b"\0aa.txt\0", 4_096);
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("parses");
     let error = rpf_core::specs_of(&archive).expect_err("a file and a directory");
     assert!(
         matches!(
@@ -1487,7 +1577,8 @@ fn one_name_in_two_directories_is_not_a_collision() {
     ];
     let bytes = archive_bytes(&rows, b"\0a\0b\0x.txt\0", 8_192);
 
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("parses");
     let specs = rpf_core::specs_of(&archive).expect("two directories, one name each");
     let paths: Vec<String> = specs.into_iter().map(|(spec, _)| spec.path).collect();
     assert_eq!(paths, ["a/x.txt", "b/x.txt"]);
@@ -1506,7 +1597,8 @@ fn a_name_two_siblings_answer_to_is_refused_rather_than_resolved_to_the_first() 
         file_row(7, 0, 5, 16, 0),
     ];
     let bytes = archive_bytes(&rows, b"\0A.txt\0a.txt\0", 4_096);
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("the archive itself parses");
+    let archive = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect("the archive itself parses");
 
     for spelling in ["a.txt", "A.txt", "a.TXT"] {
         let error = archive
@@ -1543,7 +1635,8 @@ fn one_name_in_two_directories_still_resolves() {
         file_row(5, 0, 9, 16, 0),
     ];
     let bytes = archive_bytes(&rows, b"\0a\0b\0x.txt\0", 8_192);
-    let archive = Archive::open(&mut Cursor::new(bytes)).expect("parses");
+    let archive =
+        Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed()).expect("parses");
     assert_eq!(archive.find("a/x.txt").expect("resolves"), 3);
     assert_eq!(archive.find("b/x.txt").expect("resolves"), 4);
 }
@@ -1574,7 +1667,11 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_manifest() {
         "the change is inside the payload and nowhere else",
     );
 
-    let archive = Archive::open(&mut Cursor::new(changed.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(changed.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     assert_eq!(
         archive
             .read(&mut Cursor::new(changed.clone()), 1)
@@ -1593,7 +1690,11 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_manifest() {
 
     // What the manifest can. Its checksums are taken from the sound archive,
     // and the changed one is read back against them.
-    let sound_archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let sound_archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
     let manifest = Manifest::of_contents(
         &mut Cursor::new(bytes.clone()),
         &sound_archive,
@@ -1653,7 +1754,11 @@ fn a_resource_is_checked_against_the_file_it_is_outside_the_archive() {
     let payload = resource_payload();
     let declared = payload.len() as u32;
     let bytes = one_file_archive(&payload, declared, RESOURCE_FLAG, ONE_SYSTEM_PAGE);
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
 
     let manifest = Manifest::of_contents(&mut Cursor::new(bytes.clone()), &archive, &mut Unwatched)
         .expect("digests every entry");
@@ -1688,7 +1793,11 @@ fn a_verify_with_no_manifest_says_it_checked_no_contents() {
     // checked against anything, and the second number is what says so.
     let sound = b"hello there!";
     let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
 
     let verified = Verified::of(&mut Cursor::new(bytes), &archive, &mut Unwatched).expect("walks");
     assert_eq!(verified.checked, 1);
@@ -1707,7 +1816,11 @@ fn a_manifest_that_records_no_checksum_leaves_the_entry_unchecked() {
     // `contents_checked`. DR-023's migration rule.
     let sound = b"hello there!";
     let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
-    let archive = Archive::open(&mut Cursor::new(bytes.clone())).expect("well formed");
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
 
     let text = r#"{"schema":2,"version":"rpf7","codec":"deflate",
                    "encryption":1313165391,"directories":[],

@@ -208,7 +208,8 @@ fn a_rebuilt_archive_holds_the_same_contents() {
     };
 
     let mut source = fs::File::open(&path).expect("archive opens");
-    let original = Archive::open(&mut source).expect("archive parses");
+    let original =
+        Archive::open(&mut source, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let specs = specs_for(&original);
     let by_path: BTreeMap<String, u32> = specs.iter().map(|(s, i)| (s.path.clone(), *i)).collect();
     let files: Vec<FileSpec> = specs.into_iter().map(|(s, _)| s).collect();
@@ -237,7 +238,7 @@ fn a_rebuilt_archive_holds_the_same_contents() {
 
     // Read the rebuild back with the same reader.
     let mut handle = fs::File::open(rebuilt.path()).expect("rebuild opens");
-    let round = Archive::open(&mut handle).expect("rebuild parses");
+    let round = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
 
     // Same tree, by full path.
     let original_paths: Vec<String> = (0..original.entries().len() as u32)
@@ -320,7 +321,8 @@ fn an_injected_corruption_is_caught() {
     };
 
     let mut source = fs::File::open(&path).expect("archive opens");
-    let original = Archive::open(&mut source).expect("archive parses");
+    let original =
+        Archive::open(&mut source, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let specs = specs_for(&original);
     let by_path: BTreeMap<String, u32> = specs.iter().map(|(s, i)| (s.path.clone(), *i)).collect();
     let files: Vec<FileSpec> = specs.into_iter().map(|(s, _)| s).collect();
@@ -344,7 +346,7 @@ fn an_injected_corruption_is_caught() {
     // Flip a byte inside the first payload, which is a deflate stream.
     let mut bytes = fs::read(rebuilt.path()).expect("rebuild readable");
     let mut handle = fs::File::open(rebuilt.path()).expect("opens");
-    let round = Archive::open(&mut handle).expect("parses");
+    let round = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("parses");
     let victim = round.find("content.xml").expect("content.xml is there");
     let EntryKind::Binary { block, .. } = round.entry(victim).expect("in range").kind else {
         panic!("content.xml should be a binary entry");
@@ -354,7 +356,8 @@ fn an_injected_corruption_is_caught() {
     fs::write(rebuilt.path(), &bytes).expect("writable");
 
     let mut damaged = fs::File::open(rebuilt.path()).expect("opens");
-    let archive = Archive::open(&mut damaged).expect("the table of contents is intact");
+    let archive = Archive::open(&mut damaged, &rpf_core::Unlock::unkeyed())
+        .expect("the table of contents is intact");
     let result = archive.read(&mut damaged, victim);
     assert!(
         result.is_err(),
@@ -380,7 +383,8 @@ fn replacing_a_nested_entry_cascades() {
     };
 
     let mut source = fs::File::open(&path).expect("archive opens");
-    let original = Archive::open(&mut source).expect("archive parses");
+    let original =
+        Archive::open(&mut source, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     let (holder, donor_index) = original.locate(&mut source, DONOR).expect("donor resolves");
     let donor_bytes = holder
@@ -412,7 +416,7 @@ fn replacing_a_nested_entry_cascades() {
     rebuilt.as_file_mut().flush().expect("flushed");
 
     let mut handle = fs::File::open(rebuilt.path()).expect("rebuild opens");
-    let round = Archive::open(&mut handle).expect("rebuild parses");
+    let round = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
 
     // The target now holds the donor's bytes.
     let (holder, index) = round.locate(&mut handle, TARGET).expect("target resolves");
@@ -484,7 +488,8 @@ fn a_structural_change_to_the_sample_reads_back() {
     };
 
     let mut source = fs::File::open(&path).expect("archive opens");
-    let original = Archive::open(&mut source).expect("archive parses");
+    let original =
+        Archive::open(&mut source, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let before = rpf_core::Listed::at(&mut source, &original, INSIDE, false)
         .expect("lists")
         .len();
@@ -519,7 +524,7 @@ fn a_structural_change_to_the_sample_reads_back() {
     rebuilt.as_file_mut().flush().expect("flushed");
 
     let mut handle = fs::File::open(rebuilt.path()).expect("rebuild opens");
-    let round = Archive::open(&mut handle).expect("rebuild parses");
+    let round = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
 
     let after: Vec<String> = rpf_core::Listed::at(&mut handle, &round, INSIDE, false)
         .expect("lists")
@@ -607,7 +612,7 @@ fn a_deflate_that_does_not_pay_for_itself_is_stored_and_nothing_stale_is_left() 
     let (report, bytes) = build_on_disk(&files, &[], |_| Ok(bulk.clone()));
 
     let mut src = Cursor::new(bytes.clone());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     for path in ["first.bin", "last.bin"] {
         let index = archive.find(path).expect("resolves");
         let EntryKind::Binary { compressed_len, .. } = archive.entry(index).expect("in range").kind
@@ -673,7 +678,9 @@ fn an_archive_is_written_at_the_version_it_was_asked_for() {
         );
         let mut src = Cursor::new(bytes);
         assert_eq!(
-            Archive::open(&mut src).expect("parses").version(),
+            Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
+                .expect("parses")
+                .version(),
             version,
             "{version:?} did not read back as itself"
         );
@@ -697,7 +704,7 @@ fn a_rebuild_writes_the_version_the_original_was_read_at() {
         sink.as_file_mut().flush().expect("flushed");
 
         let mut src = Cursor::new(fs::read(sink.path()).expect("readable"));
-        let archive = Archive::open(&mut src).expect("parses");
+        let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
         let edits = BTreeMap::from([("a.txt".to_owned(), b"replaced".to_vec())]);
         let mut out = tempfile::NamedTempFile::new().expect("temp file");
         rpf_core::rewrite(
@@ -713,7 +720,9 @@ fn a_rebuild_writes_the_version_the_original_was_read_at() {
 
         let mut round = Cursor::new(fs::read(out.path()).expect("readable"));
         assert_eq!(
-            Archive::open(&mut round).expect("parses").version(),
+            Archive::open(&mut round, &rpf_core::Unlock::unkeyed())
+                .expect("parses")
+                .version(),
             version,
             "a rebuild changed the version"
         );
@@ -782,7 +791,7 @@ where
 /// exists, and hands back what landed there.
 fn replaced_on_disk(source: &[u8], edits: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut src = Cursor::new(source.to_vec());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     let report = rpf_core::rewrite(
@@ -839,7 +848,7 @@ fn a_payload_ending_on_a_block_boundary_keeps_its_last_byte() {
         let (_, bytes) = build_on_disk(&files, &[], |_| Ok(contents.clone()));
 
         let mut file = Cursor::new(bytes);
-        let archive = Archive::open(&mut file).expect("parses");
+        let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
         let index = archive.find("raw.bin").expect("resolves");
         if archive.read(&mut file, index).expect("reads") != contents {
             corrupted.push(len);
@@ -860,7 +869,7 @@ fn an_archive_with_no_files_is_still_a_whole_number_of_blocks() {
     assert_eq!(report.len % 512, 0, "not a whole number of blocks");
 
     let mut file = Cursor::new(bytes);
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     assert_eq!(archive.entries().len(), 1, "the root, and nothing else");
 }
 
@@ -887,7 +896,7 @@ fn a_zero_length_last_payload_does_not_truncate_the_archive() {
     assert_eq!(report.len % 512, 0, "not a whole number of blocks");
 
     let mut file = Cursor::new(bytes);
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     for (path, expected) in [("a.txt", b"abcd".to_vec()), ("z-empty.txt", Vec::new())] {
         let index = archive.find(path).expect("resolves");
         assert_eq!(
@@ -922,7 +931,7 @@ fn deflating_an_empty_file_does_not_truncate_the_archive() {
     assert_eq!(report.len % 512, 0, "not a whole number of blocks");
 
     let mut file = Cursor::new(bytes);
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("z-empty.txt").expect("resolves");
     assert!(
         archive.read(&mut file, index).expect("reads").is_empty(),
@@ -939,7 +948,7 @@ fn emptying_the_last_payload_of_a_rebuild_does_not_truncate_it() {
     let bytes = replaced_on_disk(&source, &edits);
 
     let mut file = Cursor::new(bytes);
-    let archive = Archive::open(&mut file).expect("rebuild parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
     let index = archive.find("z.txt").expect("resolves");
     assert!(
         archive.read(&mut file, index).expect("reads").is_empty(),
@@ -1009,7 +1018,7 @@ fn every_file_name_below_sixteen_bits_reads_back() {
     assert_eq!(report.names_len, 65_532 + 19, "the whole blob");
 
     let mut file = Cursor::new(bytes);
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     for index in 0..=3449_u32 {
         // Entry 0 is the root; the files follow in ascending name order, which
         // is the order they were generated in.
@@ -1038,7 +1047,7 @@ fn a_nested_rebuild_keeps_the_last_byte_of_its_last_payload() {
     let edits = BTreeMap::from([("sub/inner.rpf/f.txt".to_owned(), contents.clone())]);
 
     let mut file = Cursor::new(replaced_on_disk(&source, &edits));
-    let round = Archive::open(&mut file).expect("rebuild parses");
+    let round = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
     let (holder, index) = round
         .locate(&mut file, "sub/inner.rpf/f.txt")
         .expect("resolves");
@@ -1059,7 +1068,7 @@ fn replacing_an_archive_and_a_file_inside_it_is_refused() {
     let inner = inner_archive(b"original");
     let replacement = inner_archive(b"a different archive entirely");
     let mut src = Cursor::new(outer_archive(&inner));
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let edits = BTreeMap::from([
         ("sub/inner.rpf".to_owned(), replacement),
@@ -1092,7 +1101,7 @@ fn replacing_an_archive_and_a_file_inside_it_is_refused() {
 fn several_spellings_of_one_edit_are_refused() {
     let inner = inner_archive(b"original");
     let mut src = Cursor::new(outer_archive(&inner));
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let edits = BTreeMap::from([
         ("sub/inner.rpf/f.txt".to_owned(), b"first".to_vec()),
@@ -1125,7 +1134,7 @@ fn several_spellings_of_one_edit_are_refused() {
 #[test]
 fn two_spellings_of_one_entry_are_refused_at_the_top_level() {
     let mut src = Cursor::new(built(&[stored("f.txt")], b"original"));
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let edits = BTreeMap::from([
         ("f.txt".to_owned(), b"first".to_vec()),
@@ -1155,7 +1164,7 @@ fn two_spellings_of_one_entry_are_refused_at_the_top_level() {
 fn edits_in_one_nested_archive_still_rebuild_it_once() {
     let inner = built(&[stored("f.txt"), stored("g.txt")], b"original");
     let mut src = Cursor::new(outer_archive(&inner));
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let edits = BTreeMap::from([
         ("sub//inner.rpf/f.txt".to_owned(), b"one".to_vec()),
@@ -1173,7 +1182,7 @@ fn edits_in_one_nested_archive_still_rebuild_it_once() {
     .expect("rebuilds");
 
     let mut file = Cursor::new(out.into_inner());
-    let round = Archive::open(&mut file).expect("parses");
+    let round = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     for (path, expected) in [
         ("sub/inner.rpf/f.txt", b"one".to_vec()),
         ("sub/inner.rpf/g.txt", b"two".to_vec()),
@@ -1322,7 +1331,7 @@ fn one_directory_is_reachable_under_any_case() {
         &[stored("X64/alpha.txt"), stored("X64/beta.txt")],
         b"contents",
     ));
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     for path in ["X64/alpha.txt", "x64/ALPHA.TXT", "x64/beta.txt"] {
         assert!(archive.find(path).is_ok(), "{path} does not resolve");
     }

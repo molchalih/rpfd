@@ -48,6 +48,8 @@ length. A ten-line probe produced the real layout. Everything in
 | What work is outstanding, in what order, and what is still unknown | `docs/backlog.md` | A new item under the owning track, or a new row in Open questions |
 | What archives exist to test against, what each one is, and what it does and does not exercise | `docs/corpus.md` | A new row per archive, with its size, version, encryption tag and entry count, and a note on what class it covers |
 | How a rebuilt archive is shown to load, and what a pass does and does not prove | `docs/acceptance.md` | Amend the procedure in place. A new observation is a step naming the command, the value it must show, and whether it has been executed here or only written |
+| Which mutations of the container survive its own tests, and what each survivor means | `docs/mutants.md` | A sweep replaces the file. A survivor argued as equivalent-to-original states the argument, so the next sweep does not re-litigate it |
+| What the NG scheme is, where its key material lives, and which routes to it are open | `docs/ng-scheme.md` | Amend in place. A route that opens or closes is also a decision record |
 | Why was an option chosen over its alternative | `docs/decisions/DR-NNN-<slug>.md` | Next free number. Never renumber, reword or delete — supersede |
 
 A fact that fits no row above does not yet have a home; add the row before

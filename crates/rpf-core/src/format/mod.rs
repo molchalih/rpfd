@@ -26,6 +26,7 @@
 //! Nothing here does I/O. These are the measured facts of the format and the
 //! pure functions over them, so that they can be tested without an archive.
 
+pub mod crypto;
 pub mod resource;
 pub mod rpf7;
 
@@ -177,6 +178,34 @@ impl Version {
     #[must_use]
     pub const fn is_open(self, tag: u32) -> bool {
         tag == self.open()
+    }
+
+    /// Whether a binary entry carrying this value in its own encryption field
+    /// is stored in the clear.
+    ///
+    /// Asked of the **entry's** field, not the archive's tag; an entry in an
+    /// unencrypted archive is in the clear whatever this says, which is why
+    /// both questions are asked.
+    #[must_use]
+    pub const fn entry_is_open(self, encryption: u32) -> bool {
+        match self {
+            Self::Rpf7 => encryption == rpf7::ENTRY_OPEN,
+        }
+    }
+
+    /// Which transform an archive carrying this tag is under, or `None` when
+    /// nothing this build holds opens it.
+    ///
+    /// `None` covers two situations a caller must not confuse: a tag that means
+    /// "not encrypted" ([`Version::is_open`] is the question for that), and a
+    /// tag that is encrypted under something unidentified — `0x0FFFFFF7`, which
+    /// `docs/rpf-format.md` records as opened by neither transform. Asking both
+    /// questions is what tells them apart.
+    #[must_use]
+    pub const fn scheme(self, tag: u32) -> Option<crypto::Scheme> {
+        match self {
+            Self::Rpf7 => rpf7::scheme(tag),
+        }
     }
 
     /// The lowest offset, relative to an archive's base, that a payload may
@@ -635,6 +664,30 @@ mod tests {
         assert_eq!(u16_at(&row, 2), None);
         assert_eq!(u24_at(&row, 1), None);
         assert_eq!(u16_at(&row, usize::MAX), None);
+    }
+
+    #[test]
+    fn a_binary_entry_is_in_the_clear_only_when_its_own_field_is_zero() {
+        // `docs/rpf-format.md`, Entry table, `verified`: the per-entry
+        // encryption field takes exactly two values across both installs, 0 on
+        // 27,276 binary entries and 1 on 64,300, and 1 means the payload is
+        // under the archive's transform. Neither `ENTRY_OPEN` nor
+        // `entry_is_open` had a test at all, and this one decides whether a
+        // payload is decrypted.
+        let version = Version::Rpf7;
+        assert_eq!(rpf7::ENTRY_OPEN, 0);
+        assert!(version.entry_is_open(rpf7::ENTRY_OPEN));
+        assert!(!version.entry_is_open(1), "1 is the value that means keyed");
+        for keyed in [2_u32, 0x0FEF_FFFF, u32::MAX] {
+            assert!(
+                !version.entry_is_open(keyed),
+                "{keyed} is not the field's open value"
+            );
+        }
+        // The archive's tag and the entry's field are different questions over
+        // different numbers, which is easy to lose: `ENCRYPTION_OPEN` is not a
+        // value this field ever carries.
+        assert!(!version.entry_is_open(version.open()));
     }
 
     #[test]

@@ -212,7 +212,7 @@ fn reader_agrees_with_the_oracle() {
     );
 
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     let mut archives = BTreeMap::new();
     let mut files = BTreeMap::new();
@@ -276,7 +276,7 @@ fn paths_carry_their_directories() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     let paths: Vec<String> = (0..u32::try_from(archive.entries().len()).expect("fits"))
         .map(|i| archive.path(i).expect("path builds"))
@@ -304,7 +304,7 @@ fn the_resource_bit_agrees_with_the_payload_magic() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     let mut checked = 0u32;
     for index in 0..u32::try_from(archive.entries().len()).expect("fits") {
@@ -338,7 +338,7 @@ fn contents_inflate_to_the_declared_lengths() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     let mut binaries = 0u32;
     let mut resources = 0u32;
@@ -404,7 +404,7 @@ fn a_single_path_addresses_through_nested_archives() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     // Within this archive only.
     let meta = archive.find("data/vehicles.meta").expect("meta resolves");
@@ -462,7 +462,7 @@ fn the_summary_reproduces_the_measured_slack() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let summary = Summary::of(&mut file, &archive, "").expect("summarises");
 
     assert_eq!(summary.len, 144_504_832);
@@ -485,7 +485,7 @@ fn every_entry_of_the_sample_reads_back() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let verified = Verified::of(&mut file, &archive, &mut Unwatched).expect("reads back");
 
     let named: Vec<&str> = verified
@@ -523,7 +523,7 @@ fn the_sample_verifies_against_a_manifest_of_itself() {
         return;
     };
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = Archive::open(&mut file).expect("archive parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
 
     let manifest =
         Manifest::of_contents(&mut file, &archive, &mut Unwatched).expect("digests every entry");

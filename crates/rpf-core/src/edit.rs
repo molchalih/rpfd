@@ -629,8 +629,15 @@ fn entry_at(archive: &Archive, path: &str) -> Result<u32> {
 /// [`Error::AlreadyExists`] for a rename or a directory onto one it does,
 /// [`Error::BadPath`] for the root, for a non-empty directory removed without
 /// saying so, and for a name [`name::check_tree`] refuses,
-/// [`Error::WrongKind`] for a write to a directory, and as [`specs_of`].
+/// [`Error::WrongKind`] for a write to a directory,
+/// [`Error::CannotWriteEncrypted`] for an archive this build can read and not
+/// write back, and as [`specs_of`].
 pub(crate) fn tree_of(archive: &Archive, changes: &Changes) -> Result<Tree> {
+    // The tree a rebuild will write, so this is where a rebuild's target is
+    // asked whether it can be written at all — once, for `rebuild`, for every
+    // level of a cascading `rewrite`, and for the resolution `allows` runs
+    // before a change is buffered. `Archive::writable` is the whole answer.
+    archive.writable()?;
     check_one_each(archive, changes)?;
     let mut tree = Tree {
         nodes: specs_of(archive)?

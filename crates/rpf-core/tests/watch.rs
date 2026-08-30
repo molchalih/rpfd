@@ -183,7 +183,7 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
     .expect("outer builds");
 
     let mut src = Cursor::new(outer.into_inner());
-    let archive = rpf_core::Archive::open(&mut src).expect("parses");
+    let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let edits = std::collections::BTreeMap::from([(
         "x64/inner.rpf/b.txt".to_owned(),
         b"replaced".to_vec(),
@@ -223,7 +223,7 @@ fn a_verify_reports_every_entry_it_reads_and_stops_when_told_to() {
         &mut Unwatched,
     )
     .expect("builds");
-    let archive = rpf_core::Archive::open(&mut out).expect("parses");
+    let archive = rpf_core::Archive::open(&mut out, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let mut watch = Recorder::watching();
     let verified = rpf_core::Verified::of(&mut out, &archive, &mut watch).expect("reads back");

@@ -209,7 +209,8 @@ impl Claim {
 /// created, [`Error::WrongKind`] for a directory, [`Error::NotAResource`] for a
 /// resource given a payload that is not one, [`Error::FieldOverflow`] for one no
 /// entry row can describe, [`Error::Overlapping`] for two edits that claim the
-/// same bytes, and [`Error::Io`] from the archive. Not
+/// same bytes, [`Error::CannotWriteEncrypted`] for an archive this build can
+/// read and not write back, and [`Error::Io`] from the archive. Not
 /// [`Error::ArchiveTooLarge`], which the same row builder can raise: the block
 /// this hands it was decoded out of the entry it is patching, so it already
 /// fits the field.
@@ -217,6 +218,13 @@ pub fn plan<F>(file: &mut F, archive: &Archive, changes: &Changes) -> Result<Pla
 where
     F: Read + Seek,
 {
+    // Asked before anything is resolved. A `Plan::Structural` is a value the
+    // caller finishes by rebuilding, and an archive that cannot be written back
+    // cannot finish it — so answering one here would be handing over a half
+    // decision (§4). It covers the archive a path never leaves; the holder a
+    // path descends into is asked for itself below.
+    archive.writable()?;
+
     let structural = structural_in(file, archive, changes)?;
     if !structural.is_empty() {
         return Ok(Plan::Structural(structural));
@@ -232,6 +240,12 @@ where
             continue;
         };
         let (holder, index) = archive.locate(file, path)?;
+        // The archive the bytes would land in, asked before a byte of payload
+        // is compressed: a patch writes plaintext where the entry already sits,
+        // and where that region is under a transform it destroys the archive in
+        // place. One answer, `Archive::writable`, shared with the rebuild path.
+        // DR-041.
+        holder.writable()?;
         let entry = *holder.entry(index)?;
 
         // The storage rule is the entry's, not the caller's: one that was

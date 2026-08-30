@@ -64,7 +64,7 @@ fn rewritten(source: &[u8], changes: &Changes) -> Vec<u8> {
 /// The same, without deciding whether it should have worked.
 fn rewriting(source: &[u8], changes: &Changes) -> Result<Vec<u8>, Error> {
     let mut src = Cursor::new(source.to_vec());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     let report = rpf_core::rewrite(
@@ -88,7 +88,7 @@ fn rewriting(source: &[u8], changes: &Changes) -> Result<Vec<u8>, Error> {
 /// Every path in an archive, files and directories alike, in listing order.
 fn paths(bytes: &[u8]) -> Vec<String> {
     let mut src = Cursor::new(bytes.to_vec());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     rpf_core::Listed::at(&mut src, &archive, "", true)
         .expect("lists")
         .into_iter()
@@ -99,7 +99,7 @@ fn paths(bytes: &[u8]) -> Vec<String> {
 /// One entry's contents, by path, addressed through nesting.
 fn contents(bytes: &[u8], path: &str) -> Vec<u8> {
     let mut src = Cursor::new(bytes.to_vec());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let (holder, index) = archive.locate(&mut src, path).expect("resolves");
     holder.extract(&mut src, index).expect("extracts")
 }
@@ -160,7 +160,7 @@ fn a_payload_that_is_a_resource_becomes_a_resource_entry() {
     let rebuilt = rewritten(&source, &changes);
 
     let mut src = Cursor::new(rebuilt.clone());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("t.ytd").expect("resolves");
     assert!(
         matches!(
@@ -180,7 +180,7 @@ fn a_payload_that_is_not_a_resource_becomes_a_binary_entry() {
     let rebuilt = rewritten(&source, &changes);
 
     let mut src = Cursor::new(rebuilt.clone());
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("b.txt").expect("resolves");
     match archive.entry(index).expect("in range").kind {
         EntryKind::Binary { compressed_len, .. } => assert!(
@@ -389,7 +389,7 @@ fn a_structural_change_inside_a_nested_archive_cascades() {
 fn a_structural_change_cannot_be_patched_in_place() {
     let source = built(&[stored("a.txt")], &[], b"first");
     let mut src = Cursor::new(source);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     for (path, change, what) in [
         ("b.txt", adding(b"second"), "adds an entry"),
@@ -425,7 +425,7 @@ fn a_structural_change_cannot_be_patched_in_place() {
 fn replacing_an_entry_that_exists_is_still_patched_in_place() {
     let source = built(&[stored("a.txt")], &[], b"first");
     let mut src = Cursor::new(source);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let changes = Changes::writing(BTreeMap::from([("a.txt".to_owned(), b"other".to_vec())]));
     match rpf_core::plan(&mut src, &archive, &changes).expect("plans") {
@@ -440,7 +440,7 @@ fn replacing_an_entry_that_exists_is_still_patched_in_place() {
 fn a_change_is_refused_when_it_is_offered() {
     let source = built(&[stored("data/a.txt")], &[], b"first");
     let mut src = Cursor::new(source);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let nothing = Changes::new();
     rpf_core::allows(
@@ -479,7 +479,7 @@ fn a_change_is_refused_when_it_is_offered() {
 fn a_change_is_judged_against_the_changes_already_buffered() {
     let source = built(&[stored("data/a.txt"), stored("readme.txt")], &[], b"first");
     let mut src = Cursor::new(source);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     // DR-026 §5: a caller that means to replace the target removes it in the
     // same set, and removals are applied before renames for exactly that
@@ -671,13 +671,13 @@ fn the_root_cannot_be_removed_or_renamed() {
 fn the_entry_count_and_names_blob_follow_the_change() {
     let source = built(&[stored("a.txt")], &[], b"first");
     let mut src = Cursor::new(source.clone());
-    let before = Archive::open(&mut src).expect("parses");
+    let before = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let names_before = before.names_blob().len();
 
     let changes = Changes::one("bbbbbbbb.txt", adding(b"second"));
     let rebuilt = rewritten(&source, &changes);
     let mut handle = Cursor::new(rebuilt);
-    let after = Archive::open(&mut handle).expect("parses");
+    let after = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     assert_eq!(
         after.entries().len(),
@@ -781,7 +781,8 @@ fn saying_recursive_allows_the_directory_to_be_rebuilt_by_the_write() {
 fn the_wire_refuses_the_removal_the_set_has_already_filled() {
     let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
     let mut src = std::io::Cursor::new(source.clone());
-    let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+    let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
+        .expect("the archive parses");
 
     let mut buffered = Changes::new();
     buffered.set(
@@ -833,7 +834,8 @@ fn a_directory_the_set_renames_into_is_not_empty_either() {
     // The daemon asks the same question, and the destination is what makes the
     // rename bear on the removal at all.
     let mut src = std::io::Cursor::new(source.clone());
-    let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+    let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
+        .expect("the archive parses");
     let mut buffered = Changes::new();
     buffered.set("a.txt", Change::RenameTo("empty/moved.txt".to_owned()));
     let offered = Change::Remove { recursive: false };
@@ -899,7 +901,8 @@ fn a_removal_is_answered_against_the_changes_that_reach_it() {
         b"same",
     );
     let mut src = std::io::Cursor::new(source);
-    let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+    let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
+        .expect("the archive parses");
 
     // `delete other.txt`, then `rename a.txt other.txt` — which DR-030 records
     // as the rename a buffered removal legitimately frees — then `forget
@@ -966,7 +969,8 @@ fn a_replacing_rename_holds_however_the_caller_spells_it() {
         let rebuilt = rewriting(&source, &changes)
             .unwrap_or_else(|error| panic!("{spelling} was refused: {error:?}"));
         let mut src = std::io::Cursor::new(rebuilt);
-        let archive = rpf_core::Archive::open(&mut src).expect("the archive parses");
+        let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
+            .expect("the archive parses");
         assert_eq!(archive.entries().len(), 2, "root and the renamed entry");
     }
 }

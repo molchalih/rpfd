@@ -113,7 +113,7 @@ fn differences(before: &[u8], after: &[u8]) -> Vec<usize> {
 fn a_patch_writes_only_its_own_payload_and_row() {
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let index = archive.find("data/notes.txt").expect("resolves");
     let (payload_at, _) = archive.payload_at(index).expect("span");
@@ -158,7 +158,7 @@ fn a_patch_writes_only_its_own_payload_and_row() {
 
     // The row really was rewritten: the new contents read back.
     let mut file = Cursor::new(after);
-    let archive = Archive::open(&mut file).expect("re-parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("re-parses");
     let index = archive.find("data/notes.txt").expect("resolves");
     assert_eq!(archive.read(&mut file, index).expect("reads"), replacement);
 
@@ -174,7 +174,7 @@ fn a_patch_writes_only_its_own_payload_and_row() {
 fn a_patch_that_does_not_fit_writes_nothing_at_all() {
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let plan = rpf_core::plan(
         &mut file,
@@ -205,7 +205,7 @@ fn one_edit_that_does_not_fit_holds_back_the_ones_that_do() {
     // promises. R4.14.
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let plan = rpf_core::plan(
         &mut file,
@@ -240,7 +240,7 @@ fn one_edit_that_does_not_fit_holds_back_the_ones_that_do() {
 fn several_edits_are_applied_together() {
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let plan = rpf_core::plan(
         &mut file,
@@ -260,7 +260,7 @@ fn several_edits_are_applied_together() {
 
     let after = file.into_inner();
     let mut file = Cursor::new(after);
-    let archive = Archive::open(&mut file).expect("re-parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("re-parses");
     for (path, expected) in [
         ("data/notes.txt", b"rewritten".to_vec()),
         ("raw.bin", vec![7_u8; 64]),
@@ -309,7 +309,7 @@ fn two_edits_that_claim_the_same_bytes_are_refused() {
     let before = outer.into_inner();
 
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let refused = rpf_core::plan(
         &mut file,
@@ -353,7 +353,7 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
     let before = outer.into_inner();
 
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     // Where the nested archive sits in the outer file.
     let nested_index = archive.find("x64/inner.rpf").expect("resolves");
@@ -387,7 +387,7 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
     }
 
     let mut file = Cursor::new(after);
-    let archive = Archive::open(&mut file).expect("re-parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("re-parses");
     let (holder, index) = archive
         .locate(&mut file, "x64/inner.rpf/raw.bin")
         .expect("resolves");
@@ -401,7 +401,7 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
 fn a_resource_entry_refuses_a_payload_that_is_not_one() {
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let refused = rpf_core::plan(
         &mut file,
@@ -483,7 +483,7 @@ fn a_resource_too_large_for_its_size_field_is_refused_rather_than_truncated() {
     let payload = oversized_resource();
     let before = roomy_resource_archive();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     assert!(
         archive
             .allocation(archive.find("art.yft").expect("resolves"))
@@ -590,7 +590,7 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
     // And the patch path, which applies the same rule through `store`.
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     let refused = rpf_core::plan(&mut file, &archive, &edits(&[("art.yft", truncated)]));
     assert!(
         matches!(refused, Err(rpf_core::Error::NotAResource { .. })),

@@ -130,7 +130,8 @@ fn a_tree_of_exactly_the_deepest_a_tree_may_be_is_packed_and_read_back() {
     let bytes = built(&[spec(&deepest, Storage::Stored)], b"deep");
 
     let mut src = Cursor::new(bytes);
-    let archive = Archive::open(&mut src).expect("the deepest legal tree parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
+        .expect("the deepest legal tree parses");
     let index = archive.find(&deepest).expect("resolves");
     assert_eq!(archive.read(&mut src, index).expect("reads"), b"deep");
 }
@@ -184,7 +185,7 @@ fn a_tree_one_component_deeper_than_a_reader_will_walk_is_refused() {
 fn a_payload_of_exactly_its_allocation_fits_in_place() {
     let source = built(&[spec("raw.bin", Storage::Stored)], &[3_u8; 200]);
     let mut file = Cursor::new(source.clone());
-    let archive = Archive::open(&mut file).expect("parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let index = archive.find("raw.bin").expect("resolves");
     let allocation = archive.allocation(index).expect("allocation");
@@ -214,7 +215,7 @@ fn a_payload_of_exactly_its_allocation_fits_in_place() {
     let after = file.into_inner();
     assert_eq!(after.len(), source.len(), "an in-place patch resized it");
     let mut file = Cursor::new(after);
-    let archive = Archive::open(&mut file).expect("re-parses");
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("re-parses");
     let index = archive.find("raw.bin").expect("resolves");
     assert_eq!(archive.read(&mut file, index).expect("reads"), exact);
 }
@@ -240,7 +241,8 @@ fn an_entry_table_ending_exactly_at_the_end_of_the_file_is_not_what_overran() {
         "the table is meant to end the file"
     );
 
-    let error = Archive::open(&mut Cursor::new(bytes)).expect_err("the names blob does not fit");
+    let error = Archive::open(&mut Cursor::new(bytes), &rpf_core::Unlock::unkeyed())
+        .expect_err("the names blob does not fit");
     assert!(
         matches!(
             error,
@@ -276,7 +278,7 @@ fn a_payload_beginning_exactly_at_the_floor_is_read_rather_than_refused() {
     bytes.extend_from_slice(b"here");
 
     let mut src = Cursor::new(bytes);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("f.txt").expect("resolves");
     assert_eq!(archive.payload_at(index).expect("span").0, BLOCK_LEN);
     assert_eq!(archive.read(&mut src, index).expect("reads"), b"here");
@@ -301,7 +303,7 @@ fn a_neighbour_ending_exactly_where_a_payload_begins_leaves_it_its_room() {
     let bytes = archive_bytes(&rows, &names, len);
 
     let mut src = Cursor::new(bytes);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let first = archive.find("first").expect("resolves");
     let second = archive.find("second").expect("resolves");
@@ -334,7 +336,7 @@ fn a_payload_that_deflates_to_exactly_its_own_length_is_stored() {
     let bytes = built(&[spec("even.bin", Storage::Deflate)], &payload);
 
     let mut src = Cursor::new(bytes);
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("even.bin").expect("resolves");
     match archive.entry(index).expect("entry").kind {
         EntryKind::Binary {

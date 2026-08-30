@@ -7,6 +7,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# docs/conventions.md §14, the AES-256 row, chosen on 2026-08-26 for exactly
+# this and unused until R3.6 had something to decrypt. The block cipher rather
+# than a mode wrapper because the transform is one raw ECB pass per block with
+# no chaining and a sub-block tail carried through in the clear, which no mode
+# wrapper will do. `docs/rpf-format.md`, Encryption.
+aes = "0.9"
+cipher = "0.5"
 flate2.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

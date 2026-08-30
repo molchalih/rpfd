@@ -11,8 +11,11 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, Change, Changes, Flow, ListedKind, Step, Unwatched, Watch,
-    keys::{AES_KEY_LEN, Cache, HASH_LUT_LEN, Keys, SourceDigest},
+    Archive, Change, Changes, Flow, ListedKind, Step, Watch,
+    keys::{
+        AES_KEY_LEN, Cache, HASH_LUT_LEN, Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN,
+        NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, SourceDigest,
+    },
 };
 use serde_json::{Value, json};
 
@@ -83,6 +86,14 @@ impl OnStderr {
             written: 0,
         }
     }
+
+    /// Whether a line has been written that nothing has closed yet.
+    ///
+    /// What [`Drop`] acts on, named so the condition can be asserted without
+    /// capturing standard error.
+    const fn line_is_open(&self) -> bool {
+        !self.silent && self.written > 0
+    }
 }
 
 impl Watch for OnStderr {
@@ -100,6 +111,27 @@ impl Watch for OnStderr {
     }
 }
 
+/// Ends the progress line, however the work it was reporting on ended.
+///
+/// The `done == total` arm above closes the line of a walk that ran to its
+/// end, which every watched operation did until 2026-08-30. A key scan is the
+/// first that **stops early on purpose**: `scan::find` gives up the moment
+/// every anchor is found, which on a memory image is around block 31 of 63, so
+/// the last line it wrote never reached that arm and the first line of the
+/// report was printed on top of it. Dropping is the one thing that happens on
+/// every path — finished, finished early, cancelled, failed — so it is where
+/// the newline belongs rather than in a `finish()` a caller has to remember
+/// (`docs/conventions.md` §4). `written` is zero after the arm above, so a walk
+/// that did run to its end does not get a second newline. DR-040.
+impl Drop for OnStderr {
+    fn drop(&mut self) {
+        if self.line_is_open() {
+            eprintln!();
+            self.written = 0;
+        }
+    }
+}
+
 /// Spaces enough to cover what a shorter line leaves behind.
 ///
 /// One line is reused rather than one printed per entry, and the reuse used to
@@ -114,10 +146,45 @@ fn padding(written: usize, now: usize) -> String {
     " ".repeat(written.saturating_sub(now))
 }
 
+/// What opens an archive at this path, if it turns out to be encrypted.
+///
+/// The archive's **own file name** is what an NG archive's key is derived from
+/// (`docs/rpf-format.md`, Encryption), and turning a path into a name is the
+/// frontend's job — §7 keeps paths out of `rpf-core`. Which cache is
+/// [`cache_of`]'s answer, so `--cache-dir` reaches opening and extraction
+/// through one function rather than two that have to agree (§3). Nothing is
+/// read here: the key cache is consulted only if an archive refuses to open
+/// without it, so an unencrypted archive still runs on a machine that has no
+/// cache and does not make one (R2.6). DR-041.
+fn unlock_for(path: &Path, named_cache: Option<&Path>) -> rpf_core::Unlock {
+    let Some(cache) = cache_of(named_cache) else {
+        return rpf_core::Unlock::unkeyed();
+    };
+    // Lossy, deliberately. The name is key-material input — an NG archive's key
+    // is a function of its bytes — so a file name this host cannot spell as
+    // UTF-8 hashes over `EF BF BD` and chooses a key the packer did not. That
+    // is not silent: the root-directory check refuses it as `WrongKey`, which
+    // is the truthful answer, because the name we can spell is not the name it
+    // was packed under. Refusing here instead would answer the same question
+    // less clearly and would refuse unencrypted archives with such a name for
+    // no reason at all.
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    rpf_core::Unlock::cached(cache, name)
+}
+
 /// Opens an archive file and parses its table of contents.
-pub fn open(path: &Path) -> Result<(fs::File, Archive)> {
+///
+/// The one place either frontend opens an archive, which is what keeps the two
+/// from differing about what they can open (§1): `serve --stdio` reaches it
+/// through the same call.
+///
+/// `named_cache` is `--cache-dir`, and `None` is the platform's own.
+pub fn open(path: &Path, named_cache: Option<&Path>) -> Result<(fs::File, Archive)> {
     let mut file = fs::File::open(path).map_err(|source| opening(path, source))?;
-    let archive = Archive::open(&mut file)?;
+    let archive = Archive::open(&mut file, &unlock_for(path, named_cache))?;
     Ok((file, archive))
 }
 
@@ -154,8 +221,8 @@ pub fn opening(path: &Path, source: std::io::Error) -> Failure {
 /// `inside` is empty for the archive itself, and names a nested archive
 /// otherwise: every other reporting command addresses through nesting, and
 /// R6.11 is this one catching up.
-pub fn info(path: &Path, inside: &str, json_out: bool) -> Result<()> {
-    let (mut file, archive) = open(path)?;
+pub fn info(path: &Path, inside: &str, named_cache: Option<&Path>, json_out: bool) -> Result<()> {
+    let (mut file, archive) = open(path, named_cache)?;
     let summary = rpf_core::Summary::of(&mut file, &archive, inside)?;
 
     if json_out {
@@ -169,6 +236,7 @@ pub fn info(path: &Path, inside: &str, json_out: bool) -> Result<()> {
             "binary_files": summary.binary_files,
             "resource_files": summary.resource_files,
             "nested_archives": summary.nested_archives,
+            "locked_archives": summary.locked_archives,
             "unreferenced_bytes": summary.unreferenced_bytes,
         }));
     } else {
@@ -183,14 +251,21 @@ pub fn info(path: &Path, inside: &str, json_out: bool) -> Result<()> {
         println!("  binary      {}", summary.binary_files);
         println!("  resource    {}", summary.resource_files);
         println!("nested       {}", summary.nested_archives);
+        println!("  locked      {}", summary.locked_archives);
         println!("unreferenced {}", summary.unreferenced_bytes);
     }
     Ok(())
 }
 
 /// `ls` — what is at a path.
-pub fn ls(path: &Path, inside: &str, recursive: bool, json_out: bool) -> Result<()> {
-    let (mut file, archive) = open(path)?;
+pub fn ls(
+    path: &Path,
+    inside: &str,
+    recursive: bool,
+    named_cache: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
+    let (mut file, archive) = open(path, named_cache)?;
     let rows = rpf_core::Listed::at(&mut file, &archive, inside, recursive)?;
 
     if json_out {
@@ -227,8 +302,8 @@ fn named(listed: &rpf_core::Listed) -> (&'static str, u64) {
 }
 
 /// `cat` — one entry's contents on standard output.
-pub fn cat(path: &Path, inside: &str) -> Result<()> {
-    let (mut file, archive) = open(path)?;
+pub fn cat(path: &Path, inside: &str, named_cache: Option<&Path>) -> Result<()> {
+    let (mut file, archive) = open(path, named_cache)?;
     let (holder, index) = archive.locate(&mut file, inside)?;
     if holder.entry(index)?.is_directory() {
         return Err(Failure::Refused {
@@ -342,6 +417,7 @@ pub fn put(
     inside: &str,
     from: &Path,
     options: WriteOptions,
+    named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
     // A regular file is opened when the library wants it, so a donor of any
@@ -370,6 +446,7 @@ pub fn put(
             },
         ),
         options,
+        named_cache,
         json_out,
     )
 }
@@ -415,6 +492,7 @@ pub fn remove(
     inside: &str,
     recursive: bool,
     options: ChangeOptions,
+    named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
     apply(
@@ -422,6 +500,7 @@ pub fn remove(
         inside,
         &Changes::one(inside, Change::Remove { recursive }),
         options.into(),
+        named_cache,
         json_out,
     )
 }
@@ -435,6 +514,7 @@ pub fn rename(
     from: &str,
     to: &str,
     options: ChangeOptions,
+    named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
     apply(
@@ -442,6 +522,7 @@ pub fn rename(
         from,
         &Changes::one(from, Change::RenameTo(to.to_owned())),
         options.into(),
+        named_cache,
         json_out,
     )
 }
@@ -451,6 +532,7 @@ pub fn make_directory(
     path: &Path,
     inside: &str,
     options: ChangeOptions,
+    named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
     apply(
@@ -458,6 +540,7 @@ pub fn make_directory(
         inside,
         &Changes::one(inside, Change::MakeDirectory),
         options.into(),
+        named_cache,
         json_out,
     )
 }
@@ -498,12 +581,13 @@ pub fn apply(
     inside: &str,
     changes: &Changes,
     options: WriteOptions,
+    named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
     refuse_game_install(path, options.change.force)?;
 
     if !options.rebuild {
-        match in_place(path, changes, options, json_out)? {
+        match in_place(path, changes, options, named_cache, json_out)? {
             Attempted::Done => return Ok(()),
             Attempted::MustRebuild => {}
         }
@@ -523,7 +607,7 @@ pub fn apply(
         return Ok(());
     }
 
-    let (mut file, archive) = open(path)?;
+    let (mut file, archive) = open(path, named_cache)?;
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let mut scratch = tempfile::NamedTempFile::new_in(directory).map_err(|source| Failure::Io {
         path: directory.display().to_string(),
@@ -565,6 +649,7 @@ fn in_place(
     path: &Path,
     changes: &Changes,
     options: WriteOptions,
+    named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<Attempted> {
     let mut file = if options.change.dry_run {
@@ -576,7 +661,7 @@ fn in_place(
         path: path.display().to_string(),
         source,
     })?;
-    let archive = rpf_core::Archive::open(&mut file)?;
+    let archive = rpf_core::Archive::open(&mut file, &unlock_for(path, named_cache))?;
 
     match rpf_core::plan(&mut file, &archive, changes)? {
         rpf_core::Plan::Fits(patches) => {
@@ -782,8 +867,14 @@ pub struct Extracted {
 /// name truncated and rewrote the file every remaining entry was still being
 /// read out of. The daemon's rule is wider — every archive an open session
 /// holds — and both are asked the same way, before anything is created.
-pub fn extract(path: &Path, into: &Path, existing: Existing, json_out: bool) -> Result<()> {
-    let (mut file, archive) = open(path)?;
+pub fn extract(
+    path: &Path,
+    into: &Path,
+    existing: Existing,
+    named_cache: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
+    let (mut file, archive) = open(path, named_cache)?;
     let reading = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let extracted = extract_into(
         &mut file,
@@ -1383,8 +1474,13 @@ fn coverage(checked: &Checked) -> Vec<String> {
 
 /// `verify` — read every entry back and check it against what the archive says,
 /// and against what a tree's manifest recorded when one is named.
-pub fn verify(path: &Path, against: Option<&Path>, json_out: bool) -> Result<()> {
-    let (mut file, archive) = open(path)?;
+pub fn verify(
+    path: &Path,
+    against: Option<&Path>,
+    named_cache: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
+    let (mut file, archive) = open(path, named_cache)?;
     let checked = verified(&mut file, &archive, against, &mut OnStderr::new())?;
     let problems = &checked.verified.problems;
 
@@ -1434,8 +1530,31 @@ pub struct KeysFound {
     pub aes_key_at: u64,
     /// Where the NG hash lookup table sits in the executable.
     pub hash_lut_at: u64,
+    /// The NG material, where the source carried it.
+    ///
+    /// `None` for every game executable measured, and `Some` for a memory image
+    /// of one. Its absence is not a failure: an archive with the AES tag needs
+    /// nothing here. DR-040.
+    pub ng: Option<NgFound>,
     /// The cache it was written to or read from, if this machine has one.
     pub cache: Option<PathBuf>,
+}
+
+/// The NG material a source carried, said in what may be said about it.
+///
+/// Counts and positions. Like [`KeysFound`], it holds no key and so cannot
+/// render into one. DR-006, DR-020.
+#[derive(Debug, Clone, Copy)]
+pub struct NgFound {
+    /// How many expanded keys were found, which is all of them or this is not
+    /// reported at all.
+    pub expanded_keys: usize,
+    /// Where the expanded keys start in the source.
+    pub expanded_keys_at: u64,
+    /// How many decrypt tables were found.
+    pub decrypt_tables: usize,
+    /// Where the decrypt tables start in the source.
+    pub decrypt_tables_at: u64,
 }
 
 /// A key cache, and a count of its entries.
@@ -1472,31 +1591,41 @@ fn cache_of(named: Option<&Path>) -> Option<Cache> {
 /// [`Failure::Io`] if the executable cannot be read or the cache cannot be
 /// written, naming which of the two; `Error::UnrecognisedExecutable` — exit 9 —
 /// if the file carries neither value.
-pub fn find_keys(executable: &Path, named_cache: Option<&Path>) -> Result<KeysFound> {
+pub fn find_keys(
+    executable: &Path,
+    named_cache: Option<&Path>,
+    watch: &mut impl Watch,
+) -> Result<KeysFound> {
     let mut file = fs::File::open(executable).map_err(|source| at(executable, source))?;
     let source = SourceDigest::of(&mut file)?;
     let cache = cache_of(named_cache);
 
     if let Some(cache) = cache.as_ref()
-        && let Some(keys) = cache
+        && let Some(material) = cache
             .load(&source)
             .map_err(|error| cache_failed(cache.directory(), error))?
     {
-        return Ok(found(executable, &source, FROM_CACHE, &keys, Some(cache)));
+        return Ok(found(
+            executable,
+            &source,
+            FROM_CACHE,
+            &material,
+            Some(cache),
+        ));
     }
 
     file.rewind().map_err(|source| at(executable, source))?;
-    let keys = Keys::extract(&mut file, &mut Unwatched)?;
+    let material = Material::extract(&mut file, watch)?;
     if let Some(cache) = cache.as_ref() {
         cache
-            .store(&source, &keys)
+            .store(&source, &material)
             .map_err(|error| cache_failed(cache.directory(), error))?;
     }
     Ok(found(
         executable,
         &source,
         FROM_EXECUTABLE,
-        &keys,
+        &material,
         cache.as_ref(),
     ))
 }
@@ -1506,15 +1635,22 @@ fn found(
     executable: &Path,
     source: &SourceDigest,
     from: &'static str,
-    keys: &Keys,
+    material: &Material,
     cache: Option<&Cache>,
 ) -> KeysFound {
+    let keys = material.keys();
     KeysFound {
         executable: executable.to_path_buf(),
         source: source.hex(),
         from,
         aes_key_at: keys.aes_key_offset(),
         hash_lut_at: keys.hash_lut_offset(),
+        ng: material.ng().map(|ng| NgFound {
+            expanded_keys: NG_EXPANDED_KEY_COUNT,
+            expanded_keys_at: ng.expanded_keys_offset(),
+            decrypt_tables: NG_DECRYPT_TABLE_COUNT,
+            decrypt_tables_at: ng.decrypt_tables_offset(),
+        }),
         cache: cache.map(|cache| cache.directory().to_path_buf()),
     }
 }
@@ -1582,29 +1718,71 @@ fn counted(cache: Option<Cache>, how: impl Fn(&Cache) -> Result<usize>) -> Resul
     })
 }
 
-/// `keys extract` — find the key material a game executable carries.
+/// `keys extract` — find the key material a source carries.
 ///
 /// # Errors
 ///
 /// As [`find_keys`].
 pub fn keys_extract(executable: &Path, cache: Option<&Path>, json_out: bool) -> Result<()> {
-    let found = find_keys(executable, cache)?;
+    let found = find_keys(executable, cache, &mut OnStderr::new())?;
 
     if json_out {
         emit(&keys_report(&found));
     } else {
-        println!("executable  {}", found.executable.display());
+        println!("source      {}", found.executable.display());
         println!("sha256      {}", found.source);
-        println!("found in    {}", found.from);
+        println!("found in    {}", how_found(found.from));
         println!("aes key     {AES_KEY_LEN} bytes at {:#x}", found.aes_key_at);
         println!(
             "hash lut    {HASH_LUT_LEN} bytes at {:#x}",
             found.hash_lut_at
         );
+        match found.ng {
+            Some(ng) => {
+                println!(
+                    "ng keys     {} x {NG_EXPANDED_KEY_LEN} bytes at {:#x}",
+                    ng.expanded_keys, ng.expanded_keys_at
+                );
+                println!(
+                    "ng tables   {} x {NG_DECRYPT_TABLE_LEN} bytes at {:#x}",
+                    ng.decrypt_tables, ng.decrypt_tables_at
+                );
+            }
+            None => println!("ng material not in this source ({NG_ABSENT})"),
+        }
         println!("cache       {}", readable(found.cache.as_deref()));
     }
     Ok(())
 }
+
+/// Where the material came from, as a person reads it.
+///
+/// The wire keeps saying `executable` — that value is a contract two suites
+/// assert on and the editor client reads, and DR-040 decided against renaming
+/// it in passing — but a memory image is not an executable, and the line a
+/// person reads should not tell them it is.
+fn how_found(from: &str) -> &'static str {
+    if from == FROM_CACHE {
+        "the cache"
+    } else {
+        "this source"
+    }
+}
+
+/// What to tell someone whose source carried no NG material.
+///
+/// Said once, because the human line and the JSON field are the same fact and
+/// §1 is why they must not drift. It is not an error and does not read as one:
+/// every archive outside the NG set opens without it. DR-040.
+///
+/// It says where the material *can* be found and does not claim anything about
+/// the source in hand. "A memory image of one does" was true while an
+/// executable was the only source anyone could pass, and this change made it
+/// conditional: an image taken before the module finished loading, of the wrong
+/// process, or carved short carries none of it either, and telling that user
+/// their image does is the one case this line is most likely to be read in.
+const NG_ABSENT: &str =
+    "an executable never carries it; it is in the clear only in a memory image of a running game";
 
 /// `keys cache` — where extracted material is kept, and how much is there.
 ///
@@ -1656,12 +1834,37 @@ pub fn keys_report(found: &KeysFound) -> Value {
         "executable": found.executable.display().to_string(),
         "sha256": found.source,
         "from": found.from,
-        "values": [
-            { "name": "aes_key", "len": AES_KEY_LEN, "at": found.aes_key_at },
-            { "name": "hash_lut", "len": HASH_LUT_LEN, "at": found.hash_lut_at },
-        ],
+        "values": values_found(found),
+        "ng": found.ng.is_some(),
         "cache": where_it_is(found.cache.as_deref()),
     })
+}
+
+/// The values an extraction found, each as a name, a length and a position.
+///
+/// The NG rows are present only when the source carried them, so a consumer
+/// reads the list rather than assuming a fixed length — and `ng` beside it
+/// answers the same question without one.
+fn values_found(found: &KeysFound) -> Value {
+    let mut values = vec![
+        json!({ "name": "aes_key", "len": AES_KEY_LEN, "at": found.aes_key_at }),
+        json!({ "name": "hash_lut", "len": HASH_LUT_LEN, "at": found.hash_lut_at }),
+    ];
+    if let Some(ng) = found.ng {
+        values.push(json!({
+            "name": "ng_expanded_keys",
+            "count": ng.expanded_keys,
+            "len": NG_EXPANDED_KEY_LEN,
+            "at": ng.expanded_keys_at,
+        }));
+        values.push(json!({
+            "name": "ng_decrypt_tables",
+            "count": ng.decrypt_tables,
+            "len": NG_DECRYPT_TABLE_LEN,
+            "at": ng.decrypt_tables_at,
+        }));
+    }
+    Value::Array(values)
 }
 
 /// A cache and what it holds, as JSON.
@@ -1716,7 +1919,10 @@ fn emit(value: &Value) {
 mod tests {
     use serde_json::json;
 
-    use super::{FROM_CACHE, KeysFound, goes_to, keys_report, padding};
+    use super::{
+        FROM_CACHE, FROM_EXECUTABLE, KeysFound, NG_ABSENT, NG_DECRYPT_TABLE_COUNT,
+        NG_EXPANDED_KEY_COUNT, NgFound, OnStderr, Step, Watch as _, goes_to, keys_report, padding,
+    };
 
     #[test]
     fn a_shorter_progress_line_covers_the_one_before_it() {
@@ -1753,6 +1959,7 @@ mod tests {
             from: FROM_CACHE,
             aes_key_at: 0x01E3_4C98,
             hash_lut_at: 0x01E3_4CC0,
+            ng: None,
             cache: Some(std::path::PathBuf::from("/config/rpf")),
         };
 
@@ -1764,7 +1971,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         fields.sort_unstable();
-        assert_eq!(fields, ["cache", "executable", "from", "sha256", "values"]);
+        assert_eq!(
+            fields,
+            ["cache", "executable", "from", "ng", "sha256", "values"]
+        );
 
         let values = reported["values"].as_array().unwrap();
         assert_eq!(values.len(), 2);
@@ -1780,7 +1990,128 @@ mod tests {
         }
         assert_eq!(values[0]["len"], json!(32), "the AES key's length");
         assert_eq!(values[1]["len"], json!(256), "the lookup table's length");
+        assert_eq!(reported["ng"], json!(false), "NG material claimed");
         assert_eq!(reported["cache"], json!("/config/rpf"));
+    }
+
+    #[test]
+    fn an_extraction_that_found_ng_material_reports_counts_and_positions() {
+        // The other half of the field-set check above, on the shape only a
+        // memory image produces. What is added is two counts and two offsets —
+        // 373 values summarised by how many there are and where they start, and
+        // nothing that could render into one of them. DR-006, DR-020, DR-040.
+        let found = KeysFound {
+            executable: std::path::PathBuf::from("/dumps/gta5.dmp"),
+            source: "0".repeat(64),
+            from: FROM_EXECUTABLE,
+            aes_key_at: 0x01E3_7E98,
+            hash_lut_at: 0x01B7_E4C0,
+            ng: Some(NgFound {
+                expanded_keys: NG_EXPANDED_KEY_COUNT,
+                expanded_keys_at: 0x01E3_3120,
+                decrypt_tables: NG_DECRYPT_TABLE_COUNT,
+                decrypt_tables_at: 0x01E8_6CE0,
+            }),
+            cache: None,
+        };
+
+        let reported = keys_report(&found);
+        assert_eq!(reported["ng"], json!(true));
+        let values = reported["values"].as_array().unwrap();
+        assert_eq!(values.len(), 4, "{reported}");
+        assert_eq!(values[2]["name"], json!("ng_expanded_keys"));
+        assert_eq!(values[2]["count"], json!(101));
+        assert_eq!(values[2]["len"], json!(272));
+        assert_eq!(values[3]["name"], json!("ng_decrypt_tables"));
+        assert_eq!(values[3]["count"], json!(272));
+        assert_eq!(values[3]["len"], json!(1024));
+        for value in values {
+            let inner: Vec<&str> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert!(
+                inner
+                    .iter()
+                    .all(|name| { matches!(*name, "at" | "len" | "name" | "count") }),
+                "a field that is not a position, a length or a count: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_that_stops_early_leaves_its_line_for_drop_to_close() {
+        // The bug this pins had a visible symptom and one input that produced
+        // it. `scan::find` stops the moment every anchor is found, which on a
+        // 65 MB memory image is block 31 of 63, so the `done == total` arm that
+        // closes the line was never reached and the report's first line landed
+        // on top of the progress line:
+        //
+        //     31/63 key materialsource      /path/to/image
+        //
+        // Every other watched operation walks to its end, which is why this
+        // survived until a scan could finish early. DR-040.
+        let mut watching = OnStderr {
+            silent: false,
+            written: 0,
+        };
+
+        assert!(!watching.line_is_open(), "nothing written yet");
+        watching.step(Step {
+            path: "key material",
+            done: 31,
+            total: 63,
+            bytes: 0,
+        });
+        assert!(
+            watching.line_is_open(),
+            "a walk that stopped early left no line to close, so the fix is \
+             unreachable and the report will be printed on top of it"
+        );
+
+        // A walk that does reach its end closes its own line, and must not then
+        // get a second newline from `Drop`.
+        watching.step(Step {
+            path: "key material",
+            done: 63,
+            total: 63,
+            bytes: 0,
+        });
+        assert!(!watching.line_is_open(), "a finished walk left a line open");
+
+        // A watcher nobody can see never has a line to close either way.
+        let mut piped = OnStderr {
+            silent: true,
+            written: 0,
+        };
+        piped.step(Step {
+            path: "key material",
+            done: 1,
+            total: 63,
+            bytes: 0,
+        });
+        assert!(!piped.line_is_open(), "a silent watcher wrote something");
+    }
+
+    #[test]
+    fn what_a_missing_ng_survey_says_is_not_a_claim_about_the_source_in_hand() {
+        // The sentence was true while an executable was the only source anyone
+        // could pass. Now that an image can be passed, "a memory image of one
+        // does" is asserted at precisely the user it is wrong for: the one
+        // whose image was taken too early, or of the wrong process, or carved
+        // short. It says where the material lives and takes no position on the
+        // file that just came up empty. DR-040.
+        assert!(
+            !NG_ABSENT.contains("this"),
+            "the line refers to the source in hand: {NG_ABSENT}"
+        );
+        assert!(
+            NG_ABSENT.contains("running game"),
+            "the line does not say what kind of image carries it: {NG_ABSENT}"
+        );
+        assert!(NG_ABSENT.is_ascii(), "{NG_ABSENT}");
     }
 
     #[test]
@@ -1794,6 +2125,7 @@ mod tests {
             from: FROM_CACHE,
             aes_key_at: 1,
             hash_lut_at: 2,
+            ng: None,
             cache: None,
         };
         assert_eq!(keys_report(&found)["cache"], json!(null));

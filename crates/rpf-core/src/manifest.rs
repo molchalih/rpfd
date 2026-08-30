@@ -454,8 +454,8 @@ impl Manifest {
     ///
     /// [`Error::BadPath`] when the text is not a manifest, names a schema this
     /// build does not read, or names a path that could not be one file on a
-    /// host, and [`Error::NeedsKey`] when it describes an encrypted archive,
-    /// which nothing here can rebuild yet.
+    /// host, and [`Error::CannotWriteEncrypted`] when it describes an encrypted
+    /// archive, which nothing here can write back yet.
     pub fn from_json(text: &str) -> Result<Self> {
         let manifest: Self = serde_json::from_str(text).map_err(|_| Error::BadPath {
             path: MANIFEST_NAME.to_owned(),
@@ -467,8 +467,13 @@ impl Manifest {
                 reason: "was written by a schema version this build does not read",
             });
         }
+        // A tree extracted from an encrypted archive packs back to an
+        // encrypted archive or to nothing, and this build has no inverse
+        // transform to write one with. Not `NeedsKey`, which would send a
+        // caller to extract material that cannot help: the missing part is
+        // here. R4.7, DR-041.
         if !manifest.version.is_open(manifest.encryption) {
-            return Err(Error::NeedsKey {
+            return Err(Error::CannotWriteEncrypted {
                 tag: manifest.encryption,
             });
         }
@@ -596,11 +601,15 @@ mod tests {
 
     #[test]
     fn an_encrypted_manifest_is_refused_rather_than_half_understood() {
+        // Exit 9, not 5: no key material writes this archive back, because the
+        // inverse transform is what is missing and it is missing here. R4.7.
         let text = r#"{"schema":1,"encryption":268435449,"directories":[],"entries":[]}"#;
-        assert!(matches!(
-            Manifest::from_json(text),
-            Err(Error::NeedsKey { tag: 268_435_449 })
-        ));
+        let error = Manifest::from_json(text).expect_err("an encrypted manifest is refused");
+        assert!(
+            matches!(error, Error::CannotWriteEncrypted { tag: 268_435_449 }),
+            "{error:?}"
+        );
+        assert_eq!(error.category(), crate::error::Category::Unsupported);
     }
 
     #[test]

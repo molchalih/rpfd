@@ -34,11 +34,20 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, Category, Error, FileKind, FileSpec, Manifest, Plan, Storage, Summary, Unwatched,
-    Verified,
+    Archive, Category, Error, FileKind, FileSpec, Manifest, Plan, Storage, Summary, Unlock,
+    Unwatched, Verified,
     format::Version,
     keys::{Cache, SourceDigest},
 };
+
+/// No key material, and no cache named to look for any in.
+///
+/// The state this whole file is about, spelled once so that every open below
+/// says it out loud: the parameter is required precisely so a call site cannot
+/// forget which of the two it is.
+fn unkeyed() -> Unlock {
+    Unlock::unkeyed()
+}
 
 /// One stored file.
 fn stored(path: &str) -> FileSpec {
@@ -122,7 +131,7 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
 
     // Open, resolve, read.
     let mut source = Cursor::new(bytes.clone());
-    let archive = Archive::open(&mut source).expect("opens with no key material");
+    let archive = Archive::open(&mut source, &unkeyed()).expect("opens with no key material");
     assert!(archive.version().is_open(archive.encryption()));
     for (path, expected) in &contents {
         let index = archive.find(path).expect("resolves");
@@ -159,7 +168,7 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     in_place.as_file_mut().flush().expect("flushed");
     let after = fs::read(in_place.path()).expect("readable");
     let mut after_source = Cursor::new(after);
-    let after_archive = Archive::open(&mut after_source).expect("the patched archive opens");
+    let after_archive = Archive::open(&mut after_source, &unkeyed()).expect("the patch opens");
     let patched_index = after_archive.find("x64/raw.bin").expect("resolves");
     assert_eq!(
         after_archive
@@ -174,7 +183,7 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     grew.insert("data/notes.meta".to_owned(), vec![0x5A; 40_000]);
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     let mut again = Cursor::new(bytes.clone());
-    let reopened = Archive::open(&mut again).expect("opens");
+    let reopened = Archive::open(&mut again, &unkeyed()).expect("opens");
     rpf_core::rewrite(
         &mut again,
         &reopened,
@@ -189,7 +198,8 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     // Describe, and read the rebuild back.
     let rebuilt = fs::read(sink.path()).expect("readable");
     let mut rebuilt_source = Cursor::new(rebuilt);
-    let rebuilt_archive = Archive::open(&mut rebuilt_source).expect("the rebuild opens");
+    let rebuilt_archive =
+        Archive::open(&mut rebuilt_source, &unkeyed()).expect("the rebuild opens");
     let manifest = Manifest::of(&rebuilt_archive).expect("describes");
     assert_eq!(manifest.specs().len(), files.len());
     // R11.3: the tree records what it came out of, so it cannot be packed as
@@ -231,7 +241,7 @@ fn an_encrypted_archive_asks_for_a_key_rather_than_being_opened_or_refused() {
     // test. R1.5 owns that question.
     for tag in [0x0FFF_FFF9_u32, 0x0FEF_FFFF] {
         assert!(!Version::Rpf7.is_open(tag));
-        let error = Archive::open(&mut Cursor::new(encrypted_header(tag)))
+        let error = Archive::open(&mut Cursor::new(encrypted_header(tag)), &unkeyed())
             .expect_err("an archive that is not OPEN cannot be opened here");
         assert!(
             matches!(error, Error::NeedsKey { tag: found } if found == tag),
@@ -256,7 +266,7 @@ fn the_key_cache_is_never_consulted_by_opening_an_archive() {
 
     let bytes = built(&[stored("a.txt")], &BTreeMap::new());
     let mut source = Cursor::new(bytes);
-    let archive = Archive::open(&mut source).expect("opens");
+    let archive = Archive::open(&mut source, &unkeyed()).expect("opens");
     let index = archive.find("a.txt").expect("resolves");
     archive.read(&mut source, index).expect("reads");
 

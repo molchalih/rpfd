@@ -126,7 +126,8 @@ fn make_colliding_archive(at: &Path) -> Vec<u8> {
 /// than itself.
 fn spans(at: &Path, inside: &str) -> (u64, u64) {
     let mut file = fs::File::open(at).expect("archive opens");
-    let archive = rpf_core::Archive::open(&mut file).expect("archive parses");
+    let archive =
+        rpf_core::Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let index = archive.find(inside).expect("entry resolves");
     let (payload_at, _) = archive.payload_at(index).expect("payload span");
     (payload_at, archive.allocation(index).expect("allocation"))
@@ -2827,6 +2828,7 @@ fn the_daemon_answers_info_and_verify_as_the_command_line_does() {
         "binary_files",
         "resource_files",
         "nested_archives",
+        "locked_archives",
         "unreferenced_bytes",
     ] {
         assert_eq!(info[field], from_cli[field], "info disagrees about {field}");
@@ -3051,6 +3053,7 @@ fn info_addresses_a_nested_archive_as_the_command_line_does() {
         "binary_files",
         "resource_files",
         "nested_archives",
+        "locked_archives",
         "unreferenced_bytes",
     ] {
         assert_eq!(
@@ -4156,5 +4159,187 @@ fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
     assert_eq!(
         answer(&responses, 6)["result"]["paths"],
         json!(["added.txt", "art.yft"]),
+    );
+}
+
+/// The AES-encrypted archive in the corpus, by the relative path that addresses
+/// it. `docs/corpus.md`.
+const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
+
+/// One corpus archive by its fixed relative path.
+fn corpus(test: &str, relative: &str) -> Option<std::path::PathBuf> {
+    let missing = |reason: String| -> Option<std::path::PathBuf> {
+        assert!(
+            std::env::var_os("RPF_REQUIRE_CORPUS").is_none(),
+            "RPF_REQUIRE_CORPUS is set, but {test} would have skipped: {reason}",
+        );
+        eprintln!("SKIP {test}: {reason}");
+        None
+    };
+    let Some(root) = std::env::var_os("RPF_CORPUS") else {
+        return missing("RPF_CORPUS is not set".to_owned());
+    };
+    let path = Path::new(&root).join(relative);
+    if path.is_file() {
+        Some(path)
+    } else {
+        missing(format!("{} is not a file", path.display()))
+    }
+}
+
+/// As [`talk`], with a configuration directory of the test's own, so the key
+/// cache the daemon reads is one this test put there.
+fn talk_homed(home: &Path, requests: &[Value]) -> Vec<Value> {
+    let mut daemon = daemon();
+    daemon
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"));
+    drive(daemon, requests).0
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn no_wire_method_writes_into_an_encrypted_archive() {
+    // §1: what `rpf put` refuses, `serve --stdio` refuses, with the same number
+    // and the same name. Each buffering method answers where the caller asks
+    // rather than at the commit that could never have landed, so an editor is
+    // told at the edit.
+    let test = "no_wire_method_writes_into_an_encrypted_archive";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "GTA5.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let copy = dir.path().join("des_canister.rpf");
+    fs::copy(&archive, &copy).expect("copyable");
+    let at = copy.display().to_string();
+    let before = fs::read(&copy).expect("readable");
+
+    let extracted = talk_homed(
+        &home,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
+            "executable": source.display().to_string()}}),
+        ],
+    );
+    assert!(answer(&extracted, 1)["result"].is_object(), "{extracted:?}");
+
+    let responses = talk_homed(
+        &home,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"_manifest.ymf","bytes":"cGxhaW4="}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"delete","params":{
+                "handle":1,"path":"_manifest.ymf"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"rename","params":{
+                "handle":1,"from":"_manifest.ymf","to":"renamed.ymf"}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"mkdir","params":{
+                "handle":1,"path":"added"}}),
+            json!({"jsonrpc":"2.0","id":6,"method":"commit","params":{"handle":1}}),
+        ],
+    );
+
+    // It opened: this is the write guard answering, not `NeedsKey`.
+    let opened = answer(&responses, 1);
+    assert_eq!(opened["result"]["entries"], json!(11), "{opened}");
+
+    for id in [2, 3, 4, 5] {
+        let refused = answer(&responses, id);
+        assert_eq!(refused["error"]["code"], json!(9), "{refused}");
+        assert_eq!(
+            refused["error"]["data"]["reason"],
+            json!("CannotWriteEncrypted"),
+            "{refused}"
+        );
+    }
+    // Nothing was ever buffered, so the commit has nothing to refuse.
+    let committed = answer(&responses, 6);
+    assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
+
+    assert_eq!(fs::read(&copy).expect("readable"), before);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
+    // §1's test: `rpf ls --cache-dir D` opens it, so `serve --stdio` must. The
+    // flag is on the process rather than on every method that opens an archive,
+    // which is what DR-041 rejected widening the wire for — and `keys.extract`
+    // takes the same default while still honouring a `cache` it is given.
+    let test = "the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "GTA5.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let named = dir.path().join("keys").display().to_string();
+    let at = archive.display().to_string();
+
+    let mut started = daemon();
+    started
+        .args(["--cache-dir", &named])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"));
+    let responses = drive(
+        started,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
+                "executable": source.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"open","params":{"path": at}}),
+        ],
+    )
+    .0;
+
+    let extracted = answer(&responses, 1);
+    assert_eq!(extracted["result"]["cache"], json!(named), "{extracted}");
+    let opened = answer(&responses, 2);
+    assert_eq!(opened["result"]["entries"], json!(11), "{opened}");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_daemon_started_without_a_cache_still_says_the_archive_needs_a_key() {
+    // The other half: the flag is what carried the material, not something
+    // else on this machine.
+    let test = "a_daemon_started_without_a_cache_still_says_the_archive_needs_a_key";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let responses = talk_homed(
+        &home,
+        &[json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}})],
+    );
+    let refused = answer(&responses, 1);
+    assert_eq!(refused["error"]["code"], json!(5), "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NeedsKey"),
+        "{refused}"
     );
 }

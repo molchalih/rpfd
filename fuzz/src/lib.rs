@@ -7,7 +7,14 @@
 //! fourth needs a witness, which is what [`Counting`] is.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::io::Cursor;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rpf_core::{
+    MAX_DEPTH, Unwatched, Version,
+    build::{FileKind, FileSpec, Storage, build},
+};
 
 /// The largest input a target accepts, in bytes.
 ///
@@ -110,4 +117,69 @@ pub fn watched<T>(body: impl FnOnce() -> T) -> T {
 #[must_use]
 pub fn bounded(data: &[u8]) -> Option<&[u8]> {
     (data.len() <= MAX_INPUT).then_some(data)
+}
+
+/// An archive nested one level deeper than [`MAX_DEPTH`] accepts.
+///
+/// **The depth bound is otherwise out of the mutator's reach.** A nested
+/// archive begins at `base + block * 512`, and a payload below its own
+/// archive's header is refused, so every level moves the base at least one
+/// block on: reaching depth 32 takes 16 KiB of input carrying 32 headers at
+/// exactly those offsets. libFuzzer's `-max_len` defaults to 4096 when no
+/// corpus raises it, which caps a generated input at depth 7 — so a target
+/// that waits for the mutator to build this chain asserts nothing about the
+/// bound, whatever its own documentation claims. It is built here instead,
+/// where no missing flag can forget it.
+///
+/// Built once per process and shared: it is the same bytes every time, and 33
+/// rounds of `build` per input would be the whole cost of the target.
+///
+/// # Panics
+///
+/// If this build will not write the chain, or writes one over [`MAX_INPUT`].
+/// Deterministic either way — it fails on the first input or on none.
+#[must_use]
+pub fn nested_to_the_bound() -> &'static [u8] {
+    static CHAIN: OnceLock<Vec<u8>> = OnceLock::new();
+    CHAIN.get_or_init(build_chain).as_slice()
+}
+
+/// [`nested_to_the_bound`], done once.
+fn build_chain() -> Vec<u8> {
+    let mut chain = pack("leaf.txt", b"leaf");
+    for level in 1..=MAX_DEPTH + 1 {
+        chain = pack("n.rpf", &chain);
+        assert!(
+            chain.len() <= MAX_INPUT,
+            "the chain passed {MAX_INPUT} bytes at level {level}"
+        );
+    }
+    chain
+}
+
+/// One archive holding one stored file, which is the only shape the chain
+/// needs.
+///
+/// Stored rather than deflated because [`rpf_core::Archive::open_nested`]
+/// reads the payload where it lies, and a deflated archive is not one there.
+fn pack(name: &str, contents: &[u8]) -> Vec<u8> {
+    let specs = [FileSpec {
+        path: name.to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = Cursor::new(Vec::new());
+    let mut fetch = |_: &str| Ok(Cursor::new(contents));
+    build(
+        &mut out,
+        Version::Rpf7,
+        &specs,
+        &[],
+        &mut fetch,
+        &mut Unwatched,
+    )
+    .expect("this build writes an archive of one stored file");
+    out.into_inner()
 }

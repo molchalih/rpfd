@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
 
     watched(|| {
         let mut src = Cursor::new(data);
-        let Ok(archive) = Archive::open(&mut src) else {
+        let Ok(archive) = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()) else {
             return;
         };
 

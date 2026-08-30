@@ -180,7 +180,7 @@ impl Scratch for OnDisk {
 /// it added over what was live when it started.
 fn cascade<S: Scratch>(outer: &Path, into: &Path, scratch: &mut S) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let edits = BTreeMap::from([(
         "x64/inner.rpf/edit.txt".to_owned(),
         b"after, and longer than before".to_vec(),
@@ -230,7 +230,7 @@ fn carrying(len: usize) -> rpf_core::Changes {
 /// term that used to be one copy per level of nesting. DR-032.
 fn carried<S: Scratch>(outer: &Path, into: &Path, len: usize, scratch: &mut S) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let changes = carrying(len);
     let mut out = fs::File::create(into).expect("creatable");
 
@@ -259,7 +259,7 @@ fn carried<S: Scratch>(outer: &Path, into: &Path, len: usize, scratch: &mut S) -
 /// If it does not, nothing [`carried`] claims is being measured either.
 fn carried_and_held<S: Scratch>(outer: &Path, into: &Path, len: usize, scratch: &mut S) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let mut out = fs::File::create(into).expect("creatable");
 
     let baseline = LIVE.load(Ordering::Relaxed);
@@ -316,7 +316,7 @@ fn one_large_entry(dir: &Path, len: usize) -> (PathBuf, u64) {
 /// started.
 fn rebuild(outer: &Path, into: &Path) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let edits = BTreeMap::from([("note.txt".to_owned(), b"after, and longer".to_vec())]);
     let mut out = fs::File::create(into).expect("creatable");
 
@@ -345,7 +345,7 @@ fn rebuild(outer: &Path, into: &Path) -> usize {
 /// the rebuild arm claims is being measured either.
 fn held_whole(outer: &Path) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("bulk.bin").expect("the large entry");
 
     let baseline = LIVE.load(Ordering::Relaxed);
@@ -365,7 +365,7 @@ fn held_whole(outer: &Path) -> usize {
 /// DR-033.
 fn verified(outer: &Path) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
     let baseline = LIVE.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
@@ -385,7 +385,7 @@ fn verified(outer: &Path) -> usize {
 /// as a stream, which is the half that has to stay flat.
 fn verified_against(outer: &Path) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
-    let archive = Archive::open(&mut src).expect("parses");
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let manifest = Manifest::of_contents(&mut src, &archive, &mut Unwatched).expect("derives");
 
     let baseline = LIVE.load(Ordering::Relaxed);

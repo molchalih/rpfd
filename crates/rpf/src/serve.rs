@@ -29,7 +29,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use rpf_core::{Archive, Change, Changes, EntryKind, Flow, Step, Watch};
+use rpf_core::{Archive, Change, Changes, EntryKind, Flow, Step, Unwatched, Watch};
 use serde_json::{Value, json};
 
 use crate::{commands, exit::Failure, install};
@@ -244,6 +244,15 @@ struct Session {
 struct State {
     sessions: BTreeMap<u64, Session>,
     next_handle: u64,
+    /// `--cache-dir`, as this process was started with, and `None` for the
+    /// platform's own.
+    ///
+    /// A process-wide choice rather than a parameter on every method that opens
+    /// an archive: DR-041 rejected widening the wire to say what the cache
+    /// already knows, and a daemon serves one install at a time. A `keys.*`
+    /// request that names a `cache` still overrides it, which is the only place
+    /// the wire ever mentioned one.
+    cache: Option<PathBuf>,
 }
 
 impl State {
@@ -728,7 +737,7 @@ enum Seen {
 ///
 /// [`Failure::Io`] if standard input or standard output failed part-way, which
 /// is what makes the exit code say so.
-pub fn run() -> crate::exit::Result<()> {
+pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
     let backlog = Arc::new(Backlog::default());
     let (lines, queued) = mpsc::channel::<Outgoing>();
     let (finished, drained) = mpsc::channel::<()>();
@@ -754,7 +763,10 @@ pub fn run() -> crate::exit::Result<()> {
         reading.backlog.room.notify_all();
     });
 
-    let mut state = State::default();
+    let mut state = State {
+        cache: named_cache.map(Path::to_path_buf),
+        ..State::default()
+    };
     let mut fault = None;
     for message in requests {
         match message {
@@ -1094,9 +1106,9 @@ fn dispatch(
         "extract" => extract(state, params, wire, request),
         "pack" => pack(state, params, wire, request),
         "commit" => commit(state, params, wire, request),
-        "keys.extract" => keys_extract(params),
-        "keys.cache" => keys_cache(params),
-        "keys.invalidate" => keys_invalidate(params),
+        "keys.extract" => keys_extract(state, params, wire, request),
+        "keys.cache" => keys_cache(state, params),
+        "keys.invalidate" => keys_invalidate(state, params),
         other => Err(protocol(METHOD_NOT_FOUND, format!("no method {other:?}"))),
     }
 }
@@ -1158,6 +1170,19 @@ fn session<'a>(state: &'a mut State, params: &Value) -> Answer<&'a mut Session> 
         .ok_or_else(|| no_such_handle(handle))
 }
 
+/// The same, for a method that buffers a change.
+///
+/// An archive this build can read and cannot write back is refused where the
+/// caller asks, rather than at the commit that could never have landed. The
+/// answer is `rpf-core`'s — this frontend holds no rule about it (§1) — and it
+/// is the one `rpf put` gets from the same call, so neither frontend can do
+/// what the other cannot.
+fn writing_session<'a>(state: &'a mut State, params: &Value) -> Answer<&'a mut Session> {
+    let session = session(state, params)?;
+    session.archive.writable().map_err(Failure::Container)?;
+    Ok(session)
+}
+
 /// The archive a request names, as the one path a session reports and rebuilds.
 ///
 /// Two names for one *file* do not resolve alike, which is what [`FileId`] is
@@ -1179,7 +1204,7 @@ fn resolve(path: &Path) -> crate::exit::Result<PathBuf> {
 fn open(state: &mut State, params: &Value) -> Answered {
     let asked = PathBuf::from(string(params, "path")?);
     let path = resolve(&asked)?;
-    let (file, archive) = commands::open(&path)?;
+    let (file, archive) = commands::open(&path, state.cache.as_deref())?;
     let id = FileId::of(&file, &path)?;
     if let Some((holder, held)) = state.holder_of(&path, Some(id)) {
         return Err(already_open(&path, held, holder).into());
@@ -1371,7 +1396,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
         contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
         create,
     };
-    let session = session(state, params)?;
+    let session = writing_session(state, params)?;
 
     // Resolved now rather than at commit, while the caller can still act on a
     // refusal.
@@ -1455,7 +1480,7 @@ fn delete(state: &mut State, params: &Value) -> Answered {
 fn rename(state: &mut State, params: &Value) -> Answered {
     let from = string(params, "from")?;
     let to = string(params, "to")?;
-    let session = session(state, params)?;
+    let session = writing_session(state, params)?;
     let change = Change::RenameTo(to.clone());
     rpf_core::allows(
         &mut session.file,
@@ -1489,7 +1514,7 @@ fn mkdir(state: &mut State, params: &Value) -> Answered {
 /// possible — a rename onto a path a buffered removal frees — is accepted here
 /// too. DR-032.
 fn buffer(state: &mut State, params: &Value, inside: &str, change: Change) -> Answered {
-    let session = session(state, params)?;
+    let session = writing_session(state, params)?;
     rpf_core::allows(
         &mut session.file,
         &session.archive,
@@ -1541,6 +1566,7 @@ fn info(state: &mut State, params: &Value) -> Answered {
         "binary_files": summary.binary_files,
         "resource_files": summary.resource_files,
         "nested_archives": summary.nested_archives,
+        "locked_archives": summary.locked_archives,
         "unreferenced_bytes": summary.unreferenced_bytes,
     }))
 }
@@ -1833,27 +1859,57 @@ fn optional_path(params: &Value, name: &str) -> Answer<Option<PathBuf>> {
 /// is the one place the object is built, so the command line and this method
 /// cannot come to say different things.
 ///
-/// It takes no `progress` and no `cancel`. The work is one pass over one file
-/// — about a second for a 47 MB executable at `--release`, DR-017 — which is
-/// bounded the way `read` of one large entry is, and `rpf_core::keys` takes no
-/// watcher to report on it with.
-fn keys_extract(params: &Value) -> Answered {
+/// It sends no `progress` and cannot be stopped, and since 2026-08-30 that is a
+/// stated cost rather than a free choice. One pass now looks for all 375 values
+/// rather than two, which is seconds for a 47 MB executable and **up to about
+/// nineteen minutes for a full-process dump** — the kind of source the NG
+/// material is actually in. Wiring the watcher `find_keys` now takes through to
+/// a `progress` notification widens the wire, and DR-040 records it as the
+/// follow-up rather than doing it here.
+///
+/// It does **register the job** it is running, which is not the same question
+/// and is why that deferral is affordable. A scan holds the single worker
+/// thread for its whole duration, and without a registration a `cancel`
+/// arriving in that window was answered `{"cancelling": false, "running":
+/// null}` — the daemon saying nothing is running while it is a quarter of an
+/// hour into a scan. It registers as [`Stoppable::No`], which is the truth:
+/// `Unwatched` gives the scan nothing to notice a cancel with, so the answer
+/// names the method and says why it cannot stop instead of denying it exists.
+fn keys_extract(state: &State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let executable = PathBuf::from(string(params, "executable")?);
-    let cache = optional_path(params, "cache")?;
-    let found = commands::find_keys(&executable, cache.as_deref())?;
-    Ok(commands::keys_report(&found))
+    let cache = named_cache(state, params)?;
+
+    wire.cancel
+        .begin(request, None, "keys.extract", Stoppable::No(SCANNING));
+    let found = commands::find_keys(&executable, cache.as_deref(), &mut Unwatched);
+    wire.cancel.finish();
+
+    Ok(commands::keys_report(&found?))
 }
 
+/// Which cache a `keys.*` request works on: the one it names, or the one this
+/// process was started with.
+///
+/// One function, so the wire's `cache` and `--cache-dir` cannot come to mean
+/// two things about which directory is read (§3).
+fn named_cache(state: &State, params: &Value) -> Answer<Option<PathBuf>> {
+    Ok(optional_path(params, "cache")?.or_else(|| state.cache.clone()))
+}
+
+/// A key scan is under way.
+const SCANNING: &str = "a key scan hashes the whole source looking for every value at once; it reports nothing \
+     part-way and has no step to stop at";
+
 /// `keys.cache` — where extracted material is kept, and how much is there.
-fn keys_cache(params: &Value) -> Answered {
-    let cache = optional_path(params, "cache")?;
+fn keys_cache(state: &State, params: &Value) -> Answered {
+    let cache = named_cache(state, params)?;
     let state = commands::cache_state(cache.as_deref())?;
     Ok(commands::cache_report(&state))
 }
 
 /// `keys.invalidate` — remove every cached entry.
-fn keys_invalidate(params: &Value) -> Answered {
-    let cache = optional_path(params, "cache")?;
+fn keys_invalidate(state: &State, params: &Value) -> Answered {
+    let cache = named_cache(state, params)?;
     let state = commands::invalidate_keys(cache.as_deref())?;
     Ok(commands::invalidated_report(&state))
 }
@@ -1988,11 +2044,18 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
         progress: wanted,
         rebuild: asked_to_rebuild,
     };
+    // Taken before the session is borrowed: re-opening after the write needs
+    // the same cache the session was opened with.
+    let cache = state.cache.clone();
     let session = session(state, params)?;
 
     if session.pending.is_empty() {
         return Ok(json!({ "committed": 0, "unchanged": true }));
     }
+    // Asked here as well as where each change was buffered, so that a dry run
+    // reports the refusal rather than a rebuild that could not happen. Nothing
+    // pending is nothing to refuse.
+    session.archive.writable().map_err(Failure::Container)?;
     // Before the dry run, not after: what a commit would do here is refuse, and
     // a dry run reports what the real call would do.
     if !force {
@@ -2028,7 +2091,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     // re-taken with it: a rebuild replaces the archive by rename, and a claim
     // kept on the old inode would claim a file nobody has. DR-009.
     let path = session.path.clone();
-    let (file, archive) = commands::open(&path)?;
+    let (file, archive) = commands::open(&path, cache.as_deref())?;
     let entries = archive.entries().len();
     let len = archive.len_bytes();
     session.id = FileId::of(&file, &path)?;
@@ -2235,7 +2298,7 @@ mod tests {
         .expect("builds");
         drop(out);
 
-        let (file, archive) = commands::open(&path).expect("opens");
+        let (file, archive) = commands::open(&path, None).expect("opens");
         let id = FileId::of(&file, &path).expect("named");
         let mut session = Session {
             path,
@@ -2339,6 +2402,31 @@ mod tests {
         assert_eq!(answer["cancelling"], json!(false), "{answer}");
         assert_eq!(answer["running"], json!("commit"), "{answer}");
         assert_eq!(answer["reason"], json!(DECIDING), "{answer}");
+    }
+
+    #[test]
+    fn a_key_scan_says_it_is_running_rather_than_that_nothing_is() {
+        // The window this closes is minutes wide: a scan of a full-process dump
+        // holds the worker thread for about nineteen of them, and before
+        // 2026-08-30 `keys.extract` registered nothing, so a cancel arriving
+        // inside that window was told nothing was running at all. It still
+        // cannot be stopped — `Unwatched` leaves the scan nothing to notice a
+        // cancel with — but "cannot stop, and here is why" and "there is no
+        // such operation" are different answers and only one of them is true.
+        // DR-040.
+        let cancel = Cancellation::default();
+        cancel.begin(&json!(7), None, "keys.extract", Stoppable::No(SCANNING));
+
+        let answer = cancel.ask(None, None);
+        assert_eq!(answer["cancelling"], json!(false), "{answer}");
+        assert_eq!(answer["running"], json!("keys.extract"), "{answer}");
+        assert_eq!(answer["reason"], json!(SCANNING), "{answer}");
+        assert!(!cancel.stopped(), "a key scan was marked cancelled");
+
+        // And it is forgotten afterwards, so a later cancel is not answered
+        // against a scan that finished.
+        cancel.finish();
+        assert_eq!(cancel.ask(None, None)["running"], json!(null));
     }
 
     #[test]

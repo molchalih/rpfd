@@ -147,7 +147,7 @@ not what the tool was doing when it noticed. DR-010.
 | 6 | The request or its input was wrong, and the tool declined to act |
 | 7 | Reading or writing failed — the source or the sink, and nobody's input |
 | 8 | The caller stopped the operation part-way |
-| 9 | The archive is an RPF version this build does not read |
+| 9 | This build cannot do it: an RPF version it does not read, a source carrying no key material, or writing back an archive that is encrypted |
 
 The daemon reports the same numbers as a JSON-RPC `error.code`. A negative code
 there is JSON-RPC's own — `-32601` for an unknown method, `-32602` for a bad
@@ -155,7 +155,8 @@ parameter — so the two schemes read apart on sight.
 
 Beside the number, every error the daemon writes carries
 `error.data.reason`: the failure's own name, as a stable symbol —
-`AlreadyExists`, `NotFound`, `NeedsKey`, `MethodNotFound`. The number says who
+`AlreadyExists`, `NotFound`, `NeedsKey`, `WrongKey`, `CannotWriteEncrypted`,
+`MethodNotFound`. The number says who
 has to act and is shared by everything in its class; the name says which
 failure it was, for a client that has a distinct answer for one of them and
 would otherwise have to read the sentence. The number is unchanged and is still
@@ -261,17 +262,34 @@ rebuild only replaces the archive once it has finished.
 
 ## Key material
 
-An encrypted archive needs the RAGE AES-256 key and the NG hash lookup table,
-and both live inside the game executable. Nothing is bundled here: the material
-is found in **your own installation**, by the SHA-1 of each value's own bytes
-rather than by an offset, and cached under the SHA-256 of the file it came
-from. DR-006, DR-017.
+An AES-encrypted archive needs the RAGE AES-256 key and the NG hash lookup
+table, and both live inside the game executable. An **NG**-encrypted archive
+needs 373 values more — 101 expanded keys and 272 decrypt tables — and those are
+not in the executable at all. On disk they are present but transformed; they are
+in the clear only in the executable's **loaded image**, which is why the rest of
+this ecosystem ships a bundled copy instead of looking. DR-040 has the
+measurement.
+
+Nothing is bundled here. The material is found in **your own installation**, by
+the SHA-1 of each value's own bytes rather than by an offset, and cached under
+the SHA-256 of the file it came from. A match is its own proof: bytes that hash
+to the digest asked for are the value. DR-006, DR-017, DR-040.
 
 ```
-rpf keys extract /path/to/GTA5.exe   # find it, and cache what was found
+rpf keys extract /path/to/GTA5.exe   # the AES key and the hash lookup table
+rpf keys extract /path/to/image      # those, and the 373 NG values
 rpf keys cache                       # where the cache is, and how much is in it
 rpf keys invalidate                  # remove every cached entry
 ```
+
+The source is any file: the search is over bytes and knows nothing about
+executables, so it takes an executable, a memory image of one, or a full-process
+dump. Size is what it costs — one pass is about 4 seconds over a 47 MB
+executable, 5 seconds over a 65 MB module image, and about 19 minutes over a
+10 GB dump — and the cache means it happens once per source.
+
+A source with no NG material is **not** an error. Every game executable is one,
+and everything outside the NG archives opens without it.
 
 `--cache-dir DIR` puts the cache somewhere other than this platform's
 configuration directory, which is `$XDG_CONFIG_HOME/rpf` or `$HOME/.config/rpf`
@@ -280,15 +298,35 @@ Windows. The daemon answers `keys.extract`, `keys.cache` and `keys.invalidate`,
 taking `executable` and `cache` as paths on its own filesystem and returning
 the same objects `--json` prints.
 
-**No output path prints a key.** What is reported is offsets, lengths, the
-executable's SHA-256 and the cache path — `--json` is written to be piped into
-automation and pasted into a bug report. Extraction is whole or it is a
-failure: an executable carrying neither value exits 9, one that is not there
-exits 7, and a cache that cannot be written exits 7 naming the directory.
+**No output path prints a key.** What is reported is offsets, lengths, counts,
+the source's SHA-256 and the cache path — `--json` is written to be piped into
+automation and pasted into a bug report. Extraction of what every source must
+carry is whole or it is a failure: a source carrying neither of those two values
+exits 9, one that is not there exits 7, and a cache that cannot be written
+exits 7 naming the directory.
 
-Extracting a key does not yet let `rpf` open an encrypted archive — R3.6, which
-is deliberately unwritten while there is no encrypted archive to check a cipher
-against.
+Extracted material is what opens an encrypted archive, and no command takes a
+flag for it: `rpf ls`, `cat`, `extract`, `verify` and every daemon method that
+opens an archive read the cache only once a header says the archive is
+encrypted, so an unencrypted one never touches the configuration directory.
+`--cache-dir` is global, and naming it reaches opening as well as extraction —
+which is how several installations are kept apart. DR-041.
+
+Two key failures, and they name different things to do. `NeedsKey` — exit 5 —
+is "no material available, go and extract some". `WrongKey` — also exit 5 — is
+"the material here is not the material this archive is under", which extraction
+cannot fix: an NG archive's key is chosen by its own file name and length, so
+renaming one stops it opening. Which archives a source opens is not something a
+source says, so every candidate is tried and the first whose table of contents
+decodes into a root directory row wins — one 16-byte block per candidate.
+
+**Reading an encrypted archive and writing one are separate capabilities, and
+this build has the first only.** Every write path — `put`, `rm`, `mv`, `mkdir`,
+`pack`, and the daemon's `write`, `delete`, `rename`, `mkdir` and `commit` —
+refuses an encrypted archive with `CannotWriteEncrypted` at exit 9 before it
+touches a byte, and `--force` does not reach it: a capability that is absent is
+not a safety interlock. Re-encryption is R4.7 and needs the inverse transform,
+which nobody outside Rockstar has for NG.
 
 ## Building and testing
 
@@ -313,12 +351,16 @@ RPF_CORPUS=/path/to/corpus RPF_REQUIRE_CORPUS=1 cargo test --all
 ```
 
 Key extraction is gated the same way, on its own variable, because a game
-executable is not an archive and no archive here is encrypted: `RPF_GAME_EXE`
-names a directory holding them, and `RPF_REQUIRE_GAME_EXE` turns its skips into
-failures.
+executable is not an archive: `RPF_GAME_EXE` names a directory holding them, and
+`RPF_REQUIRE_GAME_EXE` turns its skips into failures. `RPF_GAME_IMAGE` is a
+third and names one file, a memory image of a running game — the only source the
+NG material has ever been found in the clear in, and the only way to run the NG
+half of the encrypted-archive tests. Each variable's `RPF_REQUIRE_` turns its
+own skips into failures and no other's.
 
 ```
 RPF_GAME_EXE=/path/to/executables RPF_REQUIRE_GAME_EXE=1 cargo test --release --all
+RPF_GAME_IMAGE=/path/to/image RPF_REQUIRE_GAME_IMAGE=1 cargo test --release --all
 ```
 
 `fixtures/` records what each corpus archive looked like to an implementation

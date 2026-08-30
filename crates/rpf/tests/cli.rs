@@ -93,7 +93,8 @@ fn run_err_in(directory: &Path, args: &[&str]) -> (i32, String) {
 /// against something other than itself.
 fn spans(at: &Path, inside: &str) -> (u64, u64, u64) {
     let mut file = fs::File::open(at).expect("archive opens");
-    let archive = rpf_core::Archive::open(&mut file).expect("archive parses");
+    let archive =
+        rpf_core::Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let index = archive.find(inside).expect("entry resolves");
     let (payload_at, _) = archive.payload_at(index).expect("payload span");
     (
@@ -881,7 +882,8 @@ fn info_subtracts_the_entry_table_and_the_names_blob_from_the_slack() {
 
     let len = fs::metadata(&path).expect("stat").len();
     let mut file = fs::File::open(&path).expect("archive opens");
-    let archive = rpf_core::Archive::open(&mut file).expect("archive parses");
+    let archive =
+        rpf_core::Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
     let entries = u64::try_from(archive.entries().len()).expect("a test archive is small");
     let names = u64::try_from(archive.names_blob().len()).expect("a test names blob is small");
 
@@ -1173,7 +1175,8 @@ fn an_archive_a_host_cannot_hold_is_still_repairable() {
     );
 
     let mut file = fs::File::open(&archive).expect("archive opens");
-    let rebuilt = rpf_core::Archive::open(&mut file).expect("the rebuild parses");
+    let rebuilt = rpf_core::Archive::open(&mut file, &rpf_core::Unlock::unkeyed())
+        .expect("the rebuild parses");
     let index = rebuilt
         .find("aux.ytd")
         .expect("the name survived the rebuild");
@@ -2381,4 +2384,158 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
     let (code, bytes) = run(&["cat", &archive.display().to_string(), "data/greeting.txt"]);
     assert_eq!(code, 0);
     assert_eq!(bytes, b"through a pipe".to_vec());
+}
+
+/// The AES-encrypted archive in the corpus, by the relative path that addresses
+/// it. `docs/corpus.md`.
+const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
+
+/// One corpus archive by its fixed relative path.
+///
+/// It reports its own skip rather than borrowing [`skip`]'s: the two gates name
+/// two different things, and a skip that does not say which one is missing
+/// sends the reader to check the wrong variable.
+fn corpus(test: &str, relative: &str) -> Option<std::path::PathBuf> {
+    let missing = |reason: String| -> Option<std::path::PathBuf> {
+        assert!(
+            std::env::var_os("RPF_REQUIRE_CORPUS").is_none(),
+            "RPF_REQUIRE_CORPUS is set, but {test} would have skipped: {reason}",
+        );
+        eprintln!("SKIP {test}: {reason}");
+        None
+    };
+    let Some(root) = std::env::var_os("RPF_CORPUS") else {
+        return missing("RPF_CORPUS is not set".to_owned());
+    };
+    let path = Path::new(&root).join(relative);
+    if path.is_file() {
+        Some(path)
+    } else {
+        missing(format!("{} is not a file", path.display()))
+    }
+}
+
+/// Runs the binary with a configuration directory of its own, returning its
+/// exit code and standard error.
+///
+/// The key cache lives under the platform's configuration root, so a test that
+/// wants a cache it controls gives the child a `HOME` of its own. A child
+/// process rather than `set_var`, which is process-global and would race every
+/// other test in this binary.
+fn run_err_homed(home: &Path, args: &[&str]) -> (i32, String) {
+    let output = Command::new(RPF)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"))
+        .args(args)
+        .output()
+        .expect("binary runs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn no_command_writes_into_an_encrypted_archive() {
+    // The command line's half of the refusal `crates/rpf-core/tests/encrypted.rs`
+    // pins in the library, and the half that says `--force` does not reach it:
+    // a capability this build does not have is not a safety interlock. R4.7,
+    // DR-041.
+    let test = "no_command_writes_into_an_encrypted_archive";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "GTA5.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let copy = dir.path().join("des_canister.rpf");
+    fs::copy(&archive, &copy).expect("the archive is copyable");
+    let donor = dir.path().join("plain.txt");
+    fs::write(&donor, b"plain text").expect("donor");
+
+    // The material goes where opening looks for it, which is what makes the
+    // archive open at all — and therefore what makes this a test of the write
+    // guard rather than of `NeedsKey`.
+    let (code, message) = run_err_homed(&home, &["keys", "extract", &source.display().to_string()]);
+    assert_eq!(code, 0, "{message}");
+
+    let before = fs::read(&copy).expect("readable");
+    let at = copy.display().to_string();
+    let from = donor.display().to_string();
+    for args in [
+        vec!["put", &at, "_manifest.ymf", &from],
+        vec!["put", "--force", &at, "_manifest.ymf", &from],
+        vec!["put", "--rebuild", &at, "_manifest.ymf", &from],
+        vec!["put", "--dry-run", &at, "_manifest.ymf", &from],
+        vec!["rm", &at, "_manifest.ymf"],
+        vec!["mv", &at, "_manifest.ymf", "renamed.ymf"],
+        vec!["mkdir", &at, "added"],
+    ] {
+        let (code, message) = run_err_homed(&home, &args);
+        assert_eq!(code, 9, "{args:?} answered {message}");
+        assert!(message.contains("cannot write one back"), "{message}");
+    }
+
+    // "Refused" and "did not write" are different claims. R4.2 leaves the
+    // archive as it was, and so does a refusal before any of it runs.
+    assert_eq!(fs::read(&copy).expect("readable"), before);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
+    // DR-041 rejects a `--keys` flag on the ground that "`--cache-dir` already
+    // exists for a caller who wants to keep several installs apart". It did not
+    // reach opening: `keys extract --cache-dir D` wrote the entry and the next
+    // `ls` of an encrypted archive answered `NeedsKey` and made a platform
+    // cache of its own. One flag, one function — `commands::cache_of` — and
+    // both ends of the record are true.
+    let test = "a_named_cache_opens_the_archive_the_platform_one_would_not";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "GTA5.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let named = dir.path().join("keys").display().to_string();
+    let at = archive.display().to_string();
+
+    let (code, message) = run_err_homed(
+        &home,
+        &[
+            "keys",
+            "extract",
+            &source.display().to_string(),
+            "--cache-dir",
+            &named,
+        ],
+    );
+    assert_eq!(code, 0, "{message}");
+
+    // The whole point: the archive opens because the flag reached opening.
+    let (code, message) = run_err_homed(&home, &["ls", &at, "--cache-dir", &named]);
+    assert_eq!(code, 0, "{message}");
+
+    // And the platform cache, which nothing was put in, is still what says
+    // "needs a key" — so the first answer came from the named directory and
+    // not from somewhere else on this machine.
+    let (code, message) = run_err_homed(&home, &["ls", &at]);
+    assert_eq!(code, 5, "{message}");
+    assert!(message.contains("no key material available"), "{message}");
 }

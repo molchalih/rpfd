@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::{
-    archive::Archive,
+    archive::{Archive, Nested},
     entry::EntryKind,
     error::{Error, Result},
     format::resource::resource_len,
@@ -143,7 +143,11 @@ fn list_into<R: Read + Seek>(
     // Not a directory? If it is an archive, listing it means listing what is
     // inside it. Anything else is a single entry.
     let Ok(children) = archive.children(at) else {
-        if let Some(nested) = archive.nested_at(src, at)? {
+        // An archive that did not open is listed as the file it also is, which
+        // is the only honest row available: its own entries cannot be read.
+        // `verify` is where that gap is reported, and `info` is where it is
+        // counted.
+        if let Nested::Open(nested) = archive.nested_at(src, at)? {
             return list_into(src, &nested, 0, prefix, recursive, rows);
         }
         rows.push(Listed::of(archive, at, prefix)?);
@@ -159,7 +163,7 @@ fn list_into<R: Read + Seek>(
         }
         if archive.entry(index)?.is_directory() {
             list_into(src, archive, index, &path, true, rows)?;
-        } else if let Some(nested) = archive.nested_at(src, index)? {
+        } else if let Nested::Open(nested) = archive.nested_at(src, index)? {
             list_into(src, &nested, 0, &path, true, rows)?;
         }
     }
@@ -182,7 +186,20 @@ pub struct Summary {
     /// How many are resources.
     pub resource_files: u32,
     /// How many entries hold an archive of their own, one level down.
+    ///
+    /// Every one of them, whether this build could open it or not, so the
+    /// number is a fact about the archive rather than about what a key cache
+    /// happens to hold. [`Summary::locked_archives`] is how many of them did
+    /// not open.
     pub nested_archives: u32,
+    /// How many of [`Summary::nested_archives`] this build could not open for
+    /// want of the right key material.
+    ///
+    /// Never larger than that count, and a caller reporting one number without
+    /// the other reports more than was measured. Zero is "everything nested
+    /// here was descended into", which is what a walk needs to know before it
+    /// believes its own totals.
+    pub locked_archives: u32,
     /// Bytes of the archive that no region claims.
     ///
     /// An entry's tail is claimed, so it is not counted here and no other
@@ -227,6 +244,7 @@ impl Summary {
         let mut binary_files = 0_u32;
         let mut resource_files = 0_u32;
         let mut nested_archives = 0_u32;
+        let mut locked_archives = 0_u32;
         for index in 0..entries {
             match archive.entry(index)?.kind {
                 EntryKind::Directory { .. } => {
@@ -254,8 +272,13 @@ impl Summary {
                     referenced = referenced.saturating_add(u64::from(compressed_len));
                 }
             }
-            if archive.nested_at(src, index)?.is_some() {
-                nested_archives = nested_archives.saturating_add(1);
+            match archive.nested_at(src, index)? {
+                Nested::None => {}
+                Nested::Open(_) => nested_archives = nested_archives.saturating_add(1),
+                Nested::Locked(_) => {
+                    nested_archives = nested_archives.saturating_add(1);
+                    locked_archives = locked_archives.saturating_add(1);
+                }
             }
         }
 
@@ -267,8 +290,23 @@ impl Summary {
             binary_files,
             resource_files,
             nested_archives,
+            locked_archives,
             unreferenced_bytes: archive.len_bytes().saturating_sub(referenced),
         })
+    }
+}
+
+/// The same key failure again, where a problem is carrying one.
+///
+/// [`Error`] is not `Clone` — it carries an [`std::io::Error`] in two of its
+/// variants — and these two are the whole of what a locked nested archive
+/// answers, so they are rebuilt from what they carry rather than the enum being
+/// widened to allow copying every variant there is.
+fn key_failure(error: &Error) -> Option<Error> {
+    match *error {
+        Error::NeedsKey { tag } => Some(Error::NeedsKey { tag }),
+        Error::WrongKey { tag, scheme, tried } => Some(Error::WrongKey { tag, scheme, tried }),
+        _ => None,
     }
 }
 
@@ -411,10 +449,23 @@ impl Verified {
     ///
     /// # Errors
     ///
-    /// [`Error::VerifyFailed`] with both counts when anything did not.
+    /// [`Error::VerifyFailed`] with both counts when anything did not — except
+    /// when **every** problem is a key one, which is the archive nested here
+    /// that this build could not open. Then the answer is that key failure
+    /// itself. DR-010 classifies by who has to act, and the two answers name
+    /// different people: `VerifyFailed` is `Category::Corrupt` and says the
+    /// bytes are wrong, which they are not.
     pub fn outcome(&self) -> Result<()> {
-        if self.problems.is_empty() {
+        let Some(first) = self.problems.first() else {
             return Ok(());
+        };
+        if let Some(key) = key_failure(&first.error)
+            && self
+                .problems
+                .iter()
+                .all(|problem| key_failure(&problem.error).is_some())
+        {
+            return Err(key);
         }
         Err(Error::VerifyFailed {
             checked: self.checked,
@@ -480,8 +531,14 @@ impl Verified {
                 }),
                 Ok(()) => self.check_contents(reading, archive, index, &path)?,
             }
-            if let Some(nested) = archive.nested_at(reading.src, index)? {
-                self.walk(reading, &nested, &path)?;
+            match archive.nested_at(reading.src, index)? {
+                Nested::None => {}
+                Nested::Open(nested) => self.walk(reading, &nested, &path)?,
+                // Reported rather than walked past. DR-033 says a verify reads
+                // every entry past, and an archive it could not open is a
+                // region it never reached — reporting success over it is the
+                // green suite that tested nothing, one layer down.
+                Nested::Locked(error) => self.problems.push(Problem { path, error }),
             }
         }
         Ok(())
@@ -664,7 +721,7 @@ mod tests {
     fn a_listing_names_each_kind_with_the_number_that_belongs_to_it() {
         let bytes = archive();
         let mut src = Cursor::new(bytes);
-        let parsed = Archive::open(&mut src).expect("parses");
+        let parsed = Archive::open(&mut src, &crate::keys::Unlock::unkeyed()).expect("parses");
 
         let rows = Listed::at(&mut src, &parsed, "", true).expect("lists");
         let named = |path: &str| {
@@ -690,7 +747,7 @@ mod tests {
     fn a_listing_stops_at_the_directory_it_was_asked_for_unless_told_otherwise() {
         let bytes = archive();
         let mut src = Cursor::new(bytes);
-        let parsed = Archive::open(&mut src).expect("parses");
+        let parsed = Archive::open(&mut src, &crate::keys::Unlock::unkeyed()).expect("parses");
 
         let shallow = Listed::at(&mut src, &parsed, "", false).expect("lists");
         let paths: Vec<&str> = shallow.iter().map(|row| row.path.as_str()).collect();

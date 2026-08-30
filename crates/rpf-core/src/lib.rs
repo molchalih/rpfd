@@ -34,6 +34,7 @@ pub use entry::{Entry, EntryKind};
 pub use error::{Category, Error, Result};
 pub use format::{Codec, Version};
 pub use inspect::{Listed, ListedKind, Problem, Summary, Verified};
+pub use keys::{Material, Unlock};
 pub use manifest::{Checksum, MANIFEST_NAME, Manifest};
 pub use patch::{Patches, Plan, Planned, TooLarge, plan};
 pub use scratch::{InMemory, Scratch};

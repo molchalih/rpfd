@@ -90,6 +90,56 @@ pub enum Error {
         tag: u32,
     },
 
+    /// The archive is encrypted, key material **is** available, and none of it
+    /// opens the archive.
+    ///
+    /// Distinct from [`Error::NeedsKey`] because the two name different things
+    /// to do (DR-010): the first is answered by extracting key material, and
+    /// this one cannot be — the material in hand is the wrong material, or the
+    /// archive was renamed after it was packed, which changes the key it is
+    /// under (`docs/rpf-format.md`, Encryption). Both are
+    /// [`Category::NeedsKey`], because the person holding the archive is the
+    /// one who acts either way.
+    ///
+    /// It is decided by the archive's own root directory row, not by a guess:
+    /// a table of contents that decrypts to something whose entry 0 is not the
+    /// root directory was decrypted with the wrong key. DR-041.
+    #[error(
+        "the {scheme} key material available does not open this archive \
+         (tag {tag:#010x}, {tried} source(s) tried)"
+    )]
+    WrongKey {
+        /// The encryption tag from the header.
+        tag: u32,
+        /// Which transform the tag names, for a caller deciding what material
+        /// to go and get. Never a key, and never a key index: DR-020.
+        scheme: &'static str,
+        /// How many sources' material was tried before this was answered.
+        tried: u32,
+    },
+
+    /// The archive is encrypted, and this build has no inverse transform to
+    /// write one back.
+    ///
+    /// Reading an encrypted archive and writing one are separate capabilities:
+    /// R4.7 is the second and it is unwritten, because NG has no inverse
+    /// outside Rockstar without a 2^32 sweep per column (`docs/ng-scheme.md`).
+    /// Every write path answers this before it touches a byte, so an archive
+    /// refused here is exactly as it was.
+    ///
+    /// [`Category::Unsupported`] rather than [`Category::NeedsKey`]: no
+    /// material opens this, because the missing part is here and not there.
+    /// Not [`Category::Refused`] either — the request was reasonable and the
+    /// container simply cannot. DR-010's amendment, DR-041.
+    #[error(
+        "archive is encrypted (tag {tag:#010x}); this build reads an encrypted \
+         archive and cannot write one back"
+    )]
+    CannotWriteEncrypted {
+        /// The encryption tag from the header.
+        tag: u32,
+    },
+
     /// A game executable does not carry the key material this build knows how
     /// to find.
     ///
@@ -617,10 +667,10 @@ impl Error {
     pub fn category(&self) -> Category {
         match *self {
             Self::Io { .. } | Self::Contents { .. } => Category::Io,
-            Self::NeedsKey { .. } => Category::NeedsKey,
-            Self::UnsupportedVersion { .. } | Self::UnrecognisedExecutable { .. } => {
-                Category::Unsupported
-            }
+            Self::NeedsKey { .. } | Self::WrongKey { .. } => Category::NeedsKey,
+            Self::UnsupportedVersion { .. }
+            | Self::UnrecognisedExecutable { .. }
+            | Self::CannotWriteEncrypted { .. } => Category::Unsupported,
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
@@ -682,6 +732,8 @@ impl Error {
             Self::UnsupportedVersion { .. } => "UnsupportedVersion",
             Self::UnrecognisedExecutable { .. } => "UnrecognisedExecutable",
             Self::NeedsKey { .. } => "NeedsKey",
+            Self::WrongKey { .. } => "WrongKey",
+            Self::CannotWriteEncrypted { .. } => "CannotWriteEncrypted",
             Self::OutOfBounds { .. } => "OutOfBounds",
             Self::BadName { .. } => "BadName",
             Self::BadChildRange { .. } => "BadChildRange",
@@ -752,7 +804,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 31;
+    const VARIANTS: usize = 33;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -920,6 +972,18 @@ mod tests {
                 Category::Io,
             ),
             (Error::NeedsKey { tag: 0x0FFF_FFF9 }, Category::NeedsKey),
+            (
+                Error::WrongKey {
+                    tag: 0x0FEF_FFFF,
+                    scheme: "NG",
+                    tried: 1,
+                },
+                Category::NeedsKey,
+            ),
+            (
+                Error::CannotWriteEncrypted { tag: 0x0FEF_FFFF },
+                Category::Unsupported,
+            ),
             (
                 Error::UnsupportedVersion {
                     base: 0,

@@ -12,16 +12,20 @@
 use std::{
     collections::HashMap,
     io::{self, BufReader, Read, Seek, SeekFrom},
+    sync::Arc,
 };
 
 use crate::{
     entry::{Entry, EntryKind},
-    error::{Error, Result},
+    error::{Category, Error, Result},
     format::{
-        Header, MAX_HEADER_LEN, Names, Version, folded,
+        Header, MAX_HEADER_LEN, Names, Version,
+        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme},
+        folded,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, resource_len},
         same_name,
     },
+    keys::{Material, Unlock},
 };
 
 /// How deep anything in this container is walked before it is refused.
@@ -199,6 +203,199 @@ impl<S: Read + Seek> Seek for Region<S> {
     }
 }
 
+/// A region read through a block transform.
+///
+/// The transform has no chaining, so a block is decrypted where it is read and
+/// nothing before it is needed. The whole of what this holds is **one block**,
+/// which is what keeps a payload's cost its buffer rather than its length (§7,
+/// R3.9) — a 1.5 GB encrypted entry streams through sixteen bytes.
+///
+/// The tail rule is [`Cipher::apply`]'s, which is why `len` is held here: a
+/// stream has to know the tail is coming before it reaches it.
+#[derive(Debug)]
+struct Decrypting<R> {
+    src: R,
+    cipher: Cipher,
+    /// How long the transformed region is, so the sub-block tail is known
+    /// without reading to it.
+    len: u64,
+    /// How much of the region has been pulled out of `src`.
+    consumed: u64,
+    /// The block being handed out.
+    block: [u8; CIPHER_BLOCK_LEN],
+    /// How much of `block` holds bytes.
+    filled: usize,
+    /// How much of `block` has been handed out.
+    taken: usize,
+}
+
+impl<R: Read + Seek> Decrypting<R> {
+    /// A region of `len` bytes, decrypted as it is read.
+    const fn new(src: R, cipher: Cipher, len: u64) -> Self {
+        Self {
+            src,
+            cipher,
+            len,
+            consumed: 0,
+            block: [0_u8; CIPHER_BLOCK_LEN],
+            filled: 0,
+            taken: 0,
+        }
+    }
+
+    /// Where the next byte handed out comes from, in the region's own terms.
+    fn position(&self) -> u64 {
+        let held = u64::try_from(self.filled.saturating_sub(self.taken)).unwrap_or(0);
+        self.consumed.saturating_sub(held)
+    }
+
+    /// Reads the next block, decrypting it unless it is the sub-block tail.
+    ///
+    /// Leaves `filled` at zero at the end of the region, which is what a read
+    /// answers `Ok(0)` on.
+    fn fill(&mut self) -> io::Result<()> {
+        self.filled = 0;
+        self.taken = 0;
+        let left = self.len.saturating_sub(self.consumed);
+        if left == 0 {
+            return Ok(());
+        }
+        let want = usize::try_from(left)
+            .unwrap_or(CIPHER_BLOCK_LEN)
+            .min(CIPHER_BLOCK_LEN);
+        let mut got = 0_usize;
+        while got < want {
+            let window = self.block.get_mut(got..want).unwrap_or_default();
+            let read = self.src.read(window)?;
+            if read == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
+            got = got.saturating_add(read);
+        }
+        self.consumed = self
+            .consumed
+            .saturating_add(u64::try_from(got).unwrap_or(0));
+        if got == CIPHER_BLOCK_LEN {
+            self.cipher.block(&mut self.block);
+        }
+        self.filled = got;
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> Read for Decrypting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.taken >= self.filled {
+            self.fill()?;
+            if self.filled == 0 {
+                return Ok(0);
+            }
+        }
+        let ready = self.block.get(self.taken..self.filled).unwrap_or_default();
+        let want = ready.len().min(buf.len());
+        let (Some(target), Some(source)) = (buf.get_mut(..want), ready.get(..want)) else {
+            return Ok(0);
+        };
+        target.copy_from_slice(source);
+        self.taken = self.taken.saturating_add(want);
+        Ok(want)
+    }
+}
+
+impl<R: Read + Seek> Seek for Decrypting<R> {
+    /// Seeks within the transformed region.
+    ///
+    /// The block containing the target is the one that has to be read, so a
+    /// seek lands on a block boundary and the remainder is handed out from
+    /// there. No chaining is what makes that possible at all.
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(at) => at,
+            SeekFrom::End(delta) => shift(self.len, delta)?,
+            SeekFrom::Current(delta) => shift(self.position(), delta)?,
+        };
+        let block = u64::try_from(CIPHER_BLOCK_LEN).unwrap_or(1);
+        let start = target.checked_div(block).unwrap_or(0).saturating_mul(block);
+        self.src.seek(SeekFrom::Start(start))?;
+        self.consumed = start;
+        self.filled = 0;
+        self.taken = 0;
+        let into = usize::try_from(target.saturating_sub(start)).unwrap_or(0);
+        if into > 0 {
+            self.fill()?;
+            self.taken = into.min(self.filled);
+        }
+        Ok(target)
+    }
+}
+
+/// A payload's bytes, past whatever transform the archive is under.
+///
+/// An enum rather than a generic: the two arms are the same window on the same
+/// source, and a generic would push the choice into every signature that
+/// carries a stream.
+#[derive(Debug)]
+enum Plain<S> {
+    /// Stored in the clear.
+    Clear(Region<S>),
+    /// Decrypted a block at a time as it is read.
+    Keyed(Decrypting<Region<S>>),
+}
+
+impl<S: Read + Seek> Plain<S> {
+    /// A window on the source, through `cipher` when there is one.
+    fn new(src: S, at: u64, len: u64, cipher: Option<Cipher>) -> Self {
+        let region = Region::new(src, at, len);
+        match cipher {
+            None => Self::Clear(region),
+            Some(cipher) => Self::Keyed(Decrypting::new(region, cipher, len)),
+        }
+    }
+
+    /// How many bytes of the window have been read.
+    fn pos(&self) -> u64 {
+        match *self {
+            Self::Clear(ref region) => region.pos,
+            Self::Keyed(ref keyed) => keyed.position(),
+        }
+    }
+}
+
+impl<S: Read + Seek> Read for Plain<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match *self {
+            Self::Clear(ref mut region) => region.read(buf),
+            Self::Keyed(ref mut keyed) => keyed.read(buf),
+        }
+    }
+}
+
+impl<S: Read + Seek> Seek for Plain<S> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        match *self {
+            Self::Clear(ref mut region) => region.seek(to),
+            Self::Keyed(ref mut keyed) => keyed.seek(to),
+        }
+    }
+}
+
+/// What decrypts a **resource** payload: nothing, in either framing.
+///
+/// A resource is never under the archive's transform, whatever the archive's
+/// tag says. Its deflate stream sits in the clear sixteen bytes into the
+/// payload and inflates to exactly the length its two flag words give, and it
+/// has no per-entry encryption field to consult in the first place — offsets 8
+/// and 12 are those flag words (§5). `docs/rpf-format.md`, Encryption,
+/// `verified`: checked on every resource of the AES archive and of an NG one.
+///
+/// Named once rather than written as a bare `None` in each of the two framings,
+/// because two spellings of one format fact drift silently and this one decides
+/// whether bytes are transformed (§3).
+const RESOURCE_IS_IN_THE_CLEAR: Option<Cipher> = None;
+
 /// Which of the two forms an entry is read in.
 ///
 /// They differ for a **resource** and only for a resource: the file it is
@@ -217,15 +414,19 @@ enum Form {
 /// How an entry's bytes come out of its payload.
 #[derive(Debug)]
 enum Stream<S> {
-    /// As they sit on disk.
-    Stored(Region<S>),
+    /// As they sit on disk, past the archive's transform.
+    Stored(Plain<S>),
     /// Inflated as they are read.
     ///
     /// Buffered because the decompressor asks for input a little at a time and
     /// the window under it seeks the source. The buffer is the decoder's own,
     /// which is what makes it discardable on a restart: seeking it throws away
     /// what it read ahead, which a fresh decompressor has to see again.
-    Deflated(flate2::bufread::DeflateDecoder<BufReader<Region<S>>>),
+    ///
+    /// The transform goes **under** the decompressor, because that is the order
+    /// the archive wrote them in: a payload is deflated and then encrypted, so
+    /// it is decrypted and then inflated.
+    Deflated(flate2::bufread::DeflateDecoder<BufReader<Plain<S>>>),
 }
 
 /// One entry as a stream of the bytes it is made of.
@@ -261,20 +462,28 @@ pub struct Extracted<S> {
 }
 
 impl<S: Read + Seek> Extracted<S> {
-    /// A payload read as it sits on disk.
-    fn stored(entry: u32, src: S, at: u64, len: u64) -> Self {
+    /// A payload read as it sits on disk, through `cipher` where the archive
+    /// put one over it.
+    fn stored(entry: u32, src: S, at: u64, len: u64, cipher: Option<Cipher>) -> Self {
         Self {
             entry,
             at,
             len,
             pos: 0,
             declared: len,
-            stream: Stream::Stored(Region::new(src, at, len)),
+            stream: Stream::Stored(Plain::new(src, at, len, cipher)),
         }
     }
 
     /// A deflated payload, inflated to the `expected` length the entry claims.
-    fn deflated(entry: u32, src: S, at: u64, on_disk: u64, expected: u64) -> Self {
+    fn deflated(
+        entry: u32,
+        src: S,
+        at: u64,
+        on_disk: u64,
+        expected: u64,
+        cipher: Option<Cipher>,
+    ) -> Self {
         Self {
             entry,
             at,
@@ -282,7 +491,7 @@ impl<S: Read + Seek> Extracted<S> {
             pos: 0,
             declared: on_disk,
             stream: Stream::Deflated(flate2::bufread::DeflateDecoder::new(BufReader::new(
-                Region::new(src, at, on_disk),
+                Plain::new(src, at, on_disk, cipher),
             ))),
         }
     }
@@ -307,7 +516,7 @@ impl<S: Read + Seek> Extracted<S> {
     /// end; before that, `used` is how far it has got.
     fn extent(&self) -> (u64, u64) {
         let used = match self.stream {
-            Stream::Stored(ref region) => region.pos,
+            Stream::Stored(ref plain) => plain.pos(),
             // What the decompressor took, rather than what it was handed: that
             // is where the stream ends, and the bytes after it belong to
             // nothing.
@@ -385,7 +594,7 @@ impl<S: Read + Seek> Read for Extracted<S> {
         }
         let (entry, expected) = (self.entry, self.len);
         let read = match self.stream {
-            Stream::Stored(ref mut region) => region.read(buf)?,
+            Stream::Stored(ref mut plain) => plain.read(buf)?,
             Stream::Deflated(ref mut decoder) => {
                 // One byte past what the entry promises, so a payload that
                 // inflates to more than that is caught rather than truncated
@@ -451,8 +660,8 @@ impl<S: Read + Seek> Seek for Extracted<S> {
             SeekFrom::End(delta) => shift(self.len, delta)?,
             SeekFrom::Current(delta) => shift(self.pos, delta)?,
         };
-        if let Stream::Stored(ref mut region) = self.stream {
-            region.seek(SeekFrom::Start(target))?;
+        if let Stream::Stored(ref mut plain) = self.stream {
+            plain.seek(SeekFrom::Start(target))?;
             self.pos = target;
             return Ok(target);
         }
@@ -491,6 +700,19 @@ pub struct Archive {
     /// own, and one more than its holder's for every nested archive, which is
     /// what [`MAX_DEPTH`] is counted against.
     depth: u32,
+    /// What opened this archive, and what opens the archives nested in it.
+    ///
+    /// Normalised at parse: an archive that consulted a cache holds the
+    /// material it found rather than the cache, so reading an entry is not a
+    /// second pass over a configuration directory. DR-041.
+    unlock: Unlock,
+    /// The transform this archive's own payloads are under, or `None` when it
+    /// is not encrypted.
+    ///
+    /// `Some` implies the material that runs it is in `unlock`: the two are set
+    /// together at parse and there is no way to reach one without the other
+    /// (§5).
+    scheme: Option<Scheme>,
     entries: Vec<Entry>,
     names: Names,
     parents: Vec<Option<u32>>,
@@ -503,16 +725,30 @@ impl Archive {
     /// size of the entry that holds it, not the size of the file. Every offset
     /// inside is checked against it.
     ///
+    /// `unlock` is what opens it if it turns out to be encrypted, and what
+    /// opens every archive nested inside it. [`crate::Unlock::unkeyed`] is the
+    /// whole of what an unencrypted archive needs, and is what a caller with no
+    /// key material passes — the parameter is not optional, because an archive
+    /// that can now be opened with a key must not be silently refused by a call
+    /// site that forgot to say it had one (§4, DR-041).
+    ///
     /// # Errors
     ///
     /// [`Error::NotAnArchive`] if the magic is nothing this format uses,
     /// [`Error::UnsupportedVersion`] if it names a version this build does not
-    /// read, [`Error::NeedsKey`] if it is encrypted, and the bounds variants if
-    /// the header describes regions that do not fit.
-    pub fn parse<R: Read + Seek>(src: &mut R, base: u64, len: u64) -> Result<Self> {
+    /// read, [`Error::NeedsKey`] if it is encrypted and no material is
+    /// available, [`Error::WrongKey`] if material is available and none of it
+    /// opens the archive, and the bounds variants if the header describes
+    /// regions that do not fit.
+    pub fn parse<R: Read + Seek>(
+        src: &mut R,
+        base: u64,
+        len: u64,
+        unlock: &Unlock,
+    ) -> Result<Self> {
         // An archive parsed by name rather than through a holder is the
         // outermost one there is, so it is nested inside nothing.
-        Self::parse_nested(src, base, len, 0)
+        Self::parse_nested(src, base, len, 0, unlock)
     }
 
     /// [`Archive::parse`], told how many archives it already sits inside.
@@ -521,7 +757,13 @@ impl Archive {
     /// archive cannot tell where it is being read from. [`Archive::open_nested`]
     /// is the only caller that supplies anything but zero, which is what keeps
     /// the count honest.
-    fn parse_nested<R: Read + Seek>(src: &mut R, base: u64, len: u64, depth: u32) -> Result<Self> {
+    fn parse_nested<R: Read + Seek>(
+        src: &mut R,
+        base: u64,
+        len: u64,
+        depth: u32,
+        unlock: &Unlock,
+    ) -> Result<Self> {
         if depth > MAX_DEPTH {
             return Err(Error::TooDeep {
                 what: "archive nesting",
@@ -536,6 +778,12 @@ impl Archive {
             names_len,
             encryption,
         } = read_header(src, base)?;
+
+        // Decided from the header, before any of the layout below is believed:
+        // an archive nobody can open says so rather than being reported as
+        // malformed for a region that does not fit.
+        let opening = opening_for(version, encryption, unlock)?;
+
         let table_at = version.header_len();
 
         let table_len = u64::from(entry_count)
@@ -580,14 +828,30 @@ impl Archive {
             });
         }
 
-        let table = read_vec_at(src, base.checked_add(table_at).unwrap_or(base), table_len)?;
-        let entries = parse_entries(version, &table, entry_count)?;
-
-        let names_blob = read_vec_at(
+        let mut table = read_vec_at(src, base.checked_add(table_at).unwrap_or(base), table_len)?;
+        let mut names_blob = read_vec_at(
             src,
             base.checked_add(names_at).unwrap_or(base),
             u64::from(names_len),
         )?;
+
+        // Decrypted before a single row is decoded: an encrypted table of
+        // contents parses into nonsense otherwise, and nonsense is what the
+        // rest of this function is written to refuse. The key is chosen by this
+        // archive's own name and length, both of which the caller supplied.
+        let (unlock, scheme) = match opening {
+            None => (unlock.clone(), None),
+            Some(opening) => decrypt_table_of_contents(
+                version,
+                len,
+                unlock,
+                opening,
+                &mut table,
+                &mut names_blob,
+            )?,
+        };
+
+        let entries = parse_entries(version, &table, entry_count)?;
 
         // Names are located once, here, so that `name` has nothing left to
         // find (§5). How they are encoded is the version's, which is why the
@@ -602,6 +866,8 @@ impl Archive {
             version,
             encryption,
             depth,
+            unlock,
+            scheme,
             entries,
             names,
             parents,
@@ -613,11 +879,11 @@ impl Archive {
     /// # Errors
     ///
     /// As [`Archive::parse`], plus [`Error::Io`] if the length cannot be found.
-    pub fn open<R: Read + Seek>(src: &mut R) -> Result<Self> {
+    pub fn open<R: Read + Seek>(src: &mut R, unlock: &Unlock) -> Result<Self> {
         let len = src
             .seek(SeekFrom::End(0))
             .map_err(|source| Error::Io { offset: 0, source })?;
-        Self::parse(src, 0, len)
+        Self::parse(src, 0, len, unlock)
     }
 
     /// Where this archive begins in the source.
@@ -638,11 +904,42 @@ impl Archive {
         self.version
     }
 
-    /// The archive's encryption tag. Always [`Version::open`] for now, since
-    /// anything else is refused at parse.
+    /// The archive's encryption tag, exactly as the header carries it.
     #[must_use]
     pub const fn encryption(&self) -> u32 {
         self.encryption
+    }
+
+    /// Which transform this archive's bytes were under, or `None` when it is
+    /// not encrypted.
+    ///
+    /// A name, never a key and never a key index: DR-020.
+    #[must_use]
+    pub fn scheme(&self) -> Option<&'static str> {
+        self.scheme.map(Scheme::named)
+    }
+
+    /// Whether this archive can be written back at all.
+    ///
+    /// Reading an encrypted archive and writing one are separate capabilities,
+    /// and this build has only the first: the transform has no inverse here
+    /// (R4.7, `docs/ng-scheme.md`). Every write path asks this before it
+    /// computes a byte, so the one answer serves patching, rebuilding and the
+    /// resolution a buffered change is accepted by — which is what keeps three
+    /// call sites from growing three answers (§3).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CannotWriteEncrypted`], naming the tag, when the archive is
+    /// under a transform. It is not overridable: a capability that is absent is
+    /// not a safety interlock, and no flag supplies it. DR-041.
+    pub const fn writable(&self) -> Result<()> {
+        match self.scheme {
+            None => Ok(()),
+            Some(_) => Err(Error::CannotWriteEncrypted {
+                tag: self.encryption,
+            }),
+        }
     }
 
     /// Every entry, in table order. Entry 0 is the root directory.
@@ -1081,6 +1378,38 @@ impl Archive {
         self.opened(src, index, Form::File)
     }
 
+    /// The transform one entry's payload is under, if it is under one.
+    ///
+    /// Three measured facts decide it, and none of them is a guess.
+    ///
+    /// - The **archive's** tag chooses the transform, and an archive that is
+    ///   not encrypted puts none of its entries under one.
+    /// - A **binary** entry is transformed exactly when its own per-entry
+    ///   encryption field says so. Across both GTA V installs that field takes
+    ///   two values and no others — 27,276 entries carry 0 and 64,300 carry 1 —
+    ///   and 1 is the one whose payload only reads back after the transform.
+    ///   `docs/rpf-format.md`, Entry table; `docs/backlog.md` Q10.
+    /// - A **resource** entry never is. Its deflate stream sits in the clear
+    ///   sixteen bytes into the payload and inflates to exactly the length its
+    ///   flag words give, in every archive measured; the sixteen bytes in front
+    ///   of it are not a readable `RSC7` header and no key here recovers one.
+    ///   A resource also has no per-entry encryption field to consult — offsets
+    ///   8 and 12 are its two flag words (§5) — so there would be nothing to
+    ///   ask even if it did.
+    fn payload_cipher(&self, index: u32, contents_len: u32) -> Result<Cipher> {
+        let scheme = self.scheme.ok_or(Error::NeedsKey {
+            tag: self.encryption,
+        })?;
+        let wrong = || Error::WrongKey {
+            tag: self.encryption,
+            scheme: scheme.named(),
+            tried: 1,
+        };
+        let material = self.unlock.held_material().ok_or_else(wrong)?;
+        let name = self.name(index)?;
+        Cipher::new(scheme, material, name, u64::from(contents_len)).ok_or_else(wrong)
+    }
+
     /// The one place a payload becomes a stream, in either framing (§3).
     fn opened<S: Read + Seek>(&self, src: S, index: u32, form: Form) -> Result<Extracted<S>> {
         let (offset, on_disk) = self.payload_span(index)?;
@@ -1099,12 +1428,27 @@ impl Archive {
             EntryKind::Binary {
                 compressed_len,
                 uncompressed_len,
+                encryption,
                 ..
-            } => Ok(if compressed_len == 0 {
-                Extracted::stored(index, src, offset, on_disk)
-            } else {
-                Extracted::deflated(index, src, offset, on_disk, u64::from(uncompressed_len))
-            }),
+            } => {
+                let cipher = if self.scheme.is_some() && !self.version.entry_is_open(encryption) {
+                    Some(self.payload_cipher(index, uncompressed_len)?)
+                } else {
+                    None
+                };
+                Ok(if compressed_len == 0 {
+                    Extracted::stored(index, src, offset, on_disk, cipher)
+                } else {
+                    Extracted::deflated(
+                        index,
+                        src,
+                        offset,
+                        on_disk,
+                        u64::from(uncompressed_len),
+                        cipher,
+                    )
+                })
+            }
 
             EntryKind::Resource {
                 compressed_len,
@@ -1119,7 +1463,13 @@ impl Archive {
                             compressed_len,
                         });
                     }
-                    Ok(Extracted::stored(index, src, offset, on_disk))
+                    Ok(Extracted::stored(
+                        index,
+                        src,
+                        offset,
+                        on_disk,
+                        RESOURCE_IS_IN_THE_CLEAR,
+                    ))
                 }
                 Form::Contents => {
                     let stream_len = u64::from(compressed_len)
@@ -1141,6 +1491,7 @@ impl Archive {
                         at,
                         stream_len,
                         resource_len(system_flags, graphics_flags),
+                        RESOURCE_IS_IN_THE_CLEAR,
                     ))
                 }
             },
@@ -1310,7 +1661,11 @@ impl Archive {
             depth: u32::MAX,
             limit: MAX_DEPTH,
         })?;
-        Self::parse_nested(src, offset, on_disk, depth)
+        // A nested archive's own key is chosen by *its* name and length, not by
+        // its holder's, so the material carries over and the name does not.
+        // `docs/rpf-format.md`, Encryption.
+        let unlock = self.unlock.renamed(self.name(index)?);
+        Self::parse_nested(src, offset, on_disk, depth, &unlock)
     }
 
     /// The archive nested in an entry's payload, or `None` when the payload is
@@ -1336,14 +1691,51 @@ impl Archive {
     /// # Errors
     ///
     /// [`Error::TooDeep`] past [`MAX_DEPTH`] levels of nesting, and nothing
-    /// else: every other reason a payload is not an archive is `None`.
-    pub fn nested_at<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Option<Self>> {
+    /// else: every other reason a payload is not an archive is an answer rather
+    /// than a failure.
+    pub fn nested_at<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Nested> {
         match self.open_nested(src, index) {
-            Ok(nested) => Ok(Some(nested)),
+            Ok(nested) => Ok(Nested::Open(Box::new(nested))),
             Err(error @ Error::TooDeep { .. }) => Err(error),
-            Err(_) => Ok(None),
+            // The archive is there and this build cannot open it. Answering
+            // "not an archive" made the count depend on what a key cache
+            // happens to hold and let `verify` report clean over an archive it
+            // never descended into. DR-041.
+            Err(error) if error.category() == Category::NeedsKey => Ok(Nested::Locked(error)),
+            Err(_) => Ok(Nested::None),
         }
     }
+}
+
+/// What sniffing an entry's payload for a nested archive found.
+///
+/// Three answers rather than two, because "there is no archive here" and "there
+/// is an archive here that this build could not open" are different facts and
+/// a walk reports them differently. The distinction only became visible on
+/// 2026-08-30: before key material could be present, every encrypted nested
+/// archive was uniformly invisible, and afterwards the same walk answered
+/// differently depending on what a cache held.
+///
+/// [`Nested::None`] still covers a version this build has no codec for, which
+/// is DR-010's correction recorded rather than changed: raising that from the
+/// sniff would fail `info` on an archive holding an ordinary file whose first
+/// four bytes read `RPF3`. A key failure cannot happen to a `.txt` — the magic
+/// and the version have already been read — so it is safe to name where an
+/// unsupported version is not.
+#[derive(Debug)]
+pub enum Nested {
+    /// The payload is not an archive, or is one of a version this build does
+    /// not read.
+    None,
+    /// An archive, open.
+    ///
+    /// Boxed because an [`Archive`] is much the larger of the two arms and this
+    /// is returned by value from every sniff of every walk.
+    Open(Box<Archive>),
+    /// An archive whose header this build read and whose table of contents it
+    /// could not decrypt: [`Error::NeedsKey`] or [`Error::WrongKey`], carried
+    /// so that whoever reports it can say which and can name the tag.
+    Locked(Error),
 }
 
 /// Reads the header at `base`, or says why those bytes are not one.
@@ -1377,15 +1769,136 @@ fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
         filled = filled.saturating_add(read);
     }
 
-    let header = Header::read(bytes.get(0..filled).unwrap_or_default(), base)?;
-    // Every encrypted path is R2. Refusing here, with a distinct variant, keeps
-    // "cannot open this" separate from "this is broken". R6.3.
-    if !header.version.is_open(header.encryption) {
-        return Err(Error::NeedsKey {
-            tag: header.encryption,
-        });
+    // The encryption tag is read here and acted on in `decrypt_table_of_contents`, which is
+    // the only place that has the material to act on it with. R6.3 is still
+    // what shapes the answer: "cannot open this" stays a distinct variant from
+    // "this is broken".
+    Header::read(bytes.get(0..filled).unwrap_or_default(), base)
+}
+
+/// Whether these bytes begin with a root directory row.
+///
+/// The one check that says a table of contents was decrypted with the right
+/// key. Entry 0 is always the root directory (`docs/rpf-format.md`, Layout,
+/// `verified`), and the marker that says so is a whole word no file entry can
+/// produce — so a wrong key answers `false` with the odds of a 32-bit
+/// coincidence, and a right one cannot answer anything else. DR-041.
+fn is_root_directory(version: Version, table: &[u8]) -> bool {
+    version
+        .decode_row(table)
+        .is_some_and(|entry| entry.is_directory())
+}
+
+/// What is going to decrypt an archive's table of contents, decided from the
+/// header alone.
+///
+/// `None` for an archive that is not encrypted, which is the ordinary case and
+/// touches no key material and no cache at all (R2.6).
+struct Opening {
+    /// The tag it was decided from, which a failure has to name.
+    tag: u32,
+    /// The transform that tag names.
+    scheme: Scheme,
+    /// Every material that could run that transform, in the order to try them.
+    candidates: Vec<Arc<Material>>,
+}
+
+/// Which material is going to be tried, before a byte of layout is believed.
+///
+/// **Asked before the bounds checks on purpose.** An archive nobody here can
+/// open must say so rather than be reported as malformed because its entry
+/// table does not fit — the refusal is about the tag, and the tag is in the
+/// sixteen bytes already read. That ordering is what
+/// `crates/rpf-core/tests/no_keys.rs` pins.
+///
+/// # Errors
+///
+/// [`Error::NeedsKey`] when the archive is encrypted and no material is
+/// available — which includes a tag no transform here is named for, because no
+/// key anyone has opens one of those either.
+fn opening_for(version: Version, tag: u32, unlock: &Unlock) -> Result<Option<Opening>> {
+    if version.is_open(tag) {
+        return Ok(None);
     }
-    Ok(header)
+    // A tag this build has no transform for is `NeedsKey` whatever is in the
+    // cache: the material that would open it is not material anyone has.
+    let Some(scheme) = version.scheme(tag) else {
+        return Err(Error::NeedsKey { tag });
+    };
+    let candidates = unlock.candidates(scheme)?;
+    if candidates.is_empty() {
+        return Err(Error::NeedsKey { tag });
+    }
+    Ok(Some(Opening {
+        tag,
+        scheme,
+        candidates,
+    }))
+}
+
+/// Decrypts an archive's table of contents and names blob in place, and says
+/// what opened them.
+///
+/// Answers the [`Unlock`] the archive keeps — the same source, with whatever it
+/// resolved to already in hand — and the transform its payloads are under.
+///
+/// # Errors
+///
+/// [`Error::WrongKey`] when none of the material decrypts the table of contents
+/// into one.
+fn decrypt_table_of_contents(
+    version: Version,
+    len: u64,
+    unlock: &Unlock,
+    opening: Opening,
+    table: &mut [u8],
+    names_blob: &mut [u8],
+) -> Result<(Unlock, Option<Scheme>)> {
+    let Opening {
+        tag,
+        scheme,
+        candidates,
+    } = opening;
+    let tried = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+
+    // The row a key is judged by, read once: it is the same bytes for every
+    // candidate, and only the transform over it differs.
+    //
+    // `None` is an archive whose header claims **no entries**, and then there
+    // is no root directory row and nothing for a key to be right or wrong
+    // about. That is not a key failure: it is an archive with no entries, and
+    // asking for entry 0 is what answers — the same answer this header gives
+    // under tag `OPEN`. It used to leave the loop into `WrongKey`, reporting
+    // "1 source(s) tried" with no candidate having run, which tells an
+    // automation to go and extract a key for ever.
+    let root_row: Option<[u8; CIPHER_BLOCK_LEN]> = table.get(..CIPHER_BLOCK_LEN).map(|first| {
+        let mut probe = [0_u8; CIPHER_BLOCK_LEN];
+        probe.copy_from_slice(first);
+        probe
+    });
+
+    for material in candidates {
+        let Some(cipher) = Cipher::new(scheme, &material, unlock.name(), len) else {
+            continue;
+        };
+        // One block decides it. Decrypting the whole table to find out costs
+        // the table per candidate, and the answer is in its first row.
+        if let Some(mut probe) = root_row {
+            cipher.block(&mut probe);
+            if !is_root_directory(version, &probe) {
+                continue;
+            }
+        }
+        cipher.apply(table);
+        cipher.apply(names_blob);
+        return Ok((unlock.resolved(&material), Some(scheme)));
+    }
+
+    Err(Error::WrongKey {
+        tag,
+        scheme: scheme.named(),
+        tried,
+    })
 }
 
 /// How many entries, saturating rather than truncating.
@@ -1521,4 +2034,179 @@ fn check_depth(parents: &[Option<u32>]) -> Result<()> {
         depth.push(here);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! The streaming transform, over a key of zeros.
+    //!
+    //! `Decrypting`'s read loop and its block arithmetic had no coverage that
+    //! runs without a game installation: every gated test needs key material,
+    //! and none of the five fuzz targets can reach this code at all because a
+    //! target has no way to build a `Material` — the values are found by their
+    //! own SHA-1 digests, so no synthetic source produces one (DR-006, DR-017).
+    //! `Cipher::over_zeros` is what makes the framing testable without any.
+    //!
+    //! Nothing here checks a cipher value. What it checks is that the streaming
+    //! form and the buffered form answer the same bytes, at every read size and
+    //! from every offset — which is the claim `Cipher::block` being the one
+    //! implementation is supposed to buy (§3).
+
+    use std::io::Cursor;
+
+    use super::{Decrypting, Region};
+    use crate::format::crypto::{CIPHER_BLOCK_LEN, Cipher};
+
+    /// Bytes that are not a pattern the block arithmetic could accidentally
+    /// agree with.
+    fn bytes(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|index| u8::try_from(index.wrapping_mul(7).wrapping_add(3) & 0xFF).unwrap_or(0))
+            .collect()
+    }
+
+    /// The buffered answer: what `Cipher::apply` makes of the same bytes.
+    fn buffered(source: &[u8]) -> Vec<u8> {
+        let mut expected = source.to_vec();
+        Cipher::over_zeros().apply(&mut expected);
+        expected
+    }
+
+    /// A stream over `source`, decrypting the whole of it.
+    fn streaming(source: &[u8]) -> Decrypting<Region<Cursor<Vec<u8>>>> {
+        let len = u64::try_from(source.len()).unwrap_or(0);
+        Decrypting::new(
+            Region::new(Cursor::new(source.to_vec()), 0, len),
+            Cipher::over_zeros(),
+            len,
+        )
+    }
+
+    /// The lengths that matter: empty, under a block, a block exactly, a block
+    /// and a tail, and several blocks with and without one.
+    const LENGTHS: [usize; 11] = [0, 1, 15, 16, 17, 31, 32, 33, 100, 511, 512];
+
+    #[test]
+    fn a_stream_answers_what_the_buffered_form_answers() {
+        use std::io::Read as _;
+
+        for len in LENGTHS {
+            let source = bytes(len);
+            let mut whole = Vec::new();
+            streaming(&source)
+                .read_to_end(&mut whole)
+                .expect("reads to the end");
+            assert_eq!(whole, buffered(&source), "length {len}");
+        }
+    }
+
+    #[test]
+    fn a_short_read_hands_out_the_same_bytes_as_a_long_one() {
+        use std::io::Read as _;
+
+        // The read loop fills one block and hands out what a caller asked for,
+        // so a caller asking for one byte at a time crosses every boundary
+        // there is. R7 clients do exactly this.
+        for len in LENGTHS {
+            let source = bytes(len);
+            let expected = buffered(&source);
+            for cap in 1..=17_usize {
+                let mut stream = streaming(&source);
+                let mut got = Vec::new();
+                let mut window = vec![0_u8; cap];
+                loop {
+                    let read = stream.read(&mut window).expect("reads");
+                    if read == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(window.get(..read).unwrap_or_default());
+                }
+                assert_eq!(got, expected, "length {len} in {cap}-byte reads");
+            }
+        }
+    }
+
+    #[test]
+    fn a_seek_lands_on_the_byte_it_names_from_any_offset() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        // No chaining is what makes this possible: the block holding the target
+        // is read and the remainder handed out from inside it. An off-by-one in
+        // that arithmetic reads a whole entry from sixteen bytes away and
+        // inflates to nonsense rather than failing.
+        for len in LENGTHS {
+            let source = bytes(len);
+            let expected = buffered(&source);
+            for at in 0..=len {
+                let mut stream = streaming(&source);
+                let landed = stream
+                    .seek(SeekFrom::Start(u64::try_from(at).unwrap_or(0)))
+                    .expect("seeks");
+                assert_eq!(landed, u64::try_from(at).unwrap_or(0));
+                let mut tail = Vec::new();
+                stream.read_to_end(&mut tail).expect("reads the tail");
+                assert_eq!(
+                    tail.as_slice(),
+                    expected.get(at..).unwrap_or_default(),
+                    "length {len} seeked to {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_seek_back_and_forth_stays_on_the_same_bytes() {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        // `SeekFrom::Current` is computed from the position a partly-drained
+        // block reports, not from what has been pulled out of the source, and
+        // the two differ by whatever is still in hand.
+        let source = bytes(200);
+        let expected = buffered(&source);
+        let mut stream = streaming(&source);
+        let mut first = [0_u8; 5];
+        stream.read_exact(&mut first).expect("reads five");
+        assert_eq!(first.as_slice(), expected.get(..5).unwrap_or_default());
+
+        assert_eq!(stream.stream_position().expect("asks"), 5);
+        assert_eq!(stream.seek(SeekFrom::Current(20)).expect("seeks"), 25);
+        assert_eq!(stream.seek(SeekFrom::Current(-20)).expect("seeks"), 5);
+        assert_eq!(
+            stream.seek(SeekFrom::End(-8)).expect("seeks"),
+            u64::try_from(source.len().saturating_sub(8)).unwrap_or(0)
+        );
+        let mut tail = Vec::new();
+        stream.read_to_end(&mut tail).expect("reads");
+        assert_eq!(
+            tail.as_slice(),
+            expected
+                .get(source.len().saturating_sub(8)..)
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn the_tail_a_stream_hands_out_is_the_tail_the_archive_wrote() {
+        use std::io::Read as _;
+
+        // The one place the streaming form could disagree with the buffered
+        // one: a region whose last bytes are fewer than a block. They are
+        // handed out exactly as they sit, which is `Cipher::apply`'s rule
+        // reached from the other side.
+        let source = bytes(CIPHER_BLOCK_LEN.saturating_add(5));
+        let mut whole = Vec::new();
+        streaming(&source)
+            .read_to_end(&mut whole)
+            .expect("reads to the end");
+        assert_eq!(
+            whole.get(CIPHER_BLOCK_LEN..),
+            source.get(CIPHER_BLOCK_LEN..),
+            "the sub-block tail was transformed"
+        );
+        assert_ne!(
+            whole.get(..CIPHER_BLOCK_LEN),
+            source.get(..CIPHER_BLOCK_LEN),
+            "the whole block in front of it was not"
+        );
+    }
 }

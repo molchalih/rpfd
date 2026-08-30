@@ -1,16 +1,24 @@
-//! Key extraction: what a game executable is asked for, and what it answers.
+//! Key extraction: what a source is asked for, and what it answers.
 //!
-//! Two halves, and they are not the same kind of evidence.
+//! Three halves, and they are not the same kind of evidence.
 //!
-//! The **corpus-free** half runs everywhere. It is about the contract: a source
+//! The **corpus-free** part runs everywhere. It is about the contract: a source
 //! carrying none of the anchored values is refused by name and by count, never
 //! answered with half a value, and the failure classifies as something a caller
 //! can act on.
 //!
-//! The **executable-gated** half runs only where `RPF_GAME_EXE` names a
+//! The **executable-gated** part runs only where `RPF_GAME_EXE` names a
 //! directory holding the game executables, which is one machine. It is the
 //! measurement: which values are in them, where, and whether two builds of the
-//! same game agree. It asserts on **digests and offsets** and never on a key —
+//! same game agree — including the negative that no executable carries the NG
+//! material.
+//!
+//! The **image-gated** part runs only where `RPF_GAME_IMAGE` names a memory
+//! image of a running game. It is the positive the negative above is the
+//! counterpart to, and the only place the NG material has ever been found in
+//! the clear. DR-040.
+//!
+//! Every part asserts on **counts, digests and offsets** and never on a key —
 //! DR-006, which is also why no test here writes anything it extracted to a
 //! path the repository can reach.
 //!
@@ -26,14 +34,14 @@
 
 use std::{
     env, fs,
-    io::Cursor,
+    io::{Cursor, Seek as _},
     path::{Path, PathBuf},
 };
 
 use rpf_core::{
     Category, Error, Flow, Step, Unwatched, Watch,
     keys::{
-        AES_KEY_LEN, Cache, HASH_LUT_LEN, Keys, NG_COLUMNS, NG_DECRYPT_TABLE_COUNT,
+        AES_KEY_LEN, Cache, HASH_LUT_LEN, Keys, Material, NG_COLUMNS, NG_DECRYPT_TABLE_COUNT,
         NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NG_ROUNDS, NgKeys,
         SourceDigest,
     },
@@ -412,11 +420,14 @@ fn legacy_and_enhanced_share_one_key_at_two_offsets() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn no_executable_here_carries_the_ng_material() {
-    // R2.2, and the answer is a negative one. The search that finds the AES key
-    // in the same file finds none of the 373 NG values in any of the three, at
-    // every byte offset rather than only on the eight-byte stride. Recorded as
-    // a test rather than as a note, so that an executable which does carry them
-    // makes this fail and say so.
+    // R2.2, and the answer is a negative one — **about executables, and only
+    // about executables**. Narrowed 2026-08-30: this used to stand for "no
+    // source we have carries the NG material", and that reading is now false.
+    // A memory image of `GTA5.exe` taken while the game was running carries all
+    // 373 values, which the test below this one measures. What survives, and is
+    // worth keeping, is the narrower claim: the file on disk carries none of
+    // them, which is exactly why finding them took until 2026-08-30 and why
+    // every tool in this ecosystem ships a bundled copy instead. DR-040.
     //
     // It hashes 373 anchors over three executables and takes about three
     // minutes unoptimised, which is why it is behind `RPF_GAME_EXE` and
@@ -436,6 +447,180 @@ fn no_executable_here_carries_the_ng_material() {
             other => panic!("{name}: expected UnrecognisedExecutable, got {other:?}"),
         }
     }
+}
+
+/// The memory image the NG material is in, or `None` with a reason on stderr.
+///
+/// One file rather than a directory: `RPF_GAME_IMAGE` names the image itself,
+/// because there is no convention about what such a file is called and no
+/// second one to pick between.
+fn game_image(test: &str) -> Option<PathBuf> {
+    let Some(named) = env::var_os("RPF_GAME_IMAGE") else {
+        return skip_image(test, "RPF_GAME_IMAGE is not set");
+    };
+    let path = PathBuf::from(named);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip_image(test, &format!("{} is not a file", path.display()))
+    }
+}
+
+/// Reports a skip of an image-gated test, naming what it would have read.
+fn skip_image<T>(test: &str, reason: &str) -> Option<T> {
+    assert!(
+        env::var_os("RPF_REQUIRE_GAME_IMAGE").is_none(),
+        "RPF_REQUIRE_GAME_IMAGE is set, but {test} would have skipped: {reason}",
+    );
+    eprintln!("SKIP {test}: {reason}");
+    None
+}
+
+#[test]
+#[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE is not set")]
+fn a_memory_image_of_the_running_game_carries_the_ng_material() {
+    // The positive that the test above is the negative of, and the first input
+    // on which `NgKeys::extract` has ever succeeded. Measured 2026-08-30
+    // against the mapped image of `GTA5.exe` carved out of a dump of the
+    // running game: 101 of 101 expanded keys and 272 of 272 decrypt tables,
+    // each identified by the SHA-1 of its own bytes, which is why a match is
+    // its own proof and why this test can assert on the material without
+    // holding any of it.
+    //
+    // It asserts on **counts, lengths and offsets** and never on a value.
+    // DR-006, which is also why the offsets are printed and the bytes are not.
+    let test = "a_memory_image_of_the_running_game_carries_the_ng_material";
+    let Some(path) = game_image(test) else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the image is readable");
+    let material = Material::extract(&mut file, &mut Unwatched).expect("carries the material");
+    let ng = material
+        .ng()
+        .expect("a memory image carries the NG material");
+
+    for index in 0..NG_EXPANDED_KEY_COUNT {
+        assert_eq!(
+            ng.expanded_key(index).map(<[u8]>::len),
+            Some(NG_EXPANDED_KEY_LEN),
+            "expanded key {index}"
+        );
+    }
+    assert!(
+        ng.expanded_key(NG_EXPANDED_KEY_COUNT).is_none(),
+        "there is a 102nd expanded key"
+    );
+    for round in 0..NG_ROUNDS {
+        for column in 0..NG_COLUMNS {
+            assert_eq!(
+                ng.decrypt_table(round, column).map(<[u8]>::len),
+                Some(NG_DECRYPT_TABLE_LEN),
+                "decrypt table {round}/{column}"
+            );
+        }
+    }
+    assert!(ng.decrypt_table(NG_ROUNDS, 0).is_none());
+    assert!(ng.decrypt_table(0, NG_COLUMNS).is_none());
+
+    eprintln!(
+        "{}: {NG_EXPANDED_KEY_COUNT} expanded keys at {:#x}, \
+         {NG_DECRYPT_TABLE_COUNT} decrypt tables at {:#x}, \
+         aes key at {:#x}, hash lut at {:#x}",
+        path.display(),
+        ng.expanded_keys_offset(),
+        ng.decrypt_tables_offset(),
+        material.keys().aes_key_offset(),
+        material.keys().hash_lut_offset(),
+    );
+}
+
+#[test]
+#[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE is not set")]
+fn the_ng_material_never_prints_itself() {
+    // DR-006 on the type that holds 305 KB of it. The check is against the
+    // material's own rendering, so nothing here says a value: a `Debug` that
+    // leaked would put 373 values in a log line, a panic message or a `--json`
+    // payload.
+    let test = "the_ng_material_never_prints_itself";
+    let Some(path) = game_image(test) else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the image is readable");
+    let material = Material::extract(&mut file, &mut Unwatched).expect("carries the material");
+    let ng = material.ng().expect("carries the NG material");
+
+    let rendered = format!("{ng:?}");
+    for index in 0..NG_EXPANDED_KEY_COUNT {
+        let key = ng.expanded_key(index).expect("is there");
+        assert!(
+            !rendered.contains(&format!("{key:?}")),
+            "expanded key {index} is in the Debug rendering"
+        );
+    }
+    let table = ng.decrypt_table(0, 0).expect("is there");
+    assert!(
+        !rendered.contains(&format!("{table:?}")),
+        "a decrypt table is in the Debug rendering"
+    );
+    assert!(rendered.contains("expanded_keys_offset"), "{rendered}");
+
+    // And the same for the whole, which is the object a command holds.
+    let whole = format!("{material:?}");
+    assert!(
+        !whole.contains(&format!("{:?}", material.keys().aes_key())),
+        "the AES key is in the Debug rendering of the material"
+    );
+}
+
+#[test]
+#[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE is not set")]
+fn ng_material_extracted_from_an_image_reads_back_from_the_cache() {
+    // R2.4 for the half the cache gained on 2026-08-30, on the only input that
+    // produces it. A 305 KB entry has to survive the round trip value for value
+    // and in order, because the index into the expanded keys is chosen by the
+    // name and length of what is being decrypted (`docs/ng-scheme.md`) — a
+    // rotation would be well-formed and would decrypt nothing.
+    let test = "ng_material_extracted_from_an_image_reads_back_from_the_cache";
+    let Some(path) = game_image(test) else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the image is readable");
+    let source = SourceDigest::of(&mut file).expect("digests");
+    file.rewind().expect("rewinds");
+    let material = Material::extract(&mut file, &mut Unwatched).expect("carries the material");
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = Cache::at(directory.path());
+    cache.store(&source, &material).expect("stores");
+    let cached = cache.load(&source).expect("reads").expect("was stored");
+
+    let (stored, read) = (
+        material.ng().expect("carries NG material"),
+        cached.ng().expect("the entry carried it back"),
+    );
+    assert_eq!(
+        read.expanded_keys_offset(),
+        stored.expanded_keys_offset(),
+        "the position the expanded keys were found at did not survive"
+    );
+    assert_eq!(read.decrypt_tables_offset(), stored.decrypt_tables_offset());
+    for index in 0..NG_EXPANDED_KEY_COUNT {
+        assert_eq!(
+            digest(read.expanded_key(index).expect("is there")),
+            digest(stored.expanded_key(index).expect("is there")),
+            "expanded key {index} did not survive the cache"
+        );
+    }
+    for round in 0..NG_ROUNDS {
+        for column in 0..NG_COLUMNS {
+            assert_eq!(
+                digest(read.decrypt_table(round, column).expect("is there")),
+                digest(stored.decrypt_table(round, column).expect("is there")),
+                "decrypt table {round}/{column} did not survive the cache"
+            );
+        }
+    }
+    assert_eq!(cache.clear().expect("clears"), 1, "the entry stayed behind");
 }
 
 #[test]
@@ -520,19 +705,30 @@ fn material_extracted_from_an_executable_reads_back_from_the_cache() {
     };
     let bytes = fs::read(&path).expect("the executable is readable");
     let source = SourceDigest::of(&mut Cursor::new(&bytes)).expect("digests");
-    let keys =
-        Keys::extract(&mut Cursor::new(&bytes), &mut Unwatched).expect("carries the material");
+    let material =
+        Material::extract(&mut Cursor::new(&bytes), &mut Unwatched).expect("carries the material");
+    let keys = material.keys();
+    assert!(
+        material.ng().is_none(),
+        "an executable carries the NG material now; DR-040 and the negative \
+         test beside this one both need rewriting"
+    );
 
     let directory = tempfile::tempdir().expect("a temporary directory");
     let cache = Cache::at(directory.path());
     assert!(cache.load(&source).expect("reads").is_none());
-    cache.store(&source, &keys).expect("stores");
+    cache.store(&source, &material).expect("stores");
 
-    let cached = cache.load(&source).expect("reads").expect("was stored");
+    let read_back = cache.load(&source).expect("reads").expect("was stored");
+    let cached = read_back.keys();
     assert_eq!(digest(cached.aes_key()), digest(keys.aes_key()));
     assert_eq!(digest(cached.hash_lut()), digest(keys.hash_lut()));
     assert_eq!(cached.aes_key_offset(), keys.aes_key_offset());
     assert_eq!(cached.hash_lut_offset(), keys.hash_lut_offset());
+    assert!(
+        read_back.ng().is_none(),
+        "NG material appeared in the cache"
+    );
     eprintln!("GTA5.exe sha256 {}", source.hex());
 
     // The entry is addressable by the digest it was stored under, and clearing
