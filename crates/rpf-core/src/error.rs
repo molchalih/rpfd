@@ -615,6 +615,44 @@ pub enum Error {
         /// What the operation needed.
         wanted: &'static str,
     },
+
+    /// An `RBF` payload's token stream is not well formed.
+    ///
+    /// The metadata layer's failures are variants of this enum rather than of
+    /// one of their own, because §10 counts **crate** boundaries and there is
+    /// one of those. What is not flattened is the cause: it is the metadata
+    /// layer's own typed enum, so that the layer keeps its vocabulary and this
+    /// enum does not grow a variant per token.
+    #[error("malformed RBF at offset {offset}")]
+    BadRbf {
+        /// Where in the payload the stream stopped making sense.
+        offset: u64,
+        /// What was wrong with it.
+        cause: crate::metadata::rbf::Malformed,
+    },
+
+    /// An `RBF` payload is well formed and says something XML cannot carry.
+    ///
+    /// Distinct from [`Error::BadRbf`] because the caller's position is
+    /// different: those bytes are wrong, these are right and this build has no
+    /// way to render them. Every one of them is measured never to occur in a
+    /// shipped file — `docs/metadata-encodings.md` gives the count for each.
+    #[error("the RBF payload cannot be written as XML")]
+    UnrepresentableRbf {
+        /// Which thing it says.
+        cause: crate::metadata::rbf::Unrepresentable,
+    },
+
+    /// The XML handed to the metadata layer does not describe an `RBF`
+    /// document.
+    #[error("the XML at position {position} does not describe an RBF document")]
+    NotRbfXml {
+        /// Where in the XML the reader was. What a caller acts on: it is what
+        /// puts an editor's cursor on the line that has to change.
+        position: u64,
+        /// What was wrong with it.
+        cause: crate::metadata::rbf::NotRbf,
+    },
 }
 
 /// The class of a failure, which is what an exit code is derived from.
@@ -670,7 +708,8 @@ impl Error {
             Self::NeedsKey { .. } | Self::WrongKey { .. } => Category::NeedsKey,
             Self::UnsupportedVersion { .. }
             | Self::UnrecognisedExecutable { .. }
-            | Self::CannotWriteEncrypted { .. } => Category::Unsupported,
+            | Self::CannotWriteEncrypted { .. }
+            | Self::UnrepresentableRbf { .. } => Category::Unsupported,
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
@@ -680,7 +719,8 @@ impl Error {
             | Self::AlreadyExists { .. }
             | Self::Claimed { .. }
             | Self::NameCollision { .. }
-            | Self::WrongKind { .. } => Category::Refused,
+            | Self::WrongKind { .. }
+            | Self::NotRbfXml { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
             // DR-019: the bytes decide. A payload that never claimed to be an
             // archive was named one by the caller's own path.
@@ -703,7 +743,8 @@ impl Error {
             | Self::LengthMismatch { .. }
             | Self::TrailingBytes { .. }
             | Self::ChecksumMismatch { .. }
-            | Self::VerifyFailed { .. } => Category::Corrupt,
+            | Self::VerifyFailed { .. }
+            | Self::BadRbf { .. } => Category::Corrupt,
         }
     }
 
@@ -758,6 +799,9 @@ impl Error {
             Self::BadPath { .. } => "BadPath",
             Self::Overlapping { .. } => "Overlapping",
             Self::Cancelled { .. } => "Cancelled",
+            Self::BadRbf { .. } => "BadRbf",
+            Self::UnrepresentableRbf { .. } => "UnrepresentableRbf",
+            Self::NotRbfXml { .. } => "NotRbfXml",
             Self::WrongKind { .. } => "WrongKind",
         }
     }
@@ -804,7 +848,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 33;
+    const VARIANTS: usize = 36;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -893,6 +937,13 @@ mod tests {
                 checked: 27,
                 failed: 1,
             },
+            // A metadata payload's own bytes are wrong, which is the same
+            // fact one layer up: the container handed over exactly what it
+            // held and the tokens in it do not parse.
+            Error::BadRbf {
+                offset: 7,
+                cause: crate::metadata::rbf::Malformed::Truncated,
+            },
         ]
     }
 
@@ -950,6 +1001,11 @@ mod tests {
                 path: "data".to_owned(),
                 found: "directory",
                 wanted: "file",
+            },
+            // The XML is the caller's, so the caller is who acts on it.
+            Error::NotRbfXml {
+                position: 12,
+                cause: crate::metadata::rbf::NotRbf::Empty,
             },
         ]
     }
@@ -1016,6 +1072,15 @@ mod tests {
                 Category::NotFound,
             ),
             (Error::Cancelled { done: 1, total: 24 }, Category::Cancelled),
+            // Nothing is wrong with the payload; this build has no way to
+            // render it. The same shape as `UnsupportedVersion`: whoever holds
+            // it cannot act, because the missing part is here.
+            (
+                Error::UnrepresentableRbf {
+                    cause: crate::metadata::rbf::Unrepresentable::EmptyBlob,
+                },
+                Category::Unsupported,
+            ),
         ]
     }
 

@@ -4,9 +4,12 @@ A minimal, dependency-light toolchain for reading, editing and rebuilding
 RAGE Package File (`.rpf`) archives from the terminal, from an editor, or from
 an automated agent — without installing a GUI modding suite.
 
-Status: **the container works.** An archive can be listed, read, edited and
-rebuilt from the command line, including through nested archives. Metadata
-conversion, encryption and the editor client are not built yet; see the backlog.
+Status: **the container works, and the game's own loader has accepted what it
+wrote.** An archive can be listed, read, edited and rebuilt from the command
+line, including through nested archives. Encrypted archives can be **read** —
+AES and NG — but not written. An entry's encoding is recognised from its bytes,
+and `RBF` metadata converts to XML and back; `PSO` does not yet. There is a
+VS Code client, and it runs in a real editor. See the backlog.
 
 ```
 rpf info    dlc.rpf x64/vehicles.rpf   # or the archive alone
@@ -43,9 +46,11 @@ installing it is putting that file somewhere on your `PATH`. **No Rust, no
 Node, no package manager.** Every step below uses a tool the platform already
 ships.
 
-> **Read this first.** *No release has ever been produced.* There is no git
-> remote, no tag has ever been pushed, and `.github/workflows/release.yml` has
-> never been executed — nor has `ci.yml`. Each target has been compiled locally;
+> **Read this first.** *No release has ever been produced.* No tag has ever been
+> pushed and `.github/workflows/release.yml` has never been executed. `ci.yml`
+> has been triggered, and has never run a step either: every trigger fails in
+> about four seconds before a job starts, because the account it bills to cannot
+> start one. Each target has been compiled locally;
 > the musl link, the Windows link, the packaging step and the upload have run
 > nowhere. So the steps below describe **what to do with an asset that workflow
 > would produce**, named as that workflow names it. They are not a download
@@ -209,10 +214,12 @@ path, so a second change of another kind at one path is refused too, rather
 than the second quietly replacing the first — `forget` takes one change back
 out of the buffer and answers what is left, and `discard` takes all of them.
 
-**One thing about that is unverified, and it is the important one.** A rebuilt
-archive with a different entry count parses, verifies and reads back here, and
-whether the *game* accepts one has never been tested: it needs a machine running
-a RAGE title and there is not one. `docs/backlog.md` Q8, and DR-026.
+**That was the unverified half, and it is verified now.** A rebuilt archive with
+a different entry count parses, verifies and reads back here — and on 2026-08-30
+the game's own loader mounted one: an archive carrying 12 entries where its
+producer wrote 11, after a control run on the untouched file. **The entry count
+is not load-bearing**, so adding a file does not send anyone back to
+extract-change-pack. `docs/backlog.md` Q8, and DR-026.
 
 `--dry-run` on `put`, and `"dry_run": true` on the daemon's `commit`, take that
 same decision and stop before acting on it — reporting where each edit would be
@@ -363,6 +370,16 @@ RPF_GAME_EXE=/path/to/executables RPF_REQUIRE_GAME_EXE=1 cargo test --release --
 RPF_GAME_IMAGE=/path/to/image RPF_REQUIRE_GAME_IMAGE=1 cargo test --release --all
 ```
 
+`RPF_METADATA` is a fourth, and names a directory of metadata payloads already
+**out** of their archives. It is separate for the same reason again: the 391
+`RBF` files ship inside 94 encrypted archives, so reaching them from a corpus
+needs key material as well as a walk of 777,755 entries — and a machine can
+perfectly well hold an extracted dump and no game at all.
+
+```
+RPF_METADATA=/path/to/payloads RPF_REQUIRE_METADATA=1 cargo test --all
+```
+
 `fixtures/` records what each corpus archive looked like to an implementation
 that is not ours; `fixtures/README.md` explains how those are made and what
 they are worth.
@@ -373,6 +390,9 @@ they are worth.
 | `docs/approach.md` | goal, scope boundary, stack, architecture |
 | `docs/conventions.md` | how code is written; read before changing source |
 | `docs/rpf-format.md` | format facts, each marked verified or not |
+| `docs/metadata-encodings.md` | how `RBF` and `PSO` payloads are encoded once out of the archive |
+| `docs/acceptance.md` | how a rebuilt archive is shown to load, and what a pass proves |
+| `docs/ng-scheme.md` | the NG cipher, where its key material lives, which routes are open |
 | `docs/backlog.md` | research and delivery backlog |
 | `docs/corpus.md` | what archives exist to test against, and what they do not cover |
 | `docs/decisions/` | decision records |

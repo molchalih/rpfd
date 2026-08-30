@@ -22,11 +22,20 @@
 //! the two answer opposite questions — an executable carries none of that
 //! material and an image carries all of it — and a machine can easily have one
 //! and not the other. DR-040.
+//!
+//! `RPF_METADATA` is a fourth, and it is separate for the same reason once
+//! more: it names a directory of metadata payloads already **out** of their
+//! archives. Reaching them from `RPF_CORPUS` is not the same job — the 391
+//! `RBF` files ship inside 94 encrypted archives, so getting at them needs the
+//! key material `RPF_GAME_EXE` and `RPF_GAME_IMAGE` gate as well as a walk of
+//! 777,755 entries. A machine can perfectly well have an extracted dump and no
+//! game installed, and that is the machine the metadata layer is developed on.
 
 fn main() {
     gate("RPF_CORPUS", "RPF_REQUIRE_CORPUS", "no_corpus");
     gate("RPF_GAME_EXE", "RPF_REQUIRE_GAME_EXE", "no_executables");
     gate("RPF_GAME_IMAGE", "RPF_REQUIRE_GAME_IMAGE", "no_game_image");
+    gate("RPF_METADATA", "RPF_REQUIRE_METADATA", "no_metadata");
 }
 
 /// Sets `flag` unless `located` is set, or `required` says it must be there.

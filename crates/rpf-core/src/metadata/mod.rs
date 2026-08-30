@@ -15,6 +15,17 @@
 //! extensions carry what, and the answer refuted three intuitions at once: no
 //! `.meta` anywhere is `PSO`, `.ymf` and `.cut` are 55% of the `PSO` corpus,
 //! and a `.ytyp` is almost always a resource.
+//!
+//! Below this module sits what a payload *means* once recognised, one module per
+//! encoding, and `docs/metadata-encodings.md` owns those facts. Each takes and
+//! returns bytes for the same reason this module does.
+//!
+//! This layer is also the one place §7's rule does not reach. A container
+//! function takes `impl Read + Seek`; a metadata payload is a whole small
+//! document — the largest `RBF` in the corpus is 57,378 bytes — with nothing to
+//! seek within, because the token stream is read once, front to back.
+
+pub mod rbf;
 
 /// The `RBF` magic: bytes 0..3 of a tokenised binary XML file.
 ///

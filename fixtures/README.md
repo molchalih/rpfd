@@ -32,6 +32,11 @@ R0.2 and R8.4.
 | Fixture | Archive | Verified against |
 |---|---|---|
 | `rmrp_bp16_meringls63amg24.json` | `rmrp_bp16_meringls63amg24/dlc.rpf`, a FiveM vehicle add-on, unencrypted | Independently walked in Python before this fixture existed. The two readings agree on every field of all 27 file entries and all 6 directory entries — zero disagreements |
+| `rbf-metadata.json` | Every `RBF` payload in the 358 archives of both GTA V installs, extracted and classified by content | Not an oracle fixture. It is a **manifest**: a count, a byte total, the root-element and extension histograms, and one `sha256` per payload. `docs/metadata-encodings.md` is the independent reading — its root histogram was measured by a separate probe and agrees with this file's exactly |
+
+`rbf-metadata.json` is located through **`RPF_METADATA`** rather than
+`RPF_CORPUS`, because it describes payloads that are already out of their
+archives; the top-level README says why that is a separate variable.
 
 ## Interoperation
 
