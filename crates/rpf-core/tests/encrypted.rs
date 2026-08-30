@@ -50,6 +50,20 @@ const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 /// The AES-encrypted archive in the corpus, likewise.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
+/// The two builds of the Rockstar Games Launcher's own archive, which are the
+/// only archives here under the launcher key. `docs/corpus.md`.
+///
+/// Each row is the path, the entry count, the directories and the files, all
+/// measured 2026-08-30. The pair is one fixture: it is what established the
+/// block size and the absence of chaining before any key was in hand.
+const LAUNCHER_ARCHIVES: [(&str, usize, usize, usize); 2] = [
+    ("rockstar_launcher/Launcher.rpf", 118, 19, 99),
+    ("rockstar_launcher/Launcher.updated.rpf", 120, 20, 100),
+];
+
+/// The executable the launcher key comes from, inside `RPF_GAME_EXE`.
+const LAUNCHER_EXE: &str = "Launcher.exe";
+
 /// Reports a skip, naming the test, the gate that was not there, and what it
 /// would have read.
 ///
@@ -89,7 +103,8 @@ fn archive_path(test: &str, relative: &str) -> Option<PathBuf> {
 ///
 /// One pass over a 65 MB image is about five seconds at `--release` and a good
 /// deal longer unoptimised (DR-040), and every gated test below wants the same
-/// 375 values. Nothing is written anywhere: the material lives in this process
+/// material. An image carries 375 of the 376 values this pass looks for: the
+/// launcher key is in `Launcher.exe` and nowhere else (DR-042). Nothing is written anywhere: the material lives in this process
 /// and dies with it, which is what DR-006 is about.
 fn scanned() -> Result<Arc<Material>, String> {
     static HELD: std::sync::OnceLock<Result<Arc<Material>, String>> = std::sync::OnceLock::new();
@@ -181,7 +196,7 @@ fn an_encrypted_archive_with_no_material_says_it_needs_a_key() {
     for tag in [
         rpf7::ENCRYPTION_NG,
         rpf7::ENCRYPTION_AES,
-        rpf7::ENCRYPTION_UNIDENTIFIED,
+        rpf7::ENCRYPTION_AES_LAUNCHER,
     ] {
         let mut header = Vec::with_capacity(16);
         header.extend_from_slice(&Version::Rpf7.magic());
@@ -201,17 +216,38 @@ fn an_encrypted_archive_with_no_material_says_it_needs_a_key() {
 }
 
 #[test]
-fn a_tag_no_transform_is_named_for_needs_a_key_it_cannot_be_given() {
-    // `0x0FFFFFF7` is the Rockstar Games Launcher's, and `docs/rpf-format.md`
-    // records that neither transform opens it — measured against the 101 NG
-    // keys and against AES-256-ECB at one to sixteen passes in either
-    // direction. So it is `NeedsKey` whatever a cache holds, which is what
-    // `Version::scheme` answering `None` means.
-    assert_eq!(Version::Rpf7.scheme(rpf7::ENCRYPTION_UNIDENTIFIED), None);
-    assert!(!Version::Rpf7.is_open(rpf7::ENCRYPTION_UNIDENTIFIED));
-    assert!(Version::Rpf7.scheme(rpf7::ENCRYPTION_NG).is_some());
-    assert!(Version::Rpf7.scheme(rpf7::ENCRYPTION_AES).is_some());
+fn a_tag_names_a_transform_and_the_key_that_runs_it() {
+    // `0x0FFFFFF9` and `0x0FFFFFF7` are the **same** cipher under two different
+    // 32-byte keys — the tag selects a key, not an algorithm
+    // (`docs/rpf-format.md`, Encryption, `verified`; DR-042). Both are the AES
+    // scheme, and they are not the same scheme, which is the whole of the
+    // routing this build does.
+    assert_eq!(
+        Version::Rpf7.scheme(rpf7::ENCRYPTION_AES),
+        Some(crypto::Scheme::Aes(crypto::AesKey::Rage))
+    );
+    assert_eq!(
+        Version::Rpf7.scheme(rpf7::ENCRYPTION_AES_LAUNCHER),
+        Some(crypto::Scheme::Aes(crypto::AesKey::Launcher))
+    );
+    assert_eq!(
+        Version::Rpf7.scheme(rpf7::ENCRYPTION_NG),
+        Some(crypto::Scheme::Ng)
+    );
+    assert!(!Version::Rpf7.is_open(rpf7::ENCRYPTION_AES_LAUNCHER));
+
+    // A tag that means nothing here still has no transform, and an unencrypted
+    // one has none either — two situations `None` covers and `is_open` tells
+    // apart.
+    assert_eq!(Version::Rpf7.scheme(0x0FFF_FFF0), None);
     assert_eq!(Version::Rpf7.scheme(Version::Rpf7.open()), None);
+
+    // Named apart, because a caller told the key it has is the wrong one has
+    // two different things to do about it.
+    assert_ne!(
+        crypto::Scheme::Aes(crypto::AesKey::Rage).named(),
+        crypto::Scheme::Aes(crypto::AesKey::Launcher).named()
+    );
 }
 
 #[test]
@@ -350,8 +386,13 @@ fn one_pass_of_aes_opens_it_and_a_second_pass_does_not() {
     assert_eq!(crypto::AES_PASSES, 1);
 
     let unlock = held.unlock();
-    let cipher = crypto::Cipher::new(crypto::Scheme::Aes, &held.material, &held.name, 0)
-        .expect("the AES key is in every source");
+    let cipher = crypto::Cipher::new(
+        crypto::Scheme::Aes(crypto::AesKey::Rage),
+        &held.material,
+        &held.name,
+        0,
+    )
+    .expect("the AES key is in every source");
 
     // The table of contents begins immediately after the header and the block
     // is sixteen bytes, so the region and the blocks line up.
@@ -392,6 +433,185 @@ fn a_renamed_ng_archive_says_the_material_does_not_open_it() {
     assert_eq!(tag, rpf7::ENCRYPTION_NG);
     assert_eq!(scheme, "NG");
     assert_eq!(tried, 1);
+}
+
+/// The material one named executable inside `RPF_GAME_EXE` carries.
+///
+/// `Launcher.exe` is an executable in a directory of executables, read by the
+/// same scan for the same kind of value as `GTA5.exe`, so it is gated on the
+/// same variable rather than on a fourth one. What tells the two apart is the
+/// per-file skip below, which names the file that was not there — a machine
+/// with a game and no launcher skips loudly and passes. DR-042.
+fn material_of(test: &str, named: &str) -> Option<Arc<Material>> {
+    let Some(root) = env::var_os("RPF_GAME_EXE") else {
+        return skip(test, "RPF_GAME_EXE", "RPF_GAME_EXE is not set");
+    };
+    let path = Path::new(&root).join(named);
+    if !path.is_file() {
+        return skip(
+            test,
+            "RPF_GAME_EXE",
+            &format!("{} is not a file", path.display()),
+        );
+    }
+    let mut file = fs::File::open(&path).expect("the executable is readable");
+    Some(Arc::new(
+        Material::extract(&mut file, &mut Unwatched).expect("the executable carries the material"),
+    ))
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_launcher_archives_open_and_every_entry_reads_back() {
+    // R3.6 for the tag that was unidentified until 2026-08-30. Both builds,
+    // because the key holding across a repack is the claim that makes it a key
+    // rather than a coincidence, and because the pair is the corpus row.
+    let test = "the_launcher_archives_open_and_every_entry_reads_back";
+    let Some(material) = material_of(test, LAUNCHER_EXE) else {
+        return;
+    };
+    for (relative, entries, directories, files) in LAUNCHER_ARCHIVES {
+        let Some(path) = archive_path(test, relative) else {
+            return;
+        };
+        let bytes = fs::read(&path).expect("the archive is readable");
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .expect("a corpus path names a file");
+        let unlock = Unlock::held(Arc::clone(&material), name);
+        let mut source = Cursor::new(bytes);
+        let archive = Archive::open(&mut source, &unlock).expect("the launcher archive opens");
+
+        assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES_LAUNCHER);
+        assert_eq!(archive.scheme(), Some("AES-256 (launcher)"));
+        assert_eq!(archive.entries().len(), entries, "{relative}");
+
+        // Names resolve, which is the names blob having been decrypted from its
+        // own start rather than as part of the entry table — and a payload
+        // reads as itself, which no wrong key produces.
+        let index = archive
+            .find("metadata/rdr2/title.rgl")
+            .expect("a path the tree holds");
+        assert!(!archive.read(&mut source, index).expect("reads").is_empty());
+        let index = archive.find("stats.xml").expect("a path the tree holds");
+        let stats = archive.read(&mut source, index).expect("reads");
+        assert!(
+            stats.starts_with(b"<?xml version=\"1.0\" encoding=\"utf-8\"?>"),
+            "{relative}: stats.xml does not read as XML"
+        );
+
+        let checked = Verified::of(&mut source, &archive, &mut Unwatched).expect("verifies");
+        checked
+            .outcome()
+            .expect("every entry of the launcher archive reads back");
+        assert_eq!(
+            usize::try_from(checked.checked).expect("fits"),
+            files,
+            "{relative}"
+        );
+
+        let mut dirs = 0_usize;
+        let mut binaries = 0_usize;
+        for index in 0..u32::try_from(archive.entries().len()).expect("fits") {
+            match archive.entry(index).expect("an entry the table holds").kind {
+                rpf_core::EntryKind::Directory { .. } => dirs += 1,
+                rpf_core::EntryKind::Binary { .. } => binaries += 1,
+                rpf_core::EntryKind::Resource { .. } => {
+                    panic!("{relative} entry {index} is a resource")
+                }
+            }
+        }
+        assert_eq!((dirs, binaries), (directories, files), "{relative}");
+    }
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_game_install_without_the_launcher_needs_a_key_rather_than_holding_a_wrong_one() {
+    // The answer a machine with a game and no Rockstar Games Launcher gets, and
+    // the one thing about this change that is a decision rather than a
+    // measurement. The RAGE key is right there and it is not this archive's
+    // key, so `WrongKey` would be true of the material and useless as an
+    // instruction: what the holder does is install the launcher or point at its
+    // executable, which is extraction. DR-010, DR-041, DR-042.
+    let test = "a_game_install_without_the_launcher_needs_a_key_rather_than_holding_a_wrong_one";
+    let Some(material) = material_of(test, "GTA5.exe") else {
+        return;
+    };
+    let (relative, ..) = LAUNCHER_ARCHIVES[0];
+    let Some(path) = archive_path(test, relative) else {
+        return;
+    };
+    assert!(
+        material.launcher().is_none(),
+        "a game executable carries the launcher key, so this test proves nothing"
+    );
+
+    let bytes = fs::read(&path).expect("the archive is readable");
+    let unlock = Unlock::held(material, "Launcher.rpf");
+    let error = Archive::open(&mut Cursor::new(bytes), &unlock)
+        .expect_err("the RAGE key does not open a launcher archive");
+    assert!(
+        matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_AES_LAUNCHER),
+        "{error:?}"
+    );
+    assert_eq!(error.name(), "NeedsKey", "{error:?}");
+    assert_eq!(error.category(), Category::NeedsKey);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_tag_chooses_the_key_and_the_rage_key_is_not_it() {
+    // The fact the whole change rests on, checked where nothing else can check
+    // it: `Launcher.exe` carries **both** keys, so the two transforms below
+    // differ in the key alone — same cipher, same mode, same one pass. Only one
+    // of them puts the root directory marker at row 0. A build that quietly
+    // handed back the RAGE key for either tag would pass every other test here
+    // and fail this one.
+    let test = "the_tag_chooses_the_key_and_the_rage_key_is_not_it";
+    let Some(material) = material_of(test, LAUNCHER_EXE) else {
+        return;
+    };
+    let (relative, ..) = LAUNCHER_ARCHIVES[0];
+    let Some(path) = archive_path(test, relative) else {
+        return;
+    };
+    let bytes = fs::read(&path).expect("the archive is readable");
+    let header = usize::try_from(Version::Rpf7.header_len()).expect("sixteen");
+    let row = bytes
+        .get(header..header + crypto::CIPHER_BLOCK_LEN)
+        .expect("the first entry row");
+
+    let marker_of = |which| {
+        let cipher = crypto::Cipher::new(crypto::Scheme::Aes(which), &material, "Launcher.rpf", 0)
+            .expect("Launcher.exe carries both keys");
+        let mut block = <[u8; crypto::CIPHER_BLOCK_LEN]>::try_from(row).expect("a whole block");
+        cipher.apply(&mut block);
+        u32::from_le_bytes(
+            <[u8; 4]>::try_from(block.get(4..8).expect("the second word")).expect("four bytes"),
+        )
+    };
+
+    assert_eq!(
+        marker_of(crypto::AesKey::Launcher),
+        rpf7::DIRECTORY_MARKER,
+        "the launcher key does not decrypt the root directory row"
+    );
+    assert_ne!(
+        marker_of(crypto::AesKey::Rage),
+        rpf7::DIRECTORY_MARKER,
+        "the RAGE key decrypts it too, so the tag chooses nothing"
+    );
 }
 
 /// The material a game executable carries, which is the AES key and the hash
@@ -1042,7 +1262,11 @@ fn a_sub_block_tail_is_carried_through_rather_than_padded() {
         return;
     };
     assert_eq!(
-        tail_two_ways(&aes, crypto::Scheme::Aes, "_manifest.ymf"),
+        tail_two_ways(
+            &aes,
+            crypto::Scheme::Aes(crypto::AesKey::Rage),
+            "_manifest.ymf"
+        ),
         (311, 852, 886),
         "_manifest.ymf: 311 bytes on disk, a 7-byte tail"
     );
@@ -1121,9 +1345,12 @@ fn entry_zero_is_the_root_directory_in_every_archive_here() {
                 .unwrap_or_default();
             let mut file = fs::File::open(&path).expect("readable");
             let unlock = Unlock::held(Arc::clone(&material), name);
-            // The Rockstar Games Launcher's `0x0FFFFFF7` is the one tag here
-            // that no material opens, which is `docs/rpf-format.md`'s own
-            // `verified` negative rather than a gap in this walk.
+            // The Rockstar Games Launcher's `0x0FFFFFF7` is the one tag this
+            // walk does not open, and since 2026-08-30 that is a fact about the
+            // material rather than about the tag: a memory image carries the
+            // RAGE key and the NG values and **not** the launcher key, which is
+            // in `Launcher.exe` alone (DR-042). The archives it cannot open are
+            // counted and named rather than passed over.
             let Ok(archive) = Archive::open(&mut file, &unlock) else {
                 unopened += 1;
                 continue;
@@ -1135,8 +1362,8 @@ fn entry_zero_is_the_root_directory_in_every_archive_here() {
     }
 
     eprintln!(
-        "{files} files ({unopened} that no material opens), {archives} archives, \
-         {roots} with a root directory at entry 0"
+        "{files} files ({unopened} that this material does not open), {archives} \
+         archives, {roots} with a root directory at entry 0"
     );
     assert!(files >= 3, "the corpus holds fewer archives than expected");
     assert_eq!(
@@ -1327,7 +1554,7 @@ fn a_resource_payload_is_never_under_the_archives_transform() {
         // The same bytes with the transform applied, which is what would happen
         // if a resource were treated like a keyed binary entry.
         let cipher = crypto::Cipher::new(
-            crypto::Scheme::Aes,
+            crypto::Scheme::Aes(crypto::AesKey::Rage),
             &held.material,
             archive.name(index).expect("named"),
             u64::try_from(contents.len()).expect("fits"),

@@ -11,10 +11,10 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, Change, Changes, Flow, ListedKind, Step, Watch,
+    Archive, Change, Changes, Encoding, Flow, ListedKind, Step, Watch,
     keys::{
-        AES_KEY_LEN, Cache, HASH_LUT_LEN, Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN,
-        NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, SourceDigest,
+        AES_KEY_LEN, Cache, HASH_LUT_LEN, LauncherKey, Material, NG_DECRYPT_TABLE_COUNT,
+        NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, SourceDigest,
     },
 };
 use serde_json::{Value, json};
@@ -273,7 +273,8 @@ pub fn ls(
     } else {
         for row in &rows {
             let (kind, len) = named(row);
-            println!("{kind:<9} {len:>12}  {}", row.path);
+            let encoding = encoding_named(row).unwrap_or("-");
+            println!("{kind:<9} {encoding:<4} {len:>12}  {}", row.path);
         }
     }
     Ok(())
@@ -286,7 +287,7 @@ pub fn ls(
 /// frontends drift apart (§1).
 pub fn listing_row(listed: &rpf_core::Listed) -> Value {
     let (kind, len) = named(listed);
-    json!({ "path": listed.path, "kind": kind, "len": len })
+    json!({ "path": listed.path, "kind": kind, "len": len, "encoding": encoding_named(listed) })
 }
 
 /// What a listed entry is called, and the one number reported beside it.
@@ -296,9 +297,33 @@ pub fn listing_row(listed: &rpf_core::Listed) -> Value {
 fn named(listed: &rpf_core::Listed) -> (&'static str, u64) {
     match listed.kind {
         ListedKind::Directory { children } => ("directory", u64::from(children)),
-        ListedKind::Binary { len } => ("binary", len),
+        ListedKind::Binary { len, .. } => ("binary", len),
         ListedKind::Resource { len } => ("resource", len),
     }
+}
+
+/// What a listed entry's payload announces itself to be, in the one spelling
+/// both frontends report it in. R3.7.
+///
+/// `None` — `null` on the wire — for a directory, for a resource, and for a
+/// binary entry nothing recognised. **A resource is `null` because its payload
+/// is not read**, not because it holds nothing: `docs/backlog.md` Q7. Its
+/// `"kind"` is where a caller reads that it is one, which is a field it has
+/// always had and a source no payload can contradict.
+///
+/// Adding this field is a contract addition, and DR-032 makes field names part
+/// of the contract: `"encoding"` is now one, and its values are `"xml"`,
+/// `"text"`, `"rbf"`, `"pso"` and `null`.
+fn encoding_named(listed: &rpf_core::Listed) -> Option<&'static str> {
+    let ListedKind::Binary { encoding, .. } = listed.kind else {
+        return None;
+    };
+    Some(match encoding? {
+        Encoding::Xml => "xml",
+        Encoding::Text => "text",
+        Encoding::Rbf => "rbf",
+        Encoding::Pso => "pso",
+    })
 }
 
 /// `cat` — one entry's contents on standard output.
@@ -1530,6 +1555,12 @@ pub struct KeysFound {
     pub aes_key_at: u64,
     /// Where the NG hash lookup table sits in the executable.
     pub hash_lut_at: u64,
+    /// Where the launcher's own AES key sits, where the source carried it.
+    ///
+    /// `None` for every game executable and every memory image of one: it is in
+    /// `Launcher.exe` and nothing else measured here. An offset, never a key —
+    /// which is what makes it safe for this struct to hold. DR-020, DR-042.
+    pub launcher_key_at: Option<u64>,
     /// The NG material, where the source carried it.
     ///
     /// `None` for every game executable measured, and `Some` for a memory image
@@ -1645,6 +1676,7 @@ fn found(
         from,
         aes_key_at: keys.aes_key_offset(),
         hash_lut_at: keys.hash_lut_offset(),
+        launcher_key_at: material.launcher().map(LauncherKey::offset),
         ng: material.ng().map(|ng| NgFound {
             expanded_keys: NG_EXPANDED_KEY_COUNT,
             expanded_keys_at: ng.expanded_keys_offset(),
@@ -1737,6 +1769,13 @@ pub fn keys_extract(executable: &Path, cache: Option<&Path>, json_out: bool) -> 
             "hash lut    {HASH_LUT_LEN} bytes at {:#x}",
             found.hash_lut_at
         );
+        // Only where the source carries it, and there is no line for its
+        // absence: an executable that does not hold it is every executable but
+        // one, so a line saying so would be printed almost always and read
+        // never. The NG line is the other way round, which is why it has one.
+        if let Some(at) = found.launcher_key_at {
+            println!("launcher    {AES_KEY_LEN} bytes at {at:#x}");
+        }
         match found.ng {
             Some(ng) => {
                 println!(
@@ -1842,14 +1881,19 @@ pub fn keys_report(found: &KeysFound) -> Value {
 
 /// The values an extraction found, each as a name, a length and a position.
 ///
-/// The NG rows are present only when the source carried them, so a consumer
-/// reads the list rather than assuming a fixed length — and `ng` beside it
-/// answers the same question without one.
+/// The NG rows and the launcher key are present only when the source carried
+/// them, so a consumer reads the list rather than assuming a fixed length — and
+/// `ng` beside it answers the same question about the 373 without one. The
+/// launcher key gets no such flag: it is one row, and a consumer that reads the
+/// list at all has already answered it. DR-042.
 fn values_found(found: &KeysFound) -> Value {
     let mut values = vec![
         json!({ "name": "aes_key", "len": AES_KEY_LEN, "at": found.aes_key_at }),
         json!({ "name": "hash_lut", "len": HASH_LUT_LEN, "at": found.hash_lut_at }),
     ];
+    if let Some(at) = found.launcher_key_at {
+        values.push(json!({ "name": "launcher_aes_key", "len": AES_KEY_LEN, "at": at }));
+    }
     if let Some(ng) = found.ng {
         values.push(json!({
             "name": "ng_expanded_keys",
@@ -1959,6 +2003,7 @@ mod tests {
             from: FROM_CACHE,
             aes_key_at: 0x01E3_4C98,
             hash_lut_at: 0x01E3_4CC0,
+            launcher_key_at: None,
             ng: None,
             cache: Some(std::path::PathBuf::from("/config/rpf")),
         };
@@ -2006,6 +2051,7 @@ mod tests {
             from: FROM_EXECUTABLE,
             aes_key_at: 0x01E3_7E98,
             hash_lut_at: 0x01B7_E4C0,
+            launcher_key_at: None,
             ng: Some(NgFound {
                 expanded_keys: NG_EXPANDED_KEY_COUNT,
                 expanded_keys_at: 0x01E3_3120,
@@ -2115,6 +2161,67 @@ mod tests {
     }
 
     #[test]
+    fn an_extraction_that_found_the_launcher_key_reports_one_more_offset() {
+        // The third half of the field-set check above, on the shape only
+        // `Launcher.exe` produces. What is added is one row of the same three
+        // fields every other row has — a name, a length and a position — and no
+        // top-level field at all, so a client that knows this payload already
+        // knows this one. DR-020, DR-042.
+        let found = KeysFound {
+            executable: std::path::PathBuf::from("/launcher/Launcher.exe"),
+            source: "0".repeat(64),
+            from: FROM_EXECUTABLE,
+            aes_key_at: 0x005E_DDA0,
+            hash_lut_at: 0x0048_F3A0,
+            launcher_key_at: Some(0x005E_E3F0),
+            ng: None,
+            cache: None,
+        };
+
+        let reported = keys_report(&found);
+        let mut fields: Vec<&str> = reported
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["cache", "executable", "from", "ng", "sha256", "values"],
+            "the launcher key added a top-level field"
+        );
+        assert_eq!(reported["ng"], json!(false), "NG material claimed");
+
+        let values = reported["values"].as_array().unwrap();
+        assert_eq!(values.len(), 3, "{reported}");
+        assert_eq!(values[2]["name"], json!("launcher_aes_key"));
+        assert_eq!(values[2]["len"], json!(32), "an AES-256 key is 32 bytes");
+        assert_eq!(values[2]["at"], json!(0x005E_E3F0));
+        let mut inner: Vec<&str> = values[2]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        inner.sort_unstable();
+        assert_eq!(inner, ["at", "len", "name"], "{}", values[2]);
+
+        // A source without it says nothing about it rather than saying it is
+        // absent: that is every executable but one.
+        let without = KeysFound {
+            launcher_key_at: None,
+            ..found
+        };
+        let reported = keys_report(&without);
+        assert_eq!(
+            reported["values"].as_array().unwrap().len(),
+            2,
+            "{reported}"
+        );
+    }
+
+    #[test]
     fn a_machine_with_no_configuration_directory_reports_no_cache() {
         // `Cache::platform` answers `None` where the environment does not say
         // where a configuration directory is, and that is a complete answer
@@ -2125,6 +2232,7 @@ mod tests {
             from: FROM_CACHE,
             aes_key_at: 1,
             hash_lut_at: 2,
+            launcher_key_at: None,
             ng: None,
             cache: None,
         };

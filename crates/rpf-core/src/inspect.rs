@@ -23,6 +23,7 @@ use crate::{
     error::{Error, Result},
     format::resource::resource_len,
     manifest::{Checksum, Manifest},
+    metadata::Encoding,
     watch::{Flow, Step, Watch},
 };
 
@@ -47,6 +48,12 @@ pub struct Listed {
 /// Three variants rather than one struct with a nullable field, because the
 /// number is a child count for one of them and a byte count for the others
 /// (§5).
+///
+/// **Only [`ListedKind::Binary`] carries an encoding, and only it can.** A
+/// resource's payload is never read — `docs/backlog.md` Q7 — so a listing
+/// cannot claim one for it even by mistake, which a nullable field beside the
+/// kind would have allowed. [`crate::Classification`] is the same shape one level
+/// down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListedKind {
     /// A directory, and how many children it holds.
@@ -54,12 +61,16 @@ pub enum ListedKind {
         /// Entries directly inside it.
         children: u32,
     },
-    /// Plain bytes, and how many of them the file is.
+    /// Plain bytes, how many of them the file is, and what those bytes
+    /// announce themselves to be.
     Binary {
         /// The contents' length, which is what the file is outside the
         /// archive. Either storage choice changes what sits on disk, not what
         /// the file is.
         len: u64,
+        /// What the first [`Encoding::HEAD_LEN`] bytes name, or `None` for
+        /// R3.7's unknown binary. [`Archive::classify`].
+        encoding: Option<Encoding>,
     },
     /// A resource, and the length its page flags describe.
     Resource {
@@ -103,7 +114,11 @@ impl Listed {
 
     /// One row: what an entry is, and where it is from the path that was
     /// listed.
-    fn of(archive: &Archive, index: u32, path: &str) -> Result<Self> {
+    ///
+    /// A binary entry costs [`Encoding::HEAD_LEN`] bytes of its contents here,
+    /// which is what makes a row say `xml` rather than `binary` (R3.7). It is
+    /// sixteen bytes and never the payload: DR-031.
+    fn of<R: Read + Seek>(src: &mut R, archive: &Archive, index: u32, path: &str) -> Result<Self> {
         let kind = match archive.entry(index)?.kind {
             EntryKind::Directory { child_count, .. } => ListedKind::Directory {
                 children: child_count,
@@ -112,6 +127,7 @@ impl Listed {
                 uncompressed_len, ..
             } => ListedKind::Binary {
                 len: u64::from(uncompressed_len),
+                encoding: archive.classify(src, index)?.encoding(),
             },
             // A resource entry carries no uncompressed size; its length is the
             // two flag words decoded. `docs/rpf-format.md`, Resource page
@@ -150,13 +166,13 @@ fn list_into<R: Read + Seek>(
         if let Nested::Open(nested) = archive.nested_at(src, at)? {
             return list_into(src, &nested, 0, prefix, recursive, rows);
         }
-        rows.push(Listed::of(archive, at, prefix)?);
+        rows.push(Listed::of(src, archive, at, prefix)?);
         return Ok(());
     };
 
     for index in children {
         let path = joined(prefix, archive.name(index)?);
-        rows.push(Listed::of(archive, index, &path)?);
+        rows.push(Listed::of(src, archive, index, &path)?);
 
         if !recursive {
             continue;
@@ -657,7 +673,7 @@ fn joined(prefix: &str, name: &str) -> String {
 mod tests {
     use std::io::{Cursor, Write as _};
 
-    use super::{Listed, ListedKind};
+    use super::{Encoding, Listed, ListedKind};
     use crate::{
         archive::Archive,
         build::{FileKind, FileSpec, Storage, build},
@@ -735,11 +751,20 @@ mod tests {
         // its length: two different facts under one field, which is why they
         // are two variants rather than one nullable number.
         assert_eq!(named("data"), ListedKind::Directory { children: 1 });
-        assert_eq!(named("data/greeting.txt"), ListedKind::Binary { len: 11 });
+        assert_eq!(
+            named("data/greeting.txt"),
+            ListedKind::Binary {
+                len: 11,
+                encoding: Some(Encoding::Text)
+            }
+        );
 
         // The one that cannot be read off the entry row: a resource carries no
         // uncompressed size, so its length is the two flag words decoded.
         // `docs/rpf-format.md`, Resource page flags, `verified`.
+        //
+        // And it carries no encoding, though this payload does begin `RSC7`:
+        // the variant has nowhere to put one. R3.7, DR-044.
         assert_eq!(named("art.yft"), ListedKind::Resource { len: 512 });
     }
 

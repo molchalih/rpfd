@@ -19,8 +19,8 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    AES_KEY_LEN, HASH_LUT_LEN, Keys, Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN,
-    NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
+    AES_KEY_LEN, HASH_LUT_LEN, Keys, LauncherKey, Material, NG_DECRYPT_TABLE_COUNT,
+    NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
 };
 use crate::error::{Error, Result};
 
@@ -57,6 +57,15 @@ const MAGIC: [u8; 8] = *b"RPFKEYS\0";
 /// Raised to 2 on 2026-08-30, when an entry gained the NG material it may now
 /// carry. An entry this build cannot read is a miss and the next extraction
 /// overwrites it, so nothing migrates. DR-040.
+///
+/// **Not raised again** when an entry gained the launcher key later the same
+/// day, and that is a decision rather than an omission: the new half is
+/// appended in a shape the length already tells apart, so an entry written
+/// before it reads back as exactly what it holds — material with no launcher
+/// key, which is the truth about every source but one. Raising it would have
+/// discarded every entry on every machine, including a memory image that costs
+/// a minute to scan, to add a value only `Launcher.exe` has ever carried and
+/// which no existing entry could hold. DR-042.
 const SCHEMA: u32 = 2;
 
 /// Offset of the payload within a cache file.
@@ -73,13 +82,41 @@ const NG_LEN: usize = NG_EXPANDED_KEY_COUNT
     .saturating_add(NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN))
     .saturating_add(16);
 
+/// How much longer an entry is when it also holds the launcher's own AES key:
+/// the key, and the offset it was at.
+const LAUNCHER_LEN: usize = AES_KEY_LEN.saturating_add(8);
+
+/// The payload length of an entry that holds the launcher key and no NG
+/// material, which is what `Launcher.exe` produces.
+const WITH_LAUNCHER_LEN: usize = BASE_LEN.saturating_add(LAUNCHER_LEN);
+
 /// The payload length of an entry that also holds the NG material.
 ///
-/// The **length is the discriminator**: an entry is one of exactly two shapes,
-/// and a declared length that is neither is not an entry this build wrote. That
-/// is one fact deciding one thing, rather than a flag byte that could disagree
-/// with the bytes after it (`docs/conventions.md` §5).
+/// The **length is the discriminator**: an entry is one of exactly four shapes
+/// — the two halves are each present or not — and a declared length that is
+/// none of them is not an entry this build wrote. That is one fact deciding one
+/// thing, rather than a flag byte that could disagree with the bytes after it
+/// (`docs/conventions.md` §5). The four are distinct because the two optional
+/// halves are 40 and 306,016 bytes.
 const WITH_NG_LEN: usize = BASE_LEN.saturating_add(NG_LEN);
+
+/// The payload length of an entry holding both optional halves.
+const WITH_BOTH_LEN: usize = WITH_NG_LEN.saturating_add(LAUNCHER_LEN);
+
+/// Which optional halves an entry of this declared payload length carries, or
+/// `None` when no entry this build writes is that long.
+///
+/// One reader of the four lengths, so `encode` and `decode` cannot come to
+/// disagree about what a shape is (`docs/conventions.md` §3).
+const fn shape(len: usize) -> Option<(bool, bool)> {
+    match len {
+        BASE_LEN => Some((false, false)),
+        WITH_LAUNCHER_LEN => Some((true, false)),
+        WITH_NG_LEN => Some((false, true)),
+        WITH_BOTH_LEN => Some((true, true)),
+        _ => None,
+    }
+}
 
 /// The SHA-256 of a game executable, which is what a cache entry is keyed by.
 ///
@@ -466,11 +503,15 @@ fn create_private(path: &Path) -> Result<fs::File> {
 /// The bytes of a cache file holding this material.
 fn encode(material: &Material) -> Vec<u8> {
     let keys = material.keys();
-    let mut payload = Vec::with_capacity(WITH_NG_LEN);
+    let mut payload = Vec::with_capacity(WITH_BOTH_LEN);
     payload.extend_from_slice(keys.aes_key());
     payload.extend_from_slice(keys.hash_lut());
     payload.extend_from_slice(&keys.aes_key_offset().to_le_bytes());
     payload.extend_from_slice(&keys.hash_lut_offset().to_le_bytes());
+    if let Some(launcher) = material.launcher() {
+        payload.extend_from_slice(launcher.key());
+        payload.extend_from_slice(&launcher.offset().to_le_bytes());
+    }
     if let Some(ng) = material.ng() {
         payload.extend_from_slice(ng.expanded_bytes());
         payload.extend_from_slice(ng.table_bytes());
@@ -492,8 +533,8 @@ fn encode(material: &Material) -> Vec<u8> {
 
 /// The material in a cache file, or `None` if it is not one this build wrote.
 ///
-/// The declared payload length says which of the two shapes the entry is, and
-/// any other length is not one of ours. See [`WITH_NG_LEN`].
+/// The declared payload length says which of the four shapes the entry is, and
+/// any other length is not one of ours. See [`shape`].
 fn decode(bytes: &[u8]) -> Option<Material> {
     if bytes.get(..MAGIC.len())? != MAGIC {
         return None;
@@ -502,9 +543,7 @@ fn decode(bytes: &[u8]) -> Option<Material> {
         return None;
     }
     let len = usize::try_from(u32::from_le_bytes(word(bytes, 12)?)).ok()?;
-    if len != BASE_LEN && len != WITH_NG_LEN {
-        return None;
-    }
+    let (has_launcher, has_ng) = shape(len)?;
     let checksum = bytes.get(16..PAYLOAD_AT)?;
     let payload = bytes.get(PAYLOAD_AT..PAYLOAD_AT.checked_add(len)?)?;
     if Sha256::digest(payload).as_slice() != checksum {
@@ -523,26 +562,50 @@ fn decode(bytes: &[u8]) -> Option<Material> {
         lut,
         lut_at,
     };
-    let ng = if len == WITH_NG_LEN {
-        Some(decode_ng(payload)?)
+    // In the order the payload lays them out, so each bound is read against the
+    // one before it.
+    let launcher = if has_launcher {
+        Some(decode_launcher(payload)?)
     } else {
         None
     };
-    Some(Material::restored(keys, ng))
+    let ng_at = if has_launcher {
+        BASE_LEN.checked_add(LAUNCHER_LEN)?
+    } else {
+        BASE_LEN
+    };
+    let ng = if has_ng {
+        Some(decode_ng(payload, ng_at)?)
+    } else {
+        None
+    };
+    Some(Material::restored(keys, ng, launcher))
 }
 
-/// The NG half of a payload that declared itself long enough to hold one.
+/// The launcher key of a payload that declared itself long enough to hold one.
+fn decode_launcher(payload: &[u8]) -> Option<LauncherKey> {
+    let key_end = BASE_LEN.checked_add(AES_KEY_LEN)?;
+    let key: [u8; AES_KEY_LEN] = payload.get(BASE_LEN..key_end)?.try_into().ok()?;
+    Some(LauncherKey::restored(
+        key,
+        u64::from_le_bytes(long(payload, key_end)?),
+    ))
+}
+
+/// The NG half of a payload that declared itself long enough to hold one,
+/// beginning at `starts_at` — which is past the launcher key where the entry
+/// carries one.
 ///
 /// The three bounds are declared in the order the payload lays them out —
 /// expanded keys, decrypt tables, then the two offsets — so that a reader can
 /// check each against the one before it.
-fn decode_ng(payload: &[u8]) -> Option<NgKeys> {
+fn decode_ng(payload: &[u8], starts_at: usize) -> Option<NgKeys> {
     let tables_start =
-        BASE_LEN.checked_add(NG_EXPANDED_KEY_COUNT.checked_mul(NG_EXPANDED_KEY_LEN)?)?;
+        starts_at.checked_add(NG_EXPANDED_KEY_COUNT.checked_mul(NG_EXPANDED_KEY_LEN)?)?;
     let offsets_start =
         tables_start.checked_add(NG_DECRYPT_TABLE_COUNT.checked_mul(NG_DECRYPT_TABLE_LEN)?)?;
 
-    let expanded = payload.get(BASE_LEN..tables_start)?.to_vec();
+    let expanded = payload.get(starts_at..tables_start)?.to_vec();
     let tables = payload.get(tables_start..offsets_start)?.to_vec();
     let expanded_at = u64::from_le_bytes(long(payload, offsets_start)?);
     let tables_at = u64::from_le_bytes(long(payload, offsets_start.checked_add(8)?)?);
@@ -641,11 +704,12 @@ mod tests {
 
     use super::{
         APPLICATION, BASE_LEN, Cache, Environment, KEYS, MAGIC, PAYLOAD_AT, Platform, SUFFIX,
-        SourceDigest, TEMPORARY, WITH_NG_LEN, decode, encode, root, xdg_absolute,
+        SourceDigest, TEMPORARY, WITH_BOTH_LEN, WITH_LAUNCHER_LEN, WITH_NG_LEN, decode, encode,
+        root, xdg_absolute,
     };
     use crate::keys::{
-        AES_KEY_LEN, HASH_LUT_LEN, Keys, Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN,
-        NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
+        AES_KEY_LEN, HASH_LUT_LEN, Keys, LauncherKey, Material, NG_DECRYPT_TABLE_COUNT,
+        NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
     };
 
     /// Material that is not key material: fixed byte patterns and offsets,
@@ -659,9 +723,22 @@ mod tests {
         }
     }
 
-    /// An entry of the shape every source produces: no NG material.
+    /// An entry of the shape every source produces: no NG material and no
+    /// launcher key.
     fn material() -> Material {
-        Material::restored(keys_at(0x1234_5678), None)
+        Material::restored(keys_at(0x1234_5678), None, None)
+    }
+
+    /// The shape only the launcher's own executable produces.
+    ///
+    /// A byte pattern rather than anything extracted, for the reason
+    /// [`material_with_ng`] gives.
+    fn material_with_launcher() -> Material {
+        Material::restored(
+            keys_at(0x1234_5678),
+            None,
+            Some(LauncherKey::restored([0x55; AES_KEY_LEN], 0x005E_E3F0)),
+        )
     }
 
     /// An entry of the other shape, which only a memory image produces.
@@ -674,7 +751,25 @@ mod tests {
         let tables = vec![0x44; NG_DECRYPT_TABLE_COUNT * NG_DECRYPT_TABLE_LEN];
         let ng = NgKeys::restored(expanded, tables, 0x01E3_3120, 0x01E8_6CE0)
             .expect("the lengths are the ones the type promises");
-        Material::restored(keys_at(0x1234_5678), Some(ng))
+        Material::restored(keys_at(0x1234_5678), Some(ng), None)
+    }
+
+    /// The shape a source carrying both halves would produce.
+    ///
+    /// No source measured here carries both — the NG material is in a memory
+    /// image of a game and the launcher key is in `Launcher.exe` — but the file
+    /// format has to hold either half without the other, and a shape that is
+    /// only reachable by writing it is exactly the one that rots.
+    fn material_with_both() -> Material {
+        let expanded = vec![0x33; NG_EXPANDED_KEY_COUNT * NG_EXPANDED_KEY_LEN];
+        let tables = vec![0x44; NG_DECRYPT_TABLE_COUNT * NG_DECRYPT_TABLE_LEN];
+        let ng = NgKeys::restored(expanded, tables, 0x01E3_3120, 0x01E8_6CE0)
+            .expect("the lengths are the ones the type promises");
+        Material::restored(
+            keys_at(0x1234_5678),
+            Some(ng),
+            Some(LauncherKey::restored([0x55; AES_KEY_LEN], 0x005E_E3F0)),
+        )
     }
 
     fn digest_of(bytes: &[u8]) -> SourceDigest {
@@ -714,7 +809,59 @@ mod tests {
             expected.keys().hash_lut_offset()
         );
         assert!(read.ng().is_none(), "NG material appeared from nowhere");
+        assert!(
+            read.launcher().is_none(),
+            "a launcher key appeared from nowhere"
+        );
     }
+
+    #[test]
+    fn the_launcher_key_survives_the_file_format_and_keeps_its_position() {
+        // The half the cache gained on 2026-08-30 beside the NG one, and the
+        // one an entry written before either still reads back without: the
+        // shapes are told apart by length, so nothing migrates and nothing
+        // silently acquires a key it never had. DR-042.
+        let written = encode(&material_with_launcher());
+        let read = decode(&written).expect("a file this build wrote reads back");
+        let source = material_with_launcher();
+        let (read_key, source_key) = (
+            read.launcher().expect("the entry carried a launcher key"),
+            source.launcher().expect("as written"),
+        );
+        assert_eq!(read_key.key(), source_key.key());
+        assert_eq!(read_key.offset(), source_key.offset());
+        assert_eq!(read.keys().aes_key(), source.keys().aes_key());
+        assert!(read.ng().is_none(), "NG material appeared from nowhere");
+    }
+
+    #[test]
+    fn an_entry_holding_both_halves_reads_both_back_in_order() {
+        // The launcher key sits between the base and the NG material, so
+        // reading the second is only right if the first was measured rather
+        // than assumed absent.
+        let written = encode(&material_with_both());
+        let read = decode(&written).expect("a file this build wrote reads back");
+        let source = material_with_both();
+        assert_eq!(
+            read.launcher().expect("carried").offset(),
+            source.launcher().expect("as written").offset()
+        );
+        let read_ng = read.ng().expect("the entry carried NG material");
+        let source_ng = source.ng().expect("as written");
+        assert_eq!(
+            read_ng.expanded_keys_offset(),
+            source_ng.expanded_keys_offset()
+        );
+        assert_eq!(read_ng.expanded_key(0), source_ng.expanded_key(0));
+        assert_eq!(
+            read_ng.decrypt_table(NG_ROUNDS_LAST, 0),
+            source_ng.decrypt_table(NG_ROUNDS_LAST, 0)
+        );
+    }
+
+    /// The last round the NG material is indexed by, so the test above reaches
+    /// the far end of the payload rather than only its start.
+    const NG_ROUNDS_LAST: usize = crate::keys::NG_ROUNDS - 1;
 
     #[test]
     fn the_ng_material_survives_the_file_format_and_keeps_its_positions() {
@@ -759,14 +906,27 @@ mod tests {
     }
 
     #[test]
-    fn the_two_shapes_of_an_entry_are_told_apart_by_their_declared_length() {
+    fn the_four_shapes_of_an_entry_are_told_apart_by_their_declared_length() {
         // §5: the length is the discriminator, so there is no flag that could
-        // disagree with the bytes after it. A length that is neither shape is
-        // not an entry this build wrote, and a payload that claims the longer
+        // disagree with the bytes after it. A length that is no shape at all is
+        // not an entry this build wrote, and a payload that claims a longer
         // shape without carrying it is a miss rather than a short read.
         assert_eq!(encode(&material()).len(), PAYLOAD_AT + BASE_LEN);
         assert_eq!(encode(&material_with_ng()).len(), PAYLOAD_AT + WITH_NG_LEN);
-        assert_ne!(BASE_LEN, WITH_NG_LEN);
+        assert_eq!(
+            encode(&material_with_launcher()).len(),
+            PAYLOAD_AT + WITH_LAUNCHER_LEN
+        );
+        assert_eq!(
+            encode(&material_with_both()).len(),
+            PAYLOAD_AT + WITH_BOTH_LEN
+        );
+        let lengths = [BASE_LEN, WITH_LAUNCHER_LEN, WITH_NG_LEN, WITH_BOTH_LEN];
+        for (index, len) in lengths.iter().enumerate() {
+            for other in lengths.iter().skip(index + 1) {
+                assert_ne!(len, other, "two shapes share a length");
+            }
+        }
 
         let mut lying = encode(&material());
         lying[12..16].copy_from_slice(
@@ -837,7 +997,7 @@ mod tests {
         let source = digest_of(b"an executable");
 
         cache.store(&source, &material()).unwrap();
-        let moved = Material::restored(keys_at(0x9999), None);
+        let moved = Material::restored(keys_at(0x9999), None, None);
         cache.store(&source, &moved).unwrap();
 
         let files: Vec<_> = std::fs::read_dir(directory.path())

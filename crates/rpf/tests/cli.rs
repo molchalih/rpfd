@@ -518,6 +518,52 @@ fn an_empty_directory_survives_extract_and_pack() {
     assert!(listing.contains("x64/empty"), "listing was: {listing}");
 }
 
+/// R3.7 on the command line: a listing says what an entry's payload announces
+/// itself to be, and says nothing where nothing announced anything.
+///
+/// The text entry is **deflated**, so a classifier reading the payload where it
+/// sits on disk would answer `-` for it; the stored one is 300 bytes of `0x07`,
+/// which is text in no window. Neither is decided by an extension: `.txt` and
+/// `.bin` are read past.
+#[test]
+fn a_listing_says_what_each_payload_announces_itself_to_be() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let at = archive.display().to_string();
+
+    let (code, out) = run(&["--json", "ls", &at, "", "-R"]);
+    assert_eq!(code, 0);
+    let rows: serde_json::Value = serde_json::from_slice(&out).expect("--json ls answers an array");
+    let row = |path: &str| {
+        rows.as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["path"] == serde_json::json!(path))
+            .unwrap_or_else(|| panic!("{path} is not in {rows}"))
+            .clone()
+    };
+    assert_eq!(
+        row("data/greeting.txt")["encoding"],
+        serde_json::json!("text")
+    );
+    assert_eq!(row("stored.bin")["encoding"], serde_json::Value::Null);
+    assert_eq!(row("data")["encoding"], serde_json::Value::Null);
+    assert_eq!(
+        row("data/greeting.txt")["kind"],
+        serde_json::json!("binary"),
+        "the kind a caller has always matched on is unchanged"
+    );
+
+    // And the human listing carries the same word, with `-` where the JSON
+    // carries null.
+    let (code, listing) = run(&["ls", "-R", &at]);
+    assert_eq!(code, 0);
+    let listing = String::from_utf8_lossy(&listing);
+    assert!(listing.contains("binary    text"), "listing was: {listing}");
+    assert!(listing.contains("binary    -"), "listing was: {listing}");
+}
+
 #[test]
 fn packing_says_which_file_is_missing() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1792,6 +1838,75 @@ fn a_game_executable_reports_offsets_and_never_a_key() {
 }
 
 #[test]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn the_launcher_executable_reports_one_more_offset_and_never_that_key() {
+    // The same end-to-end check as the test above, on the value this build
+    // added: the key is read in this process and what the binary printed is
+    // searched for it in every encoding an output path could have used. A
+    // second key is a second way to lose one. DR-006, DR-020, DR-042.
+    let test = "the_launcher_executable_reports_one_more_offset_and_never_that_key";
+    let Some(path) = executable(test, "Launcher.exe") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the executable is readable");
+    let material = rpf_core::keys::Material::extract(&mut file, &mut rpf_core::Unwatched)
+        .expect("carries the material");
+    let launcher = material.launcher().expect("carries the launcher key");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let at = dir.path().join("cache").display().to_string();
+    let source = path.display().to_string();
+    let (code, out) = run(&["--json", "keys", "extract", &source, "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let reported: serde_json::Value = serde_json::from_slice(&out).expect("json");
+
+    let values = reported["values"].as_array().expect("an array");
+    assert_eq!(values.len(), 3, "{reported}");
+    assert_eq!(values[2]["name"], serde_json::json!("launcher_aes_key"));
+    assert_eq!(
+        values[2]["at"],
+        serde_json::json!(launcher.offset()),
+        "{reported}"
+    );
+
+    let (_, printed) = run_output(&["--json", "keys", "extract", &source, "--cache-dir", &at]);
+    for value in [
+        launcher.key().as_slice(),
+        material.keys().aes_key().as_slice(),
+    ] {
+        assert!(!holds(&printed, value), "key material was printed raw");
+        assert!(
+            !holds(&printed, hex(value).as_bytes()),
+            "key material was printed as hexadecimal"
+        );
+        assert!(
+            !holds(&printed, hex(value).to_uppercase().as_bytes()),
+            "key material was printed as hexadecimal"
+        );
+        assert!(
+            !holds(&printed, BASE64.encode(value).as_bytes()),
+            "key material was printed as base64"
+        );
+    }
+
+    // And the human output, which is a second rendering of the same object and
+    // therefore a second place to lose it.
+    let (_, human) = run_output(&["keys", "extract", &source, "--cache-dir", &at]);
+    assert!(
+        holds(&human, format!("{:#x}", launcher.offset()).as_bytes()),
+        "the offset is not reported"
+    );
+    for value in [
+        launcher.key().as_slice(),
+        material.keys().aes_key().as_slice(),
+    ] {
+        assert!(!holds(&human, value));
+        assert!(!holds(&human, hex(value).as_bytes()));
+        assert!(!holds(&human, BASE64.encode(value).as_bytes()));
+    }
+}
+
+#[test]
 #[cfg(unix)]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn a_cache_directory_that_cannot_be_created_fails_the_extraction_that_needed_it() {
@@ -2390,6 +2505,10 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
 /// it. `docs/corpus.md`.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
+/// The Rockstar Games Launcher's own archive, likewise: the only kind here
+/// under the launcher key rather than the RAGE one.
+const LAUNCHER_ARCHIVE: &str = "rockstar_launcher/Launcher.rpf";
+
 /// One corpus archive by its fixed relative path.
 ///
 /// It reports its own skip rather than borrowing [`skip`]'s: the two gates name
@@ -2488,6 +2607,52 @@ fn no_command_writes_into_an_encrypted_archive() {
     // "Refused" and "did not write" are different claims. R4.2 leaves the
     // archive as it was, and so does a refusal before any of it runs.
     assert_eq!(fs::read(&copy).expect("readable"), before);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_launcher_archive_opens_once_the_launcher_key_is_extracted() {
+    // The whole chain the library tests cover in pieces: an executable is
+    // scanned, its material reaches a cache file, and an archive under a key no
+    // game carries opens because of it. And the other half, which is the answer
+    // a machine with a game install and no launcher gets: a game executable's
+    // material is real, complete, and not this archive's key, and the exit code
+    // says to go and extract rather than that the archive is broken. DR-042.
+    let test = "the_launcher_archive_opens_once_the_launcher_key_is_extracted";
+    let Some(archive) = corpus(test, LAUNCHER_ARCHIVE) else {
+        return;
+    };
+    let Some(launcher) = executable(test, "Launcher.exe") else {
+        return;
+    };
+    let Some(game) = executable(test, "GTA5.exe") else {
+        return;
+    };
+    let at = archive.display().to_string();
+
+    // A game install and no launcher: exit 5, and it names extraction.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let without = dir.path().join("game-only");
+    fs::create_dir_all(&without).expect("home");
+    let (code, message) =
+        run_err_homed(&without, &["keys", "extract", &game.display().to_string()]);
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = run_err_homed(&without, &["ls", &at]);
+    assert_eq!(code, 5, "{message}");
+    assert!(message.contains("no key material available"), "{message}");
+    assert!(message.contains("0x0ffffff7"), "{message}");
+
+    // The launcher's own executable, and the same command opens it.
+    let home = dir.path().join("with-launcher");
+    fs::create_dir_all(&home).expect("home");
+    let (code, message) =
+        run_err_homed(&home, &["keys", "extract", &launcher.display().to_string()]);
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = run_err_homed(&home, &["ls", "-R", &at]);
+    assert_eq!(code, 0, "{message}");
 }
 
 #[test]

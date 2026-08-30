@@ -535,6 +535,114 @@ fn a_memory_image_of_the_running_game_carries_the_ng_material() {
 }
 
 #[test]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn the_launcher_executable_carries_a_second_aes_key_no_game_executable_has() {
+    // DR-042's measurement, re-established by `cargo test` on any machine with
+    // the launcher installed. Three claims, and the third is what makes the
+    // first two worth having: the value is there, it is **not** the RAGE key,
+    // and no game executable carries it — so an archive tagged `0x0FFFFFF7` is
+    // not simply the RAGE key under a second name.
+    let test = "the_launcher_executable_carries_a_second_aes_key_no_game_executable_has";
+    let Some(path) = executable(test, "Launcher.exe") else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("the executable is readable");
+    let material = Material::extract(&mut file, &mut Unwatched).expect("carries the material");
+    let launcher = material
+        .launcher()
+        .expect("Launcher.exe carries the launcher key");
+
+    assert_eq!(launcher.key().len(), AES_KEY_LEN, "an AES-256 key");
+    assert_ne!(
+        digest(launcher.key()),
+        digest(material.keys().aes_key()),
+        "the launcher key is the RAGE key, so the tag chooses nothing"
+    );
+    assert_eq!(
+        launcher.offset() % 8,
+        0,
+        "off the scan's stride, and it could not have been found at all"
+    );
+    eprintln!(
+        "Launcher.exe: launcher key sha256 {} at {:#x}; rage key at {:#x}",
+        digest(launcher.key()),
+        launcher.offset(),
+        material.keys().aes_key_offset(),
+    );
+
+    // Nothing it prints is a key. DR-020 on the type that holds this one, and
+    // on the type that holds *that* — `Material` derives its `Debug`, so the
+    // hand-written one below it is the only thing between a key and a log line.
+    for (what, rendered) in [
+        ("LauncherKey", format!("{launcher:?}")),
+        ("Material", format!("{material:?}")),
+    ] {
+        // The rendering is never in the message. A failure here means it holds
+        // a key, and printing it to say so would be the leak it is reporting.
+        assert!(
+            !rendered.contains(&format!("{:?}", launcher.key())),
+            "{what} renders the launcher key"
+        );
+        assert!(
+            !rendered.contains(&hex::encode(launcher.key())),
+            "{what} renders the launcher key as hexadecimal"
+        );
+        assert!(rendered.contains("offset"), "{what} renders nothing at all");
+    }
+
+    for game in ["GTA5.exe", "GTA5_Enhanced.exe", "RDR2.exe"] {
+        let Some(path) = executable(test, game) else {
+            continue;
+        };
+        let mut file = fs::File::open(&path).expect("the executable is readable");
+        let material = Material::extract(&mut file, &mut Unwatched).expect("carries the material");
+        assert!(
+            material.launcher().is_none(),
+            "{game} carries the launcher key, which DR-042 says nothing but the \
+             launcher does"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
+fn the_launcher_key_reaches_the_cache_and_comes_back_the_same() {
+    // The cache gained a third shape (`keys::cache`), and this is the one place
+    // it is exercised on material that was extracted rather than assembled. An
+    // entry that lost the launcher key on the way through would show up as an
+    // archive that opens once and never again.
+    let test = "the_launcher_key_reaches_the_cache_and_comes_back_the_same";
+    let Some(path) = executable(test, "Launcher.exe") else {
+        return;
+    };
+    let bytes = fs::read(&path).expect("the executable is readable");
+    let source = SourceDigest::of(&mut Cursor::new(&bytes)).expect("digests");
+    let material =
+        Material::extract(&mut Cursor::new(&bytes), &mut Unwatched).expect("carries the material");
+    let launcher = material.launcher().expect("carries the launcher key");
+
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let cache = Cache::at(directory.path());
+    cache.store(&source, &material).expect("stores");
+    let read_back = cache.load(&source).expect("reads").expect("was stored");
+    let cached = read_back
+        .launcher()
+        .expect("the cache kept the launcher key");
+
+    assert_eq!(digest(cached.key()), digest(launcher.key()));
+    assert_eq!(cached.offset(), launcher.offset());
+    assert_eq!(
+        digest(read_back.keys().aes_key()),
+        digest(material.keys().aes_key()),
+        "the value beside it did not survive"
+    );
+    assert!(
+        read_back.ng().is_none(),
+        "NG material appeared in the cache"
+    );
+}
+
+#[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE is not set")]
 fn the_ng_material_never_prints_itself() {
     // DR-006 on the type that holds 305 KB of it. The check is against the

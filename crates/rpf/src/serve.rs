@@ -1860,7 +1860,7 @@ fn optional_path(params: &Value, name: &str) -> Answer<Option<PathBuf>> {
 /// cannot come to say different things.
 ///
 /// It sends no `progress` and cannot be stopped, and since 2026-08-30 that is a
-/// stated cost rather than a free choice. One pass now looks for all 375 values
+/// stated cost rather than a free choice. One pass now looks for all 376 values
 /// rather than two, which is seconds for a 47 MB executable and **up to about
 /// nineteen minutes for a full-process dump** — the kind of source the NG
 /// material is actually in. Wiring the watcher `find_keys` now takes through to

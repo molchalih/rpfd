@@ -20,7 +20,8 @@ use aes::Aes256;
 use cipher::{BlockCipherDecrypt, KeyInit};
 
 use crate::keys::{
-    HASH_LUT_LEN, Material, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NG_ROUNDS, NgKeys,
+    AES_KEY_LEN, HASH_LUT_LEN, LauncherKey, Material, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN,
+    NG_ROUNDS, NgKeys,
 };
 
 /// The block both transforms work in, in bytes.
@@ -93,15 +94,42 @@ const NG_LAST_ROUND: usize = NG_ROUNDS.saturating_sub(1);
 /// How many rounds read in column order before the permuted ones begin.
 const NG_LEADING_ROUNDS: usize = 2;
 
+/// Which AES-256 key an archive's tag chose.
+///
+/// **The tag selects a key, not an algorithm**: `0x0FFFFFF9` and `0x0FFFFFF7`
+/// are the same cipher, the same mode and the same pass count, and they differ
+/// only in which 32-byte key runs it. `docs/rpf-format.md`, Encryption,
+/// `verified`; DR-042.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AesKey {
+    /// The RAGE key, which every source carries and which opens every
+    /// `0x0FFFFFF9` archive there is.
+    Rage,
+    /// The Rockstar Games Launcher's own key, which only `Launcher.exe`
+    /// carries.
+    Launcher,
+}
+
+impl AesKey {
+    /// The key itself, out of the material that carries it, or `None` where it
+    /// does not.
+    fn of(self, material: &Material) -> Option<&[u8; AES_KEY_LEN]> {
+        match self {
+            Self::Rage => Some(material.keys().aes_key()),
+            Self::Launcher => material.launcher().map(LauncherKey::key),
+        }
+    }
+}
+
 /// Which transform an archive's bytes are under.
 ///
 /// Named by the archive's encryption tag, which is the version's to read:
 /// [`crate::Version::scheme`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scheme {
-    /// The RAGE AES-256 default. One ECB pass, no chaining, and one key for
-    /// every archive there is.
-    Aes,
+    /// The RAGE AES-256 transform. One ECB pass, no chaining, and the key its
+    /// tag names.
+    Aes(AesKey),
     /// The NG white-box transform. Seventeen rounds of table lookups, and one
     /// of 101 expanded keys chosen by what is being decrypted.
     Ng,
@@ -109,23 +137,29 @@ pub enum Scheme {
 
 impl Scheme {
     /// What this transform is called where a message has to name it.
+    ///
+    /// The AES arms are named apart because a caller told its key is the wrong
+    /// one has two different things to do about it: extract from a game
+    /// executable, or from the launcher's. DR-010, DR-041.
     #[must_use]
     pub const fn named(self) -> &'static str {
         match self {
-            Self::Aes => "AES-256",
+            Self::Aes(AesKey::Rage) => "AES-256",
+            Self::Aes(AesKey::Launcher) => "AES-256 (launcher)",
             Self::Ng => "NG",
         }
     }
 
     /// Whether `material` carries what this transform needs.
     ///
-    /// Every source carries the AES key; only a memory image carries the NG
-    /// expanded keys and decrypt tables (DR-040), so an executable's material
-    /// opens an AES archive and not an NG one.
+    /// Every source carries the RAGE key; only a memory image carries the NG
+    /// expanded keys and decrypt tables (DR-040), and only `Launcher.exe`
+    /// carries the launcher key (DR-042). So an executable's material opens an
+    /// AES archive under the RAGE key and neither of the others.
     #[must_use]
     pub fn is_in(self, material: &Material) -> bool {
         match self {
-            Self::Aes => true,
+            Self::Aes(which) => which.of(material).is_some(),
             Self::Ng => material.ng().is_some(),
         }
     }
@@ -144,9 +178,16 @@ pub struct Cipher {
 /// The transform, and whatever running it needs.
 #[derive(Clone)]
 enum Inner {
-    /// The RAGE key, expanded once. Boxed because the expansion is a kilobyte
-    /// and the other arm is two words, and this enum is inside every stream.
-    Aes(Box<Aes256>),
+    /// An AES key, expanded once, and which one it was. Boxed because the
+    /// expansion is a kilobyte and the other arm is two words, and this enum is
+    /// inside every stream.
+    Aes {
+        /// Which key the tag chose. Carried so that `Debug` names the transform
+        /// this cipher actually is — a discriminant, never a key: DR-020.
+        which: AesKey,
+        /// The expanded key schedule.
+        aes: Box<Aes256>,
+    },
     /// The decrypt tables, the expanded key this buffer chose, and which one it
     /// was.
     Ng {
@@ -180,9 +221,10 @@ impl Cipher {
     #[must_use]
     pub fn new(scheme: Scheme, material: &Material, name: &str, len: u64) -> Option<Self> {
         let inner = match scheme {
-            Scheme::Aes => Inner::Aes(Box::new(
-                Aes256::new_from_slice(material.keys().aes_key()).ok()?,
-            )),
+            Scheme::Aes(which) => Inner::Aes {
+                which,
+                aes: Box::new(Aes256::new_from_slice(which.of(material)?).ok()?),
+            },
             Scheme::Ng => {
                 let key = ng_key_index(material.keys().hash_lut(), name.as_bytes(), len);
                 let tables = Arc::clone(material.ng_shared()?);
@@ -203,7 +245,7 @@ impl Cipher {
     #[must_use]
     pub const fn key_index(&self) -> Option<usize> {
         match self.inner {
-            Inner::Aes(_) => None,
+            Inner::Aes { .. } => None,
             Inner::Ng { key, .. } => Some(key),
         }
     }
@@ -234,7 +276,7 @@ impl Cipher {
     /// and the streaming form in `archive` cannot come to disagree (§3).
     pub(crate) fn block(&self, block: &mut [u8; CIPHER_BLOCK_LEN]) {
         match self.inner {
-            Inner::Aes(ref aes) => {
+            Inner::Aes { ref aes, .. } => {
                 for _ in 0..AES_PASSES {
                     let mut wide = (*block).into();
                     aes.decrypt_block(&mut wide);
@@ -264,9 +306,12 @@ impl Cipher {
     /// without a game installation (§4).
     pub(crate) fn over_zeros() -> Self {
         Self {
-            inner: Inner::Aes(Box::new(
-                Aes256::new_from_slice(&[0_u8; 32]).expect("thirty-two bytes"),
-            )),
+            inner: Inner::Aes {
+                which: AesKey::Rage,
+                aes: Box::new(
+                    Aes256::new_from_slice(&[0_u8; AES_KEY_LEN]).expect("thirty-two bytes"),
+                ),
+            },
         }
     }
 }
@@ -276,9 +321,9 @@ impl Cipher {
 impl fmt::Debug for Cipher {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.inner {
-            Inner::Aes(_) => f
+            Inner::Aes { which, .. } => f
                 .debug_struct("Cipher")
-                .field("scheme", &Scheme::Aes)
+                .field("scheme", &Scheme::Aes(which))
                 .finish_non_exhaustive(),
             Inner::Ng { key, .. } => f
                 .debug_struct("Cipher")

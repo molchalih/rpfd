@@ -26,6 +26,7 @@ use crate::{
         same_name,
     },
     keys::{Material, Unlock},
+    metadata::Encoding,
 };
 
 /// How deep anything in this container is walked before it is refused.
@@ -1518,11 +1519,79 @@ impl Archive {
         self.extracted(src, index)?.whole()
     }
 
+    /// What an entry is, and what its payload announces itself to be.
+    ///
+    /// Two sources, and the type keeps them apart. A **resource** is read off
+    /// the entry's resource bit and its payload is never touched, because
+    /// `docs/backlog.md` Q7 measured 694,470 of 694,470 Rockstar resource
+    /// entries whose payload does not begin with `RSC7`: the bit is the only
+    /// truth there is. Everything else is decided by the first
+    /// [`Encoding::HEAD_LEN`] bytes of the entry's **contents** — inflated, so
+    /// a deflated payload is classified by what it is rather than by what its
+    /// first deflate block happens to look like.
+    ///
+    /// A payload that cannot be read is [`Classification::Binary`]. That is
+    /// [`Archive::nested_at`]'s rule for the same reason: every walk over an
+    /// archive asks this of every entry, and a listing that stopped at the
+    /// first unreadable payload would be useless. `verify` is where a payload
+    /// that does not read back is reported, one problem per path.
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::entry`] for an index the entry table does not hold or an
+    /// entry it contradicts itself about.
+    pub fn classify<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Classification> {
+        match self.entry(index)?.kind {
+            EntryKind::Directory { .. } => Ok(Classification::Directory),
+            EntryKind::Resource { .. } => Ok(Classification::Resource),
+            EntryKind::Binary { .. } => {
+                let (head, len) = self.head(src, index);
+                Ok(match Encoding::of(head.get(..len).unwrap_or_default()) {
+                    Some(encoding) => Classification::Encoded(encoding),
+                    None => Classification::Binary,
+                })
+            }
+        }
+    }
+
+    /// The first [`Encoding::HEAD_LEN`] bytes of an entry's contents, and how
+    /// many of them there were.
+    ///
+    /// **The count is the answer's other half**, and a caller classifying the
+    /// buffer without it reads the filler as content: an eleven-byte text
+    /// payload followed by five zero bytes is not text, and reported itself as
+    /// unknown binary until the count came back with it.
+    ///
+    /// Short by any means — a short payload, a payload that does not open, a
+    /// deflate stream that fails part-way — is short rather than an error, for
+    /// the reason [`Archive::classify`] states.
+    fn head<R: Read + Seek>(&self, src: &mut R, index: u32) -> ([u8; Encoding::HEAD_LEN], usize) {
+        let mut head = [0_u8; Encoding::HEAD_LEN];
+        let Ok(mut contents) = self.extracted(&mut *src, index) else {
+            return (head, 0);
+        };
+        let mut got = 0_usize;
+        while let Some(rest) = head.get_mut(got..) {
+            match contents.read(rest) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => got = got.saturating_add(read),
+            }
+            if got >= Encoding::HEAD_LEN {
+                break;
+            }
+        }
+        (head, got)
+    }
+
     /// Whether an entry's payload begins with the `RSC7` magic.
     ///
-    /// The resource bit and the payload's magic are supposed to agree; whether
-    /// they always do is Q7. This reads the payload rather than trusting the
-    /// bit, so the two can be compared.
+    /// **Not a classifier, and it cannot be made into one.** `docs/backlog.md`
+    /// Q7 is closed: in a Rockstar archive this answers `false` on every
+    /// resource there is, 694,470 of 694,470, and the entry's resource bit is
+    /// the only truth. What it is for is comparing the two — the sample's
+    /// third-party packer agrees on 20 of 20, Rockstar's agrees on none — and
+    /// [`Archive::classify`] is what a caller asking what an entry is should
+    /// ask.
     ///
     /// # Errors
     ///
@@ -1703,6 +1772,48 @@ impl Archive {
             // never descended into. DR-041.
             Err(error) if error.category() == Category::NeedsKey => Ok(Nested::Locked(error)),
             Err(_) => Ok(Nested::None),
+        }
+    }
+}
+
+/// What one entry is: R3.7's six classes, and the two sources they come from.
+///
+/// [`Classification::Resource`] comes from the entry table and every other
+/// variant from the payload's leading bytes, and **no value of this type can
+/// mix the two**: there is no resource variant carrying an [`Encoding`] and no
+/// [`Encoding`] naming a resource. That is the whole shape of the type, and it
+/// is deliberate. Q7 measured that a payload sniff for `RSC7` answers `false`
+/// on all 694,470 Rockstar resources, so the obvious implementation — read the
+/// magic, believe it — is wrong on every archive the product exists to open,
+/// and a type that cannot express it is worth more than a comment saying not
+/// to. DR-044.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Classification {
+    /// A directory. It has no payload to classify.
+    Directory,
+    /// A resource, **from the entry's resource bit**. Its payload is not read.
+    ///
+    /// What kind of resource — a `Meta`, a model, a texture — is not decided
+    /// here: it is inside the paged payload, and reading it is R5.8.
+    Resource,
+    /// A binary entry whose leading bytes announce an encoding.
+    Encoded(Encoding),
+    /// A binary entry whose leading bytes announce nothing: R3.7's unknown
+    /// binary, and by far the commonest answer in a real archive.
+    Binary,
+}
+
+impl Classification {
+    /// The encoding the payload announced, for a caller that has already
+    /// decided what to do about the other three answers.
+    ///
+    /// `None` for a directory and for a resource — neither had its payload
+    /// read — as well as for a binary entry nothing recognised.
+    #[must_use]
+    pub const fn encoding(self) -> Option<Encoding> {
+        match self {
+            Self::Encoded(encoding) => Some(encoding),
+            Self::Directory | Self::Resource | Self::Binary => None,
         }
     }
 }

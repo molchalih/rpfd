@@ -11,6 +11,11 @@
 //! row 3: that is one reference implementation, so a digest here is `secondary`
 //! until a scan matches it — and a match is its own proof, because the bytes
 //! found are the bytes that hash to what was asked for.
+//!
+//! [`LAUNCHER_AES_KEY`] comes from a second source and carries its own
+//! attribution: `Disquse/RGLExtractor`'s `aes.go` (MIT), whose `aesKeyHash` is
+//! the same digest. It is also the one anchor here that was **measured** on
+//! this machine before it was read anywhere. DR-042.
 
 use super::ANCHOR_DIGEST_LEN;
 
@@ -18,6 +23,21 @@ use super::ANCHOR_DIGEST_LEN;
 pub(super) const AES_KEY: [u8; ANCHOR_DIGEST_LEN] = [
     0xA0, 0x79, 0x61, 0x28, 0xA7, 0x75, 0x72, 0x0A, 0xC2, 0x04, 0xD9, 0x81, 0x9F, 0x68, 0xC1, 0x72,
     0xE3, 0x95, 0x2C, 0x6D,
+];
+
+/// The Rockstar Games Launcher's own AES-256 key, which is not the RAGE one.
+///
+/// The tag `0x0FFFFFF7` names the same transform as `0x0FFFFFF9` under this key
+/// instead (`docs/rpf-format.md`, Encryption). Two independent routes give this
+/// digest and neither informed the other: an oracle-anchored sweep over the
+/// launcher's own binaries, which judged a candidate by whether it decrypted
+/// the archive's root directory row and printed one hit in 2.4 billion
+/// (DR-042); and `RGLExtractor`'s published `aesKeyHash`, ported with
+/// attribution under DR-007. `verified`, 2026-08-30 — the first anchor here of
+/// which that is true.
+pub(super) const LAUNCHER_AES_KEY: [u8; ANCHOR_DIGEST_LEN] = [
+    0x0E, 0x6B, 0x42, 0x74, 0x7E, 0xDF, 0x51, 0xDC, 0xE7, 0x8E, 0xD0, 0xA0, 0xA8, 0xFB, 0x22, 0xE9,
+    0x71, 0xC3, 0x16, 0x83,
 ];
 
 /// The NG hash lookup table.

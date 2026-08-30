@@ -13,8 +13,9 @@ use crate::{
     entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
-        Content, FileFields, Header, NamesPlan, Span, Version, crypto::Scheme, u16_at, u24_at,
-        u32_at,
+        Content, FileFields, Header, NamesPlan, Span, Version,
+        crypto::{AesKey, Scheme},
+        u16_at, u24_at, u32_at,
     },
 };
 
@@ -81,20 +82,21 @@ pub const ENCRYPTION_AES: u32 = 0x0FFF_FFF9;
 /// their own right.
 pub const ENCRYPTION_NG: u32 = 0x0FEF_FFFF;
 
-/// An encryption tag that occurs, is not "not encrypted", and is opened by
-/// neither transform this build has.
+/// The encryption tag meaning the same AES-256 transform under the Rockstar
+/// Games Launcher's own key.
 ///
-/// Named because it is a measured fact with a row of its own and because
-/// [`crate::Version::scheme`] answering `None` for it is a decision rather
-/// than an oversight —
-/// not because anything decodes it. The Rockstar Games Launcher's
-/// `Launcher.rpf` carries it and is the one archive of the 359 on that machine
-/// that `rpf ls` does not open.
+/// The tag names a **key**, not an algorithm: the transform is
+/// [`ENCRYPTION_AES`]'s, byte for byte, and only the 32 bytes running it
+/// differ.
 ///
-/// `docs/rpf-format.md`, RPF7 header, `verified` that it occurs and `verified`
-/// **negative** that neither the 101 NG keys nor AES-256-ECB at any pass count
-/// in either direction opens it.
-pub const ENCRYPTION_UNIDENTIFIED: u32 = 0x0FFF_FFF7;
+/// `docs/rpf-format.md`, RPF7 header, `verified`, 2026-08-30 — both builds of
+/// the launcher's `Launcher.rpf` open under the key in `Launcher.exe`, 118 and
+/// 120 entries, every payload reading back. A `secondary` reading of the same
+/// row says the header's third dword carries a platform bit that selects a
+/// second key for this tag on Xbox 360; that bit is **0** on every archive
+/// measured here, so nothing reads it and this build routes the tag by itself.
+/// DR-042.
+pub const ENCRYPTION_AES_LAUNCHER: u32 = 0x0FFF_FFF7;
 
 /// The value a **binary** entry's own encryption field carries when its payload
 /// is stored in the clear.
@@ -105,15 +107,19 @@ pub const ENCRYPTION_UNIDENTIFIED: u32 = 0x0FFF_FFF7;
 /// has no such field: offsets 8 and 12 are its two flag words.
 pub const ENTRY_OPEN: u32 = 0;
 
-/// Which transform a tag names, or `None` for a tag this build cannot open.
+/// Which transform a tag names, and under which key, or `None` for a tag this
+/// build cannot open.
 ///
-/// A tag that is neither [`ENCRYPTION_OPEN`] nor one of these is encrypted
-/// under something nobody here has identified — `docs/rpf-format.md` records
-/// `0x0FFFFFF7` as exactly that — and no key opens it, which is why it is
-/// `None` rather than a third variant.
+/// Two of the three arms are the same cipher: an archive's tag chooses the key
+/// as much as the transform, which is why [`Scheme::Aes`] carries an
+/// [`AesKey`] rather than there being two AES schemes (DR-042). A tag that is
+/// neither [`ENCRYPTION_OPEN`] nor one of these is encrypted under something
+/// nobody here has identified, and no key anyone holds opens it, which is why
+/// it is `None` rather than a further variant.
 pub(super) const fn scheme(tag: u32) -> Option<Scheme> {
     match tag {
-        ENCRYPTION_AES => Some(Scheme::Aes),
+        ENCRYPTION_AES => Some(Scheme::Aes(AesKey::Rage)),
+        ENCRYPTION_AES_LAUNCHER => Some(Scheme::Aes(AesKey::Launcher)),
         ENCRYPTION_NG => Some(Scheme::Ng),
         _ => None,
     }

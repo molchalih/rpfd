@@ -463,28 +463,107 @@ impl fmt::Debug for NgKeys {
     }
 }
 
+/// How many values [`LauncherKey`] is made of, for the reason [`KEYS_WANTED`]
+/// is a constant: it is the length of [`LauncherKey::anchors`], and it is what
+/// one pass's answers are split by.
+const LAUNCHER_WANTED: usize = 1;
+
+/// The Rockstar Games Launcher's own AES-256 key.
+///
+/// A second key, not a second cipher: an archive tagged `0x0FFFFFF7` is under
+/// exactly the transform `0x0FFFFFF9` names, keyed by this instead of by the
+/// RAGE key ([`crate::format::crypto::Scheme`]). `docs/rpf-format.md`,
+/// Encryption.
+///
+/// Optional on [`Material`] rather than a third value in [`Keys`], because
+/// **only the launcher's own executable carries it**. `Keys` is whole or not at
+/// all on the argument that a caller given one of its two values has nothing it
+/// can finish, and that argument does not reach a value most sources do not
+/// have at all: it would turn every game executable into an unrecognised one.
+/// [`NgKeys`] is the same shape for the same reason. DR-042.
+pub struct LauncherKey {
+    /// The key.
+    key: [u8; AES_KEY_LEN],
+    /// Where it was found in the source.
+    at: u64,
+}
+
+impl LauncherKey {
+    /// What this value is looked for by.
+    const fn anchors() -> [Anchor; LAUNCHER_WANTED] {
+        [Anchor {
+            len: AES_KEY_LEN,
+            digest: anchors::LAUNCHER_AES_KEY,
+        }]
+    }
+
+    /// The value a completed search found, or `None` where the source has none.
+    ///
+    /// An absence is not a failure and cannot be one: a game executable carries
+    /// the RAGE key and not this, and refusing its material because a value
+    /// that was never there is missing would withhold the key that opens 43
+    /// archives in order to report the absence of one that opens two.
+    fn assembled(found: &[Option<Sighting>]) -> Option<Self> {
+        let (key, at) = found
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(exactly::<AES_KEY_LEN>)?;
+        Some(Self { key, at })
+    }
+
+    /// The value as the cache read it back, with where it was first found.
+    pub(super) const fn restored(key: [u8; AES_KEY_LEN], at: u64) -> Self {
+        Self { key, at }
+    }
+
+    /// The key itself.
+    #[must_use]
+    pub const fn key(&self) -> &[u8; AES_KEY_LEN] {
+        &self.key
+    }
+
+    /// Where it sits in the source it came from.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.at
+    }
+}
+
+/// By hand, for the reason [`Keys`]'s is.
+impl fmt::Debug for LauncherKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LauncherKey")
+            .field("offset", &self.at)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Names the whole survey for a watcher, which is what one pass now looks for.
 const MATERIAL_NAMED: &str = "key material";
 
 /// Everything one source carries.
 ///
-/// [`Keys`] is required and [`NgKeys`] is not, and that asymmetry is the
-/// measurement rather than a preference: a game executable carries the first
-/// and none of the second, while a memory image of that same executable carries
-/// both. A source holding neither is [`Error::UnrecognisedExecutable`]; a source
-/// holding only the first is the ordinary case and is not a failure, because an
-/// archive with the AES tag needs nothing else. DR-040.
+/// [`Keys`] is required and [`NgKeys`] and [`LauncherKey`] are not, and that
+/// asymmetry is the measurement rather than a preference: a game executable
+/// carries the first and neither of the others, a memory image of that same
+/// executable carries the NG material too, and only the Rockstar Games
+/// Launcher's own executable carries the launcher key. A source holding none of
+/// it is [`Error::UnrecognisedExecutable`]; a source holding only the first is
+/// the ordinary case and is not a failure, because an archive with the AES tag
+/// needs nothing else. DR-040, DR-042.
 ///
-/// This is one pass over the source for all 375 values rather than two passes
-/// for two and 373. The values are found by hashing windows and the windows are
-/// the expensive part, so looking for everything at once costs what looking for
-/// the larger half alone would.
+/// This is one pass over the source for all 376 values rather than three passes
+/// for two, one and 373. The values are found by hashing windows and the
+/// windows are the expensive part, so looking for everything at once costs what
+/// looking for the largest group alone would.
 #[derive(Debug)]
 pub struct Material {
     /// The AES key and hash lookup table, which every source must carry.
     keys: Keys,
     /// The NG material, where the source carries it.
     ng: Option<Arc<NgKeys>>,
+    /// The launcher's own AES key, where the source carries it.
+    launcher: Option<LauncherKey>,
 }
 
 impl Material {
@@ -500,24 +579,34 @@ impl Material {
     /// table is missing, naming which; [`Error::Io`] if the source cannot be
     /// read; [`Error::Cancelled`] if the watcher said to stop.
     pub fn extract<S: Read + Seek, W: Watch>(source: &mut S, watch: &mut W) -> Result<Self> {
-        let mut wanted = Vec::with_capacity(KEYS_WANTED.saturating_add(NG_WANTED));
+        let mut wanted = Vec::with_capacity(
+            KEYS_WANTED
+                .saturating_add(LAUNCHER_WANTED)
+                .saturating_add(NG_WANTED),
+        );
         wanted.extend_from_slice(&Keys::anchors());
+        wanted.extend_from_slice(&LauncherKey::anchors());
         wanted.append(&mut NgKeys::anchors());
 
         let found = scan::find(source, &wanted, MATERIAL_NAMED, watch)?;
-        let (base, ng) = found.split_at(found.len().min(KEYS_WANTED));
+        // Read back in the order the anchors were asked for, so a slot is read
+        // by the value that asked for it (§4).
+        let (base, rest) = found.split_at(found.len().min(KEYS_WANTED));
+        let (launcher, ng) = rest.split_at(rest.len().min(LAUNCHER_WANTED));
 
         Ok(Self {
             keys: Keys::assembled(base)?,
             ng: NgKeys::assembled(ng).ok().map(Arc::new),
+            launcher: LauncherKey::assembled(launcher),
         })
     }
 
     /// The material as the cache read it back.
-    pub(super) fn restored(keys: Keys, ng: Option<NgKeys>) -> Self {
+    pub(super) fn restored(keys: Keys, ng: Option<NgKeys>, launcher: Option<LauncherKey>) -> Self {
         Self {
             keys,
             ng: ng.map(Arc::new),
+            launcher,
         }
     }
 
@@ -531,6 +620,15 @@ impl Material {
     #[must_use]
     pub fn ng(&self) -> Option<&NgKeys> {
         self.ng.as_deref()
+    }
+
+    /// The launcher's own AES key, where the source carried it.
+    ///
+    /// `None` for every game executable and for a memory image of one: it is in
+    /// `Launcher.exe` and in nothing else measured here. DR-042.
+    #[must_use]
+    pub const fn launcher(&self) -> Option<&LauncherKey> {
+        self.launcher.as_ref()
     }
 
     /// The same, as the handle a [`crate::format::crypto::Cipher`] keeps.
@@ -705,7 +803,7 @@ mod tests {
         AES_KEY_NAMED, HASH_LUT_NAMED, NG_EXPANDED_NAMED, NG_TABLES_NAMED, Unlock, keys_missing,
         ng_missing,
     };
-    use crate::format::crypto::Scheme;
+    use crate::format::crypto::{AesKey, Scheme};
 
     #[test]
     fn a_half_found_search_names_the_half_it_did_not_find() {
@@ -749,7 +847,11 @@ mod tests {
         let unlock = Unlock::unkeyed();
         assert!(unlock.is_unkeyed());
         assert_eq!(unlock.name(), "");
-        for scheme in [Scheme::Aes, Scheme::Ng] {
+        for scheme in [
+            Scheme::Aes(AesKey::Rage),
+            Scheme::Aes(AesKey::Launcher),
+            Scheme::Ng,
+        ] {
             assert!(
                 unlock
                     .candidates(scheme)

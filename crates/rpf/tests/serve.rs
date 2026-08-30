@@ -4019,6 +4019,49 @@ fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
     );
 }
 
+/// R3.7 on the wire, which is what R7.4 needs from it: a row says what the
+/// payload announces itself to be, and a resource row says nothing.
+///
+/// The field is an addition rather than a change — `"kind"` still says
+/// `binary` and `resource` as it always has — and DR-032 makes its name part of
+/// the contract from here on. A resource's `null` is not "nothing was found":
+/// its payload is never read, because `docs/backlog.md` Q7 measured that the
+/// magic in front of one says `false` on every Rockstar resource there is.
+#[test]
+fn a_list_row_says_what_the_payload_announces_and_a_resource_says_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"list","params":{
+            "handle":1,"recursive":true}}),
+    ]);
+    let rows = answer(&responses, 2)["result"]
+        .as_array()
+        .expect("an array")
+        .clone();
+    let row = |path: &str| {
+        rows.iter()
+            .find(|row| row["path"] == json!(path))
+            .unwrap_or_else(|| panic!("{path} is not in {rows:?}"))
+            .clone()
+    };
+
+    // Deflated on disk, so this is the contents being classified and not the
+    // first bytes of a deflate stream.
+    assert_eq!(row("data/greeting.txt")["encoding"], json!("text"));
+    assert_eq!(row("data/greeting.txt")["kind"], json!("binary"));
+
+    // And the resource, whose payload here really does begin `RSC7` — which
+    // changes nothing, because it is not consulted.
+    assert_eq!(row("art.yft")["kind"], json!("resource"));
+    assert_eq!(row("art.yft")["encoding"], Value::Null);
+    assert_eq!(row("data")["encoding"], Value::Null);
+}
+
 /// A row's `path` is the whole in-archive path, not a name.
 ///
 /// So a client uses it directly with `read`, `write` or `list`, and a client

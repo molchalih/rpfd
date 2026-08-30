@@ -193,14 +193,13 @@ impl Version {
         }
     }
 
-    /// Which transform an archive carrying this tag is under, or `None` when
-    /// nothing this build holds opens it.
+    /// Which transform an archive carrying this tag is under, and under which
+    /// key, or `None` when nothing this build holds opens it.
     ///
     /// `None` covers two situations a caller must not confuse: a tag that means
     /// "not encrypted" ([`Version::is_open`] is the question for that), and a
-    /// tag that is encrypted under something unidentified — `0x0FFFFFF7`, which
-    /// `docs/rpf-format.md` records as opened by neither transform. Asking both
-    /// questions is what tells them apart.
+    /// tag that is encrypted under something this build has no transform for.
+    /// Asking both questions is what tells them apart.
     #[must_use]
     pub const fn scheme(self, tag: u32) -> Option<crypto::Scheme> {
         match self {
