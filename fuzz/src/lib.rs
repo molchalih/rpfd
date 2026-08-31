@@ -21,7 +21,7 @@ use quick_xml::{Reader, events::Event};
 use rpf_core::{
     MAX_DEPTH, Unwatched, Version,
     build::{FileKind, FileSpec, Storage, build},
-    metadata::rbf,
+    metadata::{hash::Dictionary, rbf},
 };
 
 /// The largest input a target accepts, in bytes.
@@ -271,4 +271,73 @@ fn pack(name: &str, contents: &[u8]) -> Vec<u8> {
     )
     .expect("this build writes an archive of one stored file");
     out.into_inner()
+}
+
+/// The empty dictionary the metadata targets spell names with, built once per
+/// process.
+///
+/// **Setup, not work.** DR-055: anything a target computes once belongs in
+/// `libfuzzer-sys`'s `init:` block, because a `OnceLock` first touched from the
+/// target body charges its whole cost to the first input's clock — which is
+/// what reported a 991 ms hang in the campaign of 2026-08-31 and said nothing
+/// about the library. This one is cheap today (an empty `BTreeMap`), and that
+/// is exactly the kind of fact that stops being true quietly, so the three
+/// `meta` targets reach it through [`names_setup`] and assert [`names_ready`].
+///
+/// Empty because a dictionary cannot decide whether a payload converts (R5.5)
+/// and because none ships (DR-006); what the names are *spelled* as is
+/// `dictionary.rs`'s subject.
+static NAMES: OnceLock<Dictionary> = OnceLock::new();
+
+/// Builds [`NAMES`], for an `init:` block and for nothing else.
+pub fn names_setup() {
+    let _ = names();
+}
+
+/// The dictionary every `meta` target spells hashes with.
+#[must_use]
+pub fn names() -> &'static Dictionary {
+    NAMES.get_or_init(Dictionary::default)
+}
+
+/// Whether [`names_setup`] has already run, which the targets assert per input.
+///
+/// Empty here means a per-process answer is being computed on some input's
+/// clock, which is the defect DR-055 records.
+#[must_use]
+pub fn names_ready() -> bool {
+    NAMES.get().is_some()
+}
+
+/// How many of `payload`'s leading bytes a `meta` target calls system pages.
+///
+/// **A `Meta` payload does not carry its own page boundary and cannot.** It is
+/// a fact about the *entry* — `format::resource::size_from_flags` of its system
+/// flags — and `meta::parse` takes it as an argument for that reason: a
+/// resource pointer's space nibble picks system or graphics pages and its
+/// offset is flat within that space, so the split decides where every pointer
+/// in the file lands.
+///
+/// A fuzz target has no entry. Fixing the split at, say, the whole payload
+/// would freeze half of the addressing the parser does and leave the graphics
+/// space unreachable, so it is derived from the input instead: the first four
+/// bytes little-endian, taken modulo `len + 1` so that every split from
+/// all-graphics to all-system is reachable and none is out of range. The
+/// mutator then explores the boundary as it explores everything else.
+///
+/// The consequence is worth stating, because it is the one place these targets
+/// differ from the corpus test beside them: a payload dumped by
+/// `tools/metadata-dump` carries its real boundary **in its file name**
+/// (`00002_sys8192_…`, read back by `metadata_dump::system_len_of`), and a
+/// corpus seed handed to libFuzzer is bytes with no name. So a seeded payload
+/// is parsed under a split that is almost never its own. That costs nothing
+/// this asks about: `parse` either refuses the split or accepts it, and every
+/// property below is a claim about a payload the parser *accepted*, whatever
+/// boundary it accepted it under.
+#[must_use]
+pub fn meta_split(payload: &[u8]) -> usize {
+    let word = payload
+        .first_chunk::<4>()
+        .map_or(0, |head| u32::from_le_bytes(*head));
+    usize::try_from(word).unwrap_or(usize::MAX) % (payload.len() + 1)
 }

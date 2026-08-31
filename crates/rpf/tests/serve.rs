@@ -4970,3 +4970,522 @@ fn a_view_the_wire_does_not_name_is_refused_as_a_parameter() {
         assert!(named.contains(view), "must name {view}: {named}");
     }
 }
+
+/// An archive holding one resource entry at `data/thing.ymt` whose contents are
+/// a `Meta`, with `flags` as the row's two flag words. The command line builds
+/// the same one (§1).
+fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
+    let payload = common::meta_resource();
+    let mut out = fs::File::create(at).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &[FileSpec {
+            path: "data/thing.ymt".to_owned(),
+            kind: FileKind::Resource {
+                declared: Some(flags),
+            },
+        }],
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+}
+
+/// R5.8 on the wire: a resource carrying `Meta` reads as XML, takes a document
+/// back, reads the buffered document back, and commits.
+///
+/// The buffered read is the half that would break silently for this encoding in
+/// particular: what the daemon holds after a converted write is a resource
+/// **payload**, framed and deflated, and reading it back as the document means
+/// unframing it again against the entry's own flag words. A client that saved
+/// and re-opened the file sees its own edit or it sees a base64 blob.
+///
+/// `"encoding"` stays `null` throughout, before and after: a resource's payload
+/// is not what a listing reads, and having a view does not change what the
+/// entry is (Q7, DR-044).
+#[test]
+fn a_resource_meta_is_read_and_written_as_xml_on_the_wire() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    make_meta_archive(&archive, common::META_FLAGS);
+    let path = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(common::META_EDITED), "as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":7,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+    ]);
+    for id in [2, 3] {
+        let read = answer(&responses, id);
+        assert_eq!(read["result"]["as"], json!("xml"), "{read}");
+        assert_eq!(read["result"]["encoding"], json!(null), "{read}");
+        assert_eq!(
+            read["result"]["bytes"],
+            json!(BASE64.encode(common::META_DOCUMENT)),
+            "{read}"
+        );
+    }
+    let wrote = answer(&responses, 4);
+    assert_eq!(wrote["result"]["pending"], json!(1), "{wrote}");
+    assert_ne!(
+        wrote["result"]["len"],
+        json!(common::META_EDITED.len()),
+        "what was buffered is the document rather than the payload: {wrote}"
+    );
+
+    let buffered = answer(&responses, 5);
+    assert_eq!(buffered["result"]["pending"], json!(true), "{buffered}");
+    assert_eq!(buffered["result"]["as"], json!("xml"), "{buffered}");
+    assert_eq!(
+        buffered["result"]["bytes"],
+        json!(BASE64.encode(common::META_EDITED)),
+        "a buffered document did not read back as itself: {buffered}"
+    );
+
+    let committed = answer(&responses, 6);
+    assert_eq!(committed["result"]["committed"], json!(1), "{committed}");
+    let after = answer(&responses, 7);
+    assert_eq!(
+        after["result"]["bytes"],
+        json!(BASE64.encode(common::META_EDITED)),
+        "the edit did not land: {after}"
+    );
+}
+
+/// A buffered resource payload whose own `RSC7` header contradicts the entry's
+/// row has no view, in either direction.
+///
+/// DR-059's rule over the one address two elements describe. A payload in hand
+/// is unframed against the row's flag words, and `build::store_resource` records
+/// the **payload's** words when it carries a header (DR-046) — so a header
+/// declaring the boundary elsewhere is a different entry's, and reading the
+/// buffer against the row's boundary answered a document resolved at addresses
+/// that are not its own, with no diagnostic. The write that followed then
+/// re-framed with the row's flags and threw away what the client had written.
+///
+/// The two flag pairs declare the same total length, so nothing but the words
+/// themselves tells them apart.
+#[test]
+fn a_buffered_resource_whose_header_contradicts_its_row_has_no_view() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    make_meta_archive(&archive, common::META_FLAGS);
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"RSC7");
+    payload.extend_from_slice(
+        &rpf_core::format::resource::resource_version(
+            common::META_ELSEWHERE.system,
+            common::META_ELSEWHERE.graphics,
+        )
+        .to_le_bytes(),
+    );
+    payload.extend_from_slice(&common::META_ELSEWHERE.system.to_le_bytes());
+    payload.extend_from_slice(&common::META_ELSEWHERE.graphics.to_le_bytes());
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&common::minimal_meta())
+        .expect("the page deflates");
+    payload.extend_from_slice(&encoder.finish().expect("the encoder finishes"));
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(&payload), "as":"raw"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(common::META_EDITED), "as":"xml"}}),
+    ]);
+    assert_eq!(answer(&responses, 2)["result"]["pending"], json!(1));
+    let refused = answer(&responses, 3);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NoXmlView"),
+        "a buffer read against a boundary its own header denies: {refused}"
+    );
+    // `auto` hands the bytes back rather than a document, which is what it
+    // answers for every entry with no view.
+    let raw = answer(&responses, 4);
+    assert_eq!(raw["result"]["as"], json!("raw"), "{raw}");
+    assert_eq!(
+        raw["result"]["bytes"],
+        json!(BASE64.encode(&payload)),
+        "{raw}"
+    );
+    let refused = answer(&responses, 5);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NoXmlView"),
+        "a document was written into a buffer at a boundary it denies: {refused}"
+    );
+}
+
+/// As [`talk`], with the daemon given a keys cache of its own.
+///
+/// `--cache-dir` is a global flag, so it comes before the subcommand. An
+/// archive under a transform opens for the daemon exactly as it does for the
+/// command line — through `commands::open` — and this is what makes the keyed
+/// half reachable from a test at all.
+fn talk_with_cache(cache: &Path, requests: &[Value]) -> Vec<Value> {
+    let mut daemon = Command::new(RPF);
+    daemon.args([
+        "--cache-dir",
+        &cache.display().to_string(),
+        "serve",
+        "--stdio",
+    ]);
+    drive(daemon, requests).0
+}
+
+/// A buffered converted write into a **keyed** resource reads back as its own
+/// document.
+///
+/// What `view::apply` buffers for a keyed resource is the payload as it will
+/// sit on disk, which is ciphertext — it has to be, because the writer is
+/// handed resource payloads as they sit (DR-054 §3, DR-060 §2). So the seam
+/// that reads a buffer needs the key too, and until it had one this answered
+/// `NoXmlView` for the one flow the daemon exists for: an editor that saved and
+/// asked for its own file back.
+#[test]
+fn a_keyed_resource_reads_its_own_buffered_edit_back_as_xml() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    let cache = dir.path().join("keys");
+    common::make_keyed_meta_archive(&archive, &cache, 16);
+
+    let responses = talk_with_cache(
+        &cache,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(common::META_EDITED), "as":"xml"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+                "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(common::META_DOCUMENT), "as":"xml"}}),
+        ],
+    );
+    let opened = answer(&responses, 1);
+    assert_eq!(opened["result"]["entries"], json!(3), "{opened}");
+    let read = answer(&responses, 2);
+    assert_eq!(
+        read["result"]["bytes"],
+        json!(BASE64.encode(common::META_DOCUMENT)),
+        "the keyed fixture does not read as a document at all: {read}"
+    );
+    let wrote = answer(&responses, 3);
+    assert_eq!(wrote["result"]["pending"], json!(1), "{wrote}");
+    let back = answer(&responses, 4);
+    assert_eq!(back["result"]["pending"], json!(true), "{back}");
+    assert_eq!(back["result"]["as"], json!("xml"), "{back}");
+    assert_eq!(
+        back["result"]["bytes"],
+        json!(BASE64.encode(common::META_EDITED)),
+        "a buffered edit of a keyed resource did not read back: {back}"
+    );
+    let again = answer(&responses, 5);
+    assert_eq!(
+        again["result"]["pending"],
+        json!(1),
+        "a second document into the same buffer was refused: {again}"
+    );
+}
+
+/// A second `auto` write over a buffered converted write into a **keyed**
+/// resource edits the payload rather than becoming it.
+///
+/// The severe one, and the assertion is over the bytes on disk. What the daemon
+/// buffered after the first write is ciphertext; a seam that could not take it
+/// apart answered "this entry has no view", and `auto`'s fallback then wrote
+/// the **document** into the resource's entry as its payload, with nothing
+/// refused and nothing reported. `edit::check_encoding` cannot see it either: a
+/// resource carries no encoding for a document to be an encoding change from.
+#[test]
+fn a_second_auto_write_over_a_keyed_resource_does_not_land_the_document_as_the_payload() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    let cache = dir.path().join("keys");
+    common::make_keyed_meta_archive(&archive, &cache, 16);
+
+    let responses = talk_with_cache(
+        &cache,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(common::META_EDITED), "as":"xml"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(common::META_DOCUMENT), "as":"auto"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1}}),
+        ],
+    );
+    for id in [2, 3] {
+        let wrote = answer(&responses, id);
+        assert_eq!(wrote["result"]["pending"], json!(1), "{wrote}");
+        assert_ne!(
+            wrote["result"]["len"],
+            json!(common::META_DOCUMENT.len()),
+            "what was buffered is the document rather than the payload: {wrote}"
+        );
+    }
+    let committed = answer(&responses, 4);
+    assert_eq!(committed["result"]["committed"], json!(1), "{committed}");
+
+    // On disk, and read as bytes rather than through the view: the payload of a
+    // resource is never a document, whatever the reader would make of it.
+    let cache = rpf_core::keys::Cache::at(&cache);
+    let mut file = fs::File::open(&archive).expect("readable");
+    let opened = rpf_core::Archive::open(&mut file, &rpf_core::Unlock::cached(cache, "meta.rpf"))
+        .expect("the committed archive opens under the material it was packed with");
+    let index = opened.find("data/thing.ymt").expect("the entry is there");
+    let payload = opened.extract(&mut file, index).expect("extracts");
+    assert!(
+        !payload.starts_with(b"<?xml"),
+        "the document was written into the resource entry as its payload",
+    );
+    assert_ne!(payload, common::META_DOCUMENT.as_bytes());
+    // And the edit that was offered is the one the entry now carries.
+    let names = rpf_core::Dictionary::default();
+    let viewed = rpf_core::view::read(
+        &mut file,
+        &opened,
+        index,
+        "data/thing.ymt",
+        rpf_core::view::Wanted {
+            view: rpf_core::View::Xml,
+            names: &names,
+        },
+    )
+    .expect("the committed resource still reads as a document");
+    assert_eq!(
+        String::from_utf8_lossy(&viewed.bytes),
+        common::META_DOCUMENT
+    );
+}
+
+/// A resource whose payload cannot be taken apart refuses an `auto` write of a
+/// document rather than letting it become the payload.
+///
+/// The pre-existing half of the same defect, and it needs no key: a payload
+/// that begins no deflate stream at either boundary — a corrupt entry — is a
+/// resource all the same, because `Archive::classify` reads that off the row.
+/// `auto`'s fallback is "these bytes are not a document for this entry", and
+/// for an entry whose payload nothing here can interpret that answer wrote the
+/// document into the archive.
+#[test]
+fn an_auto_write_of_a_document_into_an_unreadable_resource_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    let payload = vec![0xFF_u8; 64];
+    let mut out = fs::File::create(&archive).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &[FileSpec {
+            path: "data/thing.ymt".to_owned(),
+            kind: FileKind::Resource {
+                declared: Some(common::META_FLAGS),
+            },
+        }],
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+    drop(out);
+    let before = fs::read(&archive).expect("readable");
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(common::META_DOCUMENT), "as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+    ]);
+    let refused = answer(&responses, 2);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NoXmlView"),
+        "a document became the payload of a resource nothing could read: {refused}"
+    );
+    let committed = answer(&responses, 3);
+    assert_eq!(
+        committed["result"]["committed"],
+        json!(0),
+        "the refused write was buffered anyway: {committed}"
+    );
+    assert_eq!(
+        fs::read(&archive).expect("readable"),
+        before,
+        "the archive moved under a write that was refused"
+    );
+}
+
+/// The three refusals a `Meta` earns, on the wire, with nothing written.
+///
+/// A resource that is not a `Meta` has no view at all; a `Meta` whose row
+/// declares the page boundary somewhere else is malformed rather than guessed
+/// at; and a document that does not describe the payload is the codec's
+/// refusal and never a fallback to writing it as bytes. The command line
+/// refuses the same three (§1).
+#[test]
+fn a_meta_refuses_a_wrong_boundary_and_a_document_it_cannot_take() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let elsewhere = dir.path().join("elsewhere.rpf");
+    make_meta_archive(&elsewhere, common::META_ELSEWHERE);
+    let good = dir.path().join("meta.rpf");
+    make_meta_archive(&good, common::META_FLAGS);
+    let before = fs::read(&good).expect("readable");
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": elsewhere.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(common::META_EDITED), "as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"open","params":{
+            "path": good.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"write","params":{
+            "handle":2,"path":"data/thing.ymt",
+            "bytes": BASE64.encode("<?xml version=\"1.0\"?><SomethingElse/>"), "as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"commit","params":{"handle":2}}),
+    ]);
+    for id in [2, 3] {
+        let refused = answer(&responses, id);
+        assert_eq!(
+            refused["error"]["data"]["reason"],
+            json!("BadMeta"),
+            "{refused}"
+        );
+    }
+    let refused = answer(&responses, 5);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NotMetaXml"),
+        "{refused}"
+    );
+    // Nothing was buffered, so the commit has nothing to write and the file is
+    // byte for byte what it was.
+    let committed = answer(&responses, 6);
+    assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
+    assert_eq!(
+        fs::read(&good).expect("readable"),
+        before,
+        "a refused conversion wrote something"
+    );
+}
+
+/// A resource that is not a `Meta` still has no view, and `"auto"` still hands
+/// back its bytes.
+///
+/// The other half of R5.8's answer, and the one a client meets far more often:
+/// 694,470 of the corpus's resources are not `Meta` and every one of them must
+/// come back as itself. `art.ydr` here is a page of zeroes, which is a resource
+/// whose contents carry no `Meta` magic.
+#[test]
+fn a_resource_that_is_not_a_meta_still_has_no_xml_view() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("rockstar.rpf");
+    let resource = make_rockstar_archive(&archive);
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+            "handle":1,"path":"art.ydr","as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+            "handle":1,"path":"art.ydr","as":"auto"}}),
+    ]);
+    let refused = answer(&responses, 2);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NoXmlView"),
+        "{refused}"
+    );
+    let automatic = answer(&responses, 3);
+    assert_eq!(automatic["result"]["as"], json!("raw"), "{automatic}");
+    assert_eq!(automatic["result"]["encoding"], json!(null), "{automatic}");
+    assert_eq!(
+        automatic["result"]["bytes"],
+        json!(BASE64.encode(&resource)),
+        "{automatic}"
+    );
+}
+
+/// A resource entry does not take a document, on the wire. DR-061.
+///
+/// `art.yft` is an ordinary resource: its payload comes apart, inflates to what
+/// its flag words declare, and is not a `Meta` — the shape 694,470 of the
+/// corpus's 696,578 resources are in. `write {"as":"auto"}` of an XML document
+/// answered `{"pending":1}` and `commit` wrote the document in as the payload,
+/// because "no view" means "hand the bytes back" and a resource carries no
+/// encoding for the encoding guard to see a change in. The assertion is over
+/// the bytes a raw read gives back, not over a length: the length that landed
+/// was the document's own.
+#[test]
+fn an_auto_write_of_a_document_into_a_resource_is_refused_on_the_wire() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let resource = make_archive(&archive);
+    let path = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"art.yft",
+            "bytes": BASE64.encode(common::META_DOCUMENT), "as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+            "handle":1,"path":"art.yft","as":"raw"}}),
+    ]);
+    let refused = answer(&responses, 2);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NoXmlView"),
+        "{refused}"
+    );
+    assert!(
+        refused["result"].is_null(),
+        "the document was buffered: {refused}"
+    );
+    // Nothing was buffered, so the commit has nothing to write.
+    let committed = answer(&responses, 3);
+    assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
+    let after = answer(&responses, 4);
+    assert_eq!(
+        after["result"]["bytes"],
+        json!(BASE64.encode(&resource)),
+        "the document landed as the resource's payload: {after}"
+    );
+}

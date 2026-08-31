@@ -522,6 +522,15 @@ pub(crate) struct Written {
 ///   `archive::RESOURCE_IS_IN_THE_CLEAR` is the read side of the same rule and
 ///   not of the same fact: as its own doc says, it is not a claim about the
 ///   contents either.
+///
+///   **The one write path that produces a resource payload rather than passing
+///   one through seals it itself**, before it ever reaches here: `view::apply`
+///   frames an edited `Meta` back up and hands it to
+///   `archive::Archive::seal_payload_from`, which puts it under the transform
+///   the entry was read under. That is what keeps the paragraph above true of a
+///   converted write, and it is DR-060. A converted write that landed here
+///   unsealed wrote plaintext into an encrypted archive, and `verify` read it
+///   back happily, because the read side tries the clear boundary first.
 pub(crate) const fn is_sealed(version: Version, kind: FileKind) -> bool {
     match kind {
         FileKind::Binary { encryption, .. } => !version.entry_is_open(encryption),

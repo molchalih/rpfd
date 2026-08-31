@@ -298,6 +298,32 @@ fn make_rockstar_archive(at: &Path) -> Vec<u8> {
     resource
 }
 
+/// An archive holding one resource entry at `data/thing.ymt` whose contents are
+/// a `Meta`, with `flags` as the row's two flag words.
+///
+/// The payload is the file outside the archive — no `RSC7` header, a stream
+/// beginning at 24 — so nothing about the fixture arranges for the view to find
+/// it: the boundary is recovered by the archive's own probe, exactly as it is
+/// for a Rockstar resource.
+fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
+    let payload = common::meta_resource();
+    let mut out = fs::File::create(at).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &[FileSpec {
+            path: "data/thing.ymt".to_owned(),
+            kind: FileKind::Resource {
+                declared: Some(flags),
+            },
+        }],
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+}
+
 #[test]
 fn cat_put_round_trips_a_resource_that_carries_no_header() {
     // R6.6 and DR-046, on the command line: `docs/backlog.md` Q7 measured
@@ -3691,4 +3717,319 @@ fn a_document_the_entry_cannot_take_is_refused_at_the_conversion() {
         payload,
         "a refused conversion wrote something"
     );
+}
+
+/// R5.8 on the command line: a resource carrying `Meta` reads as XML and takes
+/// an edited document back.
+///
+/// The third encoding, and the one that is not a payload with a magic. What is
+/// being asserted past the round trip is that the **entry** is what carries the
+/// conversion's other argument: a `Meta` is inside a resource's inflated
+/// payload and the boundary between its system and graphics pages is
+/// `size_from_flags` of the row's system flags, which appears nowhere in the
+/// bytes. The daemon does this too, over the same fixture (§1).
+#[test]
+fn a_resource_meta_is_read_as_xml_and_an_edited_document_is_written_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    make_meta_archive(&archive, common::META_FLAGS);
+    let at = archive.display().to_string();
+
+    let (code, shown) = run(&["cat", &at, "data/thing.ymt", "--as", "xml"]);
+    assert_eq!(code, 0, "cat --as xml");
+    assert_eq!(
+        String::from_utf8_lossy(&shown),
+        common::META_DOCUMENT,
+        "the view is the document"
+    );
+    // And `auto` answers the same, which is what a client that must not guess
+    // from the extension asks. `.ymt` is a resource here and metadata
+    // elsewhere, which is the whole reason it may not guess.
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt", "--as", "auto"]).1,
+        shown,
+        "auto"
+    );
+
+    let donor = dir.path().join("meta.xml");
+    fs::write(&donor, common::META_EDITED).expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &at,
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 0, "put --as xml said {message}");
+
+    assert_eq!(
+        String::from_utf8_lossy(&run(&["cat", &at, "data/thing.ymt", "--as", "xml"]).1),
+        common::META_EDITED,
+        "the edit did not land"
+    );
+    // The entry is the resource it always was — a listing reads no resource
+    // payload, so its encoding is `null` before and after (Q7, DR-044) — and
+    // the archive still reads back against the flag words its row declares.
+    let (code, listed) = run(&["--json", "ls", &at, "", "-R"]);
+    assert_eq!(code, 0);
+    let rows: serde_json::Value = serde_json::from_slice(&listed).expect("an array");
+    let row = rows
+        .as_array()
+        .expect("an array")
+        .iter()
+        .find(|row| row["path"] == serde_json::json!("data/thing.ymt"))
+        .expect("the entry is listed")
+        .clone();
+    assert_eq!(row["encoding"], serde_json::Value::Null, "{rows}");
+    assert_eq!(run(&["verify", &at]).0, 0, "verify");
+}
+
+/// A `Meta` document put back with nothing changed leaves the entry reading the
+/// same, value for value.
+///
+/// Not byte for byte at the payload, and that is stated rather than glossed: a
+/// converted write is the one write that is not passthrough, so its contents are
+/// deflated again at this build's own compression level rather than at the
+/// producer's (DR-060). What must not move is the file — the 2.48% no walk
+/// reaches included — and the way to see that is that a second read of the entry
+/// is the same document.
+#[test]
+fn a_meta_written_back_unedited_reads_back_as_the_same_document() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta-same.rpf");
+    make_meta_archive(&archive, common::META_FLAGS);
+    let at = archive.display().to_string();
+
+    let (code, shown) = run(&["cat", &at, "data/thing.ymt", "--as", "xml"]);
+    assert_eq!(code, 0);
+    let donor = dir.path().join("meta-same.xml");
+    fs::write(&donor, &shown).expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &at,
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 0, "{message}");
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt", "--as", "xml"]).1,
+        shown,
+        "an unedited round trip changed what the entry says"
+    );
+    assert_eq!(run(&["verify", &at]).0, 0, "verify");
+}
+
+/// The opaque bytes in front of a resource's deflate stream cross a converted
+/// write untouched, and the write is idempotent from the second time on.
+///
+/// DR-060. `docs/rpf-format.md` records that no Rockstar resource payload begins
+/// with `RSC7` and that nothing decrypts those bytes into one, so nobody knows
+/// what they are — and `docs/approach.md` commits that what this build cannot
+/// interpret still round-trips byte for byte. The fixture's stream begins at 24,
+/// which is the case that made this visible: writing a 16-byte header of this
+/// build's own moved the stream by 8 and threw the original bytes away.
+#[test]
+fn a_converted_meta_write_keeps_the_payloads_opaque_prefix_byte_for_byte() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta-prefix.rpf");
+    make_meta_archive(&archive, common::META_FLAGS);
+    let at = archive.display().to_string();
+    let before = run(&["cat", &at, "data/thing.ymt"]).1;
+    assert_eq!(before.get(..24), Some(&[0xFF_u8; 24][..]), "the fixture");
+
+    let donor = dir.path().join("meta-prefix.xml");
+    fs::write(&donor, common::META_EDITED).expect("writable");
+    let put = [
+        "put",
+        &at,
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--as",
+        "xml",
+    ];
+    let (code, message) = run_err(&put);
+    assert_eq!(code, 0, "{message}");
+
+    let after = run(&["cat", &at, "data/thing.ymt"]).1;
+    assert_eq!(
+        after.get(..24),
+        before.get(..24),
+        "the payload's opaque prefix was rewritten"
+    );
+    // And the second write of the same document moves nothing at all: what this
+    // build deflated, it deflates the same way again.
+    let (code, message) = run_err(&put);
+    assert_eq!(code, 0, "{message}");
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt"]).1,
+        after,
+        "a converted write is not idempotent"
+    );
+    assert_eq!(run(&["verify", &at]).0, 0, "verify");
+}
+
+/// A `Meta` whose row declares the page boundary somewhere else is refused, in
+/// both directions, and nothing is written.
+///
+/// The same 512 bytes as the test above, in an entry whose flag words put all
+/// of them in the graphics half. The archive cannot tell the two apart — it
+/// checks the sum, and the sum is the same — and the `Meta` inside can, because
+/// every pointer it holds is resolved against the system half. So this is the
+/// one thing a frontend cannot get right by carrying the payload alone, and a
+/// wrong answer here would be a file edited at addresses that are not its own.
+#[test]
+fn a_meta_read_against_a_boundary_its_row_does_not_declare_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta-elsewhere.rpf");
+    make_meta_archive(&archive, common::META_ELSEWHERE);
+    let at = archive.display().to_string();
+
+    // The entry itself is sound: the payload inflates to the length its row
+    // declares, and `verify` reads it back.
+    assert_eq!(run(&["verify", &at]).0, 0, "verify");
+    let before = run(&["cat", &at, "data/thing.ymt"]).1;
+
+    let (code, message) = run_err(&["cat", &at, "data/thing.ymt", "--as", "xml"]);
+    assert_eq!(code, 4, "{message}");
+    assert!(message.contains("malformed Meta"), "{message}");
+
+    let donor = dir.path().join("elsewhere.xml");
+    fs::write(&donor, common::META_EDITED).expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &at,
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 4, "{message}");
+    assert!(message.contains("malformed Meta"), "{message}");
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt"]).1,
+        before,
+        "a refused conversion wrote something"
+    );
+}
+
+/// And a document that does not describe the `Meta` it is applied to is refused
+/// by the codec, with nothing written.
+#[test]
+fn a_document_the_meta_cannot_take_is_refused_at_the_conversion() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta-bad.rpf");
+    make_meta_archive(&archive, common::META_FLAGS);
+    let at = archive.display().to_string();
+    let before = run(&["cat", &at, "data/thing.ymt"]).1;
+
+    let donor = dir.path().join("not-meta.xml");
+    fs::write(&donor, "<?xml version=\"1.0\"?><SomethingElse/>").expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &at,
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains("does not describe this Meta payload"),
+        "must be the codec's own refusal: {message}"
+    );
+    assert!(
+        !message.contains("--allow-encoding-change"),
+        "the document reached the entry as bytes: {message}"
+    );
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt"]).1,
+        before,
+        "a refused conversion wrote something"
+    );
+}
+
+/// A resource entry does not take a document, on the command line. DR-061.
+///
+/// The entry here is an ordinary resource: its payload comes apart at the
+/// boundary its stream begins at, inflates to exactly what its row declares,
+/// and carries no `Meta` — which is 694,470 of the corpus's 696,578 resources.
+/// `put --as auto` of an XML document over it exited 0 and wrote the document's
+/// own bytes in as the payload, with nothing refused: a resource carries no
+/// encoding, so `edit::check_encoding` had nothing to compare. The assertion is
+/// over the bytes `cat` gives back afterwards and not over their length, which
+/// is what could not tell this apart — the length that landed *was* the
+/// document's.
+#[test]
+fn put_as_auto_refuses_a_document_into_a_resource_that_is_not_a_meta() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("rockstar.rpf");
+    let payload = {
+        let mut bytes = vec![0xFF_u8; 24];
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&[0_u8; 512]).expect("deflates");
+        bytes.extend_from_slice(&encoder.finish().expect("the encoder finishes"));
+        bytes
+    };
+    let held = payload.clone();
+    let mut out = fs::File::create(&archive).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &[FileSpec {
+            path: "art.ydr".to_owned(),
+            kind: FileKind::Resource {
+                declared: Some(common::META_FLAGS),
+            },
+        }],
+        &[],
+        |_: &str| Ok(Cursor::new(held.clone())),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+    drop(out);
+    let at = archive.display().to_string();
+    assert_eq!(run(&["cat", &at, "art.ydr"]).1, payload, "the fixture");
+
+    let donor = dir.path().join("doc.xml");
+    fs::write(&donor, common::META_DOCUMENT).expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &at,
+        "art.ydr",
+        &donor.display().to_string(),
+        "--as",
+        "auto",
+    ]);
+    assert_ne!(code, 0, "a resource took a document: {message}");
+    assert!(
+        message.contains("has no XML view"),
+        "the refusal does not name the view: {message}"
+    );
+    let after = run(&["cat", &at, "art.ydr"]).1;
+    assert_eq!(after, payload, "the document landed as the entry's payload");
+    assert_ne!(after.get(..5), Some(&b"<?xml"[..]));
+    assert_eq!(run(&["verify", &at]).0, 0, "verify");
+
+    // And `--as raw` still writes genuine resource bytes into it, which is the
+    // write this must not have taken away.
+    let other = dir.path().join("other.ydr");
+    let mut swapped = payload.clone();
+    swapped[0] = 0xAA;
+    fs::write(&other, &swapped).expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &at,
+        "art.ydr",
+        &other.display().to_string(),
+        "--as",
+        "raw",
+    ]);
+    assert_eq!(code, 0, "raw no longer writes a resource: {message}");
+    assert_eq!(run(&["cat", &at, "art.ydr"]).1, swapped);
 }

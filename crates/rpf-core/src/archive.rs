@@ -97,6 +97,23 @@ struct Boundary {
     payload: Payload,
 }
 
+/// A resource entry taken apart, as [`Archive::resource_unframed`] answers it.
+///
+/// The three facts a converted write needs and that no two of them can be asked
+/// for separately: the contents come out under a transform the probe recovered,
+/// so what puts them back has to know the same transform and the same boundary
+/// (DR-054, DR-060).
+pub(crate) struct Unframed {
+    /// The opaque bytes in front of the deflate stream, as they sit on disk —
+    /// sixteen or twenty-four of them ([`RESOURCE_HEADER_LENS`]), and not a
+    /// header this build can read (`docs/backlog.md` Q7).
+    pub(crate) prefix: Vec<u8>,
+    /// What the stream inflates to: the length the entry's flag words declare.
+    pub(crate) contents: Vec<u8>,
+    /// Whether the stream was found under the archive's own transform. DR-051.
+    pub(crate) sealed: bool,
+}
+
 /// What a read of one entry found out about the payload it came out of.
 ///
 /// It holds no contents, only their length: a read that keeps them is
@@ -435,6 +452,11 @@ impl<S: Read + Seek> Seek for Plain<S> {
 /// change to what [`Archive::resource_stream`] finds is not a reason to change
 /// either — making the writer follow it would double-encrypt the 3,022. DR-054
 /// §3, as amended.
+///
+/// A payload this build **produced** rather than passed through is the case
+/// neither of them covers, and [`Archive::seal_payload_from`] is where it is
+/// covered: it is sealed where it is made, so what arrives at the writer is a
+/// payload in the form it sits in either way. DR-060.
 const RESOURCE_IS_IN_THE_CLEAR: Option<Cipher> = None;
 
 /// Which of the two forms an entry is read in.
@@ -1482,6 +1504,114 @@ impl Archive {
     /// when the payload does not decompress as promised.
     pub fn read<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Vec<u8>> {
         self.opened(src, index, Form::Contents)?.whole()
+    }
+
+    /// One **resource** taken apart the way a converted write has to put it
+    /// back together: the opaque bytes in front of its stream, what the stream
+    /// inflates to, and whether the payload sits under the archive's own
+    /// transform.
+    ///
+    /// [`Archive::read`] answers the middle one alone, and the middle one alone
+    /// is what wrote plaintext into an encrypted archive: an edited `Meta` was
+    /// framed back up as though every resource were in the clear, and 3,022 of
+    /// 696,578 are not (DR-051). All three come from the one probe
+    /// [`Archive::resource_stream`] already runs, so a caller cannot read the
+    /// contents under a key and then write them back without one (DR-054,
+    /// DR-060).
+    ///
+    /// The prefix is the payload **as it sits on disk** — never decrypted,
+    /// because nothing decrypts it into anything: no Rockstar payload begins
+    /// with `RSC7` and no key or pass count produces one from those bytes
+    /// (`docs/rpf-format.md`, Encryption). Carried across a write verbatim, it
+    /// is exactly as opaque afterwards as it was before.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WrongKind`] for an entry that is not a resource, and as
+    /// [`Archive::read`].
+    pub(crate) fn resource_unframed<R: Read + Seek>(
+        &self,
+        src: &mut R,
+        index: u32,
+    ) -> Result<Unframed> {
+        let (offset, _) = self.payload_span(index)?;
+        let found = self.resource_stream(src, index)?;
+        let header = usize::try_from(found.at.saturating_sub(offset)).unwrap_or(0);
+        let mut prefix = vec![0_u8; header];
+        src.seek(SeekFrom::Start(offset))
+            .and_then(|_| src.read_exact(&mut prefix))
+            .map_err(|source| Error::Io { offset, source })?;
+        let sealed = found.cipher.is_some();
+        let contents = Extracted::deflated(
+            index,
+            &mut *src,
+            found.at,
+            found.len,
+            found.expected,
+            found.cipher,
+        )
+        .whole()?;
+        Ok(Unframed {
+            prefix,
+            contents,
+            sealed,
+        })
+    }
+
+    /// The archive's own transform as a payload of the **resource** entry at
+    /// `index` needs it, in both directions.
+    ///
+    /// The pair rather than either alone, because the two seams that hold a
+    /// resource payload outside the archive need both: one takes a payload
+    /// apart under the transform it was found under, and the other puts what it
+    /// produced back under the same one. `view::Resource` is where they meet,
+    /// and `view::Resource::seal_from` is the write side (DR-060 §2, DR-061).
+    ///
+    /// `in_hand` is the length of a payload the caller holds rather than the
+    /// one this entry carries, and `None` is the entry's own. It is a parameter
+    /// because the NG key index is a function of the payload's length **on
+    /// disk** (DR-051, [`Archive::resource_cipher`]), and what a converted
+    /// write buffers is deflated again and is its own length.
+    ///
+    /// The seal is `None` rather than an error for a transform this build
+    /// cannot run forwards, because that is a refusal at the write and not at
+    /// the read: an NG archive's resources still take apart, and only putting
+    /// one back is impossible. `view::Resource::seal_from` is where that `None`
+    /// becomes [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`], and
+    /// **only that cause may become that `None`**: [`Archive::seal`] refuses for
+    /// a second reason too — [`Error::WrongKey`], for an encrypted archive with
+    /// no material in hand — and swallowing it here would have the write refuse
+    /// later in the name of a capability this build does have. It is answered
+    /// where it arises instead. Neither reason is reachable at `RPF7` today: an
+    /// archive that opened under a key keeps what opened it, and every `RPF7`
+    /// row is one cipher block ([`Version::row_is_a_cipher_block`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::name`], for an index the table does not hold, and whatever
+    /// [`Archive::seal`] refuses with other than the write's own missing
+    /// inverse.
+    pub(crate) fn resource_transform(
+        &self,
+        index: u32,
+        in_hand: Option<u64>,
+    ) -> Result<(Option<Cipher>, Option<Seal>)> {
+        let len = match in_hand {
+            Some(len) => len,
+            None => self.payload_span(index)?.1,
+        };
+        let seal = match self.seal() {
+            Ok(seal) => seal,
+            Err(Error::CannotWriteEncrypted { .. }) => None,
+            Err(other) => return Err(other),
+        };
+        Ok((self.resource_cipher(index, len)?, seal))
+    }
+
+    /// The archive's own encryption tag, which a refusal to write one names.
+    #[must_use]
+    pub(crate) const fn encryption_tag(&self) -> u32 {
+        self.encryption
     }
 
     /// [`Archive::read`] for a caller checking an entry rather than using it:

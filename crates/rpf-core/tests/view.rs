@@ -240,11 +240,15 @@ fn a_resource_entry_takes_no_document_whatever_its_payload_begins_with() {
     let refused = apply(bytes.clone(), View::Xml, EDITED.as_bytes())
         .expect_err("a resource has no view to write into");
     assert_eq!(refused.name(), "NoXmlView");
-    assert_eq!(
-        apply(bytes, View::Auto, EDITED.as_bytes()).expect("auto takes the bytes as they are"),
-        EDITED.as_bytes(),
-        "a document was tokenised against a resource payload"
-    );
+    // And `auto` refuses too, rather than handing the document back for the
+    // commit to write into the entry as its payload. This payload is not a
+    // deflate stream at either boundary, so nothing here can take it apart, and
+    // "these bytes are not a document for this entry" is the wrong answer for
+    // an entry whose payload we could not read: it is not a fallback but a
+    // silent replacement. DR-061.
+    let refused =
+        apply(bytes, View::Auto, EDITED.as_bytes()).expect_err("auto has nothing to apply to");
+    assert_eq!(refused.name(), "NoXmlView");
 }
 
 #[test]
@@ -358,5 +362,180 @@ fn a_document_that_does_not_describe_the_entry_is_refused_rather_than_taken() {
     assert!(
         matches!(refused, Error::NotRbfXml { .. }),
         "expected a refusal about the document, got {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A resource entry does not take a document. DR-061.
+//
+// The branch below is not the keyed one and not the corrupt one: it is a
+// resource whose payload comes apart exactly as intended and simply is not a
+// `Meta` — 694,470 of the corpus's 696,578 resources, every `.ydr`, `.ytd` and
+// `.ysc` there is. `Held::Resource` with no `Meta` inside it answered "no view",
+// and `auto`'s fallback for "no view" is to hand the offered bytes back, so an
+// XML document landed as the resource's payload with nothing refused and
+// nothing reported.
+// ---------------------------------------------------------------------------
+
+/// The flag words of a one-page resource: 512 bytes of system and no graphics.
+const RESOURCE_FLAGS: ResourceFlags = ResourceFlags {
+    system: 0xA800_0000,
+    graphics: 0x2000_0000,
+};
+
+/// A resource payload that **comes apart** and is not a `Meta`: 24 opaque
+/// bytes, then 512 zero bytes deflated.
+///
+/// The shape every ordinary resource is in. It unframes at the boundary its
+/// stream begins at, it inflates to exactly the length [`RESOURCE_FLAGS`]
+/// declares, and what comes out carries no `Meta` magic — so the entry is read
+/// and understood and still has no XML view.
+fn plain_resource(fill: u8) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut payload = vec![0xFF_u8; 24];
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![fill; 512]).expect("deflates");
+    payload.extend_from_slice(&encoder.finish().expect("the encoder finishes"));
+    payload
+}
+
+/// The one entry's payload as it sits in `bytes`.
+fn payload_in(bytes: Vec<u8>) -> Vec<u8> {
+    let (mut src, archive, index) = opened(bytes);
+    archive.extract(&mut src, index).expect("extracts")
+}
+
+/// What lands on disk when `offered` is written into the one entry as `view` —
+/// the whole path, `view::apply` and then the rebuild.
+///
+/// Both outcomes answer the same question, which is why the refusal is not
+/// asserted here: the payload that ends up in the archive is the payload that
+/// ends up in the archive, whether the write was refused on the way or taken.
+/// A test that asserted a *length* instead could not tell this defect apart at
+/// all — the document's own 133 bytes are what landed.
+fn landed(bytes: Vec<u8>, view: View, offered: &[u8]) -> Vec<u8> {
+    match apply(bytes.clone(), view, offered) {
+        Ok(payload) => payload_in(commits(bytes, &payload).expect("the archive rebuilds")),
+        Err(_) => payload_in(bytes),
+    }
+}
+
+#[test]
+fn a_resource_that_is_not_a_meta_takes_no_document_and_the_bytes_prove_it() {
+    let payload = plain_resource(0x00);
+    let bytes = build_with(
+        FileKind::Resource {
+            declared: Some(RESOURCE_FLAGS),
+        },
+        &payload,
+    );
+
+    // The fixture is the case it claims to be: a resource entry whose payload
+    // this build can take apart, holding contents that are not a `Meta`.
+    assert_eq!(payload_in(bytes.clone()), payload, "the fixture's payload");
+    let refused = read(bytes.clone(), View::Xml).expect_err("not a Meta");
+    assert_eq!(refused.name(), "NoXmlView");
+    assert_eq!(
+        read(bytes.clone(), View::Auto)
+            .expect("auto reads bytes")
+            .bytes,
+        payload,
+        "a read of a resource with no view is still its own bytes"
+    );
+
+    // The defect, over the bytes that land rather than over their length: the
+    // document's 133 bytes were written into the entry as its payload.
+    for view in [View::Xml, View::Auto] {
+        let refused = apply(bytes.clone(), view, DOCUMENT.as_bytes())
+            .expect_err("a resource takes no document");
+        assert_eq!(refused.name(), "NoXmlView", "as {}", view.name());
+        assert_eq!(refused.category(), rpf_core::Category::Refused);
+        let after = landed(bytes.clone(), view, DOCUMENT.as_bytes());
+        assert_eq!(
+            after,
+            payload,
+            "as {}: the entry's payload was replaced by the document",
+            view.name()
+        );
+        assert_ne!(after.get(..5), Some(&b"<?xml"[..]));
+    }
+
+    // And the two writes that must keep working. `raw` writes genuine resource
+    // bytes, and `auto` over bytes that are not a document is that same write.
+    let other = plain_resource(0x5A);
+    for view in [View::Raw, View::Auto] {
+        assert_eq!(
+            landed(bytes.clone(), view, &other),
+            other,
+            "as {}: a resource stopped taking its own bytes",
+            view.name()
+        );
+    }
+}
+
+#[test]
+fn a_resource_whose_row_is_corrupt_refuses_a_write_rather_than_overwriting_it() {
+    // The read of a resource entry now runs before `auto` decides anything —
+    // the transform its payload is under is a fact about the row and the
+    // archive (DR-061) — so an entry whose row does not describe a payload at
+    // all fails here where it once let `auto` write the offered bytes over it.
+    // That is intended and pinned: `extract` of this entry already fails with
+    // the same error, and a write that "succeeds" against a row no reader can
+    // follow puts bytes at an offset nobody can name. `--as raw` still writes
+    // it, which is the escape hatch for a caller who means to.
+    let mut bytes = build_with(
+        FileKind::Resource {
+            declared: Some(RESOURCE_FLAGS),
+        },
+        &plain_resource(0x00),
+    );
+    // The entry table follows the 16-byte header; entry 0 is the root
+    // directory and entry 1 is `data`, so the file's row is the third. A file
+    // row's block offset is the 24 bits at 5..8, and the top bit of those is
+    // the resource flag, which is kept — the row still says "resource" and no
+    // longer says where.
+    let row = 16 + 16 * 2;
+    bytes[row + 5..row + 8].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
+
+    // Opened by name rather than through `Archive::locate`, which reads the
+    // entry to see whether it nests an archive and fails on this row first.
+    let mut src = Cursor::new(bytes);
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("the archive still opens");
+    let index = archive.find(AT).expect("the entry is still listed");
+    let out_of_bounds = archive
+        .extract(&mut src, index)
+        .expect_err("the row points nowhere");
+    assert!(
+        matches!(out_of_bounds, Error::OutOfBounds { .. }),
+        "the fixture is not the case it claims to be: {out_of_bounds:?}"
+    );
+
+    let offered = b"\x00\x01\x02 not a document";
+    let refused = rpf_core::view::apply(
+        &mut src,
+        &archive,
+        index,
+        AT,
+        wanted(View::Auto),
+        offered.to_vec(),
+    )
+    .expect_err("a row no reader can follow takes no write");
+    assert!(
+        matches!(refused, Error::OutOfBounds { .. }),
+        "expected the row's own error, got {refused:?}"
+    );
+    // `raw` is untouched: it never asks what the entry holds.
+    assert_eq!(
+        rpf_core::view::apply(
+            &mut src,
+            &archive,
+            index,
+            AT,
+            wanted(View::Raw),
+            offered.to_vec(),
+        )
+        .expect("raw writes what it is given"),
+        offered,
     );
 }

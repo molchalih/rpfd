@@ -123,3 +123,24 @@ path = "fuzz_targets/encrypted.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "meta"
+path = "fuzz_targets/meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta_trip"
+path = "fuzz_targets/meta_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "meta_apply"
+path = "fuzz_targets/meta_apply.rs"
+test = false
+doc = false
+bench = false

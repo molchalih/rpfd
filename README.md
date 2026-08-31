@@ -370,8 +370,12 @@ the transform. The NG transform is a white-box construction and this build holds
 only its decrypt tables, so a `0x0FEFFFFF` archive is refused with
 `CannotWriteEncrypted` at exit 9 before a byte is touched — and `--force` does
 not reach it, because a capability that is absent is not a safety interlock.
-The message names which of the two it is; `docs/ng-scheme.md` is why the second
-one stands.
+The message names which of the two it is. **That refusal is a missing
+capability, not a permanent one**: the forward tables are derived from the
+decrypt tables by code that is published and MIT-licensed, and derives from
+nothing else, so writing NG is work this build has not done rather than work
+nobody can do. It has not been attempted against the tables here.
+`docs/ng-scheme.md` records what is established and what is not.
 
 `pack` opens no archive — it builds one from an extracted tree — so it reaches
 key material the way every other command does: `--cache-dir`, or the platform's
@@ -379,8 +383,8 @@ own cache, consulted only where the manifest's tag names a transform this build
 can write forwards. An AES tree packs back under its own tag, and one packed
 where no material is available is `NeedsKey` at exit 5 rather than an archive
 written in the clear under an encrypted tag. An NG manifest is refused at exit 9
-before any material is asked for, because there is no inverse to ask for it
-for.
+before any material is asked for, because this build cannot write that
+transform forwards yet.
 
 ## Building and testing
 
