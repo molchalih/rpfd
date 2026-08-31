@@ -9,10 +9,18 @@
     reason = "test code; a panic is the reporting mechanism"
 )]
 
-use std::{collections::BTreeMap, fs, io::Cursor, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{Cursor, Write as _},
+    path::Path,
+    process::Command,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rpf_core::{FileKind, FileSpec, Storage, Unwatched};
+
+mod common;
 
 /// The binary under test, as cargo built it.
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
@@ -251,6 +259,298 @@ fn cat_edit_put_round_trips() {
     let (_, out) = run(&["cat", &archive, "stored.bin"]);
     assert_eq!(out, contents["stored.bin"], "an unrelated entry changed");
     assert_eq!(run(&["verify", &archive]).0, 0, "verify");
+}
+
+/// An archive whose one resource is shaped the way a Rockstar archive holds
+/// one: an opaque header that is not `RSC7`, then the deflate stream. Returns
+/// the payload.
+fn make_rockstar_archive(at: &Path) -> Vec<u8> {
+    // 24 bytes of 0xFF: not `RSC7`, and not the start of a deflate stream
+    // either — the low three bits are BFINAL = 1 with the reserved BTYPE = 11.
+    let mut resource = vec![0xFF_u8; 24];
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(&vec![0_u8; 512])
+        .expect("the page deflates");
+    resource.extend_from_slice(&encoder.finish().expect("the encoder finishes"));
+
+    let files = vec![FileSpec {
+        path: "art.ydr".to_owned(),
+        kind: FileKind::Resource {
+            declared: Some(rpf_core::ResourceFlags {
+                system: 0xA800_0000,
+                graphics: 0x2000_0000,
+            }),
+        },
+    }];
+    let payload = resource.clone();
+    let mut out = fs::File::create(at).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+    resource
+}
+
+#[test]
+fn cat_put_round_trips_a_resource_that_carries_no_header() {
+    // R6.6 and DR-046, on the command line: `docs/backlog.md` Q7 measured
+    // 696,578 of 696,578 Rockstar resource payloads that do not begin with
+    // `RSC7`, so a build that required the magic on the way in refused every
+    // resource its own reader had just handed out. §1 — the daemon does this
+    // too, `crates/rpf/tests/serve.rs`.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let resource = make_rockstar_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let (code, out) = run(&["cat", &archive, "art.ydr"]);
+    assert_eq!(code, 0);
+    assert_eq!(out, resource, "cat returned something else");
+
+    let same = dir.path().join("art.ydr");
+    fs::write(&same, &out).expect("writable");
+    let (code, err) = run_err(&["put", &archive, "art.ydr", &same.display().to_string()]);
+    assert_eq!(code, 0, "writing it back was refused: {err}");
+
+    assert_eq!(
+        run(&["cat", &archive, "art.ydr"]).1,
+        resource,
+        "the bytes did not survive the round trip"
+    );
+    // And the row still describes them: `verify` reads the entry back against
+    // the flag words, which are the only record of its length there is.
+    assert_eq!(run(&["verify", &archive]).0, 0, "verify");
+}
+
+/// An archive holding one stored entry at `data/thing.ymt`, whose payload is
+/// `contents`.
+fn make_metadata_archive(at: &Path, contents: &[u8]) {
+    let payload = contents.to_vec();
+    let mut out = fs::File::create(at).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &[FileSpec {
+            path: "data/thing.ymt".to_owned(),
+            kind: FileKind::Binary {
+                storage: Storage::Stored,
+                encryption: 0,
+            },
+        }],
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+}
+
+/// Every value the `"encoding"` field can carry, spelled out.
+///
+/// DR-032 makes the field names *and* their values part of the wire contract,
+/// and there are exactly five: `"xml"`, `"text"`, `"rbf"`, `"pso"` and `null`.
+/// They are written out here rather than derived from `Encoding::name`, because
+/// a test that asked the code what it spells them would agree with a rename and
+/// every client's listing filter would not. R6.2, DR-032.
+#[test]
+fn a_listing_spells_every_encoding_the_wire_contract_names() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let payloads: [(&str, &[u8]); 5] = [
+        ("xml.ymt", b"<CVehicleModelInfo />"),
+        ("text.ymt", b"a plain line of text\n"),
+        ("rbf.ymt", b"RBF0\x01\x02\x03\x04tokens"),
+        ("pso.ymt", b"PSIN\x01\x02\x03\x04sect"),
+        ("unknown.ymt", &[0x00_u8; 32]),
+    ];
+    let held: BTreeMap<String, Vec<u8>> = payloads
+        .iter()
+        .map(|(path, bytes)| ((*path).to_owned(), (*bytes).to_vec()))
+        .collect();
+    let mut out = fs::File::create(&archive).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &payloads
+            .iter()
+            .map(|(path, _)| FileSpec {
+                path: (*path).to_owned(),
+                kind: FileKind::Binary {
+                    storage: Storage::Stored,
+                    encryption: 0,
+                },
+            })
+            .collect::<Vec<_>>(),
+        &[],
+        |path: &str| Ok(Cursor::new(held[path].clone())),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+
+    let (code, listed) = run(&["--json", "ls", &archive.display().to_string(), "", "-R"]);
+    assert_eq!(code, 0);
+    let rows: serde_json::Value = serde_json::from_slice(&listed).expect("an array");
+    let row = |path: &str| {
+        rows.as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["path"] == serde_json::json!(path))
+            .unwrap_or_else(|| panic!("{path} is not in {rows}"))
+            .clone()
+    };
+    for (path, spelt) in [
+        ("xml.ymt", serde_json::json!("xml")),
+        ("text.ymt", serde_json::json!("text")),
+        ("rbf.ymt", serde_json::json!("rbf")),
+        ("pso.ymt", serde_json::json!("pso")),
+        ("unknown.ymt", serde_json::Value::Null),
+    ] {
+        assert_eq!(row(path)["encoding"], spelt, "{path} is spelled wrong");
+    }
+}
+
+/// R6.6 on the command line: an entry holding `RBF` or `PSO` takes neither XML
+/// nor text, and `--allow-encoding-change` is the way through.
+///
+/// Both targets and both payloads, because a guard written for one of them
+/// lets the other through. The daemon does the same, under the same name —
+/// `crates/rpf/tests/serve.rs`, §1. DR-050.
+#[test]
+fn put_refuses_text_into_a_tokenised_metadata_entry() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (held, holds) in [
+        (&b"RBF0\x01\x02\x03\x04tokens"[..], "rbf"),
+        (&b"PSIN\x01\x02\x03\x04sect"[..], "pso"),
+    ] {
+        for (offered, offers) in [
+            (&b"<CVehicleModelInfo />"[..], "xml"),
+            (&b"a plain line of text\n"[..], "text"),
+        ] {
+            // Both ways a write can go. The patch path is what a small edit
+            // takes and the rebuild path is what a frontend falls back to, and
+            // every fixture here fits in place, so without `--rebuild` the
+            // second one is never reached from the command line.
+            for way in [&[][..], &["--rebuild"][..]] {
+                let archive = dir.path().join("test.rpf");
+                make_metadata_archive(&archive, held);
+                let archive = archive.display().to_string();
+                let donor = dir.path().join("donor");
+                fs::write(&donor, offered).expect("writable");
+                let donor = donor.display().to_string();
+
+                let mut args = vec!["put", &archive, "data/thing.ymt", &donor];
+                args.extend_from_slice(way);
+                let (code, err) = run_err(&args);
+                assert_eq!(code, 6, "expected the refusal DR-010 numbers 6: {err}");
+                // Everything R7.6 asks a refusal to carry: which entry, what it
+                // holds, what was offered, and the way through. A message missing
+                // any of them leaves the caller to guess, and an assertion on the
+                // sentence's connective tissue alone would pass one that did.
+                for wanted in ["data/thing.ymt", holds, offers, "--allow-encoding-change"] {
+                    assert!(
+                        err.contains(wanted),
+                        "the refusal must name {wanted:?}: {err}"
+                    );
+                }
+
+                // The entry is untouched: a refusal that had already written
+                // something would be worse than no guard at all.
+                assert_eq!(run(&["cat", &archive, "data/thing.ymt"]).1, held);
+
+                let mut args = vec![
+                    "put",
+                    &archive,
+                    "data/thing.ymt",
+                    &donor,
+                    "--allow-encoding-change",
+                ];
+                args.extend_from_slice(way);
+                let (code, err) = run_err(&args);
+                assert_eq!(code, 0, "the override was not honoured: {err}");
+                assert_eq!(
+                    run(&["cat", &archive, "data/thing.ymt"]).1,
+                    offered,
+                    "the override wrote something else"
+                );
+                assert_eq!(run(&["verify", &archive]).0, 0, "verify");
+            }
+        }
+    }
+}
+
+/// A dry run reports the refusal the real call makes, whichever way it is told
+/// to go.
+///
+/// R6.7: what a dry run reports is what would happen, "so a refusal is reported
+/// as a refusal". `--rebuild --dry-run` used to answer "would rebuild the
+/// archive" and exit 0 for a write `--rebuild` refuses, because it reported the
+/// decision without taking it.
+#[test]
+fn a_dry_run_reports_the_refusal_the_real_call_makes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let held = &b"RBF0\x01\x02\x03\x04tokens"[..];
+    make_metadata_archive(&archive, held);
+    let archive = archive.display().to_string();
+    let donor = dir.path().join("donor");
+    fs::write(&donor, b"<CVehicleModelInfo />").expect("writable");
+    let donor = donor.display().to_string();
+
+    for extra in [&["--dry-run"][..], &["--rebuild", "--dry-run"][..]] {
+        let mut args = vec!["put", &archive, "data/thing.ymt", &donor];
+        args.extend_from_slice(extra);
+        let (code, err) = run_err(&args);
+        assert_eq!(code, 6, "a dry run of {extra:?} reported success: {err}");
+        assert!(err.contains("cannot take"), "{err}");
+    }
+
+    // And a dry run still writes nothing, refused or not.
+    assert_eq!(run(&["cat", &archive, "data/thing.ymt"]).1, held);
+    let (code, err) = run_err(&[
+        "put",
+        &archive,
+        "data/thing.ymt",
+        &donor,
+        "--rebuild",
+        "--dry-run",
+        "--allow-encoding-change",
+    ]);
+    assert_eq!(code, 0, "the override was not honoured by a dry run: {err}");
+    assert_eq!(
+        run(&["cat", &archive, "data/thing.ymt"]).1,
+        held,
+        "a dry run wrote"
+    );
+}
+
+/// The override is its own switch: `--force` is the game-install override and
+/// says nothing about what an entry will take.
+///
+/// A caller that wanted one must not be given the other, which is the whole of
+/// DR-050's second half.
+#[test]
+fn force_does_not_let_text_into_a_tokenised_metadata_entry() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_metadata_archive(&archive, b"RBF0\x01\x02\x03\x04tokens");
+    let archive = archive.display().to_string();
+    let donor = dir.path().join("donor");
+    fs::write(&donor, b"<CVehicleModelInfo />").expect("writable");
+
+    let (code, err) = run_err(&[
+        "put",
+        &archive,
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--force",
+    ]);
+    assert_eq!(code, 6, "--force must not carry a second meaning: {err}");
 }
 
 #[test]
@@ -2703,4 +3003,235 @@ fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
     let (code, message) = run_err_homed(&home, &["ls", &at]);
     assert_eq!(code, 5, "{message}");
     assert!(message.contains("no key material available"), "{message}");
+}
+
+/// R7.4 on the command line: a metadata entry reads as XML and takes one back.
+///
+/// Both encodings, because a route written for one of them misses the other —
+/// `RBF` converts from the document alone and `PSO` is an **edit** of the file
+/// the document came from (DR-049), so they reach the codec by different
+/// arguments and only one of the two would notice a seam that dropped the
+/// payload. The daemon does the same, over the same fixtures (§1).
+#[test]
+fn a_metadata_entry_is_read_as_xml_and_an_edited_document_is_written_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (payload, document, edited, encoding) in common::tokenised() {
+        let archive = dir.path().join(format!("{encoding}.rpf"));
+        make_metadata_archive(&archive, &payload);
+        let at = archive.display().to_string();
+
+        let (code, shown) = run(&["cat", &at, "data/thing.ymt", "--as", "xml"]);
+        assert_eq!(code, 0, "{encoding}: cat --as xml");
+        assert_eq!(
+            String::from_utf8_lossy(&shown),
+            document,
+            "{encoding}: the view is the document"
+        );
+        // And `auto` answers the same, which is what a caller that does not
+        // know what the entry holds asks for.
+        assert_eq!(
+            run(&["cat", &at, "data/thing.ymt", "--as", "auto"]).1,
+            shown,
+            "{encoding}: auto"
+        );
+
+        let donor = dir.path().join(format!("{encoding}.xml"));
+        fs::write(&donor, edited).expect("writable");
+        let (code, message) = run_err(&[
+            "put",
+            &at,
+            "data/thing.ymt",
+            &donor.display().to_string(),
+            "--as",
+            "xml",
+        ]);
+        assert_eq!(code, 0, "{encoding}: put --as xml said {message}");
+
+        // The entry holds the binary encoding it always held, and reads back
+        // as the document that was written.
+        let (code, listed) = run(&["--json", "ls", &at, "", "-R"]);
+        assert_eq!(code, 0);
+        let rows: serde_json::Value = serde_json::from_slice(&listed).expect("an array");
+        let row = rows
+            .as_array()
+            .expect("an array")
+            .iter()
+            .find(|row| row["path"] == serde_json::json!("data/thing.ymt"))
+            .expect("the entry is listed")
+            .clone();
+        assert_eq!(
+            row["encoding"],
+            serde_json::json!(encoding),
+            "{encoding}: the entry changed encoding: {rows}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["cat", &at, "data/thing.ymt", "--as", "xml"]).1),
+            edited,
+            "{encoding}: the edit did not land"
+        );
+        assert_ne!(
+            run(&["cat", &at, "data/thing.ymt"]).1,
+            payload,
+            "{encoding}: the payload was not touched at all"
+        );
+    }
+}
+
+/// A document put back with nothing changed leaves the entry byte for byte.
+///
+/// R5.7's law — 391 of 391 and 9,753 of 9,753 — asserted where a person meets
+/// it: opening a file in an editor and saving it without typing must not
+/// rewrite the archive's bytes.
+#[test]
+fn a_document_written_back_unedited_leaves_the_entry_identical() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (payload, document, _, encoding) in common::tokenised() {
+        let archive = dir.path().join(format!("{encoding}-same.rpf"));
+        make_metadata_archive(&archive, &payload);
+        let at = archive.display().to_string();
+
+        let (code, shown) = run(&["cat", &at, "data/thing.ymt", "--as", "xml"]);
+        assert_eq!(code, 0);
+        assert_eq!(String::from_utf8_lossy(&shown), document);
+        let donor = dir.path().join(format!("{encoding}-same.xml"));
+        fs::write(&donor, &shown).expect("writable");
+        let (code, message) = run_err(&[
+            "put",
+            &at,
+            "data/thing.ymt",
+            &donor.display().to_string(),
+            "--as",
+            "xml",
+        ]);
+        assert_eq!(code, 0, "{encoding}: {message}");
+        assert_eq!(
+            run(&["cat", &at, "data/thing.ymt"]).1,
+            payload,
+            "{encoding}: an unedited round trip changed the payload"
+        );
+    }
+}
+
+/// An entry with no XML view says so, and says what it holds.
+///
+/// A resource is here for the reason DR-044 gives: its payload is not read at
+/// all, so it has no view however XML-looking its bytes are. R5.8 is what
+/// gives it one, and it will give it one from the entry's kind.
+#[test]
+fn an_entry_with_no_xml_view_is_refused_with_its_own_reason() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("plain.rpf");
+    make_metadata_archive(&archive, b"a plain line of text\n");
+    let (code, message) = run_err(&[
+        "cat",
+        &archive.display().to_string(),
+        "data/thing.ymt",
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains("no XML view") && message.contains("text"),
+        "must name what it holds: {message}"
+    );
+
+    // The resource archive the round-trip test builds, asked the same thing.
+    let resource = dir.path().join("resource.rpf");
+    let held = make_rockstar_archive(&resource);
+    assert!(!held.is_empty());
+    let (code, message) = run_err(&[
+        "cat",
+        &resource.display().to_string(),
+        "art.ydr",
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains("no XML view"),
+        "must be the same refusal: {message}"
+    );
+}
+
+/// Converting is not a way round DR-050, and DR-050 is not in the way of
+/// converting.
+///
+/// The same document, into the same entry, twice: offered as bytes it is a
+/// textual payload into a tokenised entry and is refused with the switch named,
+/// and offered as a document it is converted and taken with no switch at all —
+/// because what is written is `RBF`, which is what the entry held. There is no
+/// third outcome in which XML lands in the entry.
+#[test]
+fn a_document_is_refused_as_bytes_and_taken_as_a_document() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("guard.rpf");
+    let payload = common::rbf_payload(common::RBF_DOCUMENT);
+    make_metadata_archive(&archive, &payload);
+    let at = archive.display().to_string();
+    let donor = dir.path().join("edited.xml");
+    fs::write(&donor, common::RBF_EDITED).expect("writable");
+    let from = donor.display().to_string();
+
+    let (code, message) = run_err(&["put", &at, "data/thing.ymt", &from]);
+    assert_eq!(code, 6, "the bytes are still refused: {message}");
+    assert!(
+        message.contains("--allow-encoding-change"),
+        "the way through is still named: {message}"
+    );
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt"]).1,
+        payload,
+        "a refused put wrote something"
+    );
+
+    let (code, message) = run_err(&["put", &at, "data/thing.ymt", &from, "--as", "xml"]);
+    assert_eq!(code, 0, "a converted write needs no switch: {message}");
+    assert_eq!(
+        run(&["cat", &at, "data/thing.ymt"]).1,
+        common::rbf_payload(common::RBF_EDITED),
+        "what was written is not the payload the document describes"
+    );
+}
+
+/// And a document that does not describe the entry is refused rather than
+/// written as text.
+#[test]
+fn a_document_the_entry_cannot_take_is_refused_at_the_conversion() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("bad.rpf");
+    let payload = common::rbf_payload(common::RBF_DOCUMENT);
+    make_metadata_archive(&archive, &payload);
+    let donor = dir.path().join("not-rbf.xml");
+    fs::write(
+        &donor,
+        "<?xml version=\"1.0\"?><Root><x rbf:notatype=\"1\"/></Root>",
+    )
+    .expect("writable");
+    let (code, message) = run_err(&[
+        "put",
+        &archive.display().to_string(),
+        "data/thing.ymt",
+        &donor.display().to_string(),
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 6, "{message}");
+    // The refusal is the **converter's**, not the guardrail's. A conversion
+    // that quietly fell back to writing the document as bytes would also exit
+    // 6 — DR-050 would catch it one step later — so the two have to be told
+    // apart, and the message is what tells them: only the guardrail names
+    // `--allow-encoding-change`, and only the codec names the position.
+    assert!(
+        message.contains("does not describe an RBF document"),
+        "must be the codec's own refusal: {message}"
+    );
+    assert!(
+        !message.contains("--allow-encoding-change"),
+        "the document reached the entry as bytes: {message}"
+    );
+    assert_eq!(
+        run(&["cat", &archive.display().to_string(), "data/thing.ymt"]).1,
+        payload,
+        "a refused conversion wrote something"
+    );
 }

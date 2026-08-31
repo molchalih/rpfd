@@ -10,6 +10,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::metadata::text::is_xml_name;
+
 /// The reserved XML name prefix.
 ///
 /// Deliberately a prefix and **not** a namespace: `docs/metadata-encodings.md`
@@ -222,21 +224,6 @@ impl Name {
     pub(super) fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
-}
-
-/// Whether `text` is an XML name of the shape this build writes.
-///
-/// A deliberate subset of XML 1.0's `Name`: ASCII only. All 6,112 descriptor
-/// names in the corpus are ASCII and match this, and a name outside it is
-/// refused rather than mangled. `:` is here because a real name uses it —
-/// `CriminalCareerDefs::ShoppingCartItemCategoryLimits`.
-fn is_xml_name(text: &str) -> bool {
-    let mut chars = text.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    let start = first.is_ascii_alphabetic() || first == '_' || first == ':';
-    start && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))
 }
 
 /// A `0x60` string value: raw bytes with a `u16` length.

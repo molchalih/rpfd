@@ -87,7 +87,7 @@ fn archive() -> Vec<u8> {
         },
         FileSpec {
             path: "art.yft".to_owned(),
-            kind: FileKind::Resource,
+            kind: FileKind::Resource { declared: None },
         },
     ];
     let mut out = Vec::new();

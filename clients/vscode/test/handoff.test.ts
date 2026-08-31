@@ -116,18 +116,27 @@ describe('handing an entry over and taking it back', { skip: SKIP }, () => {
         assert.equal(session.state, 'clean');
     });
 
-    it('reports a re-import the daemon refuses instead of swallowing it', async () => {
+    it('carries a re-import through to the save the daemon refuses, rather than losing it', async () => {
         // A converter that dropped the RSC7 header would otherwise leave the
-        // user with an edit that vanished.
+        // user with an edit that vanished. DR-046 moved the refusal itself
+        // from the write to the save, so the re-import now takes the payload
+        // — it is not swallowed, it is buffered — and it is the save that
+        // the daemon refuses once it cannot fill the row from it.
         const { session, handoff } = await open('refused');
         const handed = await handoff.begin('art.yft');
         fs.writeFileSync(handed.file, Buffer.from('not a resource'));
         const event = await handoff.reimport('art.yft');
-        assert.ok(event && 'failure' in event, JSON.stringify(event));
-        assert.ok(event.failure instanceof DaemonError);
-        assert.equal(event.failure.code, EXIT.refused);
-        assert.match(event.failure.reason, /RSC7/);
-        assert.equal(session.state, 'clean');
+        assert.ok(event && 'len' in event, `re-import lost the edit: ${JSON.stringify(event)}`);
+        assert.equal(session.state, 'dirty');
+
+        const failure = await session.save().then(
+            () => undefined,
+            (error: unknown) => error,
+        );
+        assert.ok(failure instanceof DaemonError, String(failure));
+        assert.equal(failure.code, EXIT.refused);
+        assert.match(failure.reason, /shorter than a resource header/);
+        assert.equal(session.state, 'dirty', 'a refused save must not discard the edit it refused');
     });
 
     it('notices a file another tool wrote, without being asked', async () => {

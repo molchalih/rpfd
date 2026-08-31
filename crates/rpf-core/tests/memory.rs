@@ -218,6 +218,7 @@ fn carrying(len: usize) -> rpf_core::Changes {
         rpf_core::Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(vec![0x33_u8; len])),
             create: false,
+            allow_encoding_change: false,
         },
     )
 }

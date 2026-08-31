@@ -640,6 +640,60 @@ impl Material {
     }
 }
 
+/// The one seam a fuzz target opens, and the whole of it. DR-048.
+#[cfg(fuzzing)]
+impl Material {
+    /// Material made of bytes the caller already holds.
+    ///
+    /// **Not a way to obtain key material — a way to supply it.** Every value
+    /// here comes from the caller, nothing is searched for, and no anchor is
+    /// consulted, so this reaches none of `keys::anchors` and answers nothing
+    /// about a real installation. The fuzz targets pass fill bytes and a
+    /// synthetic table network; DR-006 is about what this repository carries
+    /// and about where a real key comes from, and neither is touched.
+    ///
+    /// It is `#[cfg(fuzzing)]` rather than a feature so that it cannot be
+    /// switched on: a feature is a name a dependent can write in its own
+    /// manifest, and this is set by `cargo-fuzz` on the whole build or by
+    /// nobody. It is absent from every release build, from `cargo doc`, and
+    /// from the crate a dependent compiles.
+    ///
+    /// Why it exists at all, and why the direction it opens is the harmless
+    /// one when [`Keys::aes_key`] and [`NgKeys::decrypt_table`] are already
+    /// unconditionally public: DR-048.
+    ///
+    /// `None` when `ng` is given and its two halves are not the lengths
+    /// [`NgKeys`] promises — the same check the cache's reader makes, because
+    /// it is the same constructor (§4).
+    #[must_use]
+    pub fn over_bytes(
+        aes: [u8; AES_KEY_LEN],
+        lut: [u8; HASH_LUT_LEN],
+        ng: Option<(Vec<u8>, Vec<u8>)>,
+        launcher: Option<[u8; AES_KEY_LEN]>,
+    ) -> Option<Self> {
+        // The offsets a real search would have reported. Nothing reads them
+        // but `Debug`, which prints them precisely because they are not key
+        // material (DR-020).
+        const NOWHERE: u64 = 0;
+
+        let ng = match ng {
+            None => None,
+            Some((expanded, tables)) => Some(NgKeys::restored(expanded, tables, NOWHERE, NOWHERE)?),
+        };
+        Some(Self::restored(
+            Keys {
+                aes,
+                aes_at: NOWHERE,
+                lut,
+                lut_at: NOWHERE,
+            },
+            ng,
+            launcher.map(|key| LauncherKey::restored(key, NOWHERE)),
+        ))
+    }
+}
+
 /// What an archive is opened with, and the name its key is derived from.
 ///
 /// Three states and no fourth: nothing, one material the caller already has, or
@@ -799,11 +853,536 @@ impl Unlock {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        AES_KEY_NAMED, HASH_LUT_NAMED, NG_EXPANDED_NAMED, NG_TABLES_NAMED, Unlock, keys_missing,
-        ng_missing,
+        AES_KEY_LEN, AES_KEY_NAMED, Error, HASH_LUT_LEN, HASH_LUT_NAMED, Keys, LauncherKey,
+        Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT,
+        NG_EXPANDED_KEY_LEN, NG_EXPANDED_NAMED, NG_TABLES_NAMED, NG_WANTED, NgKeys, Sighting,
+        Unlock, keys_missing, ng_missing,
     };
-    use crate::format::crypto::{AesKey, Scheme};
+    use crate::format::crypto::{AesKey, Cipher, Scheme};
+
+    /// A sighting of `len` bytes of `fill`, found at `offset`.
+    ///
+    /// Not key material and nothing like it: a byte pattern, which is all the
+    /// assembly below has to get right. DR-006 keeps the real values out of
+    /// this repository, and until this file had these, **every fact about how a
+    /// completed search is read back was defensible only on a machine with a
+    /// game installed on it** — the search itself is tested here, and what it
+    /// answers was assembled nowhere.
+    fn seen(len: usize, fill: u8, offset: u64) -> Sighting {
+        Sighting {
+            offset,
+            bytes: vec![fill; len],
+        }
+    }
+
+    /// The answers a complete [`Keys`] search returns, in the order
+    /// `Keys::anchors` asked for them: the AES key, then the hash lookup table.
+    fn keys_found() -> Vec<Option<Sighting>> {
+        vec![
+            Some(seen(AES_KEY_LEN, 0x11, 0x1234_5678)),
+            Some(seen(HASH_LUT_LEN, 0x22, 0x00AB_CDEF)),
+        ]
+    }
+
+    /// The answers a complete [`NgKeys`] search returns: 101 expanded keys and
+    /// then 272 decrypt tables, each with an offset of its own so that the
+    /// lowest can be told from the first.
+    fn ng_found() -> Vec<Option<Sighting>> {
+        let mut found = Vec::with_capacity(NG_WANTED);
+        for index in 0..NG_EXPANDED_KEY_COUNT {
+            let at = 0x1_0000_u64.saturating_add(u64::try_from(index).unwrap_or(0));
+            found.push(Some(seen(NG_EXPANDED_KEY_LEN, 0x33, at)));
+        }
+        for index in 0..NG_DECRYPT_TABLE_COUNT {
+            let at = 0x2_0000_u64.saturating_add(u64::try_from(index).unwrap_or(0));
+            found.push(Some(seen(NG_DECRYPT_TABLE_LEN, 0x44, at)));
+        }
+        found
+    }
+
+    /// Material of the shape every game executable produces: the two values
+    /// and neither optional half.
+    fn plain_material(aes: u8) -> Material {
+        let found = vec![
+            Some(seen(AES_KEY_LEN, aes, 0x1234_5678)),
+            Some(seen(HASH_LUT_LEN, 0x22, 0x00AB_CDEF)),
+        ];
+        Material::restored(
+            Keys::assembled(&found).expect("both were found"),
+            None,
+            None,
+        )
+    }
+
+    /// The shape only a memory image produces.
+    fn ng_material() -> Material {
+        Material::restored(
+            Keys::assembled(&keys_found()).expect("both were found"),
+            Some(NgKeys::assembled(&ng_found()).expect("everything was found")),
+            None,
+        )
+    }
+
+    /// The shape only `Launcher.exe` produces.
+    fn launcher_material() -> Material {
+        Material::restored(
+            Keys::assembled(&keys_found()).expect("both were found"),
+            None,
+            Some(LauncherKey::restored([0x55; AES_KEY_LEN], 0x005E_E3F0)),
+        )
+    }
+
+    /// The smallest whole encrypted archive: a header carrying `tag`, one entry
+    /// row, and no names blob.
+    ///
+    /// Whole on purpose. A header alone is refused for **not fitting** before a
+    /// key is ever judged, which would test the bounds check rather than the
+    /// key check; with the row present the layout is legal and the only thing
+    /// left to be wrong about is the key.
+    fn encrypted_archive(tag: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(b"7FPR");
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&[0_u8; 16]);
+        out
+    }
+
+    #[test]
+    fn material_that_does_not_open_an_archive_says_so_rather_than_asking_for_a_key() {
+        // DR-041's distinction, and the reason `Error::WrongKey` exists beside
+        // `Error::NeedsKey`: the two name different things to do. `NeedsKey` is
+        // answered by going and extracting key material; `WrongKey` cannot be,
+        // because the material in hand *is* the material and the archive was
+        // renamed, or belongs to another install. Telling an automation to
+        // extract a key it already has is a loop it never leaves.
+        //
+        // What decides it is `is_root_directory`: entry 0 is always the root
+        // directory (`docs/rpf-format.md`, Layout, `verified`), and the marker
+        // that says so is a whole word no file entry can produce — so a wrong
+        // key answers `false` with the odds of a 32-bit coincidence. Forced to
+        // `true`, **every key is the right key** and a table of contents is
+        // read out of noise.
+        //
+        // Until now that could only be exercised where a real game install
+        // is: `Unlock::held` needs a `Material`, and DR-006 keeps the values
+        // out of the repository, so no synthetic source produces one. It needs
+        // no source — `Keys::assembled` takes a completed search's answers, and
+        // a pattern of bytes is a complete answer. The key below is wrong for
+        // this archive because every key is: the payload is sixteen bytes of
+        // header and there is nothing it could correctly decrypt to.
+        //
+        // The test lives here rather than beside `Verified` because this is
+        // the only module that can build a `Material` at all.
+        const AES_TAG: u32 = 0x0FFF_FFF9;
+
+        let inner = encrypted_archive(AES_TAG);
+        let mut out = std::io::Cursor::new(Vec::new());
+        crate::build(
+            &mut out,
+            crate::format::Version::Rpf7,
+            &[crate::FileSpec {
+                path: "inner.rpf".to_owned(),
+                kind: crate::FileKind::Binary {
+                    storage: crate::Storage::Stored,
+                    encryption: 0,
+                },
+            }],
+            &[],
+            |_: &str| Ok(std::io::Cursor::new(inner.clone())),
+            &mut crate::Unwatched,
+        )
+        .expect("the outer archive is plain and builds with no key material");
+
+        let mut src = std::io::Cursor::new(out.into_inner());
+        let unlock = Unlock::held(Arc::new(plain_material(0x11)), "outer.rpf");
+        let archive = crate::Archive::open(&mut src, &unlock).expect("the outer archive is plain");
+
+        // The walk descends, tries the material it was given, and reports that
+        // it did not open the archive — not that there was none to try.
+        let verified = crate::Verified::of(&mut src, &archive, &mut crate::Unwatched)
+            .expect("the walk itself does not fail");
+        let refused = verified
+            .outcome()
+            .expect_err("an archive the material does not open did not read back whole");
+        match refused {
+            Error::WrongKey { tag, scheme, tried } => {
+                assert_eq!(tag, AES_TAG);
+                assert_eq!(
+                    scheme, "AES-256",
+                    "the caller is told which key to go and get"
+                );
+                assert_eq!(tried, 1, "one source was available and one was tried");
+            }
+            other => panic!("expected the key to be reported wrong, got {other:?}"),
+        }
+        assert_eq!(refused.category(), crate::Category::NeedsKey);
+    }
+
+    #[test]
+    fn a_transform_is_offered_only_the_material_that_carries_what_it_needs() {
+        // DR-040 and DR-042 as an assertion rather than as a paragraph: an
+        // executable's material opens an AES archive under the RAGE key and
+        // neither of the others, a memory image adds the NG half, and only the
+        // launcher's own executable carries the launcher key.
+        //
+        // Every source carries the RAGE key, so `Scheme::Aes(Rage)` is the one
+        // arm that is true of all three — which is what makes a blanket `true`
+        // and a blanket `false` both wrong here, and neither was before.
+        for (which, material, ng, launcher) in [
+            ("an executable", plain_material(0x11), false, false),
+            ("a memory image", ng_material(), true, false),
+            ("the launcher", launcher_material(), false, true),
+        ] {
+            assert!(
+                Scheme::Aes(AesKey::Rage).is_in(&material),
+                "{which} does not carry the RAGE key"
+            );
+            assert_eq!(Scheme::Ng.is_in(&material), ng, "{which}: NG");
+            assert_eq!(
+                Scheme::Aes(AesKey::Launcher).is_in(&material),
+                launcher,
+                "{which}: the launcher key"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cipher_is_keyed_by_the_material_it_was_made_from() {
+        // `AesKey::of` picks which of a material's keys runs the transform, and
+        // nothing asked what it picked: a version that answered a fixed
+        // thirty-two bytes for every material decrypts every archive the same
+        // wrong way, which is a payload that inflates to nonsense rather than a
+        // refusal. Two materials differing only in that key have to disagree.
+        let block = [0x5A_u8; 16];
+        let mut one = block;
+        let mut other = block;
+        Cipher::new(
+            Scheme::Aes(AesKey::Rage),
+            &plain_material(0x11),
+            "a.rpf",
+            16,
+        )
+        .expect("every source carries the RAGE key")
+        .apply(&mut one);
+        Cipher::new(
+            Scheme::Aes(AesKey::Rage),
+            &plain_material(0x77),
+            "a.rpf",
+            16,
+        )
+        .expect("every source carries the RAGE key")
+        .apply(&mut other);
+        assert_ne!(one, other, "the key the material carries did not reach it");
+        assert_ne!(one, block, "the block was not transformed at all");
+
+        // And a transform whose key the material does not carry has no cipher,
+        // rather than one over whatever was to hand.
+        assert!(
+            Cipher::new(
+                Scheme::Aes(AesKey::Launcher),
+                &plain_material(0x11),
+                "a.rpf",
+                16
+            )
+            .is_none(),
+            "a launcher cipher was made from material with no launcher key"
+        );
+        assert!(
+            Cipher::new(Scheme::Ng, &plain_material(0x11), "a.rpf", 16).is_none(),
+            "an NG cipher was made from material with no NG half"
+        );
+    }
+
+    #[test]
+    fn an_ng_cipher_chooses_a_key_and_an_aes_one_has_none_to_choose() {
+        // The index is a function of the name and the length
+        // (`docs/rpf-format.md`, Encryption), so two lengths choose two keys.
+        // A `key_index` fixed at one value, or absent, says the same thing
+        // about every payload in the archive.
+        let material = ng_material();
+        let first = Cipher::new(Scheme::Ng, &material, "dlc.rpf", 6_144)
+            .expect("the material carries the NG half");
+        let second = Cipher::new(Scheme::Ng, &material, "dlc.rpf", 6_145)
+            .expect("the material carries the NG half");
+        assert!(first.key_index().is_some());
+        assert_ne!(
+            first.key_index(),
+            second.key_index(),
+            "the length did not reach the key"
+        );
+
+        assert_eq!(
+            Cipher::new(Scheme::Aes(AesKey::Rage), &material, "dlc.rpf", 6_144)
+                .expect("every source carries the RAGE key")
+                .key_index(),
+            None,
+            "an AES cipher chose one of the NG keys"
+        );
+    }
+
+    #[test]
+    fn material_in_hand_is_a_candidate_for_what_it_carries_and_nothing_else() {
+        // `Unlock::candidates` is what an archive asks before it believes a
+        // byte of its own layout, and an empty answer is `NeedsKey`. Answering
+        // empty for material that does open the archive turns a readable
+        // archive into one the caller is told to go and find a key for.
+        let unlock = Unlock::held(Arc::new(ng_material()), "dlc.rpf");
+        assert!(!unlock.is_unkeyed());
+        assert_eq!(unlock.name(), "dlc.rpf");
+        assert!(unlock.held_material().is_some(), "the material is not held");
+
+        for (scheme, expected) in [
+            (Scheme::Aes(AesKey::Rage), 1),
+            (Scheme::Ng, 1),
+            (Scheme::Aes(AesKey::Launcher), 0),
+        ] {
+            assert_eq!(
+                unlock
+                    .candidates(scheme)
+                    .expect("held material cannot fail to be read")
+                    .len(),
+                expected,
+                "{scheme:?}"
+            );
+        }
+
+        // A nested archive keeps the material and takes its own name, which is
+        // what its key is chosen by.
+        let nested = unlock.renamed("vehicles.rpf");
+        assert_eq!(nested.name(), "vehicles.rpf");
+        assert!(nested.held_material().is_some());
+    }
+
+    #[test]
+    fn a_value_a_source_does_not_carry_is_an_absence_and_not_a_failure() {
+        // `LauncherKey::assembled` answers `None` for a source with no launcher
+        // key, and that is the ordinary case rather than an error — refusing
+        // the material would withhold the RAGE key that opens 43 archives in
+        // order to report the absence of one that opens two (DR-042). What was
+        // untested is the other arm: a source that *does* carry it.
+        let key = LauncherKey::assembled(&[Some(seen(AES_KEY_LEN, 0x55, 0x005E_E3F0))])
+            .expect("a sighting of the right length is the value");
+        assert_eq!(key.key(), &[0x55; AES_KEY_LEN]);
+        assert_eq!(key.offset(), 0x005E_E3F0);
+
+        assert!(LauncherKey::assembled(&[None]).is_none(), "nothing found");
+        assert!(
+            LauncherKey::assembled(&[Some(seen(AES_KEY_LEN.saturating_add(1), 0x55, 0))]).is_none(),
+            "a sighting of the wrong length is not the value"
+        );
+    }
+
+    #[test]
+    fn material_restored_from_a_cache_must_be_the_lengths_it_promises() {
+        // `NgKeys::restored` is the cache's way back in, and it is the only
+        // place a length is taken on trust from a file on disk. Both halves
+        // have to be right: a check that accepted either one being wrong would
+        // hand `expanded_key` and `decrypt_table` a buffer they slice blindly.
+        let expanded = vec![0x33; NG_EXPANDED_KEY_COUNT.saturating_mul(NG_EXPANDED_KEY_LEN)];
+        let tables = vec![0x44; NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN)];
+        assert!(NgKeys::restored(expanded.clone(), tables.clone(), 0, 0).is_some());
+
+        let mut short = expanded.clone();
+        short.pop();
+        assert!(
+            NgKeys::restored(short, tables.clone(), 0, 0).is_none(),
+            "expanded keys one byte short were accepted"
+        );
+
+        let mut short = tables;
+        short.pop();
+        assert!(
+            NgKeys::restored(expanded, short, 0, 0).is_none(),
+            "decrypt tables one byte short were accepted"
+        );
+    }
+
+    #[test]
+    fn a_complete_search_is_read_back_in_the_order_it_was_asked_for() {
+        // `Keys::anchors` asks for the AES key and then the hash lookup table,
+        // and `assembled` reads the answers back in that order. The two are 32
+        // and 256 bytes, so a swap is not a type error — it is the wrong key
+        // handed to the cipher, silently.
+        let keys = Keys::assembled(&keys_found()).expect("both were found");
+        assert_eq!(keys.aes_key(), &[0x11; AES_KEY_LEN]);
+        assert_eq!(keys.hash_lut(), &[0x22; HASH_LUT_LEN]);
+        assert_eq!(keys.aes_key_offset(), 0x1234_5678);
+        assert_eq!(keys.hash_lut_offset(), 0x00AB_CDEF);
+    }
+
+    #[test]
+    fn a_sighting_of_the_wrong_length_is_not_the_value_it_was_looked_for() {
+        // A digest collision is not the worry; a slot filled from an anchor of
+        // another length is. `exactly` is what refuses it, and refusing it is
+        // the difference between a missing key and a wrong one.
+        for (which, found) in [
+            (
+                "the aes key",
+                vec![
+                    Some(seen(AES_KEY_LEN.saturating_sub(1), 0x11, 0)),
+                    Some(seen(HASH_LUT_LEN, 0x22, 0)),
+                ],
+            ),
+            (
+                "the hash lookup table",
+                vec![
+                    Some(seen(AES_KEY_LEN, 0x11, 0)),
+                    Some(seen(HASH_LUT_LEN.saturating_add(1), 0x22, 0)),
+                ],
+            ),
+        ] {
+            match Keys::assembled(&found) {
+                Err(Error::UnrecognisedExecutable { found, wanted, .. }) => {
+                    assert_eq!(wanted, 2, "{which}");
+                    assert_eq!(found, 1, "{which}: the other one was found");
+                }
+                other => panic!("{which}: expected a short search, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_a_key_prints_is_a_key() {
+        // DR-006 is about what leaves this machine, and a derived `Debug` is
+        // one of the ways it would. Asserted here rather than only in
+        // `tests/keys.rs`, which needs a game executable: a fact this project
+        // can defend anywhere is worth more than the same fact on one machine.
+        let keys = Keys::assembled(&keys_found()).expect("both were found");
+        let rendered = format!("{keys:?}");
+        // The patterns are `0x11` and `0x22`, which `Debug` renders as decimal.
+        assert!(rendered.contains("aes_key_offset"), "{rendered}");
+        assert!(
+            !rendered.contains("17, 17"),
+            "a key was printed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("34, 34"),
+            "a table was printed: {rendered}"
+        );
+
+        let ng = NgKeys::assembled(&ng_found()).expect("everything was found");
+        let rendered = format!("{ng:?}");
+        assert!(rendered.contains("expanded_keys"), "{rendered}");
+        assert!(
+            !rendered.contains("51, 51"),
+            "a key was printed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("68, 68"),
+            "a table was printed: {rendered}"
+        );
+
+        let launcher = LauncherKey::restored([0x55; AES_KEY_LEN], 0x5EE3);
+        let rendered = format!("{launcher:?}");
+        assert!(rendered.contains("offset"), "{rendered}");
+        assert!(
+            !rendered.contains("85, 85"),
+            "a key was printed: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_expanded_keys_end_where_the_decrypt_tables_begin() {
+        // The one boundary in the NG survey: slots below
+        // `NG_EXPANDED_KEY_COUNT` are expanded keys and the rest are decrypt
+        // tables. Moving it by one takes the first table for the hundred and
+        // second key — and because the two lengths differ, the slot is then
+        // dropped for being the wrong length rather than refused, so the
+        // failure is "one short" and never "the wrong thing".
+        let ng = NgKeys::assembled(&ng_found()).expect("everything was found");
+        assert_eq!(
+            ng.expanded_key(NG_EXPANDED_KEY_COUNT.saturating_sub(1)),
+            Some([0x33; NG_EXPANDED_KEY_LEN].as_slice()),
+            "the last expanded key is an expanded key"
+        );
+        assert_eq!(
+            ng.expanded_key(NG_EXPANDED_KEY_COUNT),
+            None,
+            "there is no key past the last one"
+        );
+        assert_eq!(
+            ng.decrypt_table(0, 0),
+            Some([0x44; NG_DECRYPT_TABLE_LEN].as_slice()),
+            "the first table is a table"
+        );
+        assert_eq!(
+            ng.expanded_keys_offset(),
+            0x1_0000,
+            "the lowest offset an expanded key was found at"
+        );
+        assert_eq!(
+            ng.decrypt_tables_offset(),
+            0x2_0000,
+            "the lowest offset a decrypt table was found at"
+        );
+    }
+
+    #[test]
+    fn a_table_past_the_rounds_or_the_columns_is_no_table() {
+        // `ng_round` asks for a table per round and column and drops the term
+        // when there is none, so a bound that let an index through would be a
+        // block handed back one word short of its transform rather than a
+        // refusal.
+        //
+        // **The column half is the load-bearing one.** Round and column are
+        // folded into one index, so a column past the sixteenth is the *next
+        // round's* table and is a table that exists — which the slice bound
+        // below cannot notice and this assertion can. The round half is
+        // belt-and-braces: `round >= NG_ROUNDS` answers `None` with or without
+        // the check, because the index it computes is past the end of the
+        // tables and the slice refuses it. Stated so the next sweep does not
+        // re-litigate a survivor there.
+        let ng = NgKeys::assembled(&ng_found()).expect("everything was found");
+        assert!(
+            ng.decrypt_table(super::NG_ROUNDS.saturating_sub(1), 15)
+                .is_some()
+        );
+        assert!(
+            ng.decrypt_table(super::NG_ROUNDS, 0).is_none(),
+            "past the rounds"
+        );
+        assert!(
+            ng.decrypt_table(0, super::NG_COLUMNS).is_none(),
+            "a column past the sixteenth is the next round's table"
+        );
+    }
+
+    #[test]
+    fn a_survey_one_value_short_names_the_kind_it_was_short_of() {
+        // The count is what a caller acts on, and it used to be derivable two
+        // ways that could disagree. One missing expanded key and one missing
+        // table, separately, so neither can pass for the other.
+        let mut found = ng_found();
+        found[0] = None;
+        match NgKeys::assembled(&found) {
+            Err(Error::UnrecognisedExecutable {
+                missing,
+                found,
+                wanted,
+                ..
+            }) => {
+                assert_eq!(missing, [NG_EXPANDED_NAMED]);
+                assert_eq!(wanted, 373);
+                assert_eq!(found, 372);
+            }
+            other => panic!("expected one expanded key short, got {other:?}"),
+        }
+
+        let mut found = ng_found();
+        found[NG_EXPANDED_KEY_COUNT] = None;
+        match NgKeys::assembled(&found) {
+            Err(Error::UnrecognisedExecutable { missing, found, .. }) => {
+                assert_eq!(missing, [NG_TABLES_NAMED]);
+                assert_eq!(found, 372);
+            }
+            other => panic!("expected one decrypt table short, got {other:?}"),
+        }
+    }
 
     #[test]
     fn a_half_found_search_names_the_half_it_did_not_find() {

@@ -331,6 +331,35 @@ mod tests {
     }
 
     #[test]
+    fn a_source_that_is_exactly_the_value_finds_it() {
+        // The boundary of the check above, which every test was clear of: a
+        // read shorter than the anchor holds no window and is skipped, and a
+        // read of **exactly** the anchor holds one. Moving it by one — `<` to
+        // `<=` — makes a source that is nothing but the value find nothing,
+        // and the previous sweep reported that survivor as needing "an
+        // executable smaller than one scan stride", which is a `Cursor`.
+        //
+        // `crates/rpf-core/tests/boundaries.rs` is where a limit belongs, and
+        // this one cannot go there: `find` is private to this module. The rule
+        // is the same and the file is the only thing that differs.
+        let value = planted(53, 32);
+        let found = look(&mut Cursor::new(value.clone()), &[anchor(&value)]).unwrap();
+        let sighting = found[0]
+            .as_ref()
+            .expect("a source that is exactly the value holds it");
+        assert_eq!(sighting.offset, 0);
+        assert_eq!(sighting.bytes, value);
+
+        // And one byte short of it holds nothing, which is the far side.
+        let mut short = value.clone();
+        short.pop();
+        assert!(
+            look(&mut Cursor::new(short), &[anchor(&value)]).unwrap()[0].is_none(),
+            "a source one byte short of the value reported it found"
+        );
+    }
+
+    #[test]
     fn a_scan_reports_one_step_per_block_and_counts_bytes_read() {
         // DR-008's seam at the boundary the scan already had. The step is a
         // block because that is where the reads are, and where a cancellation
@@ -410,5 +439,107 @@ mod tests {
         )
         .unwrap();
         assert!(watching.0.is_empty(), "{:?}", watching.0);
+    }
+
+    /// A source that answers `EINTR` before each of its first `left` reads and
+    /// its own bytes after that.
+    ///
+    /// `Read::read` is allowed to return [`std::io::ErrorKind::Interrupted`]
+    /// and mean nothing by it, and a caller that treats it as a failure loses
+    /// the rest of the file. Nothing in the repository provoked one, so the
+    /// guard that tolerates it could be deleted or inverted with the whole
+    /// suite staying green.
+    struct Interrupting {
+        inner: Cursor<Vec<u8>>,
+        left: usize,
+    }
+
+    impl std::io::Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left > 0 {
+                self.left -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for Interrupting {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// A source that hands over `head` and then fails once, permanently.
+    ///
+    /// The failure is not `Interrupted`, so it is the case the guard above must
+    /// **not** swallow. It ends rather than failing again, so a scan that did
+    /// swallow it finishes instead of spinning — a hang and a wrong answer are
+    /// told apart by what this test asserts, not by how long it takes.
+    struct Failing {
+        head: Vec<u8>,
+        at: usize,
+        failed: bool,
+    }
+
+    impl std::io::Read for Failing {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(rest) = self.head.get(self.at..)
+                && !rest.is_empty()
+            {
+                let want = rest.len().min(buf.len());
+                buf[..want].copy_from_slice(&rest[..want]);
+                self.at += want;
+                return Ok(want);
+            }
+            if self.failed {
+                return Ok(0);
+            }
+            self.failed = true;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    impl std::io::Seek for Failing {
+        fn seek(&mut self, _to: std::io::SeekFrom) -> std::io::Result<u64> {
+            Ok(u64::try_from(self.head.len()).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_read_interrupted_part_way_through_still_finds_the_value() {
+        let value = planted(43, 32);
+        let mut hay = haystack(4096);
+        plant(&mut hay, 1024, &value);
+
+        let mut source = Interrupting {
+            inner: Cursor::new(hay),
+            left: 3,
+        };
+        let found = look(&mut source, &[anchor(&value)]).unwrap();
+        let sighting = found[0].as_ref().expect("an interruption is not an end");
+        assert_eq!(sighting.offset, 1024);
+        assert_eq!(sighting.bytes, value);
+    }
+
+    #[test]
+    fn a_read_that_actually_fails_is_reported_with_how_far_it_got() {
+        // The other half of the guard: an error that is not `Interrupted` ends
+        // the scan and names the offset reached, rather than being retried for
+        // ever or quietly treated as the end of the source.
+        let value = planted(47, 32);
+        let head = haystack(512);
+        let mut source = Failing {
+            head,
+            at: 0,
+            failed: false,
+        };
+        match find(&mut source, &[anchor(&value)], SEARCHING, &mut Unwatched) {
+            Err(Error::Io { offset, source }) => {
+                assert_eq!(offset, 512, "the offset reached is not where it stopped");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected the read failure to be reported, got {other:?}"),
+        }
     }
 }

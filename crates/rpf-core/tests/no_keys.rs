@@ -276,3 +276,67 @@ fn the_key_cache_is_never_consulted_by_opening_an_archive() {
         cache.directory().display()
     );
 }
+
+#[test]
+fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
+    // The third of R2.6's shapes, and the one nothing outside the corpus tests:
+    // an *unencrypted* archive that happens to carry an encrypted one. Every
+    // walk sniffs each payload for a nested archive, so this is a path the
+    // primary workflow reaches on a machine with no key material at all — and
+    // it must be a count and a named refusal rather than a failed walk.
+    //
+    // Until now the only tests of it opened two real archives under real key
+    // material, which needs `RPF_CORPUS` and `RPF_GAME_IMAGE`: a fact this
+    // project could defend on one machine. The payload here is sixteen bytes of
+    // header, because nothing past the encryption tag is read.
+    const TAG: u32 = 0x0FEF_FFFF;
+
+    let mut contents = BTreeMap::new();
+    contents.insert("inner.rpf".to_owned(), encrypted_header(TAG));
+    let bytes = built(&[stored("inner.rpf"), stored("a.txt")], &contents);
+
+    let mut source = Cursor::new(bytes);
+    let archive = Archive::open(&mut source, &unkeyed()).expect("the outer archive is plain");
+
+    let summary = Summary::of(&mut source, &archive, "").expect("summarises");
+    assert_eq!(
+        summary.locked_archives, 1,
+        "the nested encrypted archive was not counted as locked"
+    );
+    // A locked archive is still an archive that is there, so it is counted in
+    // both: `nested_archives` is how many the sniff found and
+    // `locked_archives` how many of those did not open.
+    assert_eq!(summary.nested_archives, 1);
+
+    // And the failure it carries is the one a caller acts on: which tag, so
+    // that "go and extract a key" is answerable. A walk that lost the variant
+    // would report the entry as an ordinary unreadable file.
+    let verified = Verified::of(&mut source, &archive, &mut Unwatched).expect("walks");
+    let locked: Vec<_> = verified
+        .problems
+        .iter()
+        .filter(|problem| matches!(problem.error, Error::NeedsKey { .. }))
+        .collect();
+    assert_eq!(locked.len(), 1, "{:?}", verified.problems);
+    assert_eq!(locked[0].path, "inner.rpf");
+    assert!(
+        matches!(locked[0].error, Error::NeedsKey { tag } if tag == TAG),
+        "{:?}",
+        locked[0].error
+    );
+    assert_eq!(locked[0].error.category(), Category::NeedsKey);
+
+    // And the walk's own verdict is that key failure rather than
+    // `VerifyFailed`. DR-010 classifies by who has to act, and the two name
+    // different people: `VerifyFailed` is `Category::Corrupt` and says the
+    // bytes are wrong, which they are not — the archive is intact and this
+    // machine has no key for part of it.
+    let refused = verified
+        .outcome()
+        .expect_err("an archive this build cannot open did not read back whole");
+    assert!(
+        matches!(refused, Error::NeedsKey { tag } if tag == TAG),
+        "expected the key failure itself, got {refused:?}"
+    );
+    assert_eq!(refused.category(), Category::NeedsKey);
+}

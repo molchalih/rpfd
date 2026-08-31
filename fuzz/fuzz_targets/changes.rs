@@ -37,7 +37,11 @@ use std::sync::Arc;
 /// rather than something `Arbitrary` can produce.
 #[derive(Debug, Arbitrary)]
 enum Wanted {
-    Write { contents: Vec<u8>, create: bool },
+    Write {
+        contents: Vec<u8>,
+        create: bool,
+        allow_encoding_change: bool,
+    },
     Remove { recursive: bool },
     RenameTo(String),
     MakeDirectory,
@@ -88,9 +92,14 @@ const PAYLOAD_LIMIT: u64 = 1024 * 1024;
 /// The [`Change`] a [`Wanted`] names.
 fn change_of(wanted: Wanted) -> Change {
     match wanted {
-        Wanted::Write { contents, create } => Change::Write {
+        Wanted::Write {
+            contents,
+            create,
+            allow_encoding_change,
+        } => Change::Write {
             contents: Arc::new(Bytes::new(contents)),
             create,
+            allow_encoding_change,
         },
         Wanted::Remove { recursive } => Change::Remove { recursive },
         Wanted::RenameTo(to) => Change::RenameTo(to),

@@ -31,6 +31,7 @@ use crate::{
     build::{FileKind, FileSpec, Payload, Storage, directories_of, kind_of, specs_of},
     error::{Error, Result},
     format::{folded, resource::MAGIC_RSC7, same_name},
+    metadata::Encoding,
     name,
 };
 
@@ -127,6 +128,10 @@ pub enum Change {
         /// [`Error::NotFound`], which is what it has always been: creating an
         /// entry a caller merely misspelled is the failure that guards against.
         create: bool,
+        /// Whether the entry may end up holding a different encoding from the
+        /// one it holds now. Without it, XML or plain text written into an
+        /// entry holding `RBF` or `PSO` is [`Error::WrongEncoding`]. DR-050.
+        allow_encoding_change: bool,
     },
     /// Remove the entry at a path.
     Remove {
@@ -285,6 +290,9 @@ impl Changes {
 
     /// New contents for paths the archive already holds, which is the whole of
     /// what a change set was before there were others.
+    ///
+    /// Each write is a plain one: neither creating an entry nor allowing its
+    /// encoding to change.
     #[must_use]
     pub fn writing(edits: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
@@ -296,6 +304,7 @@ impl Changes {
                         Change::Write {
                             contents: Arc::new(Bytes::new(contents)),
                             create: false,
+                            allow_encoding_change: false,
                         },
                     )
                 })
@@ -568,14 +577,59 @@ fn fill(from: &mut dyn Read, into: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
-/// The kind of entry a payload has to be written as.
+/// Refuses a payload that the entry it is being written into cannot hold.
 ///
-/// The payload decides, because for a new entry there is no entry to ask. A
-/// resource carries its own `RSC7` header and its page flags with it, and
-/// nothing else could recover them; anything else is offered to the compressor,
-/// which is what `build` does with every file `pack` gives it. DR-026, and Q7
-/// is why this is safe on the evidence there is: 27 entries of the sample, zero
-/// disagreements between the resource bit and the payload's own magic.
+/// [`Archive::classify`] says what the entry holds and [`Encoding::refuses`] is
+/// the whole of the rule. Both write paths reach it here — [`tree_of`] for a
+/// rebuild and [`crate::patch::plan`] for a patch — so a caller falling back
+/// from one to the other gets the same answer (§3). `allowed` is the caller
+/// saying it meant this. DR-050.
+///
+/// # Errors
+///
+/// [`Error::WrongEncoding`] for a payload a tokenised entry will not take, and
+/// as [`Archive::classify`] and [`Contents::open`].
+pub(crate) fn check_encoding<R: Read + Seek>(
+    src: &mut R,
+    archive: &Archive,
+    index: u32,
+    path: &str,
+    contents: &dyn Contents,
+    allowed: bool,
+) -> Result<()> {
+    if allowed {
+        return Ok(());
+    }
+    let Some(held) = archive.classify(src, index)?.encoding() else {
+        return Ok(());
+    };
+    let mut window = [0_u8; Encoding::HEAD_LEN];
+    let read = fill(&mut *contents.open()?, &mut window)?;
+    let Some(offered) = held.refuses(Encoding::of(window.get(..read).unwrap_or_default())) else {
+        return Ok(());
+    };
+    Err(Error::WrongEncoding {
+        path: path.to_owned(),
+        held,
+        offered,
+    })
+}
+
+/// The kind of entry a payload has to be written as, for a path the archive
+/// does not hold yet.
+///
+/// The payload decides, because for a new entry there is no entry to ask, and
+/// a resource carries its own `RSC7` header and its page flags with it — so
+/// `declared` is `None`: there is no row to fall back to and none is needed.
+/// Anything else is offered to the compressor, which is what `build` does with
+/// every file `pack` gives it. DR-026.
+///
+/// **This is the one place the magic is still asked about, and it is the one
+/// place it answers something.** Q7 measured that the magic cannot say whether
+/// a payload *is* a resource — no Rockstar resource carries it — but a payload
+/// that does carry it states its own flags, and that is all this needs to
+/// create an entry. A payload that does not becomes a binary entry rather than
+/// a resource with no flags anyone knows. DR-046.
 ///
 /// # Errors
 ///
@@ -586,7 +640,7 @@ fn kind_for(contents: &dyn Contents) -> Result<FileKind> {
     let mut magic = [0_u8; MAGIC_RSC7.len()];
     let read = fill(&mut *contents.open()?, &mut magic)?;
     Ok(if magic.get(..read) == Some(MAGIC_RSC7.as_slice()) {
-        FileKind::Resource
+        FileKind::Resource { declared: None }
     } else {
         FileKind::Binary {
             storage: Storage::Deflate,
@@ -630,9 +684,14 @@ fn entry_at(archive: &Archive, path: &str) -> Result<u32> {
 /// [`Error::BadPath`] for the root, for a non-empty directory removed without
 /// saying so, and for a name [`name::check_tree`] refuses,
 /// [`Error::WrongKind`] for a write to a directory,
+/// [`Error::WrongEncoding`] for a payload the entry it replaces will not take,
 /// [`Error::CannotWriteEncrypted`] for an archive this build can read and not
 /// write back, and as [`specs_of`].
-pub(crate) fn tree_of(archive: &Archive, changes: &Changes) -> Result<Tree> {
+pub(crate) fn tree_of<R: Read + Seek>(
+    src: &mut R,
+    archive: &Archive,
+    changes: &Changes,
+) -> Result<Tree> {
     // The tree a rebuild will write, so this is where a rebuild's target is
     // asked whether it can be written at all — once, for `rebuild`, for every
     // level of a cascading `rewrite`, and for the resolution `allows` runs
@@ -666,11 +725,22 @@ pub(crate) fn tree_of(archive: &Archive, changes: &Changes) -> Result<Tree> {
         let Change::Write {
             ref contents,
             create,
+            allow_encoding_change,
         } = *change
         else {
             continue;
         };
-        write(archive, &mut tree, path, &**contents, create)?;
+        write(
+            src,
+            archive,
+            &mut tree,
+            path,
+            &**contents,
+            Told {
+                create,
+                allow_encoding_change,
+            },
+        )?;
     }
     for (path, change) in changes {
         if !matches!(*change, Change::MakeDirectory) {
@@ -807,14 +877,24 @@ fn rename(archive: &Archive, tree: &mut Tree, path: &str, to: &str) -> Result<()
     Ok(())
 }
 
+/// What a [`Change::Write`] was told, beside the bytes.
+#[derive(Debug, Clone, Copy)]
+struct Told {
+    /// [`Change::Write::create`].
+    create: bool,
+    /// [`Change::Write::allow_encoding_change`].
+    allow_encoding_change: bool,
+}
+
 /// Puts new contents at `path`, creating the entry when the archive does not
 /// hold one and the caller asked for that.
-fn write(
+fn write<R: Read + Seek>(
+    src: &mut R,
     archive: &Archive,
     tree: &mut Tree,
     path: &str,
     contents: &dyn Contents,
-    create: bool,
+    told: Told,
 ) -> Result<()> {
     match archive.find(path) {
         Ok(0) => Err(Error::WrongKind {
@@ -828,6 +908,14 @@ fn write(
             // was deflated is offered to the compressor again. `kind_of`
             // refuses a directory, which is the other thing this has to answer.
             let kind = kind_of(path, archive.entry(index)?)?;
+            check_encoding(
+                src,
+                archive,
+                index,
+                path,
+                contents,
+                told.allow_encoding_change,
+            )?;
             let node = tree
                 .nodes
                 .iter_mut()
@@ -841,7 +929,7 @@ fn write(
             Ok(())
         }
         Err(error @ Error::NotFound { .. }) => {
-            if !create {
+            if !told.create {
                 return Err(error);
             }
             name::check_tree(path)?;
@@ -950,12 +1038,18 @@ pub fn allows<R: Read + Seek>(
     staged.set(path, change.clone());
     let (here, nested) = split(archive, &staged)?;
     match landing_of(archive, path)? {
-        None => tree_of(archive, &here).map(|_| ()),
+        None => tree_of(src, archive, &here).map(|_| ()),
         Some((index, _)) => {
             let holder = archive.open_nested(src, index)?;
             let nothing = Changes::new();
-            let inside = nested.get(&index).map_or(&nothing, |group| &group.changes);
-            tree_of(&holder, inside).map(|_| ())
+            let group = nested.get(&index);
+            let inside = group.map_or(&nothing, |group| &group.changes);
+            tree_of(src, &holder, inside)
+                .map(|_| ())
+                .map_err(|failure| match group {
+                    Some(group) => respelled(failure, &group.spellings),
+                    None => failure,
+                })
         }
     }
 }
@@ -1063,7 +1157,9 @@ pub(crate) fn split(archive: &Archive, changes: &Changes) -> Result<(Changes, Gr
                 let group = nested.entry(index).or_insert_with(|| Nested {
                     first: path.to_owned(),
                     changes: Changes::new(),
+                    spellings: Spellings::new(),
                 });
+                group.spellings.insert(within.clone(), path.to_owned());
                 group.changes.set(within, within_change);
             }
         }
@@ -1096,6 +1192,45 @@ pub(crate) struct Nested {
     pub(crate) first: String,
     /// The changes, spelled as paths within it.
     pub(crate) changes: Changes,
+    /// How the caller spelled each of those paths.
+    pub(crate) spellings: Spellings,
+}
+
+/// A path within a nested archive, and the path the caller addressed it by.
+pub(crate) type Spellings = BTreeMap<String, String>;
+
+/// The same failure, with every path it names spelled as the caller spelled it.
+///
+/// [`split`] re-keys a change landing in a nested archive to the path *within*
+/// that archive, and a path that does not resolve in the archive the caller
+/// addressed is not one the caller can act on. DR-050 §2. Exact matches only,
+/// so a path that came out of the archive is left as it is.
+pub(crate) fn respelled(mut failure: Error, spellings: &Spellings) -> Error {
+    for named in named_paths_mut(&mut failure) {
+        if let Some(spelt) = spellings.get(named.as_str()) {
+            named.clone_from(spelt);
+        }
+    }
+    failure
+}
+
+/// Every path a failure names that can be one of a change set's own.
+fn named_paths_mut(failure: &mut Error) -> Vec<&mut String> {
+    match *failure {
+        Error::NotFound { ref mut path, .. }
+        | Error::WrongKind { ref mut path, .. }
+        | Error::WrongEncoding { ref mut path, .. }
+        | Error::NotAResource { ref mut path, .. }
+        | Error::AlreadyExists { ref mut path, .. }
+        | Error::BadPath { ref mut path, .. }
+        | Error::Claimed { ref mut path, .. }
+        | Error::FieldOverflow { ref mut path, .. } => vec![path],
+        Error::Overlapping {
+            ref mut path,
+            ref mut other,
+        } => vec![path, other],
+        _ => Vec::new(),
+    }
 }
 
 /// Nested change groups, by the entry index of the archive they land in.

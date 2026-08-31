@@ -964,6 +964,85 @@ fn a_payload_that_is_not_deflate_at_all_is_refused() {
     );
 }
 
+/// A deflate stream stopped at a block boundary without its final block, which
+/// is what a `Sync` flush leaves behind.
+///
+/// Everything the entry declares has already been produced; what is missing is
+/// the stream saying it is over.
+fn unterminated(plain: &[u8]) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(plain).expect("deflates");
+    encoder
+        .flush()
+        .expect("a sync flush closes the block and not the stream");
+    encoder.get_ref().clone()
+}
+
+/// A stream that ran out of input is refused, even when it produced exactly the
+/// length its entry declares.
+///
+/// **This is the check DR-045 §1a rests on**, and it is the decompressor's
+/// rather than ours: `Extracted::read` sees a zero-length read at the declared
+/// length and cannot tell "the stream ended" from "the input did". `flate2`
+/// 1.1.10 is the first release that tells them apart — its `zio::read` answers
+/// `UnexpectedEof` for a decoder that produced nothing at end of input with the
+/// stream unfinished, where 1.1.9 answered `Ok(0)`. Measured on this archive,
+/// through `Archive::read`: under 1.1.9 both payloads below were **accepted,
+/// 512 bytes each**; under 1.1.10 both are refused and the control still reads.
+///
+/// The minimum version is therefore load-bearing rather than incidental, which
+/// is why `Cargo.toml` asks for `1.1.10` and not `1.1`. `docs/conventions.md`
+/// §14, the `flate2` row.
+///
+/// It is a truncation this test is about, so §12's fourth case is where it
+/// belongs: a payload cut off by the end of its own extent has `used ==
+/// declared`, so `Payload::checked` never sees it and only the decompressor
+/// can.
+#[test]
+fn a_deflate_stream_that_never_terminates_is_refused_at_its_declared_length() {
+    let plain = [0xAA_u8; ONE_SYSTEM_PAGE_LEN];
+    let whole = deflate(&plain);
+
+    // The control. Without it the two refusals below would be satisfied by a
+    // decompressor that refused everything.
+    let bytes = one_file_archive(&whole, whole.len() as u32, 0, ONE_SYSTEM_PAGE_LEN as u32);
+    let archive = Archive::open(
+        &mut Cursor::new(bytes.clone()),
+        &rpf_core::Unlock::unkeyed(),
+    )
+    .expect("well formed");
+    assert_eq!(
+        archive.read(&mut Cursor::new(bytes), 1).expect("reads"),
+        plain,
+        "a whole stream of exactly the declared length must still read"
+    );
+
+    let mut chopped = whole;
+    chopped.pop();
+    for (what, payload) in [
+        ("sync-flushed, with no final block", unterminated(&plain)),
+        ("finished, with its last byte removed", chopped),
+    ] {
+        let bytes = one_file_archive(
+            &payload,
+            payload.len() as u32,
+            0,
+            ONE_SYSTEM_PAGE_LEN as u32,
+        );
+        let archive = Archive::open(
+            &mut Cursor::new(bytes.clone()),
+            &rpf_core::Unlock::unkeyed(),
+        )
+        .expect("well formed");
+        match archive.read(&mut Cursor::new(bytes), 1) {
+            Err(Error::Inflate { entry: 1, .. }) => {}
+            Ok(read) => panic!("a stream {what} was accepted, {} bytes of it", read.len()),
+            other => panic!("expected an inflate failure for a stream {what}, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn a_resource_declaring_no_compressed_size_is_refused_rather_than_guessed() {
     // The "compressed size 0 means stored" sentinel is a binary entry's, and

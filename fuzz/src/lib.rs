@@ -5,15 +5,23 @@
 //! [`rpf_core::Error`], never a panic, an abort, or an allocation the input
 //! chose the size of. The first three the fuzzer observes for itself; the
 //! fourth needs a witness, which is what [`Counting`] is.
+//!
+//! The metadata targets ask one more thing, and it needs its own witness for
+//! the same reason: a writer that answers `Ok` has claimed its bytes are a
+//! document, and nothing about not panicking checks that claim. [`well_formed`]
+//! is that check.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use quick_xml::{Reader, events::Event};
+
 use rpf_core::{
     MAX_DEPTH, Unwatched, Version,
     build::{FileKind, FileSpec, Storage, build},
+    metadata::rbf,
 };
 
 /// The largest input a target accepts, in bytes.
@@ -117,6 +125,87 @@ pub fn watched<T>(body: impl FnOnce() -> T) -> T {
 #[must_use]
 pub fn bounded(data: &[u8]) -> Option<&[u8]> {
     (data.len() <= MAX_INPUT).then_some(data)
+}
+
+/// What an `RBF` document that `from_xml` accepts must then satisfy.
+///
+/// One spelling, here, because two targets want it and §4 allows exactly one:
+/// `rbf_xml` reaches it from documents the corpus produced, `rbf_built` from
+/// documents an `Arbitrary` script wrote, and the claim is the same one.
+///
+/// Two things, and the first is the one that matters. **`from_xml` writes a
+/// token stream and `to_xml` reads one, and they are halves of one build**: a
+/// payload this build wrote that this build then refuses is DR-039's shape one
+/// layer up from the archive. Then the law `rbf::to_xml` states in its own doc
+/// comment — feeding its output back reproduces the input byte for byte — over
+/// payloads `from_xml` built, which is a different set from the 391 shipped
+/// files that law was measured on.
+///
+/// Does nothing when `document` is not `RBF` XML at all, which is most inputs
+/// and is not a failure.
+///
+/// # Panics
+///
+/// If either half refuses what the other wrote, or if the round trip is not
+/// exact.
+pub fn rbf_law(document: &[u8]) {
+    let Ok(payload) = rbf::from_xml(document) else {
+        return;
+    };
+
+    let written = match rbf::to_xml(&payload) {
+        Ok(written) => written,
+        Err(failure) => panic!("`to_xml` refuses the payload `from_xml` built: {failure:?}"),
+    };
+    if let Err(cause) = well_formed(&written) {
+        panic!("the XML written for a payload `from_xml` built is not a document: {cause}");
+    }
+
+    let back = match rbf::from_xml(&written) {
+        Ok(back) => back,
+        Err(failure) => panic!("`from_xml` refuses the XML `to_xml` wrote: {failure:?}"),
+    };
+    assert!(
+        back == payload,
+        "the round trip changed a payload `from_xml` built: {} bytes in, {} out",
+        payload.len(),
+        back.len()
+    );
+}
+
+/// Reads `document` to its end as XML, answering why it is not a document.
+///
+/// **The metadata writers are the only paths here that answer bytes meant to
+/// be read by something else**, and `Ok` from one of them is a claim that what
+/// it wrote is XML. Nothing in "it did not panic" checks that claim, and for
+/// `pso::to_xml` there is no reader on this side to check it with: `RBF` has
+/// `from_xml` and gets the round trip instead, which is strictly stronger.
+///
+/// It matters most for the names. A `PSO` member name is a Jenkins hash, and
+/// what it is *spelled* as comes out of a dictionary file the user supplied —
+/// so the one thing standing between a hostile line of that file and a
+/// document nothing can parse is what `Dictionary::load` refuses. This is that
+/// gate, checked from the outside.
+///
+/// `check_end_names` is set rather than left, because it is the whole of what
+/// this asks: with it off a reader accepts `<a></b>` and the check means
+/// nothing. `expand_empty_elements` matches `rbf::xml`'s reader, so a document
+/// this accepts is one that parser gets the same events from.
+///
+/// # Errors
+///
+/// The reader's own message, with the position it stopped at.
+pub fn well_formed(document: &[u8]) -> Result<(), String> {
+    let mut reader = Reader::from_reader(document);
+    reader.config_mut().check_end_names = true;
+    reader.config_mut().expand_empty_elements = true;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => return Ok(()),
+            Ok(_) => {}
+            Err(error) => return Err(format!("at byte {}: {error}", reader.error_position())),
+        }
+    }
 }
 
 /// An archive nested one level deeper than [`MAX_DEPTH`] accepts.

@@ -53,9 +53,29 @@ pub enum FileKind {
     },
     /// An `RSC7` resource, written through untouched.
     ///
-    /// The payload already carries its own flags and version, so nothing about
-    /// it is reconstructed. Passthrough is a commitment: `docs/approach.md`.
-    Resource,
+    /// Passthrough is a commitment: `docs/approach.md`. What has to be
+    /// reconstructed is the row, and `declared` is where its two flag words
+    /// come from when the payload does not carry an `RSC7` header of its own —
+    /// which in a Rockstar archive is every resource there is (Q7). `None`
+    /// says nothing but the payload knows them, which is a created entry, and a
+    /// payload without a header is then [`Error::NotAResource`]. DR-046.
+    Resource {
+        /// The flag words to record when the payload does not carry its own.
+        declared: Option<ResourceFlags>,
+    },
+}
+
+/// A resource's two flag words, which are its length and its version.
+///
+/// `docs/rpf-format.md`, Resource page flags: [`crate::format::resource_len`]
+/// reads a length out of them and the version is their two top nibbles, so
+/// carrying the pair carries both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceFlags {
+    /// System page flags — offset 8 of the entry row, and of the header.
+    pub system: u32,
+    /// Graphics page flags — offset 12 of the entry row, and of the header.
+    pub graphics: u32,
 }
 
 /// One file to put in the archive.
@@ -439,7 +459,19 @@ pub(crate) fn kind_of(path: &str, entry: &Entry) -> Result<FileKind> {
             found: "directory",
             wanted: "file",
         }),
-        EntryKind::Resource { .. } => Ok(FileKind::Resource),
+        // The row's own flag words travel with the kind, because they are the
+        // only place a Rockstar resource's flags exist: its payload does not
+        // begin with `RSC7` and carries no readable header (Q7). DR-046.
+        EntryKind::Resource {
+            system_flags,
+            graphics_flags,
+            ..
+        } => Ok(FileKind::Resource {
+            declared: Some(ResourceFlags {
+                system: system_flags,
+                graphics: graphics_flags,
+            }),
+        }),
         EntryKind::Binary {
             compressed_len,
             encryption,
@@ -515,7 +547,7 @@ where
     })?;
 
     match kind {
-        FileKind::Resource => store_resource(path, src, out, start),
+        FileKind::Resource { declared } => store_resource(path, declared, src, out, start),
         FileKind::Binary {
             storage: Storage::Stored,
             encryption,
@@ -541,16 +573,31 @@ where
     }
 }
 
-/// [`store`] for a resource: written through untouched, with its own flags read
-/// out of its `RSC7` header on the way past.
-fn store_resource<S, W>(path: &str, src: &mut S, out: &mut W, start: u64) -> Result<Written>
+/// [`store`] for a resource: written through untouched, with the flag words its
+/// row will declare taken from the payload's own `RSC7` header when it has one
+/// and from `declared` when it has not.
+///
+/// **The payload wins when it carries a header, because the header describes
+/// the payload** — a resource exported from any archive carries its flags with
+/// it, and they are the new entry's rather than the old one's. Otherwise
+/// `declared` is the only source there is: `docs/backlog.md` Q7 measured
+/// 696,578 of 696,578 Rockstar resource payloads that do not begin with `RSC7`,
+/// so requiring the magic here refused every resource a Rockstar archive ever
+/// produced. DR-046.
+fn store_resource<S, W>(
+    path: &str,
+    declared: Option<ResourceFlags>,
+    src: &mut S,
+    out: &mut W,
+    start: u64,
+) -> Result<Written>
 where
     S: Payload,
     W: Write,
 {
-    // The header is read before anything goes out, so a payload that is not a
+    // The head is read before anything goes out, so a payload too short to be a
     // resource is refused with nothing written for it. Read rather than seeked
-    // over: the flags in it are what the entry duplicates.
+    // over: a header carries the flags the entry duplicates.
     let mut head = Vec::new();
     (&mut *src)
         .take(RESOURCE_HEADER_LEN)
@@ -562,23 +609,28 @@ where
     if u64::try_from(head.len()).unwrap_or(u64::MAX) < RESOURCE_HEADER_LEN {
         return Err(Error::NotAResource {
             path: path.to_owned(),
+            reason: "the payload is shorter than a resource header",
         });
     }
     let magic: [u8; 4] = head
         .get(0..4)
         .and_then(|s| s.try_into().ok())
         .unwrap_or_default();
-    if magic != MAGIC_RSC7 {
-        return Err(Error::NotAResource {
+    // Offsets 8 and 12 of an `RSC7` header are the flag words, and both are
+    // inside the sixteen bytes read above, so the default is unreachable rather
+    // than a guess at a truncated header.
+    let flags = if magic == MAGIC_RSC7 {
+        ResourceFlags {
+            system: u32_at(&head, 8).unwrap_or_default(),
+            graphics: u32_at(&head, 12).unwrap_or_default(),
+        }
+    } else {
+        declared.ok_or_else(|| Error::NotAResource {
             path: path.to_owned(),
-        });
-    }
-    // The flags are the payload's own, at offsets 8 and 12 of its RSC7 header,
-    // and they are what the entry duplicates. Both are inside the sixteen bytes
-    // checked just above, so the default is unreachable rather than a guess at
-    // a truncated header.
-    let word_at_8 = u32_at(&head, 8).unwrap_or_default();
-    let word_at_12 = u32_at(&head, 12).unwrap_or_default();
+            reason: "the payload carries no RSC7 header and no entry declares \
+                     its page flags",
+        })?
+    };
 
     out.write_all(&head).map_err(|source| Error::Io {
         offset: start,
@@ -588,8 +640,8 @@ where
     Ok(Written {
         compressed_len: len,
         content: Content::Resource {
-            system_flags: word_at_8,
-            graphics_flags: word_at_12,
+            system_flags: flags.system,
+            graphics_flags: flags.graphics,
         },
         len,
         reached: len,
@@ -1056,7 +1108,7 @@ where
     R: Read + Seek,
     W: Write + Seek,
 {
-    let tree = edit::tree_of(archive, changes)?;
+    let tree = edit::tree_of(&mut *src, archive, changes)?;
     let files = tree.files();
     let fetch = FromArchive {
         src,
@@ -1177,9 +1229,34 @@ where
         // to be `Cursor::new(Vec::new())` and then `buffer.into_inner()`, and
         // the archive above it copied that again to write it.
         let mut sink = scratch.create()?;
-        rewrite(src, &holder, &group.changes, &mut sink, scratch, watch)?;
+        rewrite(src, &holder, &group.changes, &mut sink, scratch, watch)
+            .map_err(|failure| edit::respelled(failure, &group.spellings))?;
         overrides.insert(index, Box::new(sink));
     }
 
     rebuild(src, archive, &here, out, overrides, watch)
+}
+
+/// Whether this set can be committed as it stands, writing none of it.
+///
+/// The resolution [`rewrite`] performs, run and thrown away, at every level of
+/// the nesting. It does not build, so a refusal only a row builder raises is
+/// not among its answers. [`crate::allows`] is the same question asked of one
+/// change joining a buffered set; this is the whole set, which is what a dry
+/// run is about. R6.7.
+///
+/// # Errors
+///
+/// As [`rewrite`], less what only a build raises.
+pub fn resolves<R>(src: &mut R, archive: &Archive, changes: &Changes) -> Result<()>
+where
+    R: Read + Seek,
+{
+    let (here, nested) = edit::split(archive, changes)?;
+    for (index, group) in nested {
+        let holder = archive.open_nested(src, index)?;
+        resolves(src, &holder, &group.changes)
+            .map_err(|failure| edit::respelled(failure, &group.spellings))?;
+    }
+    edit::tree_of(src, archive, &here).map(|_| ())
 }

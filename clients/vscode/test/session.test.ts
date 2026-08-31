@@ -12,7 +12,16 @@ import { after, describe, it } from 'node:test';
 import { Daemon } from '../src/core/daemon.js';
 import { DaemonError, EXIT, advise } from '../src/core/errors.js';
 import { ArchiveSession, SessionBusy } from '../src/core/session.js';
-import { SKIP, binary, incompressible, packArchive, resourceBytes, scratch } from './support.js';
+import {
+    SKIP,
+    binary,
+    incompressible,
+    packArchive,
+    rbfBytes,
+    rbfDocument,
+    resourceBytes,
+    scratch,
+} from './support.js';
 
 describe('an archive session', { skip: SKIP }, () => {
     const dir = scratch('session');
@@ -73,6 +82,48 @@ describe('an archive session', { skip: SKIP }, () => {
         assert.deepEqual(session.dirtyPaths(), []);
         assert.notDeepEqual(fs.readFileSync(archive), before, 'the save did not take');
         assert.deepEqual(await session.read('data/greeting.txt'), Buffer.from('replaced'));
+    });
+
+    it('presents a tokenised metadata entry as XML and takes a document back', async () => {
+        // R7.4. The client asks for `auto` and shows what it is given: it reads
+        // no extension, converts nothing itself, and would be handed the raw
+        // `RBF` bytes if either half of that stopped being asked for. The entry
+        // is `.ymt`, which the corpus says is `PSO` in some archives, `RBF` in
+        // others and a resource in most — so the name is evidence about
+        // nothing. DR-053.
+        const archive = await packArchive(path.join(dir, 'view.rpf'), {
+            entries: [
+                { path: 'data/thing.ymt', bytes: rbfBytes('Root'), storage: 'stored' },
+            ],
+        });
+        const session = await ArchiveSession.open(start(), archive);
+
+        const shown = await session.read('data/thing.ymt');
+        assert.equal(
+            Buffer.from(shown).toString('utf8'),
+            rbfDocument('Root'),
+            'the entry is not shown as XML',
+        );
+
+        // And the edited document goes back as the encoding the entry holds,
+        // with no `allow_encoding_change`: a client that offered these bytes as
+        // a payload would be refused, exit 6. DR-050, DR-053.
+        await session.write('data/thing.ymt', Buffer.from(rbfDocument('Other')));
+        assert.deepEqual(
+            await session.read('data/thing.ymt'),
+            Buffer.from(rbfDocument('Other')),
+            'a buffered document did not read back as itself',
+        );
+        const saved = await session.save();
+        assert.equal(saved?.committed, 1);
+
+        const written = fs.readFileSync(archive);
+        assert.ok(written.includes(Buffer.from('RBF0')), 'the entry stopped being RBF');
+        assert.ok(!written.includes(Buffer.from('<?xml')), 'a document was written into the entry');
+        assert.equal(
+            Buffer.from(await session.read('data/thing.ymt')).toString('utf8'),
+            rbfDocument('Other'),
+        );
     });
 
     it('reports nothing to save when nothing is buffered', async () => {
@@ -250,21 +301,29 @@ describe('an archive session', { skip: SKIP }, () => {
     });
 
     it('refuses a payload a resource entry cannot hold, while the user can still act', async () => {
-        // R6.6, and refused at the write rather than at the save: the caller
-        // finds out while it still knows which edit it made.
+        // R6.6, DR-046: the payload's length against the header floor is the
+        // one thing still checked, and only once the archive is actually
+        // rebuilt — the write itself is taken and buffered like any other
+        // edit, so the refusal lands on the save, not the write. The edit is
+        // not lost by it: it stays buffered for the caller to correct.
         const archive = await archiveOf('resource');
         const session = await ArchiveSession.open(start(), archive);
-        const failure = await session.write('art.yft', Buffer.from('plain text')).then(
+        await session.write('art.yft', Buffer.from('plain text'));
+        assert.equal(session.state, 'dirty', 'the write must be taken, not refused');
+
+        const failure = await session.save().then(
             () => undefined,
             (error: unknown) => error,
         );
         assert.ok(failure instanceof DaemonError, String(failure));
         assert.equal(failure.code, EXIT.refused);
-        assert.match(failure.reason, /RSC7/);
-        assert.equal(session.state, 'clean', 'a refused write made the archive dirty');
+        assert.match(failure.reason, /shorter than a resource header/);
+        assert.equal(session.state, 'dirty', 'a refused save must not discard the edit it refused');
 
         await session.write('art.yft', resourceBytes());
         assert.equal(session.state, 'dirty');
+        assert.ok(await session.save(), 'a corrected write must still save');
+        assert.equal(session.state, 'clean');
     });
 
     it('refuses to write a directory as though it were a file', async () => {

@@ -50,6 +50,14 @@ const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 /// The AES-encrypted archive in the corpus, likewise.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
+/// The AES-encrypted archive whose resources carry a **24-byte** header rather
+/// than the 16 every other archive here uses. `docs/corpus.md`.
+///
+/// It is in the corpus for one reason: it is the smallest archive on either
+/// install, 4,096 bytes, whose payloads begin their deflate stream anywhere but
+/// 16 bytes in. `docs/backlog.md` Q14, population 1.
+const AES_24_ARCHIVE: &str = "gtav_aes/des_hosp_ceil2.rpf";
+
 /// The two builds of the Rockstar Games Launcher's own archive, which are the
 /// only archives here under the launcher key. `docs/corpus.md`.
 ///
@@ -364,6 +372,57 @@ fn the_aes_archive_opens_and_every_entry_reads_back() {
         .expect("verifies")
         .outcome()
         .expect("every entry of the AES archive reads back");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_resource_whose_header_is_twenty_four_bytes_reads_back() {
+    // `docs/backlog.md` Q14, population 1, and the reason
+    // `format::resource::RESOURCE_HEADER_LENS` is a set rather than a constant.
+    // Both resources here begin their deflate stream 24 bytes into the payload,
+    // and neither begins one at 16: a reader that assumed the `RSC7` header's
+    // own length read nothing out of this archive at all.
+    //
+    // The synthetic half of this is `crates/rpf-core/tests/resource.rs`, which
+    // runs with no corpus. This is the archive the measurement came from.
+    let test = "a_resource_whose_header_is_twenty_four_bytes_reads_back";
+    let Some(held) = Encrypted::under_aes(test, AES_24_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the archive opens");
+
+    // Measured 2026-08-30: a root, one binary `.ytyp` and two resources.
+    assert_eq!(archive.entries().len(), 4);
+    for (name, len) in [
+        ("des_hosp_ceil2.ydr", 16_384),
+        ("des_hosp_ceil2_txd.ytd", 8_192),
+    ] {
+        let index = archive.find(name).expect("resolves");
+        let read = archive
+            .read(&mut source, index)
+            .unwrap_or_else(|error| panic!("{name} did not read back: {error}"));
+        assert_eq!(read.len(), len, "{name} inflated to the wrong length");
+
+        // The stream begins 24 bytes in and nowhere else: the payload as the
+        // archive holds it does not inflate from 16.
+        let payload = archive.extract(&mut source, index).expect("extracts");
+        let mut short = flate2::bufread::DeflateDecoder::new(&payload[16..]);
+        let mut sunk = Vec::new();
+        assert!(
+            std::io::copy(&mut short, &mut sunk).is_err(),
+            "{name} inflated from 16 as well, so 24 is not what settles it"
+        );
+    }
+
+    Verified::of(&mut source, &archive, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the 24-byte-header archive reads back");
 }
 
 #[test]
@@ -933,6 +992,7 @@ fn every_change() -> Vec<(&'static str, Changes)> {
         Change::Write {
             contents: Arc::new(Bytes::new(b"plain text".to_vec())),
             create: false,
+            allow_encoding_change: false,
         },
     );
     let mut create = Changes::new();
@@ -941,6 +1001,7 @@ fn every_change() -> Vec<(&'static str, Changes)> {
         Change::Write {
             contents: Arc::new(Bytes::new(b"plain text".to_vec())),
             create: true,
+            allow_encoding_change: false,
         },
     );
     let mut remove = Changes::new();

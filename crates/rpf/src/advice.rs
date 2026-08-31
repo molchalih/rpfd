@@ -1,35 +1,46 @@
-//! What to say when a caller spells a path inside an archive the Windows way.
+//! What a caller is told to do about a failure, beyond what the failure says.
 //!
-//! DR-016. `/` is the only separator a path inside an archive has, and `\` is
-//! an ordinary character in an entry name — measured: an archive holding
-//! `x64\evil.txt` lists it, verifies it, `cat`s it and patches it in place,
-//! and one holding `x64/evil.txt` beside it addresses each by its own
-//! spelling. So a `\` a caller types is never rewritten: `data\greeting.txt`
-//! names an entry the archive does not hold, and the answer is not-found.
+//! `rpf_core::Error` carries what a caller acts on and not a rendered sentence
+//! (§10), and a remedy is spelled in the frontend's own vocabulary — a command
+//! line switch — so it is added here rather than in the container. Both
+//! frontends render through this one function, so the daemon says what the
+//! command line says (§1).
 //!
-//! That answer is correct and unhelpful, and this module is the whole of what
-//! R10.6 puts at the boundary: the rule, and the caller's own path respelled.
-//! It is here rather than in `rpf-core` because it is a rendered sentence,
-//! which §10 assigns to the frontend; `Error::NotFound` already carries the
-//! path, which is all this needs. Both frontends call it from the one place
-//! each of them renders a failure, so the daemon says what the command line
-//! says (§1).
+//! Two things are added. A path spelled the Windows way is respelt: DR-016
+//! makes `/` the only separator a path inside an archive has and `\` an
+//! ordinary character in an entry name, so a `\` a caller types is never
+//! rewritten and `data\greeting.txt` is simply not-found. That answer is
+//! correct and unhelpful, and R10.6 puts the rule and the caller's own path
+//! respelt at this boundary. And a refusal with a switch behind it names the
+//! switch: DR-050.
 
 use rpf_core::Error;
 
 use crate::exit::Failure;
 
-/// Renders a failure for a caller, saying how paths inside an archive are
-/// spelled when that is what went wrong.
+/// Renders a failure for a caller, with whatever the frontend can add to it.
 pub fn render(failure: &Failure) -> String {
-    match respelling(failure) {
-        Some(respelt) => format!(
+    if let Some(respelt) = respelling(failure) {
+        return format!(
             "{failure} (a path inside an archive separates with / on every \
              platform, and \\ is an ordinary character in an entry name rather \
              than a separator; try {respelt:?})"
-        ),
-        None => failure.to_string(),
+        );
     }
+    if let Some(remedy) = remedy(failure) {
+        return format!("{failure}. {remedy}");
+    }
+    failure.to_string()
+}
+
+/// The way through a refusal that has one, in the caller's own vocabulary.
+///
+/// Only [`Error::WrongEncoding`], which is the one refusal whose override is a
+/// switch of its own: `--force` means "write into a detected game install" and
+/// says so in its own sentence. DR-050.
+fn remedy(failure: &Failure) -> Option<&'static str> {
+    matches!(*failure, Failure::Container(Error::WrongEncoding { .. }))
+        .then_some("Pass --allow-encoding-change to override, or convert the payload first")
 }
 
 /// The path the caller asked for with `\` read as the separator, or `None` when
@@ -50,7 +61,7 @@ fn respelling(failure: &Failure) -> Option<String> {
 mod tests {
     use rpf_core::Error;
 
-    use super::{render, respelling};
+    use super::{remedy, render, respelling};
     use crate::exit::Failure;
 
     /// The failure a caller gets for a path that did not resolve.
@@ -104,6 +115,42 @@ mod tests {
             reason: "has a component holding \\, which is a separator on Windows",
         });
         assert_eq!(respelling(&failure), None);
+        assert_eq!(render(&failure), failure.to_string());
+    }
+
+    /// A refusal with a way through names it, in the spelling a caller passes.
+    ///
+    /// R7.6 wants a message a caller can act on, and `rpf_core::Error` cannot
+    /// give one: it knows nothing of command-line switches (§2). DR-050.
+    #[test]
+    fn a_refusal_with_a_switch_behind_it_names_the_switch() {
+        let failure = Failure::Container(Error::WrongEncoding {
+            path: "data/thing.ymt".to_owned(),
+            held: rpf_core::Encoding::Rbf,
+            offered: rpf_core::Encoding::Xml,
+        });
+        let rendered = render(&failure);
+        assert!(
+            rendered.contains("--allow-encoding-change"),
+            "must name the way through: {rendered}"
+        );
+        assert!(
+            rendered.contains("data/thing.ymt")
+                && rendered.contains("rbf")
+                && rendered.contains("xml"),
+            "must still say what was refused and what of: {rendered}"
+        );
+    }
+
+    /// And nothing else grows one: the sentence is the failure's own.
+    #[test]
+    fn a_refusal_with_no_switch_behind_it_is_rendered_unchanged() {
+        let failure = Failure::Container(Error::WrongKind {
+            path: "data".to_owned(),
+            found: "directory",
+            wanted: "file",
+        });
+        assert_eq!(remedy(&failure), None);
         assert_eq!(render(&failure), failure.to_string());
     }
 

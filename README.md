@@ -8,8 +8,9 @@ Status: **the container works, and the game's own loader has accepted what it
 wrote.** An archive can be listed, read, edited and rebuilt from the command
 line, including through nested archives. Encrypted archives can be **read** —
 AES and NG — but not written. An entry's encoding is recognised from its bytes,
-and `RBF` metadata converts to XML and back; `PSO` does not yet. There is a
-VS Code client, and it runs in a real editor. See the backlog.
+`RBF` and `PSO` metadata convert to XML and back, and either can be **read and
+written as XML** through both frontends. There is a VS Code client, it runs in a
+real editor, and it presents a metadata entry as its XML. See the backlog.
 
 ```
 rpf info    dlc.rpf x64/vehicles.rpf   # or the archive alone
@@ -22,6 +23,9 @@ rpf mv      dlc.rpf data/old.meta data/new.meta
 rpf mkdir   dlc.rpf data/empty
 rpf extract dlc.rpf tree/ && rpf pack tree/ dlc.rpf   # --overwrite to reuse a tree
 rpf put     dlc.rpf data/vehicles.meta new.meta --dry-run   # decide, write nothing
+rpf cat     dlc.rpf data/thing.ymt --as xml   # an RBF or PSO entry as XML
+rpf put     dlc.rpf data/thing.ymt edited.xml --as xml   # and the document back
+rpf put     dlc.rpf data/thing.ymt new.xml --allow-encoding-change   # RBF entry, XML bytes
 rpf verify  dlc.rpf --against tree/   # and against what the tree recorded
 rpf keys extract GTA5.exe   # find the key material in your own install
 rpf serve --stdio        # JSON-RPC, one object per line, edits held until commit
@@ -226,6 +230,35 @@ same decision and stop before acting on it — reporting where each edit would b
 written and how much room its entry has, or which edits will not fit and force
 the rebuild. It needs no write permission, and a refusal is reported as a
 refusal, so what it says is what the real call would do.
+
+An entry announces what it holds, and a write is refused when the payload
+contradicts it: XML or plain text put into an entry holding `RBF` or `PSO` is
+refused — exit 6, `WrongEncoding` — because those are binary encodings and the
+game reads the entry as one, so the result would be an archive that parses and
+does not load. `--allow-encoding-change` on `put`, and
+`"allow_encoding_change": true` on the daemon's `write`, is the way through when
+that is what was meant. It is a switch of its own and **not** `--force`, which
+means "write into a detected game installation" and nothing else: a caller that
+wanted one must not be given the other. DR-050.
+
+**A metadata entry can be read and written as XML instead**, which is what that
+refusal exists to make unnecessary. `rpf cat --as xml` writes the XML view of an
+entry holding `RBF` or `PSO`, `rpf put --as xml` reads a document and converts it
+back into whatever the entry holds, and the daemon's `read` and `write` take the
+same word as `"as"`. Three values: `"raw"` is the entry's own bytes and is the
+default everywhere; `"xml"` is the XML view, and an entry that has none is
+refused — exit 6, `NoXmlView` — naming what it holds; `"auto"` is the XML view
+where there is one and the bytes where there is not, which is what a client that
+must not guess from an extension asks for. `read` answers `"as"`, saying which
+of the two it gave, and `"encoding"`, the same value a listing row carries.
+
+**A converted write needs no `--allow-encoding-change`**, because there is no
+encoding change in it: what is written is a payload of the entry's own encoding,
+and the same document offered as *bytes* is refused exactly as before. A
+document that does not describe the entry is refused too, rather than written as
+text. A round trip with no edit leaves the entry byte for byte — 391 of 391
+`RBF` files and 9,753 of 9,753 `PSO` files — and an edit that changes a `PSO`'s
+*shape* is refused with a position rather than made to fit. DR-053, DR-049.
 
 `extract` refuses a directory that already holds something, and `--overwrite`
 — `"overwrite": true` on the daemon — is the way through. An extracted tree

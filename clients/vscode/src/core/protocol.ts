@@ -80,12 +80,31 @@ export interface Listed {
     len: number;
 }
 
+/** Which form of an entry a request asks for, and an answer came back in. */
+export type ViewName = 'raw' | 'xml' | 'auto';
+
 /** What `read` answers. */
 export interface ReadEntry {
     path: string;
     len: number;
     /** Whether these bytes are a buffered edit rather than what is on disk. */
     pending: boolean;
+    /**
+     * Which form these bytes are: the entry's own, or its XML view.
+     *
+     * Never `'auto'` — that is a question and not an answer. DR-053.
+     */
+    as: Exclude<ViewName, 'auto'>;
+    /**
+     * What the entry's payload announces itself to be, and `null` when it
+     * announces nothing or was not read.
+     *
+     * **This is the only thing a client may decide a presentation from.** The
+     * scope boundary is self-describing formats: a `.ymt` is `PSO` in some
+     * archives, `RBF` in others and a resource in most, so an extension is not
+     * evidence about anything. DR-044, DR-053.
+     */
+    encoding: 'xml' | 'text' | 'rbf' | 'pso' | null;
     bytes: string;
 }
 

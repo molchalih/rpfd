@@ -30,7 +30,7 @@ use std::{
 use crate::{
     archive::Archive,
     build::{file_row, kind_of, store},
-    edit::{Change, Changes, Structural},
+    edit::{self, Change, Changes, Structural},
     error::{Error, Result},
     format::Row,
 };
@@ -207,9 +207,11 @@ impl Claim {
 ///
 /// [`Error::NotFound`] for a path that does not resolve and was not asked to be
 /// created, [`Error::WrongKind`] for a directory, [`Error::NotAResource`] for a
-/// resource given a payload that is not one, [`Error::FieldOverflow`] for one no
-/// entry row can describe, [`Error::Overlapping`] for two edits that claim the
-/// same bytes, [`Error::CannotWriteEncrypted`] for an archive this build can
+/// resource given a payload that is not one, [`Error::WrongEncoding`] for an
+/// entry given a payload the encoding it holds will not take,
+/// [`Error::FieldOverflow`] for one no entry row can describe,
+/// [`Error::Overlapping`] for two edits that claim the same bytes,
+/// [`Error::CannotWriteEncrypted`] for an archive this build can
 /// read and not write back, and [`Error::Io`] from the archive. Not
 /// [`Error::ArchiveTooLarge`], which the same row builder can raise: the block
 /// this hands it was decoded out of the entry it is patching, so it already
@@ -236,7 +238,12 @@ where
 
     for (path, change) in changes {
         // Everything else was structural, and structural returned above.
-        let Change::Write { ref contents, .. } = *change else {
+        let Change::Write {
+            ref contents,
+            allow_encoding_change,
+            ..
+        } = *change
+        else {
             continue;
         };
         let (holder, index) = archive.locate(file, path)?;
@@ -246,6 +253,14 @@ where
         // place. One answer, `Archive::writable`, shared with the rebuild path.
         // DR-041.
         holder.writable()?;
+        edit::check_encoding(
+            file,
+            &holder,
+            index,
+            path,
+            &**contents,
+            allow_encoding_change,
+        )?;
         let entry = *holder.entry(index)?;
 
         // The storage rule is the entry's, not the caller's: one that was

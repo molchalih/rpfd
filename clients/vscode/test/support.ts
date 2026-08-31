@@ -118,6 +118,35 @@ export async function packArchive(at: string, spec: ArchiveSpec): Promise<string
 }
 
 /**
+ * A minimal but real `RBF` payload: one open element named `root`, and the
+ * close that ends it.
+ *
+ * Hand-encoded from `docs/metadata-encodings.md` — magic, a descriptor
+ * declaring the name, the element's two meaningless words and its attribute
+ * count, then the `0xFFFF` close. It is a fixture rather than game data
+ * (DR-006), and it exists so the client can be shown presenting a tokenised
+ * entry as XML without knowing anything about the encoding itself.
+ */
+export function rbfBytes(name: string): Buffer {
+    const named = Buffer.from(name, 'ascii');
+    const length = Buffer.alloc(2);
+    length.writeUInt16LE(named.length);
+    return Buffer.concat([
+        Buffer.from('RBF0', 'ascii'),
+        Buffer.from([0x00, 0x00]), // descriptor 0, an open element
+        length,
+        named,
+        Buffer.from([0, 0, 0, 0, 0, 0]), // two unknown words and no attributes
+        Buffer.from([0xff, 0xff]), // close
+    ]);
+}
+
+/** The XML {@link rbfBytes} converts to. */
+export function rbfDocument(name: string): string {
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<${name}/>\n`;
+}
+
+/**
  * A minimal but real resource: an `RSC7` header whose flags describe one
  * 512-byte system page and no graphics pages, followed by a raw deflate stream
  * of exactly that.

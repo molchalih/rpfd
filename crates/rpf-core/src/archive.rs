@@ -22,7 +22,7 @@ use crate::{
         Header, MAX_HEADER_LEN, Names, Version,
         crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme},
         folded,
-        resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, resource_len},
+        resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, RESOURCE_HEADER_LENS, resource_len},
         same_name,
     },
     keys::{Material, Unlock},
@@ -69,6 +69,28 @@ fn read_vec_at<R: Read + Seek>(src: &mut R, offset: u64, len: u64) -> Result<Vec
     let mut buf = vec![0u8; len];
     read_exact_at(src, offset, &mut buf)?;
     Ok(buf)
+}
+
+/// Where a resource's deflate stream was found, and what inflating it from
+/// there produced.
+///
+/// The whole of what [`Archive::resource_stream`] settles, answered in one
+/// value (§4). The three numbers are the ones the probe already had to compute
+/// to reach its verdict, so a caller building the stream for real takes them
+/// rather than deriving them a second time from the entry — which is the same
+/// arithmetic written twice, and §3's duplicated fact one level up.
+struct Boundary {
+    /// Offset of the stream's first byte, inside the archive.
+    at: u64,
+    /// Length of the stream: the payload's extent less the header in front of
+    /// it.
+    len: u64,
+    /// What the entry's flag words declare the contents to be, and what the
+    /// probe confirmed the stream inflates to.
+    expected: u64,
+    /// What the probe's own inflate found, for a caller checking the entry
+    /// rather than reading it.
+    payload: Payload,
 }
 
 /// What a read of one entry found out about the payload it came out of.
@@ -1347,6 +1369,13 @@ impl Archive {
     ///
     /// As [`Archive::read`].
     pub(crate) fn read_back<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Payload> {
+        // A resource's stream boundary is recovered by inflating it
+        // ([`Archive::resource_stream`]), and that inflate answers everything
+        // this reports. Going through `opened` would run it twice: once to
+        // settle the boundary and once to check what it settled.
+        if let EntryKind::Resource { .. } = self.entry(index)?.kind {
+            return self.resource_stream(src, index).map(|found| found.payload);
+        }
         let mut stream = self.opened(src, index, Form::Contents)?;
         let len = stream.drained()?;
         let (declared, used) = stream.extent();
@@ -1356,6 +1385,90 @@ impl Archive {
             declared,
             used,
         })
+    }
+
+    /// Where a resource's deflate stream begins inside its payload, and what
+    /// inflating it from there found.
+    ///
+    /// **The header length is not declared and cannot be derived**, so it is
+    /// recovered here rather than assumed. A resource entry has nowhere to
+    /// record it — offsets 8 and 12 are both flag words — and it does not
+    /// follow from those flags either: two entries of `x64f.rpf` with identical
+    /// flag words, identical version and identical declared length begin their
+    /// streams at 16 and at 24 ([`RESOURCE_HEADER_LENS`]).
+    ///
+    /// What the entry *does* declare is enough to check a candidate: the length
+    /// its flag words give, and the payload the compressed-size field bounds. A
+    /// candidate is right when the stream starting there inflates to exactly
+    /// that length. Over the 7,072 resources of `x64f.rpf` no payload answers
+    /// to two candidates, and the first candidate is right for 7,050 of them.
+    ///
+    /// Nothing is held: the probe drains into a sink exactly as
+    /// [`Archive::read_back`] does, which is why that function takes its answer
+    /// from here rather than paying for the decision twice.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceTooSmall`] for a payload no candidate fits inside, and
+    /// otherwise whatever the **first** candidate failed with — the payload
+    /// that begins no deflate stream at any known boundary is reported as the
+    /// ordinary case it is, rather than as the last candidate's complaint.
+    fn resource_stream<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Boundary> {
+        let (offset, _) = self.payload_span(index)?;
+        let EntryKind::Resource {
+            compressed_len,
+            system_flags,
+            graphics_flags,
+            ..
+        } = self.entry(index)?.kind
+        else {
+            return Err(Error::WrongKind {
+                path: self.named(index),
+                found: self.entry(index)?.kind.noun(),
+                wanted: "resource file",
+            });
+        };
+        let expected = resource_len(system_flags, graphics_flags);
+        let too_small = Error::ResourceTooSmall {
+            entry: index,
+            compressed_len,
+        };
+        let mut first: Option<Error> = None;
+
+        for header in RESOURCE_HEADER_LENS {
+            let (Some(stream_len), Some(at)) = (
+                u64::from(compressed_len).checked_sub(header),
+                offset.checked_add(header),
+            ) else {
+                continue;
+            };
+            let mut stream = Extracted::deflated(
+                index,
+                &mut *src,
+                at,
+                stream_len,
+                expected,
+                RESOURCE_IS_IN_THE_CLEAR,
+            );
+            match stream.drained() {
+                Ok(len) => {
+                    let (declared, used) = stream.extent();
+                    return Ok(Boundary {
+                        at,
+                        len: stream_len,
+                        expected,
+                        payload: Payload {
+                            entry: index,
+                            len,
+                            declared,
+                            used,
+                        },
+                    });
+                }
+                Err(error) => first.get_or_insert(error),
+            };
+        }
+        Err(first.unwrap_or(too_small))
     }
 
     /// One entry as a stream of the file it is **outside the archive**.
@@ -1451,12 +1564,7 @@ impl Archive {
                 })
             }
 
-            EntryKind::Resource {
-                compressed_len,
-                system_flags,
-                graphics_flags,
-                ..
-            } => match form {
+            EntryKind::Resource { compressed_len, .. } => match form {
                 Form::File => {
                     if u64::from(compressed_len) < RESOURCE_HEADER_LEN {
                         return Err(Error::ResourceTooSmall {
@@ -1472,26 +1580,19 @@ impl Archive {
                         RESOURCE_IS_IN_THE_CLEAR,
                     ))
                 }
+                // The boundary is asked for once and answered whole (§4): the
+                // probe already settled where the stream starts, how long it
+                // is and what it has to inflate to, so nothing here recomputes
+                // any of the three.
                 Form::Contents => {
-                    let stream_len = u64::from(compressed_len)
-                        .checked_sub(RESOURCE_HEADER_LEN)
-                        .ok_or(Error::ResourceTooSmall {
-                            entry: index,
-                            compressed_len,
-                        })?;
-                    let at =
-                        offset
-                            .checked_add(RESOURCE_HEADER_LEN)
-                            .ok_or(Error::ResourceTooSmall {
-                                entry: index,
-                                compressed_len,
-                            })?;
+                    let mut src = src;
+                    let found = self.resource_stream(&mut src, index)?;
                     Ok(Extracted::deflated(
                         index,
                         src,
-                        at,
-                        stream_len,
-                        resource_len(system_flags, graphics_flags),
+                        found.at,
+                        found.len,
+                        found.expected,
                         RESOURCE_IS_IN_THE_CLEAR,
                     ))
                 }

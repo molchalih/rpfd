@@ -1,0 +1,27 @@
+{
+  "what": "every PSO metadata payload in the 358 archives of both GTA V installs, classified by content and never by extension",
+  "measured": "2026-08-30",
+  "files": 9753,
+  "bytes": 141750352,
+  "extensions": {
+    ".ymt": 4378,
+    ".ymf": 3623,
+    ".cut": 1738,
+    ".ytyp": 6,
+    ".pso": 4,
+    ".ymap": 4
+  },
+  "sections": {
+    "PSIN": 9753,
+    "PMAP": 9753,
+    "PSCH": 9753,
+    "PSIG": 9745,
+    "CHKS": 8978,
+    "STRE": 3047,
+    "STRF": 326,
+    "STRS": 12
+  },
+  "distinct_root_structures": 43,
+  "sha256_of_sorted_sha256_lines": "c564fda2c84d7e25a00c3d37bcc047d39d7a790c7c8a0195a79151f7cb07015d",
+  "note": "One digest of the sorted per-payload digests, rather than 9,753 of them: the RBF manifest lists all 391 because 391 is a list, and 9,753 is a file of its own. The roll-up binds the same claim - that the tests ran against these bytes - and a mismatch is found the same way, by regenerating it."
+}

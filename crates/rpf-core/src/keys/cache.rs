@@ -700,7 +700,9 @@ fn root(platform: Platform, environment: &Environment) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{fs, io::Cursor};
+
+    use crate::Error;
 
     use super::{
         APPLICATION, BASE_LEN, Cache, Environment, KEYS, MAGIC, PAYLOAD_AT, Platform, SUFFIX,
@@ -1029,6 +1031,45 @@ mod tests {
 
         let expected = format!("{}{SUFFIX}", source.hex());
         assert!(directory.path().join(&expected).is_file(), "{expected}");
+    }
+
+    #[test]
+    fn every_material_a_cache_holds_is_a_candidate_it_offers() {
+        // `Cache::materials` is what `Unlock::cached` asks, and an empty answer
+        // is `Error::NeedsKey`: a cache holding the material that opens the
+        // archive, reported as holding nothing, tells an automation to go and
+        // extract a key it already has. Nothing called it in a test at all —
+        // replacing it with an empty vector left the whole suite green.
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+
+        assert!(
+            cache.materials().unwrap().is_empty(),
+            "an empty cache offered a candidate"
+        );
+
+        // Two sources, and the shapes an entry can be: one plain, one with the
+        // NG half. Both come back, so `materials` is not answering from the
+        // first entry alone either.
+        cache.store(&digest_of(b"one"), &material()).unwrap();
+        cache
+            .store(&digest_of(b"two"), &material_with_ng())
+            .unwrap();
+
+        let held = cache.materials().unwrap();
+        assert_eq!(
+            held.len(),
+            2,
+            "the cache holds two and offered {}",
+            held.len()
+        );
+        assert_eq!(
+            held.iter()
+                .filter(|material| material.ng().is_some())
+                .count(),
+            1,
+            "the NG half did not survive the round trip through the cache"
+        );
     }
 
     #[test]
@@ -1366,6 +1407,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn a_unix_that_says_where_home_is_finds_a_platform_cache() {
+        // `Cache::platform` is `root(HOST, Environment::of_this_process())`.
+        // Both halves are tested exhaustively against a written-down
+        // environment; **the fetch is what nothing tested**, and replacing
+        // either of them with an empty answer left the whole suite green.
+        //
+        // It stayed green for a specific and instructive reason.
+        // `tests/keys.rs`'s `the_platform_cache_is_an_absolute_directory_of_
+        // this_tool_s_own` opens with `let Some(cache) = Cache::platform()
+        // else { skip; return }`, and nothing checks that the skip was earned
+        // — so a `platform` that answers `None` everywhere makes the one test
+        // of the platform cache skip on every machine and report `ok`. That is
+        // §12's silent pass, one level in: the gate is the function under test.
+        //
+        // This is the check that skip needs. On a Unix both configuration
+        // roots are reached through `$HOME` — `$HOME/.config` under the XDG
+        // rule and `$HOME/Library/Application Support` under Apple's — so a
+        // `$HOME` that is set is an environment that says where the directory
+        // is, and `None` is then the wrong answer. `expect` rather than a skip,
+        // because a Unix running `cargo test` without `$HOME` is a broken
+        // environment and should say so rather than pass quietly.
+        let home =
+            std::env::var_os("HOME").expect("a Unix that can run cargo test says where $HOME is");
+        assert!(!home.is_empty(), "$HOME is set to nothing");
+
+        let cache = Cache::platform()
+            .expect("$HOME is set, so this environment says where its configuration root is");
+        assert!(cache.directory().is_absolute());
+        assert!(
+            cache
+                .directory()
+                .ends_with(std::path::Path::new(APPLICATION).join(KEYS)),
+            "{} is not this tool's own directory",
+            cache.directory().display()
+        );
+    }
+
+    #[test]
     fn windows_uses_appdata_and_nothing_else() {
         let with = environment("C:\\Users\\p", None, Some("C:\\Users\\p\\AppData\\Roaming"));
         assert_eq!(
@@ -1388,6 +1468,177 @@ mod tests {
                 root(platform, &nothing).is_none(),
                 "{platform:?} guessed a directory from an empty environment"
             );
+        }
+    }
+
+    /// A source that answers `EINTR` before each of its first `left` reads and
+    /// its own bytes after that.
+    ///
+    /// The digest is what decides whether a cache entry belongs to the
+    /// executable in hand, so a read that stopped at an interruption would
+    /// digest a prefix and hand the previous install's material back under it.
+    /// Nothing in the repository provoked one.
+    struct Interrupting {
+        inner: Cursor<Vec<u8>>,
+        left: usize,
+    }
+
+    impl std::io::Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left > 0 {
+                self.left = self.left.saturating_sub(1);
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for Interrupting {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    /// A source that hands over `head` and then fails once, permanently.
+    ///
+    /// Not an `Interrupted` failure, so it is the one the guard must let
+    /// through. It ends rather than failing again, so a digest that swallowed
+    /// it answers a digest instead of spinning, and the assertion below is what
+    /// tells the two apart.
+    struct Failing {
+        head: Vec<u8>,
+        at: usize,
+        failed: bool,
+    }
+
+    impl std::io::Read for Failing {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(rest) = self.head.get(self.at..)
+                && !rest.is_empty()
+            {
+                let want = rest.len().min(buf.len());
+                buf[..want].copy_from_slice(&rest[..want]);
+                self.at = self.at.saturating_add(want);
+                return Ok(want);
+            }
+            if self.failed {
+                return Ok(0);
+            }
+            self.failed = true;
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    impl std::io::Seek for Failing {
+        fn seek(&mut self, _to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.at = 0;
+            self.failed = false;
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_digest_of_an_interrupted_source_is_the_digest_of_the_whole_source() {
+        let bytes: Vec<u8> = (0..40_000_u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let mut source = Interrupting {
+            inner: Cursor::new(bytes.clone()),
+            left: 3,
+        };
+        assert_eq!(
+            SourceDigest::of(&mut source).unwrap(),
+            digest_of(&bytes),
+            "an interruption changed which source this is"
+        );
+    }
+
+    #[test]
+    fn a_digest_of_a_source_that_fails_says_how_far_it_got() {
+        // The other half of the guard, and the reason the offset is carried:
+        // a truncated read must not become a digest of a prefix, which would
+        // be a cache key for a file nobody has.
+        let head: Vec<u8> = (0..1_000_u32)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let mut source = Failing {
+            head,
+            at: 0,
+            failed: false,
+        };
+        match SourceDigest::of(&mut source) {
+            Err(crate::Error::Io { offset, source }) => {
+                assert_eq!(offset, 1_000);
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected the read failure to be reported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_read_is_a_failure_and_not_a_miss() {
+        // A cache is disposable, so an entry that is **absent** is a miss and
+        // the answer is to extract again. An entry that is there and cannot be
+        // read is not that: it is a directory the tool cannot use, or a file
+        // somebody else owns, and reporting it as a miss re-scans a 47 MB
+        // executable on every command for ever while saying nothing.
+        //
+        // Only the absence is a miss, and nothing said so — every test of this
+        // path used a cache directory that was simply not there, which is the
+        // one case both readings agree on.
+        let parent = tempfile::tempdir().unwrap();
+        let scratch = parent.path().join("cache");
+        let cache = Cache::at(&scratch);
+        let digest = digest_of(b"an executable");
+
+        // Absent: a miss, and the directory is not created by asking.
+        assert!(cache.load(&digest).expect("absent is a miss").is_none());
+
+        // Present and unreadable: a directory where the entry file goes. Every
+        // platform refuses to read one as a file, and none of them calls it
+        // `NotFound`.
+        let path = cache.path_for(&digest);
+        fs::create_dir_all(&path).expect("a directory where the entry goes");
+        match cache.load(&digest) {
+            Err(Error::Io { source, .. }) => {
+                assert_ne!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "an entry that is there was reported absent"
+                );
+            }
+            other => panic!("expected the unreadable entry to be reported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cache_directory_that_is_a_file_is_a_failure_and_not_an_empty_cache() {
+        // The same rule one level up, for the enumeration `entries` and `clear`
+        // are built on: a directory that is **not there** holds nothing, which
+        // is why neither creates one. Anything else that stops it being read is
+        // a failure — and a `clear` that reported success over a cache it never
+        // managed to open would leave key material on disk while saying it had
+        // removed it.
+        let parent = tempfile::tempdir().unwrap();
+        let scratch = parent.path().join("cache");
+
+        // Absent: no entries, and asking did not create it.
+        let cache = Cache::at(&scratch);
+        assert!(cache.entries().expect("absent holds nothing").is_empty());
+        assert!(!scratch.exists(), "asking created the cache directory");
+
+        // A plain file where the directory goes: every platform refuses to
+        // enumerate it, and none of them calls it `NotFound`.
+        fs::write(&scratch, b"not a directory").expect("a file where the directory goes");
+        match cache.entries() {
+            Err(Error::Io { source, .. }) => {
+                assert_ne!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "a cache that is there was reported absent"
+                );
+            }
+            other => panic!("expected the unreadable cache to be reported, got {other:?}"),
         }
     }
 }

@@ -29,7 +29,9 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use rpf_core::{Archive, Change, Changes, EntryKind, Flow, Step, Unwatched, Watch};
+use rpf_core::{
+    Archive, Change, Changes, Dictionary, Encoding, Flow, Step, Unwatched, View, Watch,
+};
 use serde_json::{Value, json};
 
 use crate::{commands, exit::Failure, install};
@@ -1051,7 +1053,7 @@ impl Rejected {
     fn message(&self) -> String {
         match *self {
             Self::Protocol { ref message, .. } => message.clone(),
-            Self::Failed(ref failure) => crate::separator::render(failure),
+            Self::Failed(ref failure) => crate::advice::render(failure),
         }
     }
 }
@@ -1149,6 +1151,46 @@ fn flag(params: &Value, name: &str) -> Answer<bool> {
         Some(value) => value
             .as_bool()
             .ok_or_else(|| invalid_params(format!("{name:?} is a boolean"))),
+    }
+}
+
+/// The view a request asks for, which is the entry's own bytes unless it says
+/// otherwise.
+///
+/// `"raw"` is the default because it is what every client sent before this
+/// existed, and a wire addition never changes what a request already meant.
+/// DR-053, DR-032's rule for an addition.
+fn view_of(params: &Value) -> Answer<View> {
+    match params.get("as") {
+        None | Some(Value::Null) => Ok(View::Raw),
+        Some(Value::String(name)) => View::parse(name).ok_or_else(|| {
+            let known = View::ALL.map(View::name).join(", ");
+            invalid_params(format!("{name:?} is not a view; one of {known}"))
+        }),
+        Some(_) => Err(invalid_params("\"as\" is a string".to_owned())),
+    }
+}
+
+/// A view, with the dictionary this frontend offers with it.
+///
+/// The command line's [`commands::wanted`] is the same one, because a hash
+/// spelled one way here and another way there would be two products (§1).
+const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
+    rpf_core::view::Wanted {
+        view,
+        names: Dictionary::EMPTY,
+    }
+}
+
+/// What a view answered, in the one spelling `--as` takes.
+///
+/// [`View::Auto`] is a question and never an answer, so what is reported is
+/// whichever of the two forms came back. DR-053.
+const fn answered(xml: bool) -> &'static str {
+    if xml {
+        View::Xml.name()
+    } else {
+        View::Raw.name()
     }
 }
 
@@ -1335,9 +1377,38 @@ fn list(state: &mut State, params: &Value) -> Answered {
 ///
 /// A pending write is returned in preference to what is on disk: an editor that
 /// wrote a buffer and read it back should see what it wrote.
+///
+/// **`"as"` says which form of the entry is wanted** — `"raw"`, `"xml"` or
+/// `"auto"` — and the answer says which form it got, beside the `"encoding"`
+/// the entry holds. A client presenting metadata as XML asks for `"auto"` and
+/// reads the answer; it never asks the path what it is, because the scope
+/// boundary is self-describing formats and `.ymt` is not one. DR-053.
+///
+/// The rule that a buffered write is preferred reaches the conversion as well:
+/// what a document is converted **from** is the payload this method would
+/// answer, so a read and a write of one entry are about the same bytes.
 fn read(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
+    let view = view_of(params)?;
     let session = session(state, params)?;
+
+    if view != View::Raw && session.pending.contents_at(&inside).is_some() {
+        let payload = buffered_payload(session, &inside)?;
+        let encoding = Encoding::of(
+            payload
+                .get(..Encoding::HEAD_LEN)
+                .unwrap_or(payload.as_slice()),
+        );
+        let viewed = rpf_core::view::of(payload, encoding, &inside, wanted(view))?;
+        return Ok(json!({
+            "path": inside,
+            "len": viewed.bytes.len(),
+            "pending": true,
+            "as": answered(viewed.xml),
+            "encoding": viewed.encoding.map(Encoding::name),
+            "bytes": BASE64.encode(&viewed.bytes),
+        }));
+    }
 
     if let Some(buffered) = session.pending.contents_at(&inside) {
         // Read out of the source rather than out of a buffer the session kept:
@@ -1353,10 +1424,16 @@ fn read(state: &mut State, params: &Value) -> Answered {
             path: inside.clone(),
             source,
         })?;
+        // A payload nothing asked a question of is not classified: `"raw"` is
+        // what this method has always answered and it costs the head read
+        // nothing. `"encoding"` is `null` for the same reason a resource's is —
+        // it was not read.
         return Ok(json!({
             "path": inside,
             "len": len,
             "pending": true,
+            "as": answered(false),
+            "encoding": Value::Null,
             "bytes": encoder.into_inner(),
         }));
     }
@@ -1368,13 +1445,34 @@ fn read(state: &mut State, params: &Value) -> Answered {
         }
         .into());
     }
-    let bytes = holder.extract(&mut session.file, index)?;
+    let viewed = rpf_core::view::read(&mut session.file, &holder, index, &inside, wanted(view))?;
     Ok(json!({
         "path": inside,
-        "len": bytes.len(),
+        "len": viewed.bytes.len(),
         "pending": false,
-        "bytes": BASE64.encode(&bytes),
+        "as": answered(viewed.xml),
+        "encoding": viewed.encoding.map(Encoding::name),
+        "bytes": BASE64.encode(&viewed.bytes),
     }))
+}
+
+/// The whole of a buffered write's payload.
+///
+/// Held rather than streamed, because a conversion is a whole document against
+/// a whole payload and there is nothing to stream it into. What the daemon
+/// buffers is [`rpf_core::Bytes`] — a `write` arrives as base64 and is already
+/// in memory — so this is a copy of something held rather than a second read of
+/// something large.
+fn buffered_payload(session: &Session, inside: &str) -> Answer<Vec<u8>> {
+    let Some(buffered) = session.pending.contents_at(inside) else {
+        return Ok(Vec::new());
+    };
+    let mut payload = Vec::new();
+    io::copy(&mut buffered.open()?, &mut payload).map_err(|source| Failure::Io {
+        path: inside.to_owned(),
+        source,
+    })?;
+    Ok(payload)
 }
 
 /// `write` — buffer an edit. Nothing on disk changes until `commit`.
@@ -1388,14 +1486,11 @@ fn write(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let encoded = string(params, "bytes")?;
     let create = flag(params, "create")?;
-    let bytes = BASE64
+    let allow_encoding_change = flag(params, "allow_encoding_change")?;
+    let view = view_of(params)?;
+    let offered = BASE64
         .decode(encoded.as_bytes())
         .map_err(|_| invalid_params("\"bytes\" is not base64".to_owned()))?;
-    let is_resource_payload = bytes.get(0..4) == Some(&rpf_core::format::resource::MAGIC_RSC7);
-    let change = Change::Write {
-        contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
-        create,
-    };
     let session = writing_session(state, params)?;
 
     // Resolved now rather than at commit, while the caller can still act on a
@@ -1409,17 +1504,33 @@ fn write(state: &mut State, params: &Value) -> Answered {
                 }
                 .into());
             }
-            // R6.6: a resource entry takes an RSC7 payload and nothing else.
-            if matches!(holder.entry(index)?.kind, EntryKind::Resource { .. })
-                && !is_resource_payload
-            {
-                return Err(Failure::Refused {
-                    reason: format!(
-                        "{inside} is a resource entry; its payload must begin with RSC7"
-                    ),
-                }
-                .into());
-            }
+            // Converted here, against the payload `read` would have answered
+            // for this path, and buffered as the payload it becomes. So what
+            // the set holds is of the entry's own encoding whatever route it
+            // came in by, and `edit::check_encoding` judges it unchanged: a
+            // converted write needs no `allow_encoding_change` because there is
+            // no encoding change in it, and a document that does not describe
+            // the entry is refused here rather than taken as text. DR-053.
+            let bytes = if view == View::Raw {
+                offered
+            } else if session.pending.contents_at(&inside).is_some() {
+                let held = buffered_payload(session, &inside)?;
+                rpf_core::view::applied(&held, &inside, wanted(view), offered)?
+            } else {
+                rpf_core::view::apply(
+                    &mut session.file,
+                    &holder,
+                    index,
+                    &inside,
+                    wanted(view),
+                    offered,
+                )?
+            };
+            let change = Change::Write {
+                contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
+                create,
+                allow_encoding_change,
+            };
             // The archive's own answer is the whole of it only while nothing
             // buffered has moved the entry: a removal or a rename above this
             // path leaves the commit writing to something that will not be
@@ -1444,6 +1555,15 @@ fn write(state: &mut State, params: &Value) -> Answered {
         // table, and a write to an entry that exists is what an editor sends
         // once per save.
         Err(rpf_core::Error::NotFound { .. }) if create => {
+            // And nothing to convert against either: an entry that is not there
+            // holds no encoding for a document to adopt. `"auto"` takes the
+            // bytes as they are and `"xml"` says why it cannot.
+            let bytes = rpf_core::view::applied(&[], &inside, wanted(view), offered)?;
+            let change = Change::Write {
+                contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
+                create,
+                allow_encoding_change,
+            };
             rpf_core::allows(
                 &mut session.file,
                 &session.archive,
@@ -2138,6 +2258,9 @@ fn commit_now(
 /// are.
 fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
     if asked_to_rebuild {
+        // Nothing is allocated and nothing is restructured, so there is no
+        // plan to report — only the resolution. R6.7.
+        rpf_core::resolves(&mut session.file, &session.archive, &session.pending)?;
         return Ok(json!({ "committed": 0, "dry_run": true, "method": "rebuild" }));
     }
 
@@ -2310,6 +2433,7 @@ mod tests {
                 Change::Write {
                     contents: std::sync::Arc::new(rpf_core::Bytes::new(b"replaced".to_vec())),
                     create: false,
+                    allow_encoding_change: false,
                 },
             ),
         };

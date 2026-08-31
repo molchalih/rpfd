@@ -33,10 +33,28 @@ R0.2 and R8.4.
 |---|---|---|
 | `rmrp_bp16_meringls63amg24.json` | `rmrp_bp16_meringls63amg24/dlc.rpf`, a FiveM vehicle add-on, unencrypted | Independently walked in Python before this fixture existed. The two readings agree on every field of all 27 file entries and all 6 directory entries — zero disagreements |
 | `rbf-metadata.json` | Every `RBF` payload in the 358 archives of both GTA V installs, extracted and classified by content | Not an oracle fixture. It is a **manifest**: a count, a byte total, the root-element and extension histograms, and one `sha256` per payload. `docs/metadata-encodings.md` is the independent reading — its root histogram was measured by a separate probe and agrees with this file's exactly |
+| `pso-metadata.json` | Every `PSO` payload in the same 358 archives, likewise classified by content | The same kind of manifest, with one difference: it carries **one `sha256` of the sorted per-payload digests** rather than 9,753 of them. 391 digests are a list; 9,753 are a file of their own, and the roll-up binds the same claim — that the tests ran against these bytes — and is regenerated the same way. Its extension histogram (4,378 `.ymt`, 3,623 `.ymf`, 1,738 `.cut`, 6 `.ytyp`, 4 `.pso`, 4 `.ymap`) and its section census (9,753 `PSIN`/`PMAP`/`PSCH`, 9,745 `PSIG`, 8,978 `CHKS`, 3,047 `STRE`, 326 `STRF`, 12 `STRS`) were measured here and agree with `docs/metadata-encodings.md` exactly, which was measured by a separate probe |
 
-`rbf-metadata.json` is located through **`RPF_METADATA`** rather than
-`RPF_CORPUS`, because it describes payloads that are already out of their
-archives; the top-level README says why that is a separate variable.
+Both are located through **`RPF_METADATA`** rather than `RPF_CORPUS`, because
+they describe payloads that are already out of their archives; the top-level
+README says why that is a separate variable.
+
+**With `RPF_METADATA` unset the metadata tests are `#[ignore]`d and the harness
+names each one; with it set and pointing somewhere else they fail.** That is not
+the same rule as the one above, and the difference is deliberate:
+`docs/conventions.md` §12 asks for a skip that is reported rather than
+swallowed, and `eprintln!` is not one, because `cargo test` captures it. A
+directory that was named and does not hold the corpus is a misconfiguration, and
+the only outcome that says so is a failure. The `files` count in each manifest
+is what a run is checked against, so a directory holding one payload cannot
+satisfy a test whose claim is about 9,753 of them.
+
+**No dictionary is tracked here, and none ever will be.** DR-006 and DR-047: a
+name list derived from the game is not ours to redistribute, and after the
+load-time `joaat(name) == key` check the dictionary is cosmetic rather than
+load-bearing, so nothing in the suite needs one. The handful of names the
+metadata tests use are the seven `docs/metadata-encodings.md` verified against
+real `PSCH` hashes, inline in the test.
 
 ## Interoperation
 

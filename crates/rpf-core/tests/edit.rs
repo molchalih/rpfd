@@ -109,6 +109,7 @@ fn adding(contents: &[u8]) -> Change {
     Change::Write {
         contents: std::sync::Arc::new(rpf_core::Bytes::new(contents.to_vec())),
         create: true,
+        allow_encoding_change: false,
     }
 }
 
@@ -202,6 +203,7 @@ fn a_write_that_did_not_ask_to_create_is_still_not_found() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"second".to_vec())),
             create: false,
+            allow_encoding_change: false,
         },
     );
     match rewriting(&source, &changes) {
@@ -383,6 +385,54 @@ fn a_structural_change_inside_a_nested_archive_cascades() {
     );
 }
 
+/// A rename **inside** a nested archive lands where it was addressed.
+///
+/// The third structural change, and the one the test above leaves out: adding
+/// and removing inside a nested archive were covered and renaming was not, so
+/// the function that translates a destination into the nested archive's own
+/// spelling could be replaced by a constant with the whole suite staying green.
+/// What that costs is an entry renamed to the wrong name inside an archive that
+/// still parses — the failure mode `docs/acceptance.md` names as the top risk,
+/// one level in.
+#[test]
+fn a_rename_inside_a_nested_archive_lands_at_the_path_it_named() {
+    let inner = built(&[stored("f.txt")], &[], b"inner");
+    let source = built(&[stored("sub/inner.rpf")], &[], &inner);
+
+    let changes = Changes::one(
+        "sub/inner.rpf/f.txt",
+        Change::RenameTo("sub/inner.rpf/moved.txt".to_owned()),
+    );
+    let rebuilt = rewritten(&source, &changes);
+
+    assert_eq!(
+        paths(&rebuilt),
+        vec!["sub", "sub/inner.rpf", "sub/inner.rpf/moved.txt"]
+    );
+    assert_eq!(contents(&rebuilt, "sub/inner.rpf/moved.txt"), b"inner");
+}
+
+/// And into a directory of the nested archive's own, which is where the
+/// destination's spelling actually matters.
+#[test]
+fn a_rename_into_a_directory_of_a_nested_archive_keeps_the_whole_path() {
+    let inner = built(&[stored("f.txt")], &["data".to_owned()], b"inner");
+    let source = built(&[stored("sub/inner.rpf")], &[], &inner);
+
+    let changes = Changes::one(
+        "sub/inner.rpf/f.txt",
+        Change::RenameTo("sub/inner.rpf/data/moved.txt".to_owned()),
+    );
+    let rebuilt = rewritten(&source, &changes);
+
+    assert!(
+        paths(&rebuilt).contains(&"sub/inner.rpf/data/moved.txt".to_owned()),
+        "{:?}",
+        paths(&rebuilt)
+    );
+    assert_eq!(contents(&rebuilt, "sub/inner.rpf/data/moved.txt"), b"inner");
+}
+
 /// Nothing structural can be patched in place, and the plan says so before
 /// anything is written rather than discovering it entry by entry.
 #[test]
@@ -535,6 +585,7 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"second".to_vec())),
             create: false,
+            allow_encoding_change: false,
         },
     );
     match rpf_core::allows(
@@ -607,6 +658,7 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"x".to_vec())),
             create: false,
+            allow_encoding_change: false,
         },
     );
     assert!(
@@ -628,6 +680,7 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"x".to_vec())),
             create: false,
+            allow_encoding_change: false,
         },
     );
     assert!(!changes.bears_on("data/a.txt"));
@@ -734,6 +787,7 @@ fn a_directory_the_set_writes_into_is_not_empty_either() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
             create: true,
+            allow_encoding_change: false,
         },
     );
     changes.set("empty", Change::Remove { recursive: false });
@@ -762,6 +816,7 @@ fn saying_recursive_allows_the_directory_to_be_rebuilt_by_the_write() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
             create: true,
+            allow_encoding_change: false,
         },
     );
     changes.set("empty", Change::Remove { recursive: true });
@@ -790,6 +845,7 @@ fn the_wire_refuses_the_removal_the_set_has_already_filled() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
             create: true,
+            allow_encoding_change: false,
         },
     );
 
@@ -942,6 +998,7 @@ fn a_removal_is_answered_against_the_changes_that_reach_it() {
         Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"new".to_vec())),
             create: false,
+            allow_encoding_change: false,
         },
     );
     rpf_core::allows(&mut src, &archive, &buffered, "empty", &unrelated)
@@ -997,4 +1054,108 @@ fn a_nul_inside_a_path_is_refused_rather_than_silently_truncating_it() {
         Err(Error::BadPath { path, .. }) => assert!(path.contains('\u{0}'), "{path:?}"),
         other => panic!("expected a refusal, got {:?}", other.map(|b| b.len())),
     }
+}
+
+/// The public accessors nothing inside this crate calls.
+///
+/// `Bytes::len`, `Contents::is_empty` and `Changes::iter` are surface a caller
+/// is offered and no code here uses: the daemon asks a `Contents` for its
+/// length before it opens it, and `iter` exists because
+/// `clippy::into_iter_without_iter` asks for it beside the `IntoIterator` twin.
+/// Nothing having a caller is exactly what leaves them free to answer anything
+/// — every mutation of all three survived — and a public item without a test
+/// has a doc comment where its contract should be (§4).
+#[test]
+fn the_accessors_a_caller_is_offered_answer_what_they_promise() {
+    use rpf_core::Contents as _;
+
+    let empty = rpf_core::Bytes::new(Vec::new());
+    assert_eq!(empty.len().expect("a length"), 0);
+    assert!(empty.is_empty().expect("emptiness"));
+
+    let three = rpf_core::Bytes::new(vec![1, 2, 3]);
+    assert_eq!(three.len().expect("a length"), 3);
+    assert!(!three.is_empty().expect("emptiness"));
+
+    // `iter` and the `IntoIterator` twin are the same iteration, which is the
+    // whole reason both exist.
+    let mut changes = Changes::new();
+    changes.set("a.txt", Change::Remove { recursive: false });
+    changes.set("b.txt", Change::MakeDirectory);
+    let by_method: Vec<&str> = changes.iter().map(|(path, _)| path).collect();
+    let by_trait: Vec<&str> = (&changes).into_iter().map(|(path, _)| path).collect();
+    assert_eq!(by_method, vec!["a.txt", "b.txt"]);
+    assert_eq!(by_method, by_trait);
+}
+
+/// Contents whose reader answers `EINTR` before each of its first reads.
+///
+/// `Read::read` may return [`std::io::ErrorKind::Interrupted`] and mean nothing
+/// by it, and the four bytes a new entry's kind is decided from are read
+/// through a loop that tolerates it. Nothing in the repository provoked one, so
+/// the guard could be deleted with every test staying green — and what it costs
+/// is a `put` that fails on a busy pipe rather than on anything being wrong.
+#[derive(Debug)]
+struct Interrupted {
+    bytes: Vec<u8>,
+    interruptions: usize,
+}
+
+impl rpf_core::Contents for Interrupted {
+    fn open(&self) -> Result<Box<dyn rpf_core::Payload + '_>, Error> {
+        Ok(Box::new(Stutters {
+            inner: Cursor::new(self.bytes.clone()),
+            left: self.interruptions,
+        }))
+    }
+
+    fn len(&self) -> Result<u64, Error> {
+        Ok(self.bytes.len() as u64)
+    }
+}
+
+/// The reader [`Interrupted`] hands out.
+struct Stutters {
+    inner: Cursor<Vec<u8>>,
+    left: usize,
+}
+
+impl std::io::Read for Stutters {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left > 0 {
+            self.left -= 1;
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl std::io::Seek for Stutters {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+#[test]
+fn a_new_entry_whose_reader_is_interrupted_is_still_written_whole() {
+    let source = built(&[stored("a.txt")], &[], b"same");
+    let payload = b"the contents of a brand new entry".to_vec();
+
+    let changes = Changes::one(
+        "new.bin",
+        Change::Write {
+            contents: std::sync::Arc::new(Interrupted {
+                bytes: payload.clone(),
+                interruptions: 2,
+            }),
+            create: true,
+            allow_encoding_change: false,
+        },
+    );
+
+    let rebuilt = rewritten(&source, &changes);
+    let mut src = Cursor::new(rebuilt);
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
+    let index = archive.find("new.bin").expect("the new entry is there");
+    assert_eq!(archive.read(&mut src, index).expect("reads"), payload);
 }

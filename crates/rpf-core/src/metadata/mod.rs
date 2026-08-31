@@ -25,7 +25,11 @@
 //! document — the largest `RBF` in the corpus is 57,378 bytes — with nothing to
 //! seek within, because the token stream is read once, front to back.
 
+pub mod hash;
+pub mod pso;
 pub mod rbf;
+pub(crate) mod text;
+pub mod view;
 
 /// The `RBF` magic: bytes 0..3 of a tokenised binary XML file.
 ///
@@ -88,6 +92,35 @@ impl Encoding {
     /// naming it must not cost holding it.
     pub const HEAD_LEN: usize = 16;
 
+    /// This encoding's name, in the one spelling everything reports it in.
+    ///
+    /// `docs/rpf-format.md`'s Metadata encodings section, and what a listing
+    /// row's `"encoding"` field carries on the wire. DR-032 makes those values
+    /// part of the contract, so they are spelled once (§3).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Xml => "xml",
+            Self::Text => "text",
+            Self::Rbf => "rbf",
+            Self::Pso => "pso",
+        }
+    }
+
+    /// What an entry holding this encoding refuses of a payload announcing
+    /// `offered`, or `None` when it takes it.
+    ///
+    /// **A tokenised encoding does not take a textual one.** What comes back
+    /// is the encoding refused, which is what [`crate::Error::WrongEncoding`]
+    /// names (§4); an `offered` of `None` contradicts no entry. DR-050.
+    #[must_use]
+    pub const fn refuses(self, offered: Option<Self>) -> Option<Self> {
+        match (self, offered) {
+            (Self::Rbf | Self::Pso, Some(refused @ (Self::Xml | Self::Text))) => Some(refused),
+            _ => None,
+        }
+    }
+
     /// The encoding these leading bytes announce, or `None` when they announce
     /// none.
     ///
@@ -96,6 +129,10 @@ impl Encoding {
     /// not an error: an empty payload, a two-byte one and a payload that is
     /// entirely `<` each name something or name nothing, and none of them is a
     /// failure.
+    ///
+    /// **All of it when it is shorter is load-bearing**: a fifteen-byte text
+    /// payload read into a sixteen-byte buffer is followed by a zero byte, and
+    /// judging the buffer rather than what was read calls it unknown binary.
     ///
     /// `None` is R3.7's unknown binary.
     #[must_use]

@@ -17,7 +17,7 @@ edition = "2024"
 rust-version = "1.98"
 
 [workspace.dependencies]
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 thiserror = "2.0"
 
 # One place decides the lint levels; every member opts in with
@@ -26,6 +26,12 @@ thiserror = "2.0"
 unsafe_code = "deny"
 missing_docs = "warn"
 missing_debug_implementations = "warn"
+# `cargo-fuzz` sets `--cfg fuzzing` over the whole build; nothing else does, and
+# it is deliberately not a feature so that no dependent can switch it on
+# (DR-048). Declaring it here is what keeps it a *known* cfg that is simply off
+# — without this row the compiler reports the one `#[cfg(fuzzing)]` item in
+# `rpf-core` as a typo, and `-D warnings` fails on it in every ordinary build.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

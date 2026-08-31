@@ -434,6 +434,7 @@ fn ng_block(ng: &NgKeys, expanded: &[u8; NG_EXPANDED_KEY_LEN], block: &mut [u8; 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{NG_COLUMNS, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN};
 
     /// What `ng_key_index` answers for `dlc.rpf` at 6,144 bytes over a lookup
     /// table of the identity. Measured, and the number the real table gives for
@@ -447,6 +448,76 @@ mod tests {
     /// As [`Cipher::over_zeros`], under the name these tests read by.
     fn framing_only() -> Cipher {
         Cipher::over_zeros()
+    }
+
+    /// A decrypt table set of the length [`NgKeys`] promises, answering zero
+    /// for every input byte of every round and column.
+    ///
+    /// The NG transform used to be reachable only with the real material, so
+    /// every fact about it below this line was defensible on the one machine
+    /// that has a memory image and nowhere else. `NgKeys::restored` takes the
+    /// tables as bytes, so tables chosen to make the wiring readable cost no
+    /// key material at all and are not any (DR-006): what they pin is which
+    /// byte reaches which word, and that is arithmetic rather than a value.
+    fn no_tables() -> Vec<u8> {
+        vec![0; NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN)]
+    }
+
+    /// An expanded key set of the promised length, all zero.
+    fn no_expanded() -> Vec<u8> {
+        vec![0; NG_EXPANDED_KEY_COUNT.saturating_mul(NG_EXPANDED_KEY_LEN)]
+    }
+
+    /// Where one decrypt table begins, in the order `NgKeys::decrypt_table`
+    /// reads them.
+    fn table_at(round: usize, column: usize) -> usize {
+        round
+            .saturating_mul(NG_COLUMNS)
+            .saturating_add(column)
+            .saturating_mul(NG_DECRYPT_TABLE_LEN)
+    }
+
+    /// Makes the table for `round` and `column` answer `word` whatever byte it
+    /// is asked about.
+    fn answers(tables: &mut [u8], round: usize, column: usize, word: u32) {
+        let base = table_at(round, column);
+        for byte in 0..0x100_usize {
+            let at = base.saturating_add(byte.saturating_mul(4));
+            let Some(slot) = tables.get_mut(at..at.saturating_add(4)) else {
+                continue;
+            };
+            slot.copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// Makes the table for `round` and `column` answer the byte it was asked
+    /// about, placed at byte `at` of the word.
+    fn answers_its_byte(tables: &mut [u8], round: usize, column: usize, at: usize) {
+        let base = table_at(round, column);
+        for byte in 0..0x100_usize {
+            let word = u32::try_from(byte).unwrap_or(0)
+                << (8_u32).saturating_mul(u32::try_from(at).unwrap_or(0));
+            let start = base.saturating_add(byte.saturating_mul(4));
+            let Some(slot) = tables.get_mut(start..start.saturating_add(4)) else {
+                continue;
+            };
+            slot.copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// Material of exactly these tables and expanded keys.
+    fn ng_over(tables: Vec<u8>, expanded: Vec<u8>) -> NgKeys {
+        NgKeys::restored(expanded, tables, 0, 0).expect("the lengths this type promises")
+    }
+
+    /// The four little-endian words of a block.
+    fn words(block: &[u8; CIPHER_BLOCK_LEN]) -> [u32; 4] {
+        let (chunks, _) = block.as_chunks::<4>();
+        let mut out = [0_u32; 4];
+        for (slot, chunk) in out.iter_mut().zip(chunks) {
+            *slot = u32::from_le_bytes(*chunk);
+        }
+        out
     }
 
     #[test]
@@ -647,5 +718,210 @@ mod tests {
     fn an_empty_buffer_decrypts_to_itself() {
         let mut nothing: [u8; 0] = [];
         framing_only().apply(&mut nothing);
+    }
+
+    #[test]
+    fn a_round_reads_the_four_columns_its_own_order_names() {
+        // `the_two_orders_are_the_ones_the_format_uses` says what the two
+        // arrays hold. Nothing said the round *reads* them: a round that took
+        // its columns from the other order, or from the output word's own four
+        // bytes, decrypts most of a block and corrupts the rest, and the only
+        // thing that noticed was a machine with a memory image on it.
+        //
+        // Each column's table answers a bit of its own, so an output word is
+        // the set of columns that reached it, written down.
+        for (order, expected) in [
+            (NG_COLUMN_ORDER, [0xF_u32, 0xF0, 0xF00, 0xF000]),
+            (NG_SHIFTED_ORDER, [0x2481_u32, 0x4812, 0x8124, 0x1248]),
+        ] {
+            let mut tables = no_tables();
+            for column in 0..NG_COLUMNS {
+                answers(&mut tables, 0, column, 1_u32 << column);
+            }
+            let ng = ng_over(tables, no_expanded());
+            let mut block = [0_u8; CIPHER_BLOCK_LEN];
+            ng_round(&ng, 0, &[0_u8; NG_ROUND_KEY_LEN], &order, &mut block);
+            assert_eq!(words(&block), expected, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn the_four_lookups_and_the_round_key_are_combined_by_exclusive_or() {
+        // Every other test here gives each column a bit of its own, so the
+        // four terms of a word are disjoint — and over disjoint operands
+        // exclusive-or and inclusive-or agree. `^=` could become `|=` and all
+        // of them stayed green, which is the equivalence in the tests rather
+        // than in the code: an OR is not invertible, so a payload decrypted
+        // with one would never come back.
+        //
+        // These two tables overlap on purpose, and the three answers are three
+        // different words: `^` gives 0x00FF_FF00, `|` gives 0xFFFF_FF00 and `&`
+        // gives 0.
+        let mut tables = no_tables();
+        answers(&mut tables, 0, 0, 0xFFFF_0000);
+        answers(&mut tables, 0, 1, 0xFF00_FF00);
+        let ng = ng_over(tables, no_expanded());
+
+        let mut block = [0_u8; CIPHER_BLOCK_LEN];
+        ng_round(
+            &ng,
+            0,
+            &[0_u8; NG_ROUND_KEY_LEN],
+            &NG_COLUMN_ORDER,
+            &mut block,
+        );
+        assert_eq!(words(&block)[0], 0x00FF_FF00);
+
+        // And the round key is folded in the same way: a key word that shares
+        // bits with the lookups has to cancel them, not add to them.
+        let mut key = [0_u8; NG_ROUND_KEY_LEN];
+        key[..4].copy_from_slice(&0x00FF_0000_u32.to_le_bytes());
+        let mut tables = no_tables();
+        answers(&mut tables, 0, 0, 0x00FF_0000);
+        let ng = ng_over(tables, no_expanded());
+        let mut block = [0_u8; CIPHER_BLOCK_LEN];
+        ng_round(&ng, 0, &key, &NG_COLUMN_ORDER, &mut block);
+        assert_eq!(
+            words(&block)[0],
+            0,
+            "a lookup equal to its round key word did not cancel it"
+        );
+    }
+
+    #[test]
+    fn a_round_key_word_lands_in_the_output_word_of_its_own_position() {
+        // With every table answering zero, a round is its round key and
+        // nothing else — so this says the sixteen key bytes reach the sixteen
+        // output bytes in order, and that the round key is exclusive-ored in
+        // rather than dropped.
+        let ng = ng_over(no_tables(), no_expanded());
+        let key: [u8; NG_ROUND_KEY_LEN] =
+            std::array::from_fn(|index| u8::try_from(index).unwrap_or(0).wrapping_mul(17));
+        let mut block = [0xAA_u8; CIPHER_BLOCK_LEN];
+        ng_round(&ng, 0, &key, &NG_COLUMN_ORDER, &mut block);
+        assert_eq!(block, key);
+    }
+
+    #[test]
+    fn a_column_looks_its_own_byte_up_in_its_own_table() {
+        // One table that answers the byte it was asked about, and fifteen that
+        // answer zero. The one is **column 1**, and its own byte is the second
+        // of the block: a lookup that read a fixed byte, or the first one,
+        // answers the first byte here and is told so. Column 0's byte is a
+        // different value on purpose, and so is column 1's position in its
+        // table, so neither can pass for the other.
+        for (column, byte, at) in [(1_usize, 0x99_u8, 0_usize), (3, 0x7E, 2)] {
+            let mut tables = no_tables();
+            answers_its_byte(&mut tables, 0, column, at);
+            let ng = ng_over(tables, no_expanded());
+
+            let mut block = [0_u8; CIPHER_BLOCK_LEN];
+            block[0] = 0x5A;
+            block[column] = byte;
+            ng_round(
+                &ng,
+                0,
+                &[0_u8; NG_ROUND_KEY_LEN],
+                &NG_COLUMN_ORDER,
+                &mut block,
+            );
+
+            // Column `column` is in the first row of the column order, so its
+            // lookup reaches the first output word, at the byte the table put
+            // it in.
+            let shift = (8_u32).saturating_mul(u32::try_from(at).unwrap_or(0));
+            assert_eq!(
+                words(&block)[0],
+                u32::from(byte) << shift,
+                "column {column} did not read its own byte through its own table"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transform_runs_one_round_per_round_key_and_ends_on_the_last() {
+        // Tables that answer zero make every round its own round key, so the
+        // block a whole transform answers is the *last* round key and nothing
+        // else. A transform that stopped a round early would answer the
+        // sixteenth, which is a block of fifteens rather than sixteens.
+        let expanded: Vec<u8> = (0..NG_EXPANDED_KEY_LEN)
+            .map(|index| {
+                u8::try_from(index.checked_div(NG_ROUND_KEY_LEN).unwrap_or(0)).unwrap_or(0)
+            })
+            .collect();
+        let key: [u8; NG_EXPANDED_KEY_LEN] = expanded
+            .clone()
+            .try_into()
+            .expect("the expanded key length");
+        let mut whole = no_expanded();
+        whole
+            .get_mut(..NG_EXPANDED_KEY_LEN)
+            .expect("room for one key")
+            .copy_from_slice(&expanded);
+
+        let ng = ng_over(no_tables(), whole);
+        let mut block = [0xC3_u8; CIPHER_BLOCK_LEN];
+        ng_block(&ng, &key, &mut block);
+
+        let last = u8::try_from(NG_ROUNDS.saturating_sub(1)).unwrap_or(0);
+        assert_eq!(block, [last; CIPHER_BLOCK_LEN], "not the last round key");
+    }
+
+    #[test]
+    fn the_permuted_rounds_are_the_middle_fourteen_of_the_transform() {
+        // `the_permuted_rounds_are_the_middle_fourteen` states the rule over a
+        // copy of the condition written in the test itself, so moving the real
+        // one — `NG_LEADING_ROUNDS`, or the `== NG_LAST_ROUND` that lets the
+        // sixteenth round back into column order — changed no answer anywhere
+        // without a memory image present. This runs the transform.
+        //
+        // Every table answers the byte it was asked about, placed at that
+        // column's own position in a word. A round reading in column order is
+        // then the identity, and a round reading through the shift-rows
+        // permutation is that permutation exactly — so the whole transform is
+        // the permutation applied once per permuted round, and the count is
+        // readable off the answer.
+        let mut tables = no_tables();
+        for round in 0..NG_ROUNDS {
+            for column in 0..NG_COLUMNS {
+                answers_its_byte(&mut tables, round, column, column % 4);
+            }
+        }
+        let ng = ng_over(tables, no_expanded());
+
+        let start: [u8; CIPHER_BLOCK_LEN] =
+            std::array::from_fn(|index| u8::try_from(index).unwrap_or(0));
+        let mut block = start;
+        ng_block(&ng, &[0_u8; NG_EXPANDED_KEY_LEN], &mut block);
+
+        // Fourteen, from `docs/rpf-format.md`, Encryption: rounds 2 through 15
+        // read through the permutation and rounds 0, 1 and 16 do not.
+        assert_eq!(
+            block,
+            shifted_times(start, 14),
+            "not fourteen permuted rounds"
+        );
+        assert_ne!(block, shifted_times(start, 13), "one round too few");
+        assert_ne!(block, shifted_times(start, 15), "one round too many");
+        assert_ne!(block, start, "no round permuted anything");
+    }
+
+    /// `block` with the shift-rows permutation applied `times` times.
+    ///
+    /// Read straight off [`NG_SHIFTED_ORDER`]: column `c` of the input becomes
+    /// the byte of output word `j` that `c` occupies, for the `j` whose row
+    /// names it.
+    fn shifted_times(block: [u8; CIPHER_BLOCK_LEN], times: usize) -> [u8; CIPHER_BLOCK_LEN] {
+        let mut current = block;
+        for _ in 0..times {
+            let source = current;
+            for (word, columns) in NG_SHIFTED_ORDER.iter().enumerate() {
+                for &column in columns {
+                    let at = word.saturating_mul(4).saturating_add(column % 4);
+                    current[at] = source[column];
+                }
+            }
+        }
+        current
     }
 }

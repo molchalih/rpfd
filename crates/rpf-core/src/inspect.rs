@@ -711,7 +711,7 @@ mod tests {
             },
             FileSpec {
                 path: "art.yft".to_owned(),
-                kind: FileKind::Resource,
+                kind: FileKind::Resource { declared: None },
             },
         ];
         let mut out = Vec::new();

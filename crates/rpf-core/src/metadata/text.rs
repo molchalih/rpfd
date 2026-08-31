@@ -1,4 +1,12 @@
-//! The escape that lets an arbitrary byte string be XML text.
+//! The XML text, names and numbers both metadata encodings write.
+//!
+//! One owner for the three questions `RBF` and `PSO` ask identically
+//! (`docs/conventions.md` §3): how an arbitrary byte string becomes XML text,
+//! how a float is spelled so it reads back to the same bits, and what counts as
+//! a name. `RBF` asks them of literal descriptor names and blobs, `PSO` of a
+//! name a dictionary offered for a hash and of a counted string in a block.
+//!
+//! # The escape
 //!
 //! `RBF` string values and raw blobs are **bytes**, and XML text is characters.
 //! Three measured facts decide the shape of this:
@@ -33,7 +41,7 @@ const ESCAPED_SPACE: &str = "\\x20";
 ///
 /// The result is valid UTF-8, contains no character XML has to normalise, and
 /// begins and ends with no space.
-pub(super) fn encode(bytes: &[u8]) -> String {
+pub(crate) fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     let mut body = bytes;
     let mut trailing = "";
@@ -124,7 +132,7 @@ fn literal(character: char) -> bool {
 ///
 /// Returns `None` if `text` carries a backslash that does not begin `\\` or
 /// `\xNN` — an escape this never writes, which a hand edit can still produce.
-pub(super) fn decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find(ESCAPE) {
@@ -147,9 +155,54 @@ pub(super) fn decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A float written as its raw bits rather than as a decimal, for the values
+/// whose shortest decimal does not read back to the same bits.
+///
+/// No shipped file needs it: all 48,324 `RBF` floats in the corpus are finite
+/// and round-trip through their shortest decimal. A NaN carrying a payload does
+/// not, and this is what keeps such a value exact rather than canonical.
+/// DR-043.
+const BITS_PREFIX: &str = "0x";
+
+/// A float, as the shortest decimal that reads back to the same bits.
+///
+/// Falls back to the bits themselves when no decimal does — which is a NaN
+/// carrying a payload, and nothing else.
+pub(crate) fn float(number: f32) -> String {
+    let shortest = format!("{number:?}");
+    if shortest.parse::<f32>().map(f32::to_bits) == Ok(number.to_bits()) {
+        shortest
+    } else {
+        format!("{BITS_PREFIX}{:08x}", number.to_bits())
+    }
+}
+
+/// Reads back the float [`float`] wrote.
+pub(crate) fn unfloat(text: &str) -> Option<f32> {
+    match text.strip_prefix(BITS_PREFIX) {
+        Some(bits) => u32::from_str_radix(bits, 16).ok().map(f32::from_bits),
+        None => text.parse().ok(),
+    }
+}
+
+/// Whether `text` is an XML name of the shape this layer writes.
+///
+/// A deliberate subset of XML 1.0's `Name`: ASCII only, starting with a letter,
+/// `_` or `:`. All 6,112 `RBF` descriptor names in the corpus match it, and `:`
+/// is here because a real name uses it —
+/// `CriminalCareerDefs::ShoppingCartItemCategoryLimits`.
+pub(crate) fn is_xml_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let start = first.is_ascii_alphabetic() || first == '_' || first == ':';
+    start && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, encode, float, is_xml_name, unfloat};
 
     #[test]
     fn a_shipped_blob_shows_its_own_trailing_nul() {
@@ -184,6 +237,39 @@ mod tests {
                 let two = [u8::try_from(first).unwrap(), u8::try_from(second).unwrap()];
                 assert_eq!(decode(&encode(&two)).as_deref(), Some(&two[..]), "{two:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_float_is_its_shortest_decimal_and_reads_back_to_the_same_bits() {
+        for number in [0.0f32, -0.0, 1.0, 15.418, -13.966_396, f32::MIN, f32::MAX] {
+            assert_eq!(
+                unfloat(&float(number)).map(f32::to_bits),
+                Some(number.to_bits())
+            );
+        }
+        assert_eq!(float(1.0), "1.0");
+    }
+
+    #[test]
+    fn a_float_no_decimal_reads_back_to_is_written_as_its_bits() {
+        // A NaN carrying a payload: `docs/metadata-encodings.md` measured all
+        // 48,324 floats in the corpus finite, so this is what makes the round
+        // trip a property of the code rather than of the corpus. DR-043.
+        let payload = f32::from_bits(0x7fc0_0001);
+        assert_eq!(float(payload), "0x7fc00001");
+        assert_eq!(unfloat("0x7fc00001").map(f32::to_bits), Some(0x7fc0_0001));
+    }
+
+    #[test]
+    fn a_name_is_ascii_and_starts_with_a_letter_an_underscore_or_a_colon() {
+        // `CriminalCareerDefs::ShoppingCartItemCategoryLimits` is a real
+        // descriptor name, which is why `:` is admitted.
+        for name in ["a", "_a", ":a", "CriminalCareerDefs::Shopping", "a-b.c1"] {
+            assert!(is_xml_name(name), "{name}");
+        }
+        for name in ["", "1a", "-a", ".a", "a b", "a<b", "n\u{e4}me"] {
+            assert!(!is_xml_name(name), "{name}");
         }
     }
 

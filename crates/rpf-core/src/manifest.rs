@@ -341,11 +341,11 @@ impl Manifest {
                     storage: Storage::Stored,
                     ..
                 }
-                | FileKind::Resource => StorageKind::Stored,
+                | FileKind::Resource { .. } => StorageKind::Stored,
             };
             let encryption = match spec.kind {
                 FileKind::Binary { encryption, .. } => encryption,
-                FileKind::Resource => 0,
+                FileKind::Resource { .. } => 0,
             };
             entries.push(ManifestEntry {
                 checksum: recorded.get(&spec.path).copied(),
@@ -405,7 +405,13 @@ impl Manifest {
             .map(|entry| FileSpec {
                 path: entry.path.clone(),
                 kind: match entry.class {
-                    EntryClass::Resource => FileKind::Resource,
+                    // `None`, because schema 3 records that an entry is a
+                    // resource and not what its flag words are. A tree packed
+                    // from an archive whose resources carry no `RSC7` header —
+                    // every Rockstar archive (Q7) — is therefore still refused
+                    // by `store`, and the sidecar is where that would be
+                    // answered. DR-004, DR-046.
+                    EntryClass::Resource => FileKind::Resource { declared: None },
                     EntryClass::Binary => FileKind::Binary {
                         storage: match entry.storage {
                             StorageKind::Stored => Storage::Stored,

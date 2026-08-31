@@ -51,7 +51,7 @@ fn archive_bytes() -> Vec<u8> {
         },
         FileSpec {
             path: "art.yft".to_owned(),
-            kind: FileKind::Resource,
+            kind: FileKind::Resource { declared: None },
         },
         FileSpec {
             path: "raw.bin".to_owned(),
@@ -454,7 +454,7 @@ fn oversized_resource() -> Vec<u8> {
 fn roomy_resource_archive() -> Vec<u8> {
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
-        kind: FileKind::Resource,
+        kind: FileKind::Resource { declared: None },
     }];
     let mut out = Cursor::new(Vec::new());
     rpf_core::build(
@@ -514,7 +514,7 @@ fn a_build_and_a_patch_refuse_the_same_oversized_resource() {
     let payload = oversized_resource();
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
-        kind: FileKind::Resource,
+        kind: FileKind::Resource { declared: None },
     }];
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
@@ -567,7 +567,7 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
 
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
-        kind: FileKind::Resource,
+        kind: FileKind::Resource { declared: None },
     }];
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
@@ -579,7 +579,10 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
         &mut Unwatched,
     );
     match refused {
-        Err(rpf_core::Error::NotAResource { ref path }) => assert_eq!(path, "art.yft"),
+        Err(rpf_core::Error::NotAResource { ref path, reason }) => {
+            assert_eq!(path, "art.yft");
+            assert_eq!(reason, "the payload is shorter than a resource header");
+        }
         other => panic!("expected a truncated header to be refused, got {other:?}"),
     }
     assert!(
@@ -600,5 +603,48 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
         file.get_ref(),
         &before,
         "a refused plan still wrote something"
+    );
+}
+
+/// A plan prints what it will do and never the bytes it will write.
+///
+/// `Patches` carries a hand-written `Debug` for one reason, stated in its own
+/// comment: a payload is megabytes and this type appears in test failures. That
+/// is a contract, and nothing asserted it — the impl could have been replaced
+/// by one that prints nothing, or by the derived one that prints every byte,
+/// and the suite stayed green either way. The second is the expensive
+/// direction: a `--json` payload or a panic message carrying a whole entry.
+#[test]
+fn a_plan_prints_what_it_will_do_and_never_the_bytes() {
+    let before = archive_bytes();
+    let mut file = Cursor::new(before);
+    let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
+
+    // A payload of one repeated byte, so that finding it in the rendering is
+    // unambiguous: `Debug` for a byte slice writes decimal, and 0xC7 is 199.
+    let replacement = vec![0xC7_u8; 400];
+    let plan = rpf_core::plan(
+        &mut file,
+        &archive,
+        &edits(&[("raw.bin", replacement.clone())]),
+    )
+    .expect("decides");
+    let Plan::Fits(patches) = plan else {
+        panic!("expected the patch to fit")
+    };
+
+    let rendered = format!("{patches:?}");
+    assert!(
+        rendered.contains("raw.bin"),
+        "a plan that says nothing about what it will do: {rendered}"
+    );
+    assert!(
+        !rendered.contains("199, 199"),
+        "the payload reached the rendering: {rendered}"
+    );
+    assert!(
+        rendered.len() < replacement.len(),
+        "the rendering grows with the payload: {} bytes",
+        rendered.len()
     );
 }

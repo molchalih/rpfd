@@ -229,11 +229,21 @@ export class ArchiveSession {
     /**
      * One entry's bytes: the buffered write when there is one, and what is on
      * disk otherwise.
+     *
+     * **Asked for as `auto`, which is the XML view where the entry has one.**
+     * `RBF` and `PSO` are tokenised binary that no editor can show and nobody
+     * can type, so what is presented is the document the daemon converts them
+     * to — and {@link write} hands that same document back, where it is
+     * converted the other way. The client neither converts anything nor decides
+     * what to ask for from a path: the daemon says what an entry holds, and an
+     * entry that gains a view later is presented without a change here. R7.4,
+     * DR-053.
      */
     async read(inside: string): Promise<Uint8Array> {
         const answer = await this.daemon.request<ReadEntry>('read', {
             handle: this.handle,
             path: this.pending.address(normalise(inside)),
+            as: 'auto',
         });
         return Buffer.from(answer.bytes, 'base64');
     }
@@ -252,6 +262,18 @@ export class ArchiveSession {
      *
      * A write over a path this set removes is the removal withdrawn and these
      * contents in its place, which is the one change the set holds there.
+     *
+     * **Offered as `auto`, which is what {@link read} answered.** A document
+     * going into an entry that holds `RBF` or `PSO` is converted by the daemon
+     * before it is buffered, so what the archive takes is of the entry's own
+     * encoding and DR-050's guardrail is neither weakened nor in the way.
+     * Anything that is not a document is offered exactly as it is, so pasting a
+     * payload into an entry is what it always was. DR-053.
+     *
+     * One consequence, and it is visible: the length this session projects for
+     * an edited metadata entry is the **document's**, because that is what this
+     * client holds. The entry's own length is what a listing says, and a
+     * listing is the archive on disk. DR-028.
      */
     async write(inside: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
         const visible = normalise(inside);
@@ -619,6 +641,7 @@ export class ArchiveSession {
                     path,
                     bytes: Buffer.from(change.contents).toString('base64'),
                     create: change.create,
+                    as: 'auto',
                 });
             case 'remove':
                 return this.daemon.request('delete', {

@@ -27,14 +27,14 @@ use quick_xml::{
     events::Event,
 };
 
-use super::{
-    model::{
-        Attribute, Blob, Content, Document, Element, MAX_DEPTH, Name, Node, NotRbf,
-        RESERVED_PREFIX, Scalar, Str, Unrepresentable,
-    },
-    text,
+use super::model::{
+    Attribute, Blob, Content, Document, Element, MAX_DEPTH, Name, Node, NotRbf, RESERVED_PREFIX,
+    Scalar, Str, Unrepresentable,
 };
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    metadata::text::{self, float, unfloat},
+};
 
 /// The reserved attribute that carries an open element's two meaningless words.
 ///
@@ -52,14 +52,6 @@ const FLOAT: &str = "float";
 const BOOL: &str = "bool";
 const FLOAT3: &str = "float3";
 const STRING: &str = "string";
-
-/// A float written as its raw bits rather than as a decimal, for the values
-/// whose shortest decimal does not read back to the same bits.
-///
-/// No shipped file needs it: all 48,324 floats in the corpus are finite and
-/// round-trip through their shortest decimal. A NaN carrying a payload does
-/// not, and this is what keeps such a value exact rather than canonical.
-const BITS_PREFIX: &str = "0x";
 
 /// Writes the document as XML.
 pub(super) fn write(document: &Document) -> Vec<u8> {
@@ -168,27 +160,6 @@ fn render(value: &Scalar) -> String {
         Scalar::Float(number) => float(*number),
         Scalar::Float3([x, y, z]) => format!("{}, {}, {}", float(*x), float(*y), float(*z)),
         Scalar::Str(string) => text::encode(string.as_bytes()),
-    }
-}
-
-/// A float, as the shortest decimal that reads back to the same bits.
-///
-/// Falls back to the bits themselves when no decimal does — which is a NaN
-/// carrying a payload, and nothing else.
-fn float(number: f32) -> String {
-    let shortest = format!("{number:?}");
-    if shortest.parse::<f32>().map(f32::to_bits) == Ok(number.to_bits()) {
-        shortest
-    } else {
-        format!("{BITS_PREFIX}{:08x}", number.to_bits())
-    }
-}
-
-/// Reads back the float [`float`] wrote.
-fn unfloat(text: &str) -> Option<f32> {
-    match text.strip_prefix(BITS_PREFIX) {
-        Some(bits) => u32::from_str_radix(bits, 16).ok().map(f32::from_bits),
-        None => text.parse().ok(),
     }
 }
 

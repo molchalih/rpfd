@@ -150,7 +150,7 @@ fn specs_for(archive: &Archive) -> Vec<(FileSpec, u32)> {
         let entry = archive.entry(index).expect("in range");
         let kind = match entry.kind {
             EntryKind::Directory { .. } => continue,
-            EntryKind::Resource { .. } => FileKind::Resource,
+            EntryKind::Resource { .. } => FileKind::Resource { declared: None },
             EntryKind::Binary {
                 compressed_len,
                 encryption,
@@ -500,6 +500,7 @@ fn a_structural_change_to_the_sample_reads_back() {
         rpf_core::Change::Write {
             contents: std::sync::Arc::new(rpf_core::Bytes::new(b"<added/>".to_vec())),
             create: true,
+            allow_encoding_change: false,
         },
     );
     changes.set(

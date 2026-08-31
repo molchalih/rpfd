@@ -22,6 +22,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rpf_core::{FileKind, FileSpec, Storage, Unwatched};
 use serde_json::{Value, json};
 
+mod common;
+
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
 /// An archive with one deflated file and one resource.
@@ -54,7 +56,7 @@ fn make_archive(at: &Path) -> Vec<u8> {
         },
         FileSpec {
             path: "art.yft".to_owned(),
-            kind: FileKind::Resource,
+            kind: FileKind::Resource { declared: None },
         },
     ];
     let payload = resource.clone();
@@ -71,6 +73,45 @@ fn make_archive(at: &Path) -> Vec<u8> {
                 b"hello there".to_vec()
             }))
         },
+        &mut Unwatched,
+    )
+    .expect("builds");
+    resource
+}
+
+/// An archive whose one resource is shaped the way a Rockstar archive holds
+/// one: an opaque header that is not `RSC7`, then the deflate stream. Returns
+/// the payload.
+///
+/// The flag words come from the entry the writer is told to make, because
+/// nothing else knows them — which is the whole of DR-046 in one fixture.
+fn make_rockstar_archive(at: &Path) -> Vec<u8> {
+    // 24 bytes of 0xFF: not `RSC7`, and not the start of a deflate stream
+    // either, since the low three bits are BFINAL = 1 with the reserved
+    // BTYPE = 11.
+    let mut resource = vec![0xFF_u8; 24];
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![0_u8; 512]).expect("deflates");
+    resource.extend_from_slice(&encoder.finish().expect("finishes"));
+
+    let files = vec![FileSpec {
+        path: "art.ydr".to_owned(),
+        kind: FileKind::Resource {
+            declared: Some(rpf_core::ResourceFlags {
+                system: 0xA800_0000,
+                graphics: 0x2000_0000,
+            }),
+        },
+    }];
+    let payload = resource.clone();
+    let mut out = fs::File::create(at).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
         &mut Unwatched,
     )
     .expect("builds");
@@ -285,34 +326,102 @@ fn nothing_reaches_disk_before_commit() {
 }
 
 #[test]
-fn a_resource_entry_refuses_a_payload_that_is_not_one() {
-    // R6.6. The primary consumer is automation, which will attempt exactly this.
+fn a_resource_entry_takes_a_payload_its_own_archive_produced() {
+    // R6.6 and DR-046. The daemon used to refuse an incoming payload that did
+    // not begin with `RSC7`, which refused every resource Rockstar ever packed:
+    // `docs/backlog.md` Q7 measured 696,578 of 696,578 whose payload does not.
+    // So the round trip below — read an entry, write exactly those bytes back —
+    // was a refusal, and it is now what it looks like.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
-    let resource = make_archive(&archive);
+    let resource = make_rockstar_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{"handle":1,"path":"art.ydr"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
+            "handle":1,"path":"art.ydr","bytes": BASE64.encode(&resource)}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"verify","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":6,"method":"read","params":{"handle":1,"path":"art.ydr"}}),
+    ]);
+
+    let read = BASE64
+        .decode(
+            answer(&responses, 2)["result"]["bytes"]
+                .as_str()
+                .expect("bytes"),
+        )
+        .expect("base64");
+    assert_eq!(
+        read, resource,
+        "the payload comes out as the archive holds it"
+    );
+    assert!(
+        answer(&responses, 3).get("result").is_some(),
+        "writing it back was refused: {:?}",
+        answer(&responses, 3)
+    );
+    assert_eq!(answer(&responses, 4)["result"]["committed"], json!(1));
+
+    // The row it went back into still declares what the payload is, which is
+    // the half a byte-comparison cannot see: the flag words are the only record
+    // of its length and the payload does not carry them.
+    let verified = &answer(&responses, 5)["result"];
+    assert_eq!(
+        verified["problems"].as_array().map(Vec::len),
+        Some(0),
+        "the rebuilt archive does not read back: {verified}"
+    );
+    let again = BASE64
+        .decode(
+            answer(&responses, 6)["result"]["bytes"]
+                .as_str()
+                .expect("bytes"),
+        )
+        .expect("base64");
+    assert_eq!(again, resource, "the bytes did not survive the round trip");
+}
+
+#[test]
+fn a_resource_entry_refuses_a_payload_too_short_to_be_one() {
+    // What is left of the guard, and the whole of what a content test can
+    // honestly say: a payload that cannot hold a resource header cannot be
+    // written into a resource entry, whatever it begins with. Exit 6 on both
+    // frontends, because the rule is `rpf-core`'s (§1).
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_rockstar_archive(&archive);
     let archive_str = archive.display().to_string();
 
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
         json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-            "handle":1,"path":"art.yft","bytes": BASE64.encode(b"plain text, not a resource")}}),
-        // The same entry accepts a payload that is one.
-        json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
-            "handle":1,"path":"art.yft","bytes": BASE64.encode(&resource)}}),
+            "handle":1,"path":"art.ydr","bytes": BASE64.encode(b"short")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
     ]);
 
     assert_eq!(
-        responses[1]["error"]["code"],
+        answer(&responses, 3)["error"]["code"],
         json!(6),
-        "should have been refused"
+        "should have been refused: {:?}",
+        answer(&responses, 3)
     );
-    let message = responses[1]["error"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.contains("RSC7"), "message was: {message}");
-    assert!(
-        responses[2].get("result").is_some(),
-        "a real resource should be accepted"
+
+    // And the command line says the same thing with the same number.
+    let short = dir.path().join("short.bin");
+    fs::write(&short, b"short").expect("writable");
+    let refused = Command::new(RPF)
+        .args(["put", &archive_str, "art.ydr"])
+        .arg(&short)
+        .output()
+        .expect("runs");
+    assert_eq!(
+        refused.status.code(),
+        Some(6),
+        "the command line disagreed: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
 }
 
@@ -4385,4 +4494,445 @@ fn a_daemon_started_without_a_cache_still_says_the_archive_needs_a_key() {
         json!("NeedsKey"),
         "{refused}"
     );
+}
+
+/// An archive holding one stored entry at `data/thing.ymt`, whose payload is
+/// `contents`.
+fn make_metadata_archive(at: &Path, contents: &[u8]) {
+    let payload = contents.to_vec();
+    let mut out = fs::File::create(at).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &[FileSpec {
+            path: "data/thing.ymt".to_owned(),
+            kind: FileKind::Binary {
+                storage: Storage::Stored,
+                encryption: 0,
+            },
+        }],
+        &[],
+        |_: &str| Ok(Cursor::new(payload.clone())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+}
+
+/// R6.6 on the wire: an entry holding `RBF` or `PSO` takes neither XML nor
+/// text, and `"allow_encoding_change": true` is the way through.
+///
+/// **The refusal arrives at the commit**, which is where every refusal the
+/// daemon cannot decide from the entry table alone arrives — this one needs
+/// both payloads read. The command line refuses the same four pairs with the
+/// same error and the same number (§1, `crates/rpf/tests/cli.rs`). DR-050.
+#[test]
+fn a_write_of_text_into_a_tokenised_metadata_entry_is_refused_at_the_commit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for held in [
+        &b"RBF0\x01\x02\x03\x04tokens"[..],
+        &b"PSIN\x01\x02\x03\x04sect"[..],
+    ] {
+        for offered in [
+            &b"<CVehicleModelInfo />"[..],
+            &b"a plain line of text\n"[..],
+        ] {
+            let archive = dir.path().join("test.rpf");
+            make_metadata_archive(&archive, held);
+            let path = archive.display().to_string();
+            let before = fs::read(&archive).expect("readable");
+
+            let responses = talk(&[
+                json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                    "handle":1,"path":"data/thing.ymt","bytes": BASE64.encode(offered)}}),
+                json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+            ]);
+            let refused = answer(&responses, 3);
+            assert_eq!(refused["error"]["code"], json!(6), "{refused}");
+            assert_eq!(
+                refused["error"]["data"]["reason"],
+                json!("WrongEncoding"),
+                "{refused}"
+            );
+            assert_eq!(
+                fs::read(&archive).expect("readable"),
+                before,
+                "a refused commit wrote something"
+            );
+
+            let responses = talk(&[
+                json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+                json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                    "handle":1,"path":"data/thing.ymt",
+                    "bytes": BASE64.encode(offered),
+                    "allow_encoding_change": true}}),
+                json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+                json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+                    "handle":1,"path":"data/thing.ymt"}}),
+            ]);
+            let committed = answer(&responses, 3);
+            assert_eq!(committed["result"]["committed"], json!(1), "{committed}");
+            let read = answer(&responses, 4);
+            assert_eq!(
+                read["result"]["bytes"],
+                json!(BASE64.encode(offered)),
+                "{read}"
+            );
+        }
+    }
+}
+
+/// A dry run reports the refusal the real commit makes, whichever way it is
+/// told to go.
+///
+/// R6.7: a dry run is a prediction rather than an estimate. `"rebuild": true`
+/// used to answer `"method": "rebuild"` and no error for a set the real commit
+/// refuses, because it reported the decision without taking it. The command
+/// line had the same hole and is pinned in `crates/rpf/tests/cli.rs` (§1).
+#[test]
+fn a_dry_run_told_to_rebuild_reports_the_refusal_the_commit_would_make() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_metadata_archive(&archive, b"RBF0\x01\x02\x03\x04tokens");
+    let path = archive.display().to_string();
+    let before = fs::read(&archive).expect("readable");
+
+    for rebuild in [false, true] {
+        let responses = talk(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(b"<CVehicleModelInfo />")}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{
+                "handle":1,"rebuild": rebuild,"dry_run":true}}),
+            // And the buffer survives a refused dry run, so the client can fix
+            // the edit rather than re-send it.
+            json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
+        ]);
+        let refused = answer(&responses, 3);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(6),
+            "a dry run with rebuild {rebuild} reported success: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["reason"],
+            json!("WrongEncoding"),
+            "{refused}"
+        );
+        assert_eq!(
+            answer(&responses, 4)["result"]["paths"],
+            json!(["data/thing.ymt"]),
+            "the dry run dropped the buffered edit"
+        );
+        assert_eq!(
+            fs::read(&archive).expect("readable"),
+            before,
+            "a dry run wrote"
+        );
+    }
+}
+
+/// The daemon's own `"force"` is the game-install override and carries no
+/// second meaning, **on either verb it could be sent to**.
+///
+/// Both are asked because only one of them takes it: `commit` has a `"force"`
+/// and `write` has none, so a `write` that grew one would be a second meaning
+/// on a name a caller already reads as "write into a game install". Sending it
+/// on the request that carries the payload is the way that mistake would
+/// actually be made. DR-050.
+#[test]
+fn force_does_not_let_text_into_a_tokenised_metadata_entry() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for forced_on_write in [false, true] {
+        let archive = dir.path().join("test.rpf");
+        make_metadata_archive(&archive, b"RBF0\x01\x02\x03\x04tokens");
+        let path = archive.display().to_string();
+
+        let responses = talk(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(b"<CVehicleModelInfo />"),
+                "force": forced_on_write}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{
+                "handle":1,"force": true}}),
+        ]);
+        let refused = answer(&responses, 3);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(6),
+            "forced on write: {forced_on_write}, {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["reason"],
+            json!("WrongEncoding"),
+            "{refused}"
+        );
+    }
+}
+
+/// R7.4 on the wire: `read` answers the view it was asked for and names what
+/// the entry holds, and `write` takes the document back.
+///
+/// Both encodings for the reason the command-line test gives, and all three
+/// views, because the answer has to say which of them it gave: a client that
+/// asked for `"auto"` presents what it is handed and must not have to guess
+/// whether it was converted.
+#[test]
+fn read_answers_the_view_it_was_asked_for_and_names_what_the_entry_holds() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (payload, document, _, encoding) in common::tokenised() {
+        let archive = dir.path().join(format!("{encoding}.rpf"));
+        make_metadata_archive(&archive, &payload);
+        let path = archive.display().to_string();
+
+        let responses = talk(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"data/thing.ymt","as":"xml"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+                "handle":1,"path":"data/thing.ymt","as":"auto"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+                "handle":1,"path":"data/thing.ymt"}}),
+        ]);
+        for id in [2, 3] {
+            let read = answer(&responses, id);
+            assert_eq!(read["result"]["as"], json!("xml"), "{read}");
+            assert_eq!(read["result"]["encoding"], json!(encoding), "{read}");
+            assert_eq!(
+                read["result"]["bytes"],
+                json!(BASE64.encode(document)),
+                "{read}"
+            );
+            assert_eq!(read["result"]["len"], json!(document.len()), "{read}");
+        }
+        // The default is what every client sent before this existed: the
+        // entry's own bytes, with the encoding now named beside them.
+        let raw = answer(&responses, 4);
+        assert_eq!(raw["result"]["as"], json!("raw"), "{raw}");
+        assert_eq!(raw["result"]["encoding"], json!(encoding), "{raw}");
+        assert_eq!(
+            raw["result"]["bytes"],
+            json!(BASE64.encode(&payload)),
+            "{raw}"
+        );
+    }
+}
+
+/// A document written back is converted, buffered as the payload, read back as
+/// the document, and committed with no override.
+///
+/// The buffered read is the half that would break silently: `read` prefers a
+/// pending write, so a client that saved and re-opened a file must see its own
+/// edit and not what is still on disk.
+#[test]
+fn a_document_is_written_back_read_back_and_committed_as_the_entrys_encoding() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for (payload, _, edited, encoding) in common::tokenised() {
+        let archive = dir.path().join(format!("{encoding}-write.rpf"));
+        make_metadata_archive(&archive, &payload);
+        let path = archive.display().to_string();
+
+        let responses = talk(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"data/thing.ymt",
+                "bytes": BASE64.encode(edited), "as":"xml"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+                "handle":1,"path":"data/thing.ymt","as":"auto"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"list","params":{
+                "handle":1,"path":"data/thing.ymt"}}),
+        ]);
+        let wrote = answer(&responses, 2);
+        assert_eq!(wrote["result"]["pending"], json!(1), "{wrote}");
+        assert_ne!(
+            wrote["result"]["len"],
+            json!(edited.len()),
+            "what was buffered is the document rather than the payload: {wrote}"
+        );
+
+        let read = answer(&responses, 3);
+        assert_eq!(read["result"]["pending"], json!(true), "{read}");
+        assert_eq!(read["result"]["as"], json!("xml"), "{read}");
+        assert_eq!(
+            read["result"]["bytes"],
+            json!(BASE64.encode(edited)),
+            "a buffered document did not read back as itself: {read}"
+        );
+
+        let committed = answer(&responses, 4);
+        assert_eq!(committed["result"]["committed"], json!(1), "{committed}");
+        let listed = answer(&responses, 5);
+        assert_eq!(
+            listed["result"][0]["encoding"],
+            json!(encoding),
+            "the entry changed encoding: {listed}"
+        );
+    }
+}
+
+/// Converting is not a way round DR-050 on the wire either.
+///
+/// The same document into the same entry: as bytes it is refused at the commit
+/// with `WrongEncoding` and the archive is untouched; as a document it is
+/// converted, taken with no `"allow_encoding_change"`, and what lands in the
+/// entry is the tokenised payload. The command line does the same (§1).
+#[test]
+fn a_document_is_refused_as_bytes_and_taken_as_a_document_on_the_wire() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("guard.rpf");
+    let payload = common::rbf_payload(common::RBF_DOCUMENT);
+    make_metadata_archive(&archive, &payload);
+    let path = archive.display().to_string();
+    let before = fs::read(&archive).expect("readable");
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(common::RBF_EDITED)}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+    ]);
+    let refused = answer(&responses, 3);
+    assert_eq!(refused["error"]["code"], json!(6), "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("WrongEncoding"),
+        "{refused}"
+    );
+    assert_eq!(
+        fs::read(&archive).expect("readable"),
+        before,
+        "a refused commit wrote something"
+    );
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(common::RBF_EDITED), "as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt"}}),
+    ]);
+    let committed = answer(&responses, 3);
+    assert_eq!(committed["result"]["committed"], json!(1), "{committed}");
+    let read = answer(&responses, 4);
+    assert_eq!(
+        read["result"]["bytes"],
+        json!(BASE64.encode(common::rbf_payload(common::RBF_EDITED))),
+        "the entry does not hold the payload the document describes: {read}"
+    );
+}
+
+/// A payload that is not a document is offered to the entry as it is.
+///
+/// `"auto"` is what an editor client sends on every write, including the ones
+/// that are not edits of a view — pasting a second `RBF` payload over the
+/// first. A conversion attempted on those would refuse a write `"raw"` takes,
+/// which is the way this would break a client that asked for it once.
+#[test]
+fn auto_offers_a_payload_that_is_not_a_document_exactly_as_it_is() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("paste.rpf");
+    make_metadata_archive(&archive, &common::rbf_payload(common::RBF_DOCUMENT));
+    let path = archive.display().to_string();
+    let other = common::rbf_payload(common::RBF_EDITED);
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"data/thing.ymt",
+            "bytes": BASE64.encode(&other), "as":"auto"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt"}}),
+    ]);
+    assert_eq!(answer(&responses, 3)["result"]["committed"], json!(1));
+    let read = answer(&responses, 4);
+    assert_eq!(
+        read["result"]["bytes"],
+        json!(BASE64.encode(&other)),
+        "{read}"
+    );
+}
+
+/// An entry with no XML view refuses one, and says so under its own name.
+#[test]
+fn an_entry_with_no_xml_view_refuses_one_on_the_wire() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("noview.rpf");
+    let resource = make_archive(&archive);
+    assert!(!resource.is_empty());
+    let path = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        // A resource: its payload is not read at all, so it has no view and
+        // its `"encoding"` is `null` for the reason a listing row's is. R5.8
+        // is what gives it one. DR-044, Q7.
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+            "handle":1,"path":"art.yft","as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+            "handle":1,"path":"art.yft","as":"auto"}}),
+        // And plain text, which announces itself and still has no view.
+        json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+            "handle":1,"path":"data/greeting.txt","as":"xml"}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"write","params":{
+            "handle":1,"path":"data/greeting.txt",
+            "bytes": BASE64.encode("<a/>"), "as":"xml"}}),
+    ]);
+    for id in [2, 4] {
+        let refused = answer(&responses, id);
+        assert_eq!(refused["error"]["code"], json!(6), "{refused}");
+        assert_eq!(
+            refused["error"]["data"]["reason"],
+            json!("NoXmlView"),
+            "{refused}"
+        );
+    }
+    let automatic = answer(&responses, 3);
+    assert_eq!(automatic["result"]["as"], json!("raw"), "{automatic}");
+    assert_eq!(
+        automatic["result"]["encoding"],
+        Value::Null,
+        "a resource's payload is not read: {automatic}"
+    );
+    let refused = answer(&responses, 5);
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NoXmlView"),
+        "a write of a document into an entry with no view: {refused}"
+    );
+}
+
+/// A view name the wire does not have is a parameter failure, and names the
+/// three it does.
+#[test]
+fn a_view_the_wire_does_not_name_is_refused_as_a_parameter() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("views.rpf");
+    make_metadata_archive(&archive, &common::rbf_payload(common::RBF_DOCUMENT));
+    let path = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":"XML"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+            "handle":1,"path":"data/thing.ymt","as":7}}),
+    ]);
+    for id in [2, 3] {
+        let refused = answer(&responses, id);
+        assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    }
+    let named = answer(&responses, 2)["error"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_owned();
+    for view in ["raw", "xml", "auto"] {
+        assert!(named.contains(view), "must name {view}: {named}");
+    }
 }

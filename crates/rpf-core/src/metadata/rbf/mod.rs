@@ -10,7 +10,7 @@
 //!   else — R5.1.
 //! - **Byte-perfect re-serialisation is reachable.** A name-keyed descriptor
 //!   table reproduced **391 of 391** shipped files byte-for-byte. That is why
-//!   this is a real serialiser and not R5.6's differential rebuild.
+//!   this is a real serialiser and not a differential rebuild.
 //!
 //! # The seam
 //!
@@ -51,7 +51,6 @@
 //! namespace-well-formed document can carry.
 
 mod model;
-mod text;
 mod token;
 mod xml;
 
@@ -69,7 +68,17 @@ pub const MAGIC: [u8; 4] = *b"RBF0";
 /// Reads an `RBF` payload and writes the XML that describes it.
 ///
 /// The output is driven entirely by the payload's own tokens — R5.1. Feeding
-/// it back to [`from_xml`] reproduces the input byte for byte.
+/// it back to [`from_xml`] reproduces the input byte for byte, **for a stream
+/// whose descriptor table introduces each name once** — which is all 391
+/// shipped files.
+///
+/// A stream that declares one name at two descriptors comes back with the
+/// second declaration gone: the table [`from_xml`] rebuilds is keyed by name
+/// alone, so two descriptors of a name collapse into the one they were always
+/// interchangeable with. Nothing is lost — the document is identical and only
+/// the table spelling it is smaller — and the normalised form is a fixed
+/// point. Found by fuzzing on 2026-08-31; pinned by
+/// `a_name_two_descriptors_declare_is_read_and_written_back_once`.
 ///
 /// # Errors
 ///

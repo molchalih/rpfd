@@ -15,7 +15,8 @@
 /// `docs/rpf-format.md`, Resource entries, `verified`.
 pub const MAGIC_RSC7: [u8; 4] = *b"RSC7";
 
-/// Length of the `RSC7` header that precedes a resource's deflate stream.
+/// Length of the `RSC7` header itself, and the shortest header a resource
+/// payload can carry.
 ///
 /// This is the constant behind the correction in `docs/rpf-format.md`: a
 /// resource entry's compressed size *includes* these bytes, so its deflate
@@ -23,8 +24,27 @@ pub const MAGIC_RSC7: [u8; 4] = *b"RSC7";
 /// `RESOURCE_HEADER_LEN` into the payload. Reading the full compressed size
 /// still inflates correctly, which is why the mistake survives until a rebuild.
 ///
+/// It is the floor rather than the answer: [`RESOURCE_HEADER_LENS`] is the set
+/// of lengths that occur.
+///
 /// `docs/rpf-format.md`, Compression, `verified` — 20 of 20 entries.
 pub const RESOURCE_HEADER_LEN: u64 = 16;
+
+/// The header lengths a resource's deflate stream has been measured to begin
+/// at, shortest first.
+///
+/// **Nothing declares which one a payload carries and nothing derives it.** The
+/// entry cannot say: offsets 8 and 12 are both flag words. Nor does it follow
+/// from the flags — two entries of `x64f.rpf` with the same system flags
+/// `0x00020000`, the same graphics flags `0xd0000040` and therefore the same
+/// version and the same declared length of 139,264 begin their streams at 24
+/// and at 16. So the boundary is recovered by reading, against what the entry
+/// does declare: `Archive::resource_stream`.
+///
+/// `docs/rpf-format.md`, Compression, `verified` — 7,050 of 7,072 resources of
+/// `x64f.rpf` at 16 and 22 at 24, none at any other offset in 0..64 and none at
+/// two.
+pub const RESOURCE_HEADER_LENS: [u64; 2] = [RESOURCE_HEADER_LEN, 24];
 
 /// Number of pages described by one of a resource's two flag words.
 ///

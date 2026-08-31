@@ -1,18 +1,24 @@
 # Third-party game archives and extracted assets. Never tracked: redistribution
 # is not ours to grant, and 195 MB of binaries poisons clone time for a repo
 # whose tracked content is text.
-assets/
+/assets
 fixtures/corpus/
 
 # Design notes, decision records and the backlog. Present in the working tree
 # and deliberately untracked: they are how the work is thought through, not what
 # the work ships.
-docs/
+/docs
 
 # Game executables, kept locally so key extraction has something to read.
 # Never tracked: DR-006 keeps key material out of this repository, and an
 # executable is where that material lives before it is extracted.
-bin/
+/bin
+
+# Metadata payloads extracted from the corpus, addressed by `RPF_METADATA`.
+# 10,144 files, 162 MB, and every one of them is shipped game data — the same
+# content `assets/` is ignored for. Kept beside `assets/` and `bin/` because it
+# is the third thing a gate names and the first two live here.
+/metadata
 
 # Extracted key material. Derived from a local game install; never redistributed.
 # Anchored at the root: the rule is about a `keys/` directory beside `assets/`
@@ -21,8 +27,22 @@ bin/
 /keys/
 *.keys
 
+# Fuzzing corpora and findings. `cargo fuzz` writes both of these beside the
+# targets, and **a seed corpus here is game data**: the metadata targets are
+# seeded with 9,324 shipped `PSO` payloads and 388 `RBF` ones, which is the
+# same content `assets/` is ignored for. A crash artefact is derived from one.
+# Neither was ever tracked; this is what stops the first `git add -A` after a
+# local run from doing it. DR-006.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
 # Rust
 target/
+# `cargo-mutants` build output. Not tracked for `target/`'s reason, and
+# named here because a sweep leaves it beside the source and `git add -A`
+# would otherwise carry it onto a branch.
+mutants.out/
 **/*.rs.bk
 
 # Node (editor client)

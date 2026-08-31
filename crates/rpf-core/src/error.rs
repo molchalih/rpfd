@@ -447,11 +447,55 @@ pub enum Error {
         limit: u64,
     },
 
-    /// An entry was declared a resource but its payload is not one.
-    #[error("{path:?}: declared a resource, but the payload does not begin with RSC7")]
+    /// A payload cannot be written into a resource entry.
+    ///
+    /// **Never because it does not begin with `RSC7`.** `docs/backlog.md` Q7
+    /// measured that no Rockstar resource payload does, so that test refused
+    /// the archives it was meant to serve; what is refused now is a write whose
+    /// row could not be filled in. DR-046.
+    #[error("{path:?}: cannot be written into a resource entry: {reason}")]
     NotAResource {
         /// The entry being written.
         path: String,
+        /// What is missing, for a caller that has to change what it asked for.
+        reason: &'static str,
+    },
+
+    /// A payload cannot be written into an entry that holds a tokenised
+    /// metadata encoding.
+    ///
+    /// Both encodings are carried rather than a sentence, so a caller acts on
+    /// the pair rather than on English (§10). DR-050.
+    #[error(
+        "{path:?}: an entry holding {} cannot take a payload of {}",
+        held.name(),
+        offered.name()
+    )]
+    WrongEncoding {
+        /// The entry being written, by path from the archive that holds it.
+        path: String,
+        /// What its payload announces itself to be now.
+        held: crate::metadata::Encoding,
+        /// What the offered payload announces itself to be.
+        offered: crate::metadata::Encoding,
+    },
+
+    /// An entry was asked for as XML and has no XML view.
+    ///
+    /// What it holds is carried rather than a sentence (§10), and `None` is
+    /// both "its payload announces nothing" and "it is a resource, whose
+    /// payload is not read" — `docs/backlog.md` Q7. An entry that gains a view
+    /// later stops answering this, which is what makes it the right refusal to
+    /// leave R5.8 room in. DR-053.
+    #[error(
+        "{path:?}: an entry holding {} has no XML view",
+        held.map_or("no encoding this tool converts", crate::metadata::Encoding::name)
+    )]
+    NoXmlView {
+        /// The entry, by path from the archive that holds it.
+        path: String,
+        /// What its payload announces itself to be, if anything.
+        held: Option<crate::metadata::Encoding>,
     },
 
     /// Two children of one directory are one name here, so one of them cannot
@@ -643,6 +687,33 @@ pub enum Error {
         cause: crate::metadata::rbf::Unrepresentable,
     },
 
+    /// A `PSO` payload contradicts itself.
+    ///
+    /// The same shape as [`Error::BadRbf`] and for the same reason: §10 counts
+    /// **crate** boundaries and there is one, so the metadata layer keeps its
+    /// own vocabulary inside `cause` rather than this enum growing a variant
+    /// per section.
+    #[error("malformed PSO at offset {offset}")]
+    BadPso {
+        /// Where in the payload the file stopped making sense.
+        offset: u64,
+        /// What was wrong with it.
+        cause: crate::metadata::pso::Malformed,
+    },
+
+    /// A `PSO` payload is well formed and carries something this build does not
+    /// decode.
+    ///
+    /// `docs/metadata-encodings.md` measured 37 `(type, subtype)` pairs over
+    /// 580,044 members, and a decoder that handles those handles every metadata
+    /// file both games ship — so reaching this means a file neither shipped
+    /// build contains.
+    #[error("the PSO payload carries something this build does not decode")]
+    UnsupportedPso {
+        /// Which thing.
+        cause: crate::metadata::pso::Unsupported,
+    },
+
     /// The XML handed to the metadata layer does not describe an `RBF`
     /// document.
     #[error("the XML at position {position} does not describe an RBF document")]
@@ -652,6 +723,21 @@ pub enum Error {
         position: u64,
         /// What was wrong with it.
         cause: crate::metadata::rbf::NotRbf,
+    },
+
+    /// The XML handed to the metadata layer does not describe the `PSO`
+    /// payload it was given beside.
+    ///
+    /// The `PSO` write direction is an edit of the file the document came from
+    /// — DR-049 — so this says the two disagree rather than that either is
+    /// malformed on its own.
+    #[error("the XML at position {position} does not describe this PSO payload")]
+    NotPsoXml {
+        /// Where in the XML the reader was, so an editor can put the cursor on
+        /// the line that has to change.
+        position: u64,
+        /// What was wrong with it.
+        cause: crate::metadata::pso::NotPsoXml,
     },
 }
 
@@ -709,18 +795,22 @@ impl Error {
             Self::UnsupportedVersion { .. }
             | Self::UnrecognisedExecutable { .. }
             | Self::CannotWriteEncrypted { .. }
-            | Self::UnrepresentableRbf { .. } => Category::Unsupported,
+            | Self::UnrepresentableRbf { .. }
+            | Self::UnsupportedPso { .. } => Category::Unsupported,
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
             | Self::ArchiveTooLarge { .. }
             | Self::NotAResource { .. }
+            | Self::WrongEncoding { .. }
+            | Self::NoXmlView { .. }
             | Self::BadPath { .. }
             | Self::AlreadyExists { .. }
             | Self::Claimed { .. }
             | Self::NameCollision { .. }
             | Self::WrongKind { .. }
-            | Self::NotRbfXml { .. } => Category::Refused,
+            | Self::NotRbfXml { .. }
+            | Self::NotPsoXml { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
             // DR-019: the bytes decide. A payload that never claimed to be an
             // archive was named one by the caller's own path.
@@ -744,7 +834,8 @@ impl Error {
             | Self::TrailingBytes { .. }
             | Self::ChecksumMismatch { .. }
             | Self::VerifyFailed { .. }
-            | Self::BadRbf { .. } => Category::Corrupt,
+            | Self::BadRbf { .. }
+            | Self::BadPso { .. } => Category::Corrupt,
         }
     }
 
@@ -793,6 +884,8 @@ impl Error {
             Self::FieldOverflow { .. } => "FieldOverflow",
             Self::ArchiveTooLarge { .. } => "ArchiveTooLarge",
             Self::NotAResource { .. } => "NotAResource",
+            Self::WrongEncoding { .. } => "WrongEncoding",
+            Self::NoXmlView { .. } => "NoXmlView",
             Self::NameCollision { .. } => "NameCollision",
             Self::AlreadyExists { .. } => "AlreadyExists",
             Self::Claimed { .. } => "Claimed",
@@ -800,8 +893,11 @@ impl Error {
             Self::Overlapping { .. } => "Overlapping",
             Self::Cancelled { .. } => "Cancelled",
             Self::BadRbf { .. } => "BadRbf",
+            Self::BadPso { .. } => "BadPso",
+            Self::UnsupportedPso { .. } => "UnsupportedPso",
             Self::UnrepresentableRbf { .. } => "UnrepresentableRbf",
             Self::NotRbfXml { .. } => "NotRbfXml",
+            Self::NotPsoXml { .. } => "NotPsoXml",
             Self::WrongKind { .. } => "WrongKind",
         }
     }
@@ -848,7 +944,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 36;
+    const VARIANTS: usize = 41;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -944,6 +1040,13 @@ mod tests {
                 offset: 7,
                 cause: crate::metadata::rbf::Malformed::Truncated,
             },
+            // The same fact for the other binary encoding. Added when
+            // `the_variant_count_is_the_one_the_enum_declares` caught the enum
+            // growing past the tables — which is what it is for.
+            Error::BadPso {
+                offset: 7,
+                cause: crate::metadata::pso::Malformed::NotPso,
+            },
         ]
     }
 
@@ -972,6 +1075,16 @@ mod tests {
             },
             Error::NotAResource {
                 path: "x.ytd".to_owned(),
+                reason: "the payload is shorter than a resource header",
+            },
+            Error::WrongEncoding {
+                path: "data/vehicles.ymt".to_owned(),
+                held: crate::metadata::Encoding::Rbf,
+                offered: crate::metadata::Encoding::Xml,
+            },
+            Error::NoXmlView {
+                path: "data/vehicles.ymt".to_owned(),
+                held: Some(crate::metadata::Encoding::Text),
             },
             Error::BadPath {
                 path: "../escape".to_owned(),
@@ -1006,6 +1119,12 @@ mod tests {
             Error::NotRbfXml {
                 position: 12,
                 cause: crate::metadata::rbf::NotRbf::Empty,
+            },
+            // And the `PSO` document is the caller's twice over: it says the
+            // payload it was given beside is not the one it describes.
+            Error::NotPsoXml {
+                position: 12,
+                cause: crate::metadata::pso::NotPsoXml::Empty,
             },
         ]
     }
@@ -1081,6 +1200,18 @@ mod tests {
                 },
                 Category::Unsupported,
             ),
+            // A `(type, subtype)` pair outside the 37 the corpus carries: the
+            // payload is fine and this build cannot render it, which is
+            // `UnsupportedVersion`'s shape once more.
+            (
+                Error::UnsupportedPso {
+                    cause: crate::metadata::pso::Unsupported::DataType {
+                        code: 0xFF,
+                        subtype: 0xFF,
+                    },
+                },
+                Category::Unsupported,
+            ),
         ]
     }
 
@@ -1142,6 +1273,76 @@ mod tests {
             VARIANTS,
             "the tables name {} of {VARIANTS} variants",
             named.len()
+        );
+    }
+
+    /// Every variant [`Error`] declares, read off this file.
+    ///
+    /// The enum is `rustfmt`-formatted, so a variant is a line of exactly four
+    /// spaces, an upper-case letter, and an opening brace; a field is
+    /// lower-case, a doc comment begins `///` and an attribute `#[`. Nothing
+    /// else sits at that indentation.
+    fn declared_variants() -> Vec<String> {
+        let source = include_str!("error.rs");
+        let mut found = Vec::new();
+        let mut inside = false;
+        for line in source.lines() {
+            if line == "pub enum Error {" {
+                inside = true;
+                continue;
+            }
+            if !inside {
+                continue;
+            }
+            if line == "}" {
+                break;
+            }
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if !rest.starts_with(|first: char| first.is_ascii_uppercase()) {
+                continue;
+            }
+            found.push(rest.trim_end_matches(" {").to_owned());
+        }
+        found
+    }
+
+    #[test]
+    fn the_variant_count_is_the_one_the_enum_declares() {
+        // The test above compares two things that are both written by hand:
+        // the taxonomy tables and `VARIANTS`. **Neither is the enum.** Adding a
+        // variant makes `Error::name` fail to compile until it is named there,
+        // and then nothing at all requires the tables or the count to follow —
+        // so both stay as they were, `named.len()` stays equal to `VARIANTS`,
+        // and the taxonomy test passes while covering one variant fewer than
+        // there are. That has now happened twice: `VARIANTS` sat at 29 against
+        // 30 arms, and again at 31 when `WrongKey` arrived against 32.
+        //
+        // This is the third party. It reads the declaration itself, so a new
+        // variant makes the count wrong here whatever anybody remembered to
+        // update — and the only way to make it right again is to add the
+        // variant to the tables, which is what was wanted in the first place.
+        let declared = declared_variants();
+        assert!(
+            declared.len() > 20,
+            "the enum was not found in this file: {declared:?}"
+        );
+        assert_eq!(
+            declared.len(),
+            VARIANTS,
+            "`Error` declares {} variants and `VARIANTS` says {VARIANTS}: {declared:?}",
+            declared.len()
+        );
+
+        // And the tables name those variants and no others, so a count that
+        // matches by coincidence — one variant dropped and another added — is
+        // not enough either.
+        let named: BTreeSet<&str> = taxonomy().iter().map(|(error, _)| name(error)).collect();
+        let declared: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+        assert_eq!(
+            named, declared,
+            "the tables and the enum do not name the same variants"
         );
     }
 }

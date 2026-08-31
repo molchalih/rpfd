@@ -2,6 +2,13 @@
 # a nightly compiler and `rust-toolchain.toml` pins the workspace to stable.
 # Nothing here is built by a default build, by `cargo test --all`, or by
 # continuous integration. docs/conventions.md §14, the fuzzing row.
+#
+# This crate is built with `--cfg fuzzing`, which `cargo fuzz` sets for the
+# whole build and nothing else does. The `encrypted` target does not compile
+# without it and is not meant to: the constructor it reaches key material
+# through is `#[cfg(fuzzing)]` in `rpf-core` precisely so that it exists under
+# the fuzzer and in no other build (DR-048). To check this crate by hand, pass
+# it — `RUSTFLAGS="--cfg fuzzing" cargo check --bins`.
 [workspace]
 
 [package]
@@ -20,6 +27,11 @@ cargo-fuzz = true
 arbitrary = { version = "1.4", features = ["derive"] }
 libfuzzer-sys = "0.4"
 rpf-core = { path = "../crates/rpf-core" }
+# docs/conventions.md §14, the XML row, and the same version the crate parses
+# with. The metadata targets are the only ones whose subject *writes* bytes for
+# something else to read, and `rpf_fuzz::well_formed` is the one question that
+# can be asked of what `pso::to_xml` answers — it has no reader on this side.
+quick-xml = "0.42"
 
 [[bin]]
 name = "parse"
@@ -66,6 +78,48 @@ bench = false
 [[bin]]
 name = "changes"
 path = "fuzz_targets/changes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pso"
+path = "fuzz_targets/pso.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dictionary"
+path = "fuzz_targets/dictionary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rbf"
+path = "fuzz_targets/rbf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rbf_xml"
+path = "fuzz_targets/rbf_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rbf_built"
+path = "fuzz_targets/rbf_built.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypted"
+path = "fuzz_targets/encrypted.rs"
 test = false
 doc = false
 bench = false

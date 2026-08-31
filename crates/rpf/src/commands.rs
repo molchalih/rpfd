@@ -11,7 +11,7 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, Change, Changes, Encoding, Flow, ListedKind, Step, Watch,
+    Archive, Change, Changes, Dictionary, Flow, ListedKind, Step, View, Watch,
     keys::{
         AES_KEY_LEN, Cache, HASH_LUT_LEN, LauncherKey, Material, NG_DECRYPT_TABLE_COUNT,
         NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, SourceDigest,
@@ -313,27 +313,74 @@ fn named(listed: &rpf_core::Listed) -> (&'static str, u64) {
 ///
 /// Adding this field is a contract addition, and DR-032 makes field names part
 /// of the contract: `"encoding"` is now one, and its values are `"xml"`,
-/// `"text"`, `"rbf"`, `"pso"` and `null`.
+/// `"text"`, `"rbf"`, `"pso"` and `null`. The four spellings are
+/// [`rpf_core::Encoding::name`]'s, so an error naming an encoding says the same
+/// word a listing row does (§3).
 fn encoding_named(listed: &rpf_core::Listed) -> Option<&'static str> {
     let ListedKind::Binary { encoding, .. } = listed.kind else {
         return None;
     };
-    Some(match encoding? {
-        Encoding::Xml => "xml",
-        Encoding::Text => "text",
-        Encoding::Rbf => "rbf",
-        Encoding::Pso => "pso",
-    })
+    Some(encoding?.name())
+}
+
+/// A view, with the dictionary the command line has to offer with it.
+///
+/// The empty one, which is a complete answer: a hash a dictionary does not name
+/// is rendered `hash_XXXXXXXX` and read back as the same hash, so what a
+/// dictionary changes is legibility and never the payload (R5.5). There is no
+/// switch for one because no dictionary ships — DR-006 — and adding one is R5.5's
+/// to add, in both frontends at once.
+const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
+    rpf_core::view::Wanted {
+        view,
+        names: Dictionary::EMPTY,
+    }
+}
+
+/// The command line's spelling of [`View`], for `--as`.
+///
+/// A wrapper rather than a second enum: the three names are [`View::name`]'s
+/// and are written down once, so `--as xml` and the daemon's `"as": "xml"` can
+/// never come to mean different things (§3). DR-053.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewArg(View);
+
+impl From<ViewArg> for View {
+    fn from(argument: ViewArg) -> Self {
+        argument.0
+    }
+}
+
+impl clap::ValueEnum for ViewArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        const VIEWS: [ViewArg; View::ALL.len()] = [
+            ViewArg(View::ALL[0]),
+            ViewArg(View::ALL[1]),
+            ViewArg(View::ALL[2]),
+        ];
+        &VIEWS
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.0.name()))
+    }
 }
 
 /// `cat` — one entry's contents on standard output.
-pub fn cat(path: &Path, inside: &str, named_cache: Option<&Path>) -> Result<()> {
+pub fn cat(path: &Path, inside: &str, view: View, named_cache: Option<&Path>) -> Result<()> {
     let (mut file, archive) = open(path, named_cache)?;
     let (holder, index) = archive.locate(&mut file, inside)?;
     if holder.entry(index)?.is_directory() {
         return Err(Failure::Refused {
             reason: format!("{inside} is a directory"),
         });
+    }
+    // A view other than the entry's own bytes is a whole document either way —
+    // the conversion reads the payload and writes another — so there is no
+    // stream to keep, and the terminal rule below is applied to what came back.
+    if view != View::Raw {
+        let viewed = rpf_core::view::read(&mut file, &holder, index, inside, wanted(view))?;
+        return to_stdout(inside, &viewed.bytes);
     }
     // `extract`, not `read`: this has to be the same form `put` accepts, or
     // `rpf cat … > f && rpf put … f` would fail on every resource. For a binary
@@ -364,15 +411,22 @@ pub fn cat(path: &Path, inside: &str, named_cache: Option<&Path>) -> Result<()> 
         return sink.flush().map_err(failing);
     }
 
-    // Refused at this tool's own boundary rather than at the platform's. On
-    // Windows the standard library's console writer declines bytes that are not
-    // UTF-8 — so `cat` of a resource inside a terminal failed with a sentence
-    // about UTF-8, exit 7, while the same command redirected worked, and the
-    // same command on macOS filled the terminal with a resource. One rule
-    // instead, the same on all three: a terminal takes text, and anything else
-    // goes to a file or a pipe. R10.7.
-    let bytes = holder.extract(&mut file, index)?;
-    if !goes_to(&bytes, true) {
+    to_stdout(inside, &holder.extract(&mut file, index)?)
+}
+
+/// Bytes a caller asked for, onto standard output, under the rule that a
+/// terminal takes text and nothing else.
+///
+/// Refused at this tool's own boundary rather than at the platform's. On
+/// Windows the standard library's console writer declines bytes that are not
+/// UTF-8 — so `cat` of a resource inside a terminal failed with a sentence
+/// about UTF-8, exit 7, while the same command redirected worked, and the same
+/// command on macOS filled the terminal with a resource. One rule instead, the
+/// same on all three and the same for every form an entry is asked for: a
+/// terminal takes text, and anything else goes to a file or a pipe. R10.7.
+fn to_stdout(inside: &str, bytes: &[u8]) -> Result<()> {
+    let out = std::io::stdout();
+    if !goes_to(bytes, out.is_terminal()) {
         return Err(Failure::Refused {
             reason: format!(
                 "{inside} is not text and standard output is a terminal; \
@@ -380,10 +434,13 @@ pub fn cat(path: &Path, inside: &str, named_cache: Option<&Path>) -> Result<()> 
             ),
         });
     }
-    out.lock().write_all(&bytes).map_err(|source| Failure::Io {
-        path: "<stdout>".to_owned(),
-        source,
-    })
+    let mut sink = std::io::BufWriter::with_capacity(64 * 1024, out.lock());
+    sink.write_all(bytes)
+        .and_then(|()| sink.flush())
+        .map_err(|source| Failure::Io {
+            path: "<stdout>".to_owned(),
+            source,
+        })
 }
 
 /// How a change to what an archive holds is allowed to happen.
@@ -420,6 +477,14 @@ pub struct WriteOptions {
     /// about a path the archive already holds.
     #[arg(long)]
     pub create: bool,
+    /// Write text or XML into an entry that holds RBF or PSO. Refused without
+    /// it: those are binary encodings, and the runtime reads the entry as one.
+    #[arg(long)]
+    pub allow_encoding_change: bool,
+    /// What the file being put is: the entry's own bytes, an XML document to
+    /// convert into whatever the entry holds, or either.
+    #[arg(long = "as", value_name = "VIEW", default_value = "raw")]
+    pub view: ViewArg,
 }
 
 impl From<ChangeOptions> for WriteOptions {
@@ -428,6 +493,8 @@ impl From<ChangeOptions> for WriteOptions {
             change,
             rebuild: false,
             create: false,
+            allow_encoding_change: false,
+            view: ViewArg(View::Raw),
         }
     }
 }
@@ -445,20 +512,37 @@ pub fn put(
     named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
-    // A regular file is opened when the library wants it, so a donor of any
-    // size costs a buffer rather than its length. Anything else — a FIFO, a
-    // process substitution, `/dev/stdin` — can be neither reopened nor seeked,
-    // and the only thing to be done with it is to read it once and hold it,
-    // which is what this did for every donor before. DR-036.
-    let contents: std::sync::Arc<dyn rpf_core::Contents> = match fs::metadata(from) {
-        Ok(found) if found.is_file() => std::sync::Arc::new(Donor::at(from)),
-        _ => {
-            let read = fs::read(from).map_err(|source| Failure::Io {
-                path: from.display().to_string(),
-                source,
-            })?;
-            std::sync::Arc::new(rpf_core::Bytes::new(read))
+    let view = View::from(options.view);
+    let contents: std::sync::Arc<dyn rpf_core::Contents> = if view == View::Raw {
+        // A regular file is opened when the library wants it, so a donor of any
+        // size costs a buffer rather than its length. Anything else — a FIFO, a
+        // process substitution, `/dev/stdin` — can be neither reopened nor
+        // seeked, and the only thing to be done with it is to read it once and
+        // hold it, which is what this did for every donor before. DR-036.
+        match fs::metadata(from) {
+            Ok(found) if found.is_file() => std::sync::Arc::new(Donor::at(from)),
+            _ => {
+                let read = fs::read(from).map_err(|source| Failure::Io {
+                    path: from.display().to_string(),
+                    source,
+                })?;
+                std::sync::Arc::new(rpf_core::Bytes::new(read))
+            }
         }
+    } else {
+        // A document is converted against the entry it is going into, and the
+        // entry is read here, in the call that converts it — DR-049 makes a
+        // `PSO` write an edit of the file it came from, so the file has to be
+        // to hand. What is buffered is the payload, of the entry's own
+        // encoding, so nothing downstream can tell it from a write of the same
+        // bytes by any other route. DR-053.
+        std::sync::Arc::new(rpf_core::Bytes::new(convert(
+            path,
+            inside,
+            from,
+            view,
+            named_cache,
+        )?))
     };
     apply(
         path,
@@ -468,6 +552,7 @@ pub fn put(
             Change::Write {
                 contents,
                 create: options.create,
+                allow_encoding_change: options.allow_encoding_change,
             },
         ),
         options,
@@ -508,6 +593,34 @@ impl rpf_core::Contents for Donor {
             fs::metadata(&self.0).map_err(|source| rpf_core::Error::Io { offset: 0, source })?;
         Ok(found.len())
     }
+}
+
+/// The payload a document at `from` becomes, against the entry it is going into.
+///
+/// The archive is opened for reading only: this decides what will be written
+/// and writes none of it, so `--dry-run` reaches it on the same terms every
+/// other refusal does.
+fn convert(
+    path: &Path,
+    inside: &str,
+    from: &Path,
+    view: View,
+    named_cache: Option<&Path>,
+) -> Result<Vec<u8>> {
+    let document = fs::read(from).map_err(|source| Failure::Io {
+        path: from.display().to_string(),
+        source,
+    })?;
+    let (mut file, archive) = open(path, named_cache)?;
+    let (holder, index) = archive.locate(&mut file, inside)?;
+    Ok(rpf_core::view::apply(
+        &mut file,
+        &holder,
+        index,
+        inside,
+        wanted(view),
+        document,
+    )?)
 }
 
 /// `rm` — remove an entry, and its children when it is a directory and
@@ -619,7 +732,9 @@ pub fn apply(
     } else if options.change.dry_run {
         // Reached only with --rebuild --dry-run: the rebuild was asked for
         // rather than forced by anything about the changes, so there is no
-        // allocation and no structural change to report against.
+        // allocation and no structural change to report against. R6.7.
+        let (mut file, archive) = open(path, named_cache)?;
+        rpf_core::resolves(&mut file, &archive, changes)?;
         if json_out {
             emit(&json!({ "method": "rebuild", "path": inside, "dry_run": true }));
         } else {

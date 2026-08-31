@@ -1,10 +1,10 @@
 //! Command-line frontend. Holds no archive knowledge: everything it does, it
 //! does through `rpf-core`. See `docs/conventions.md` §1.
 
+mod advice;
 mod commands;
 mod exit;
 mod install;
-mod separator;
 mod serve;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -63,6 +63,10 @@ enum Command {
         archive: PathBuf,
         /// A path inside it.
         path: String,
+        /// Which form of the entry to write: its own bytes, its XML view, or
+        /// the XML view where there is one and the bytes where there is not.
+        #[arg(long = "as", value_name = "VIEW", default_value = "raw")]
+        view: commands::ViewArg,
     },
     /// Replace one entry, or create it, cascading through nesting.
     Put {
@@ -213,7 +217,8 @@ fn main() -> ExitCode {
         Command::Cat {
             ref archive,
             ref path,
-        } => commands::cat(archive, path, cache),
+            view,
+        } => commands::cat(archive, path, view.into(), cache),
         Command::Put {
             ref archive,
             ref path,
@@ -272,7 +277,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::from(Code::Ok as u8),
         Err(failure) => {
-            eprintln!("rpf: {}", separator::render(&failure));
+            eprintln!("rpf: {}", advice::render(&failure));
             ExitCode::from(failure.code() as u8)
         }
     }
