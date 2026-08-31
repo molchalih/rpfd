@@ -60,3 +60,8 @@ dist/
 # Narrow rather than the whole directory, so a shared `.claude/settings.json`
 # stays trackable if this project ever wants one.
 .claude/worktrees/
+
+# A mutation sweep in progress, and the partial results of the attempt before
+# it. Kept out of the tree for `mutants.out/`'s reason — a sweep is measurement
+# output, not source — and named by date so a finished one can be deleted.
+/.sweep-*

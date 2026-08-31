@@ -601,6 +601,31 @@ impl Material {
         })
     }
 
+    /// Material whose every value is zero bytes.
+    ///
+    /// The counterpart of `crate::format::crypto::Cipher::over_zeros`, one
+    /// level up: it makes an AES-tagged archive **writable and readable in the
+    /// crate's own tests** with no game installation and no key material of any
+    /// kind (DR-006). It carries no NG half, so nothing NG-tagged opens under
+    /// it, which is the arm those tests are about.
+    ///
+    /// `#[cfg(test)]`, so it is in no release build and in nothing a dependent
+    /// compiles — the same confinement DR-048 puts on the fuzz seam.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn over_zeros() -> Self {
+        Self::restored(
+            Keys {
+                aes: [0; AES_KEY_LEN],
+                aes_at: 0,
+                lut: [0; HASH_LUT_LEN],
+                lut_at: 0,
+            },
+            None,
+            None,
+        )
+    }
+
     /// The material as the cache read it back.
     pub(super) fn restored(keys: Keys, ng: Option<NgKeys>, launcher: Option<LauncherKey>) -> Self {
         Self {
@@ -859,7 +884,7 @@ mod tests {
         AES_KEY_LEN, AES_KEY_NAMED, Error, HASH_LUT_LEN, HASH_LUT_NAMED, Keys, LauncherKey,
         Material, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT,
         NG_EXPANDED_KEY_LEN, NG_EXPANDED_NAMED, NG_TABLES_NAMED, NG_WANTED, NgKeys, Sighting,
-        Unlock, keys_missing, ng_missing,
+        Unlock, anchors, keys_missing, ng_missing,
     };
     use crate::format::crypto::{AesKey, Cipher, Scheme};
 
@@ -1353,6 +1378,29 @@ mod tests {
     }
 
     #[test]
+    fn ng_anchors_names_every_expanded_key_then_every_decrypt_table() {
+        // `NgKeys::assembled` is tested above against a hand-built `found`, so
+        // nothing else here calls through `NgKeys::anchors` to `find` — this is
+        // its only exercise. The order is the contract `assembled` reads back
+        // by: expanded keys first, decrypt tables after.
+        let wanted = NgKeys::anchors();
+        assert_eq!(wanted.len(), NG_WANTED);
+
+        let (expanded, tables) = wanted.split_at(NG_EXPANDED_KEY_COUNT);
+        assert_eq!(expanded.len(), NG_EXPANDED_KEY_COUNT);
+        assert_eq!(tables.len(), NG_DECRYPT_TABLE_COUNT);
+
+        for (anchor, digest) in expanded.iter().zip(anchors::NG_EXPANDED_KEYS) {
+            assert_eq!(anchor.len, NG_EXPANDED_KEY_LEN);
+            assert_eq!(anchor.digest, digest);
+        }
+        for (anchor, digest) in tables.iter().zip(anchors::NG_DECRYPT_TABLES) {
+            assert_eq!(anchor.len, NG_DECRYPT_TABLE_LEN);
+            assert_eq!(anchor.digest, digest);
+        }
+    }
+
+    #[test]
     fn a_survey_one_value_short_names_the_kind_it_was_short_of() {
         // The count is what a caller acts on, and it used to be derivable two
         // ways that could disagree. One missing expanded key and one missing
@@ -1461,5 +1509,58 @@ mod tests {
                 .is_empty()
         );
         assert!(!directory.exists(), "asking must not create a cache");
+    }
+
+    #[cfg(fuzzing)]
+    #[test]
+    fn over_bytes_carries_exactly_the_bytes_it_was_given() {
+        let aes = [7_u8; AES_KEY_LEN];
+        let lut = [9_u8; HASH_LUT_LEN];
+        let material =
+            Material::over_bytes(aes, lut, None, None).expect("well-formed bytes assemble");
+        assert_eq!(material.keys().aes_key(), &aes);
+        assert_eq!(material.keys().hash_lut(), &lut);
+        assert!(material.ng().is_none());
+        assert!(material.launcher().is_none());
+    }
+
+    #[cfg(fuzzing)]
+    #[test]
+    fn over_bytes_carries_the_ng_half_and_the_launcher_key_when_given_both() {
+        let expanded = vec![3_u8; NG_EXPANDED_KEY_COUNT.saturating_mul(NG_EXPANDED_KEY_LEN)];
+        let tables = vec![5_u8; NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN)];
+        let launcher_key = [11_u8; AES_KEY_LEN];
+        let material = Material::over_bytes(
+            [0; AES_KEY_LEN],
+            [0; HASH_LUT_LEN],
+            Some((expanded.clone(), tables.clone())),
+            Some(launcher_key),
+        )
+        .expect("well-formed bytes assemble");
+
+        let ng = material.ng().expect("the ng half was given");
+        assert_eq!(ng.expanded_bytes(), expanded.as_slice());
+        assert_eq!(ng.table_bytes(), tables.as_slice());
+        assert_eq!(
+            material
+                .launcher()
+                .expect("the launcher key was given")
+                .key(),
+            &launcher_key
+        );
+    }
+
+    #[cfg(fuzzing)]
+    #[test]
+    fn over_bytes_refuses_an_ng_half_of_the_wrong_length() {
+        assert!(
+            Material::over_bytes(
+                [0; AES_KEY_LEN],
+                [0; HASH_LUT_LEN],
+                Some((vec![], vec![])),
+                None
+            )
+            .is_none()
+        );
     }
 }

@@ -14,7 +14,7 @@
 //! respelt at this boundary. And a refusal with a switch behind it names the
 //! switch: DR-050.
 
-use rpf_core::Error;
+use rpf_core::{Error, NoWrite};
 
 use crate::exit::Failure;
 
@@ -35,12 +35,26 @@ pub fn render(failure: &Failure) -> String {
 
 /// The way through a refusal that has one, in the caller's own vocabulary.
 ///
-/// Only [`Error::WrongEncoding`], which is the one refusal whose override is a
-/// switch of its own: `--force` means "write into a detected game install" and
-/// says so in its own sentence. DR-050.
+/// Two refusals have one. [`Error::WrongEncoding`]'s override is a switch of
+/// its own — `--force` means "write into a detected game install" and says so
+/// in its own sentence (DR-050). And [`NoWrite::NotThroughTheArchive`] is not
+/// an override at all but a **different command**: an AES-encrypted archive is
+/// written back through the archive it was opened from, so the way past
+/// `pack`'s refusal is to edit rather than to pack. DR-054.
+///
+/// [`NoWrite::NoInverse`] deliberately has none. There is no way through it,
+/// and offering one would be worse than saying nothing.
 fn remedy(failure: &Failure) -> Option<&'static str> {
-    matches!(*failure, Failure::Container(Error::WrongEncoding { .. }))
-        .then_some("Pass --allow-encoding-change to override, or convert the payload first")
+    match *failure {
+        Failure::Container(Error::WrongEncoding { .. }) => {
+            Some("Pass --allow-encoding-change to override, or convert the payload first")
+        }
+        Failure::Container(Error::CannotWriteEncrypted {
+            reason: NoWrite::NotThroughTheArchive,
+            ..
+        }) => Some("Edit through the archive instead — put, rm, mv and mkdir write one back"),
+        _ => None,
+    }
 }
 
 /// The path the caller asked for with `\` read as the separator, or `None` when
@@ -140,6 +154,34 @@ mod tests {
                 && rendered.contains("xml"),
             "must still say what was refused and what of: {rendered}"
         );
+    }
+
+    /// The two halves of the encrypted-write refusal, which is the case where
+    /// one reason has a way through and the other has none. DR-054.
+    #[test]
+    fn only_the_encrypted_refusal_that_has_a_way_through_offers_one() {
+        let packing = Failure::Container(Error::CannotWriteEncrypted {
+            tag: 0x0FFF_FFF9,
+            reason: rpf_core::NoWrite::NotThroughTheArchive,
+        });
+        let rendered = render(&packing);
+        assert!(
+            rendered.contains("Edit through the archive instead"),
+            "pack's refusal must name the command that works: {rendered}"
+        );
+        assert!(
+            rendered.contains("0x0ffffff9"),
+            "must still say which archive: {rendered}"
+        );
+
+        // NG has no way through, and offering one would be a lie.
+        let ng = Failure::Container(Error::CannotWriteEncrypted {
+            tag: 0x0FEF_FFFF,
+            reason: rpf_core::NoWrite::NoInverse,
+        });
+        assert_eq!(remedy(&ng), None);
+        assert_eq!(render(&ng), ng.to_string());
+        assert!(ng.to_string().contains("has no inverse"), "{ng}");
     }
 
     /// And nothing else grows one: the sentence is the failure's own.

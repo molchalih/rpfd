@@ -261,6 +261,15 @@ where
             &**contents,
             allow_encoding_change,
         )?;
+        // The transform the payload and the row go back under, which is the
+        // holder's and not the outermost archive's: a nested archive carries
+        // its own tag and its own key. A patch writes into the live archive, so
+        // both the region the payload sits in and the sixteen bytes of its row
+        // have to be ciphertext again — an entry row is exactly one aligned
+        // cipher block of the table, which is what makes rewriting one row
+        // without the rest of the table sound and which `Archive::seal` is what
+        // asks.
+        let seal = holder.seal()?;
         let entry = *holder.entry(index)?;
 
         // The storage rule is the entry's, not the caller's: one that was
@@ -281,6 +290,7 @@ where
             holder.version(),
             path,
             kind_of(path, &entry)?,
+            seal.as_ref(),
             &mut opened,
             &mut buffer,
         )?;
@@ -308,31 +318,28 @@ where
                 archive_len: holder.len_bytes(),
             })?;
         let row = file_row(holder.version(), path, entry.name_offset, block, &written)?;
+        let row = match seal {
+            None => row,
+            Some(ref seal) => row.sealed(seal),
+        };
 
         // Claimed whether or not it fits, so that the same set of edits always
         // reaches the same verdict rather than one that depends on how well
         // the payloads happened to compress.
-        for claim in [
-            Claim {
-                at,
-                len: allocation,
-            },
-            Claim {
-                at: row_at,
-                len: holder.version().row_len(),
-            },
-        ] {
-            if let Some((other, _)) = claims
-                .iter()
-                .find(|(other, staked)| *other != path && staked.overlaps(&claim))
-            {
-                return Err(Error::Overlapping {
-                    path: path.to_owned(),
-                    other: (*other).to_owned(),
-                });
-            }
-            claims.push((path, claim));
-        }
+        stake(
+            &mut claims,
+            path,
+            [
+                Claim {
+                    at,
+                    len: allocation,
+                },
+                Claim {
+                    at: row_at,
+                    len: holder.version().row_len(),
+                },
+            ],
+        )?;
 
         if needed > allocation {
             rejected.push(TooLarge {
@@ -361,6 +368,33 @@ where
     } else {
         Ok(Plan::DoesNotFit(rejected))
     }
+}
+
+/// Records what one edit claims, refusing a claim another edit already made.
+///
+/// Split out of [`plan`] because it is the one part of it that is about the set
+/// rather than about the edit, and because a function that decides something
+/// decides it completely (§4): a caller gets the refusal or a recorded claim,
+/// never a half-staked one.
+///
+/// # Errors
+///
+/// [`Error::Overlapping`], naming both paths, for two edits over the same
+/// bytes.
+fn stake<'a>(claims: &mut Vec<(&'a str, Claim)>, path: &'a str, staking: [Claim; 2]) -> Result<()> {
+    for claim in staking {
+        if let Some((other, _)) = claims
+            .iter()
+            .find(|(other, staked)| *other != path && staked.overlaps(&claim))
+        {
+            return Err(Error::Overlapping {
+                path: path.to_owned(),
+                other: (*other).to_owned(),
+            });
+        }
+        claims.push((path, claim));
+    }
+    Ok(())
 }
 
 /// Every change in the set that no patch can express.

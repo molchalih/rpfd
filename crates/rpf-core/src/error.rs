@@ -12,6 +12,42 @@ use crate::{
     manifest::Checksum,
 };
 
+/// Why an encrypted archive cannot be written, in the two ways it cannot.
+///
+/// A typed reason rather than a rendered sentence (§10), because the two name
+/// different things for a caller to do: one is a wall, and the other is a
+/// different command. DR-054.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum NoWrite {
+    /// The transform has no inverse in this build.
+    ///
+    /// The NG scheme is a white-box construction and this repository holds only
+    /// its decrypt tables; inverting it is Gaussian elimination over GF(2) for
+    /// rounds 0, 1 and 16 and a 2^32 sweep per column for the rest.
+    /// `docs/ng-scheme.md`. Nothing a caller can supply changes it.
+    #[error(
+        "the NG transform has no inverse in this build, so an NG archive is \
+         read and never written"
+    )]
+    NoInverse,
+
+    /// The bytes are not being written **through the archive they came from**,
+    /// so nothing here holds the key its tag chose.
+    ///
+    /// `pack` builds an archive out of a tree and a manifest and opens no
+    /// archive at all, so it has no key material and no name to derive one
+    /// from. Editing through the archive — `put`, `rm`, `mv`, `mkdir` — does,
+    /// and **that remedy is the frontend's to spell**: `rpf`'s `advice` module
+    /// names the commands, because a command name is a frontend's vocabulary
+    /// and §10 keeps a rendered sentence out of a variant. DR-050's pattern.
+    #[error(
+        "pack builds from a tree and opens no archive, so it holds no key for \
+         this tag"
+    )]
+    NotThroughTheArchive,
+}
+
 /// Anything that can go wrong reading a container.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -118,26 +154,26 @@ pub enum Error {
         tried: u32,
     },
 
-    /// The archive is encrypted, and this build has no inverse transform to
-    /// write one back.
+    /// The archive is encrypted and this write cannot produce one.
     ///
-    /// Reading an encrypted archive and writing one are separate capabilities:
-    /// R4.7 is the second and it is unwritten, because NG has no inverse
-    /// outside Rockstar without a 2^32 sweep per column (`docs/ng-scheme.md`).
+    /// Two situations, and `reason` tells them apart because they are two
+    /// different things to do about it — [`NoWrite`]. An AES-tagged archive is
+    /// written back through the archive it was read from; an NG-tagged one is
+    /// written back by nobody outside Rockstar.
+    ///
     /// Every write path answers this before it touches a byte, so an archive
     /// refused here is exactly as it was.
     ///
     /// [`Category::Unsupported`] rather than [`Category::NeedsKey`]: no
-    /// material opens this, because the missing part is here and not there.
-    /// Not [`Category::Refused`] either — the request was reasonable and the
-    /// container simply cannot. DR-010's amendment, DR-041.
-    #[error(
-        "archive is encrypted (tag {tag:#010x}); this build reads an encrypted \
-         archive and cannot write one back"
-    )]
+    /// material closes either gap, because the missing part is here and not
+    /// there. Not [`Category::Refused`] either — the request was reasonable and
+    /// the container simply cannot. DR-010's amendment, DR-041, DR-054.
+    #[error("archive is encrypted (tag {tag:#010x}); {reason}")]
     CannotWriteEncrypted {
         /// The encryption tag from the header.
         tag: u32,
+        /// Which of the two gaps this is.
+        reason: NoWrite,
     },
 
     /// A game executable does not carry the key material this build knows how
@@ -937,7 +973,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{Category, Error};
+    use super::{Category, Error, NoWrite};
 
     /// How many variants [`Error`] has, which is what [`Error::name`] counts.
     ///
@@ -1156,7 +1192,10 @@ mod tests {
                 Category::NeedsKey,
             ),
             (
-                Error::CannotWriteEncrypted { tag: 0x0FEF_FFFF },
+                Error::CannotWriteEncrypted {
+                    tag: 0x0FEF_FFFF,
+                    reason: NoWrite::NoInverse,
+                },
                 Category::Unsupported,
             ),
             (

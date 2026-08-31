@@ -156,7 +156,7 @@ not what the tool was doing when it noticed. DR-010.
 | 6 | The request or its input was wrong, and the tool declined to act |
 | 7 | Reading or writing failed — the source or the sink, and nobody's input |
 | 8 | The caller stopped the operation part-way |
-| 9 | This build cannot do it: an RPF version it does not read, a source carrying no key material, or writing back an archive that is encrypted |
+| 9 | This build cannot do it: an RPF version it does not read, a source carrying no key material, or writing back an NG-encrypted archive |
 
 The daemon reports the same numbers as a JSON-RPC `error.code`. A negative code
 there is JSON-RPC's own — `-32601` for an unknown method, `-32602` for a bad
@@ -360,13 +360,25 @@ renaming one stops it opening. Which archives a source opens is not something a
 source says, so every candidate is tried and the first whose table of contents
 decodes into a root directory row wins — one 16-byte block per candidate.
 
-**Reading an encrypted archive and writing one are separate capabilities, and
-this build has the first only.** Every write path — `put`, `rm`, `mv`, `mkdir`,
-`pack`, and the daemon's `write`, `delete`, `rename`, `mkdir` and `commit` —
-refuses an encrypted archive with `CannotWriteEncrypted` at exit 9 before it
-touches a byte, and `--force` does not reach it: a capability that is absent is
-not a safety interlock. Re-encryption is R4.7 and needs the inverse transform,
-which nobody outside Rockstar has for NG.
+**An AES-encrypted archive is written back; an NG-encrypted one is not.**
+AES-256 is symmetric, so the key and the single pass that decrypt a table of
+contents encrypt one: `put`, `rm`, `mv`, `mkdir` and the daemon's `write`,
+`delete`, `rename`, `mkdir` and `commit` all work over a `0x0FFFFFF9` or
+`0x0FFFFFF7` archive, patching in place or rebuilding, and re-encrypt the entry
+table, the names blob and every payload whose own entry field says it is under
+the transform. The NG transform is a white-box construction and this build holds
+only its decrypt tables, so a `0x0FEFFFFF` archive is refused with
+`CannotWriteEncrypted` at exit 9 before a byte is touched — and `--force` does
+not reach it, because a capability that is absent is not a safety interlock.
+The message names which of the two it is; `docs/ng-scheme.md` is why the second
+one stands.
+
+`pack` is the exception on both counts: it builds from an extracted tree and
+opens no archive, so it holds no key for either tag and refuses any encrypted
+manifest at the same exit 9. The reason it gives is the tag's own, not `pack`'s:
+an AES manifest is told to edit through the archive instead, because that route
+works, and an NG one is told there is no inverse, because every editing command
+refuses it too and a remedy that is walled off is worse than none.
 
 ## Building and testing
 

@@ -170,7 +170,7 @@ mod tests {
 
     use sha1::{Digest, Sha1};
 
-    use super::{Anchor, STRIDE, Sighting, find};
+    use super::{Anchor, STRIDE, Sighting, fill, find};
     use crate::{
         Error, Result, Unwatched,
         keys::ANCHOR_DIGEST_LEN,
@@ -541,5 +541,28 @@ mod tests {
             }
             other => panic!("expected the read failure to be reported, got {other:?}"),
         }
+    }
+
+    /// A source that fills whatever it is handed in one call, and refuses to
+    /// be asked again once there is nothing left to fill.
+    struct FillsOnceAndRefusesAnEmptyAsk;
+
+    impl std::io::Read for FillsOnceAndRefusesAnEmptyAsk {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Err(std::io::Error::other("asked to read into an empty buffer"));
+            }
+            buf.fill(0x5A);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn fill_stops_asking_once_the_buffer_is_full() {
+        let mut buffer = [0_u8; 4];
+        let filled = fill(&mut FillsOnceAndRefusesAnEmptyAsk, &mut buffer, 0)
+            .expect("a source that filled the buffer in one call must not be asked again");
+        assert_eq!(filled, 4);
+        assert_eq!(buffer, [0x5A; 4]);
     }
 }

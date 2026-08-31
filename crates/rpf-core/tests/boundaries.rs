@@ -40,6 +40,7 @@ use std::{
 
 use rpf_core::{
     Archive, EntryKind, FileKind, FileSpec, MAX_DEPTH, Plan, Storage, Unwatched,
+    format::rpf7::RESOURCE_FLAG,
     name::{MAX_COMPONENT_LEN, MAX_PATH_LEN, check_host},
 };
 
@@ -852,4 +853,118 @@ fn a_counted_string_of_exactly_its_room_is_written_and_one_byte_more_is_not() {
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
+}
+
+/// The value a 24-bit compressed-size field holds at its largest, and — on a
+/// resource — the sentinel it writes when the payload is longer.
+///
+/// Spelled out rather than imported, for the reason
+/// `crates/rpf-core/tests/patch.rs` spells `MAX_SIZE_24` out: a test that took
+/// the limit from the code it checks would agree with whatever that code came
+/// to believe. `docs/rpf-format.md`, Compression, `verified` — 166 of the
+/// corpus's 696,578 resources carry exactly this and none carries more.
+const SATURATED: u32 = 0x00FF_FFFF;
+
+/// Flags describing one 512-byte system page and no graphics pages, as
+/// `crates/rpf-core/tests/resource.rs` uses them. `docs/rpf-format.md`,
+/// Resource page flags.
+const RESOURCE_SYSTEM_FLAGS: u32 = 0xA800_0000;
+const RESOURCE_GRAPHICS_FLAGS: u32 = 0x2000_0000;
+
+/// An archive of two resources, the first declaring `compressed_len` and the
+/// second bounding it two blocks later.
+///
+/// Both payloads are the same: a 16-byte opaque header and one deflated
+/// 512-byte page, which is far shorter than either declaration. So the only
+/// thing the two tests below differ in is whether the reader believes the
+/// field, and the room the first payload has is exactly two blocks.
+fn saturating_archive(compressed_len: u32) -> Vec<u8> {
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![0_u8; 512]).expect("deflates");
+    let mut payload = vec![0xFF_u8; 16];
+    payload.extend_from_slice(&encoder.finish().expect("finishes"));
+
+    let mut names = vec![0_u8];
+    let mut rows = vec![directory_row(0, 1, 2)];
+    for (which, block) in [(0_u32, 1_u32), (1, 3)] {
+        let name_offset = names.len() as u16;
+        names.extend_from_slice(format!("r{which}.ydr").as_bytes());
+        names.push(0);
+        let declared = if which == 0 {
+            compressed_len
+        } else {
+            payload.len() as u32
+        };
+        rows.push(common::file_row(
+            name_offset,
+            declared,
+            block | RESOURCE_FLAG,
+            RESOURCE_SYSTEM_FLAGS,
+            RESOURCE_GRAPHICS_FLAGS,
+        ));
+    }
+
+    let mut out = archive_bytes(&rows, &names, 4 * BLOCK_LEN as usize);
+    for block in [1_usize, 3] {
+        let at = block * BLOCK_LEN as usize;
+        out[at..at + payload.len()].copy_from_slice(&payload);
+    }
+    out
+}
+
+/// `archive.rs`: a compressed-size field at exactly its largest value is a
+/// **sentinel**, and the payload's extent is the room to the next payload.
+///
+/// The near side of the limit, and the one a reader gets wrong: 166 resources
+/// in the corpus declare it, the largest of them a 41 MB payload inside
+/// `x64g.rpf/gtxd.rpf`, and a reader that takes the field literally hands the
+/// inflater a truncated stream and gets about 91% of the output. DR-051.
+#[test]
+fn a_resource_size_field_at_exactly_its_largest_value_is_a_sentinel() {
+    let mut src = Cursor::new(saturating_archive(SATURATED));
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
+    let index = archive.find("r0.ydr").expect("resolves");
+
+    assert_eq!(
+        archive.payload_at(index).expect("span").1,
+        2 * BLOCK_LEN,
+        "the room to the next payload, not the 16,777,215 the field reads"
+    );
+    assert_eq!(archive.read(&mut src, index).expect("reads").len(), 512);
+
+    // The slack past the stream is not a shortfall: the field that would have
+    // bounded it declared nothing, so there is nothing to report against.
+    let walked = rpf_core::Verified::of(&mut src, &archive, &mut Unwatched).expect("walks");
+    assert!(
+        walked.problems.is_empty(),
+        "a sound archive reported {:?}",
+        walked.problems
+    );
+}
+
+/// `archive.rs`: one below that value is a length, and is believed.
+///
+/// The far side, and it is reachable only as a refusal here: a payload of
+/// 16,777,214 bytes does not fit this archive, so believing the field is what
+/// puts the entry out of bounds. A reader that treated the sentinel as "at
+/// least this large" would recover a span for this row too and read it back.
+#[test]
+fn a_resource_size_field_one_below_its_largest_value_is_a_length() {
+    let mut src = Cursor::new(saturating_archive(SATURATED - 1));
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
+    let index = archive.find("r0.ydr").expect("resolves");
+
+    let refused = archive.payload_at(index);
+    assert!(
+        matches!(
+            refused,
+            Err(rpf_core::Error::OutOfBounds {
+                region: "payload",
+                len,
+                ..
+            }) if len == u64::from(SATURATED - 1)
+        ),
+        "the field is a length one below the sentinel; got {refused:?}"
+    );
 }

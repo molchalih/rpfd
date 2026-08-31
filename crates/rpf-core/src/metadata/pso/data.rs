@@ -114,3 +114,50 @@ pub(super) fn until_nul(bytes: &[u8]) -> &[u8] {
 pub(super) fn step(base: u32, index: u32, stride: u32) -> Option<u32> {
     base.checked_add(index.checked_mul(stride)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block table naming one block, id 1, covering the whole section.
+    ///
+    /// `terminated` never reads it, but `Data` carries a reference to one, so
+    /// a test that only exercises `terminated` still needs a table that
+    /// resolves.
+    fn one_block(section_len: u32) -> Blocks {
+        let mut table = Vec::from(*b"PMAP");
+        table.extend_from_slice(&0u32.to_be_bytes()); // section length, unread here
+        table.extend_from_slice(&1i32.to_be_bytes()); // rootId
+        table.extend_from_slice(&1i16.to_be_bytes()); // entriesCount
+        table.extend_from_slice(&[0u8; 2]); // pad to the entries' offset
+        table.extend_from_slice(&0u32.to_be_bytes()); // nameHash
+        table.extend_from_slice(&0i32.to_be_bytes()); // offset
+        table.extend_from_slice(&0i32.to_be_bytes()); // unknown_8h
+        let length = i32::try_from(section_len).expect("a test length fits");
+        table.extend_from_slice(&length.to_be_bytes());
+        Blocks::read(&table, section_len).expect("a well-formed one-block table")
+    }
+
+    #[test]
+    fn terminated_stops_at_the_nul_and_leaves_it_out() {
+        let section = *b"hello\0world";
+        let blocks = one_block(u32::try_from(section.len()).expect("a test length fits"));
+        let data = Data {
+            section: &section,
+            blocks: &blocks,
+        };
+        assert_eq!(data.terminated(0).expect("in range"), b"hello");
+    }
+
+    #[test]
+    fn terminated_refuses_an_address_past_the_section() {
+        let section = *b"hello\0";
+        let len = u32::try_from(section.len()).expect("a test length fits");
+        let blocks = one_block(len);
+        let data = Data {
+            section: &section,
+            blocks: &blocks,
+        };
+        assert!(data.terminated(len + 1).is_err());
+    }
+}

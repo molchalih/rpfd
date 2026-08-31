@@ -1394,11 +1394,7 @@ fn read(state: &mut State, params: &Value) -> Answered {
 
     if view != View::Raw && session.pending.contents_at(&inside).is_some() {
         let payload = buffered_payload(session, &inside)?;
-        let encoding = Encoding::of(
-            payload
-                .get(..Encoding::HEAD_LEN)
-                .unwrap_or(payload.as_slice()),
-        );
+        let encoding = buffered_encoding(session, &inside, &payload)?;
         let viewed = rpf_core::view::of(payload, encoding, &inside, wanted(view))?;
         return Ok(json!({
             "path": inside,
@@ -1475,6 +1471,36 @@ fn buffered_payload(session: &Session, inside: &str) -> Answer<Vec<u8>> {
     Ok(payload)
 }
 
+/// What a payload the session has buffered over `inside` announces itself to
+/// be, or `None` where the entry it is buffered over can hold no encoding.
+///
+/// **The entry decides whether there is one; the bytes decide only which.** A
+/// resource has no encoding whatever is buffered over it, exactly as it has
+/// none on disk: `rpf_core::view::read` short-circuits on the entry's kind
+/// before any payload is looked at, and a buffered read that sniffed instead
+/// would answer `"encoding": "xml"` where the on-disk read answers `null` for
+/// the same entry. `docs/backlog.md` Q7, DR-044.
+///
+/// A path the archive does not hold yet is a creation, and only its bytes can
+/// answer for it.
+fn buffered_encoding(
+    session: &mut Session,
+    inside: &str,
+    payload: &[u8],
+) -> Answer<Option<Encoding>> {
+    let sniffed = || Encoding::of(payload.get(..Encoding::HEAD_LEN).unwrap_or(payload));
+    match session.archive.locate(&mut session.file, inside) {
+        Ok((holder, index)) => match holder.classify(&mut session.file, index)? {
+            rpf_core::Classification::Resource | rpf_core::Classification::Directory => Ok(None),
+            rpf_core::Classification::Encoded(_) | rpf_core::Classification::Binary => {
+                Ok(sniffed())
+            }
+        },
+        Err(rpf_core::Error::NotFound { .. }) => Ok(sniffed()),
+        Err(failed) => Err(failed.into()),
+    }
+}
+
 /// `write` — buffer an edit. Nothing on disk changes until `commit`.
 ///
 /// `create: true` lets it be a path the archive does not hold yet, which is an
@@ -1515,7 +1541,8 @@ fn write(state: &mut State, params: &Value) -> Answered {
                 offered
             } else if session.pending.contents_at(&inside).is_some() {
                 let held = buffered_payload(session, &inside)?;
-                rpf_core::view::applied(&held, &inside, wanted(view), offered)?
+                let encoding = buffered_encoding(session, &inside, &held)?;
+                rpf_core::view::applied(&held, encoding, &inside, wanted(view), offered)?
             } else {
                 rpf_core::view::apply(
                     &mut session.file,
@@ -1558,7 +1585,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
             // And nothing to convert against either: an entry that is not there
             // holds no encoding for a document to adopt. `"auto"` takes the
             // bytes as they are and `"xml"` says why it cannot.
-            let bytes = rpf_core::view::applied(&[], &inside, wanted(view), offered)?;
+            let bytes = rpf_core::view::applied(&[], None, &inside, wanted(view), offered)?;
             let change = Change::Write {
                 contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
                 create,

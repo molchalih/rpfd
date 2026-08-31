@@ -38,7 +38,7 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, Bytes, Category, Change, Changes, Error, Unlock, Unwatched, Verified,
+    Archive, Bytes, Category, Change, Changes, Error, NoWrite, Unlock, Unwatched, Verified,
     format::{Version, crypto, rpf7},
     keys::Material,
 };
@@ -57,6 +57,35 @@ const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 /// install, 4,096 bytes, whose payloads begin their deflate stream anywhere but
 /// 16 bytes in. `docs/backlog.md` Q14, population 1.
 const AES_24_ARCHIVE: &str = "gtav_aes/des_hosp_ceil2.rpf";
+
+/// The archive whose **resources are under its own transform**, which every
+/// other archive here would have you believe cannot happen. `docs/corpus.md`.
+///
+/// 155,648 bytes and two entries, both of them resources that begin no deflate
+/// stream in the clear at any measured boundary and both of which inflate to
+/// exactly what their flag words declare once decrypted. `docs/backlog.md`
+/// Q14, population 2; DR-051.
+const AES_KEYED_ARCHIVE: &str = "gtav_aes/script_release.rpf";
+
+/// The two resources [`AES_KEYED_ARCHIVE`] holds, and what each inflates to.
+///
+/// Measured 2026-08-31, and written down rather than derived so that a read
+/// which stopped decrypting them would fail here instead of agreeing with
+/// itself. DR-051.
+const KEYED_RESOURCES: [(&str, usize); 2] = [
+    ("pilot_school.ysc", 458_752),
+    ("pilotschool_dlc_startup.ysc", 8_192),
+];
+
+/// Which of the 101 NG expanded keys `abigail1.ysc` is decrypted with, and
+/// which one the binary-entry rule would have chosen for it.
+///
+/// `docs/rpf-format.md`, Encryption, `verified`: the index is
+/// `(hash(name) + length + 61) % 101`, so the two lengths choose different keys
+/// and only the first decrypts anything. Written down rather than derived, so
+/// that a change to the hash is a failure here rather than a silent agreement.
+const ON_DISK_KEY: usize = 85;
+const CONTENTS_KEY: usize = 13;
 
 /// The two builds of the Rockstar Games Launcher's own archive, which are the
 /// only archives here under the launcher key. `docs/corpus.md`.
@@ -423,6 +452,85 @@ fn a_resource_whose_header_is_twenty_four_bytes_reads_back() {
         .expect("verifies")
         .outcome()
         .expect("every entry of the 24-byte-header archive reads back");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_resource_under_the_archives_own_transform_reads_back() {
+    // `docs/backlog.md` Q14, population 2, and the reason
+    // `Archive::resource_stream` recovers a transform as well as a boundary.
+    // Both resources here are under the archive's AES transform: neither
+    // begins a deflate stream in the clear at either measured boundary, and
+    // both inflate to exactly what their flag words declare once decrypted.
+    // Under the build before DR-051 this archive failed 2 of 2.
+    let test = "a_resource_under_the_archives_own_transform_reads_back";
+    let Some(held) = Encrypted::under_aes(test, AES_KEYED_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the archive opens");
+
+    // Measured 2026-08-31: a root and two resources, and no binary entry.
+    assert_eq!(archive.entries().len(), 3);
+    for (name, len) in KEYED_RESOURCES {
+        let index = archive.find(name).expect("resolves");
+        let read = archive
+            .read(&mut source, index)
+            .unwrap_or_else(|error| panic!("{name} did not read back: {error}"));
+        assert_eq!(read.len(), len, "{name} inflated to the wrong length");
+
+        // The half that says it is the transform and not a boundary: the same
+        // bytes with no key applied, at either measured boundary, inflate to
+        // nothing like what the flag words declare.
+        let payload = archive.extract(&mut source, index).expect("extracts");
+        for header in [16_usize, 24] {
+            let stream = payload.get(header..).expect("inside the payload");
+            assert_ne!(
+                inflated(stream).len(),
+                len,
+                "{name} inflated in the clear from {header}, so a transform is \
+                 not what settles it"
+            );
+        }
+    }
+
+    Verified::of(&mut source, &archive, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the keyed-resource archive reads back");
+}
+
+#[test]
+#[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
+fn a_resources_ng_key_is_chosen_by_its_length_on_disk() {
+    // The one part of DR-051 no archive in `assets/` can pin: the NG script
+    // archives are tens of megabytes each and stay out of the corpus, so what
+    // is pinned here is the field the key is chosen by rather than a payload
+    // that comes back. `docs/rpf-format.md`, Encryption, `verified` —
+    // `script_rel.rpf/abigail1.ysc` is 90,775 bytes on disk and inflates to the
+    // 229,376 its flag words declare, and only the on-disk length chooses the
+    // key that decrypts it. A **binary** entry keys by the other one, which is
+    // why this can regress into that rule without anything else noticing.
+    let test = "a_resources_ng_key_is_chosen_by_its_length_on_disk";
+    let Some(material) = material(test) else {
+        return;
+    };
+    let keyed = |len: u64| {
+        crypto::Cipher::new(crypto::Scheme::Ng, &material, "abigail1.ysc", len)
+            .expect("the material carries the NG half")
+            .key_index()
+    };
+    assert_ne!(
+        keyed(90_775),
+        keyed(229_376),
+        "the two lengths choose one key, so this test could not tell them apart"
+    );
+    assert_eq!(keyed(90_775), Some(ON_DISK_KEY), "the on-disk length's key");
+    assert_eq!(keyed(229_376), Some(CONTENTS_KEY), "the contents' key");
 }
 
 #[test]
@@ -981,14 +1089,18 @@ fn an_encrypted_archive_extracts_the_bytes_a_second_read_agrees_with() {
 
 // ------------------------------------------------------- the write refusal ---
 
-/// Every change a write path can be asked for, by the name a report uses.
+/// The entry of the NG corpus archive every refusal below is asked about.
+const NG_ENTRY: &str = "content.xml";
+
+/// Every change a write path can be asked for, by the name a report uses, over
+/// an entry the archive holds.
 ///
 /// One table so that a path added later has to be added here rather than
 /// quietly go unchecked.
-fn every_change() -> Vec<(&'static str, Changes)> {
+fn every_change(held: &str) -> Vec<(&'static str, Changes)> {
     let mut replace = Changes::new();
     replace.set(
-        "_manifest.ymf",
+        held,
         Change::Write {
             contents: Arc::new(Bytes::new(b"plain text".to_vec())),
             create: false,
@@ -1005,9 +1117,9 @@ fn every_change() -> Vec<(&'static str, Changes)> {
         },
     );
     let mut remove = Changes::new();
-    remove.set("_manifest.ymf", Change::Remove { recursive: false });
+    remove.set(held, Change::Remove { recursive: false });
     let mut rename = Changes::new();
-    rename.set("_manifest.ymf", Change::RenameTo("renamed.ymf".to_owned()));
+    rename.set(held, Change::RenameTo("renamed.bin".to_owned()));
     let mut directory = Changes::new();
     directory.set("added", Change::MakeDirectory);
     vec![
@@ -1019,44 +1131,67 @@ fn every_change() -> Vec<(&'static str, Changes)> {
     ]
 }
 
+/// The same, over the NG archive's own entry.
+fn ng_changes() -> Vec<(&'static str, Changes)> {
+    every_change(NG_ENTRY)
+}
+
 /// What every write path answers about an archive that cannot be written back.
-fn refuses_the_write(what: &str, error: &Error, tag: u32) {
+fn refuses_the_write(what: &str, error: &Error, tag: u32, reason: NoWrite) {
     assert!(
-        matches!(*error, Error::CannotWriteEncrypted { tag: found } if found == tag),
+        matches!(
+            *error,
+            Error::CannotWriteEncrypted { tag: found, reason: why }
+                if found == tag && why == reason
+        ),
         "{what} answered {error:?}"
     );
     assert_eq!(error.category(), Category::Unsupported, "{what}");
     assert_eq!(error.name(), "CannotWriteEncrypted", "{what}");
+    // The message names the reason rather than only the tag, which is the whole
+    // point of splitting the two: an automation told "cannot write an encrypted
+    // archive" over an AES archive would stop trying something that works.
+    assert!(
+        error.to_string().contains(&reason.to_string()),
+        "{what}: {error} does not name its reason"
+    );
 }
 
 #[test]
 #[cfg_attr(
-    any(no_corpus, no_executables),
-    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+    any(no_corpus, no_game_image),
+    ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
-fn no_write_path_touches_an_encrypted_archive() {
-    // The failure this exists for: `plan` decided a patch fitted, `apply`
-    // wrote plaintext into a region the format requires to be ciphertext, and
-    // the command exited 0 over an archive that no longer opened. R4.7 is the
-    // inverse transform and it is unwritten, so every write path refuses ahead
-    // of the first byte. DR-041.
-    let test = "no_write_path_touches_an_encrypted_archive";
-    let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
+fn no_write_path_touches_an_ng_archive() {
+    // **The NG half of R4.7, enforced.** The AES half landed; this one is
+    // blocked on the inverse of a white-box construction (`docs/ng-scheme.md`),
+    // so every write path refuses ahead of the first byte and names *why* —
+    // `NoWrite::NoInverse`, which no material a caller extracts can change.
+    //
+    // The failure this exists for: `plan` decided a patch fitted, `apply` wrote
+    // plaintext into a region the format requires to be ciphertext, and the
+    // command exited 0 over an archive that no longer opened. DR-041, DR-054.
+    let test = "no_write_path_touches_an_ng_archive";
+    let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
     };
     let unlock = held.unlock();
     let original = held.bytes.clone();
     let mut source = Cursor::new(held.bytes.clone());
-    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+    let archive = Archive::open(&mut source, &unlock).expect("the NG archive opens");
     let tag = archive.encryption();
-    assert_eq!(tag, rpf7::ENCRYPTION_AES);
+    assert_eq!(tag, rpf7::ENCRYPTION_NG);
+    assert!(
+        archive.seal().is_err(),
+        "an NG archive handed out a forward transform"
+    );
 
-    for (what, changes) in every_change() {
+    for (what, changes) in ng_changes() {
         // Patching in place, which is the one that wrote into the live file.
         let error = rpf_core::plan(&mut source, &archive, &changes)
             .err()
             .unwrap_or_else(|| panic!("{what}: plan did not refuse"));
-        refuses_the_write(&format!("plan {what}"), &error, tag);
+        refuses_the_write(&format!("plan {what}"), &error, tag, NoWrite::NoInverse);
 
         // Rebuilding, which would have written the archive out as `OPEN` with
         // every payload in the clear.
@@ -1071,7 +1206,7 @@ fn no_write_path_touches_an_encrypted_archive() {
         )
         .err()
         .unwrap_or_else(|| panic!("{what}: rewrite did not refuse"));
-        refuses_the_write(&format!("rewrite {what}"), &error, tag);
+        refuses_the_write(&format!("rewrite {what}"), &error, tag, NoWrite::NoInverse);
         assert!(
             out.into_inner().is_empty(),
             "{what}: a refused rebuild wrote bytes"
@@ -1080,12 +1215,12 @@ fn no_write_path_touches_an_encrypted_archive() {
 
     // The resolution the daemon accepts a buffered change by, so an editor is
     // told at the edit rather than at the save.
-    for (what, changes) in every_change() {
+    for (what, changes) in ng_changes() {
         for (path, change) in &changes {
             let error = rpf_core::allows(&mut source, &archive, &Changes::new(), path, change)
                 .err()
                 .unwrap_or_else(|| panic!("{what}: allows did not refuse"));
-            refuses_the_write(&format!("allows {what}"), &error, tag);
+            refuses_the_write(&format!("allows {what}"), &error, tag, NoWrite::NoInverse);
         }
     }
 
@@ -1106,8 +1241,10 @@ fn no_write_path_touches_an_encrypted_archive() {
 )]
 fn a_tree_extracted_from_an_encrypted_archive_will_not_pack_back() {
     // `pack` never opens the archive it replaces — it builds from a tree — so
-    // the refusal is the manifest's, which records the tag the tree came out
-    // of. Exit 9 and not 5: no key material writes this back.
+    // it holds no key for either tag and no name to derive one from, whichever
+    // transform the tag names. Exit 9, and the reason is
+    // `NotThroughTheArchive` rather than `NoInverse`: this is AES, which *is*
+    // written back, through the archive it came out of. DR-054.
     let test = "a_tree_extracted_from_an_encrypted_archive_will_not_pack_back";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
@@ -1117,7 +1254,420 @@ fn a_tree_extracted_from_an_encrypted_archive_will_not_pack_back() {
     let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
     let error = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
         .expect_err("an encrypted manifest does not pack back");
-    refuses_the_write("manifest", &error, archive.encryption());
+    refuses_the_write(
+        "manifest",
+        &error,
+        archive.encryption(),
+        NoWrite::NotThroughTheArchive,
+    );
+}
+
+// ------------------------------------------------- the AES write path, R4.7 ---
+
+/// The AES archive, its unlock, and a cursor over a copy of its bytes.
+///
+/// The copy is the point: every test below writes into it, and the corpus file
+/// itself is never opened for writing.
+fn aes_copy(test: &str) -> Option<(Encrypted, Unlock, Cursor<Vec<u8>>)> {
+    let held = Encrypted::under_aes(test, AES_ARCHIVE)?;
+    let unlock = held.unlock();
+    let source = Cursor::new(held.bytes.clone());
+    Some((held, unlock, source))
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_resource_put_back_leaves_an_aes_archive_byte_identical() {
+    // **The strongest evidence available here, and it is independent of our own
+    // decryptor.** A resource is written through untouched and is not under the
+    // archive's transform, so putting one back unchanged writes the same
+    // payload bytes and rebuilds the same entry row — and that row then has to
+    // be *sealed* back to the sixteen bytes Rockstar's packer wrote. If our
+    // forward transform were anything but the exact inverse of the decrypt that
+    // read the row, or the row encoder lost a field, those sixteen bytes would
+    // differ and the whole archive would not compare equal.
+    //
+    // What it does not say: nothing here re-deflates, so it is silent about the
+    // payload seal. The two tests after it are what cover that.
+    let test = "a_resource_put_back_leaves_an_aes_archive_byte_identical";
+    let Some((held, unlock, mut source)) = aes_copy(test) else {
+        return;
+    };
+    let original = held.bytes.clone();
+    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+
+    // Every resource of it, which is nine of the ten file entries.
+    let mut changes = Changes::new();
+    let mut resources = 0_u32;
+    for index in 0..u32::try_from(archive.entries().len()).expect("small") {
+        let entry = archive.entry(index).expect("in range");
+        if !matches!(entry.kind, rpf_core::EntryKind::Resource { .. }) {
+            continue;
+        }
+        let path = archive.path(index).expect("resolves");
+        let bytes = archive.extract(&mut source, index).expect("extracts");
+        changes.set(
+            path,
+            Change::Write {
+                contents: Arc::new(Bytes::new(bytes)),
+                create: false,
+                allow_encoding_change: false,
+            },
+        );
+        resources = resources.saturating_add(1);
+    }
+    assert_eq!(resources, 9, "the corpus archive's shape changed");
+
+    let plan = rpf_core::plan(&mut source, &archive, &changes).expect("an AES patch is planned");
+    let rpf_core::Plan::Fits(patches) = plan else {
+        panic!("putting a resource back does not fit: {plan:?}");
+    };
+    patches.apply(&mut source).expect("the patch applies");
+
+    assert_eq!(
+        source.get_ref(),
+        &original,
+        "putting every resource back changed the archive's bytes"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
+    // The payload seal, in the path that writes into the live archive.
+    // `_manifest.ymf` is the one binary entry, it is deflated, and its own
+    // encryption field says it is under the transform — so this covers the row,
+    // the deflate and the payload seal at once, and the archive has to open
+    // again afterwards with no key but the one it already had.
+    let test = "an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes";
+    let Some((_, unlock, mut source)) = aes_copy(test) else {
+        return;
+    };
+    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+    let index = archive.find("_manifest.ymf").expect("resolves");
+    let was = archive.read(&mut source, index).expect("reads");
+    assert_eq!(was.len(), 852);
+
+    // Deliberately not compressible and not a multiple of the cipher block, so
+    // the tail rule is exercised rather than avoided.
+    let wanted: Vec<u8> = (0..401_u32)
+        .map(|n| u8::try_from(n % 251).unwrap())
+        .collect();
+    let mut changes = Changes::new();
+    changes.set(
+        "_manifest.ymf",
+        Change::Write {
+            contents: Arc::new(Bytes::new(wanted.clone())),
+            create: false,
+            allow_encoding_change: false,
+        },
+    );
+
+    let plan = rpf_core::plan(&mut source, &archive, &changes).expect("an AES patch is planned");
+    let rpf_core::Plan::Fits(patches) = plan else {
+        panic!("the edit does not fit: {plan:?}");
+    };
+    patches.apply(&mut source).expect("the patch applies");
+
+    // Re-opened from the bytes on disk, under the same unlock: a table of
+    // contents whose row was not resealed does not parse, and a payload that
+    // was not sealed does not inflate.
+    let reopened = Archive::open(&mut source, &unlock).expect("the patched archive opens again");
+    assert_eq!(reopened.encryption(), rpf7::ENCRYPTION_AES);
+    let index = reopened.find("_manifest.ymf").expect("resolves");
+    assert_eq!(
+        reopened.read(&mut source, index).expect("reads"),
+        wanted,
+        "the patched entry did not read back"
+    );
+    Verified::of(&mut source, &reopened, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the patched archive still reads back");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn an_aes_archive_rebuilt_opens_again_with_every_entry_intact() {
+    // The other write path. A rebuild lays the whole archive out afresh — a new
+    // entry table, a new names blob, payloads at new offsets — so it is the one
+    // that has to seal three kinds of region rather than two rows. The added
+    // entry makes it structural, which is what forces the rebuild rather than a
+    // patch.
+    //
+    // The claim is per **entry contents**, never per archive: our deflate is
+    // not the producer's and slack is not reconstructed, so the archive's bytes
+    // differ by construction. `docs/backlog.md`, "an archive-level digest is
+    // not a round-trip test".
+    let test = "an_aes_archive_rebuilt_opens_again_with_every_entry_intact";
+    let Some((_, unlock, mut source)) = aes_copy(test) else {
+        return;
+    };
+    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+
+    let mut before = Vec::new();
+    let mut fields = Vec::new();
+    for index in 0..u32::try_from(archive.entries().len()).expect("small") {
+        let entry = archive.entry(index).expect("in range");
+        if entry.is_directory() {
+            continue;
+        }
+        let path = archive.path(index).expect("resolves");
+        if let rpf_core::EntryKind::Binary { encryption, .. } = entry.kind {
+            fields.push((path.clone(), encryption));
+        }
+        let bytes = archive.extract(&mut source, index).expect("extracts");
+        before.push((path, bytes));
+    }
+    // The other half of "the writer honours the field verbatim and invents no
+    // third value" (`docs/rpf-format.md`, Entry table). Flipping the *bytes*
+    // fails the reads below, but a writer that zeroed the *field* and wrote its
+    // payload in the clear would round-trip through our own reader with nothing
+    // else here noticing — and the game would then read a plaintext payload as
+    // ciphertext. So the field itself is compared, and the non-zero assertion
+    // is what stops the comparison from being vacuous.
+    assert!(
+        fields.iter().any(|&(_, encryption)| encryption != 0),
+        "no binary entry of the AES archive is under the transform, so this \
+         claim would hold for a writer that zeroed every field"
+    );
+
+    let added = b"added by a rebuild of an encrypted archive".to_vec();
+    let mut changes = Changes::new();
+    changes.set(
+        "added.txt",
+        Change::Write {
+            contents: Arc::new(Bytes::new(added.clone())),
+            create: true,
+            allow_encoding_change: false,
+        },
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::rewrite(
+        &mut source,
+        &archive,
+        &changes,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    )
+    .expect("an AES archive rebuilds");
+
+    // The rebuilt archive is still encrypted, still under the same tag, and
+    // still needs a key: a rebuild that wrote it out in the clear would open
+    // under `Unlock::unkeyed` and every assertion below would pass anyway.
+    let rebuilt = out.into_inner();
+    let error = Archive::open(&mut Cursor::new(rebuilt.clone()), &Unlock::unkeyed())
+        .expect_err("the rebuilt archive is not in the clear");
+    assert!(
+        matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_AES),
+        "{error:?}"
+    );
+
+    let mut source = Cursor::new(rebuilt);
+    let opened = Archive::open(&mut source, &unlock).expect("the rebuilt archive opens");
+    assert_eq!(opened.encryption(), rpf7::ENCRYPTION_AES);
+    for (path, expected) in &before {
+        let index = opened
+            .find(path)
+            .unwrap_or_else(|error| panic!("{path} is gone: {error}"));
+        assert_eq!(
+            &opened.extract(&mut source, index).expect("extracts"),
+            expected,
+            "{path} did not survive the rebuild"
+        );
+    }
+    for (path, encryption) in &fields {
+        let index = opened.find(path).expect("resolves");
+        assert!(
+            matches!(
+                opened.entry(index).expect("in range").kind,
+                rpf_core::EntryKind::Binary { encryption: wrote, .. } if wrote == *encryption
+            ),
+            "{path}'s per-entry encryption field was not carried through"
+        );
+    }
+    let index = opened.find("added.txt").expect("the added entry resolves");
+    assert_eq!(opened.read(&mut source, index).expect("reads"), added);
+
+    Verified::of(&mut source, &opened, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the rebuilt archive reads back");
+}
+
+/// [`AES_KEYED_ARCHIVE`], its unlock, and a cursor over a copy of its bytes.
+///
+/// [`aes_copy`]'s counterpart for the one archive here whose resources are
+/// **keyed**, and the reason there are two: every other write test in this file
+/// goes through `des_canister.rpf`, all nine of whose resources are in the
+/// clear.
+fn keyed_copy(test: &str) -> Option<(Encrypted, Unlock, Cursor<Vec<u8>>)> {
+    let held = Encrypted::under_aes(test, AES_KEYED_ARCHIVE)?;
+    let unlock = held.unlock();
+    let source = Cursor::new(held.bytes.clone());
+    Some((held, unlock, source))
+}
+
+/// Each of [`KEYED_RESOURCES`] as it sits on disk, and the change set that
+/// writes every one of them back unaltered.
+///
+/// Asserts on the way through what the write half is about to depend on: that
+/// the entry really is a resource, and that its payload read back before
+/// anything was written to the archive.
+fn keyed_resources_put_back(
+    archive: &Archive,
+    source: &mut Cursor<Vec<u8>>,
+) -> (Vec<(&'static str, Vec<u8>)>, Changes) {
+    let mut on_disk = Vec::new();
+    let mut changes = Changes::new();
+    for (name, len) in KEYED_RESOURCES {
+        let index = archive.find(name).expect("resolves");
+        assert!(
+            matches!(
+                archive.entry(index).expect("in range").kind,
+                rpf_core::EntryKind::Resource { .. }
+            ),
+            "{name} is not a resource, so this test is about something else"
+        );
+        assert_eq!(
+            archive.read(source, index).expect("reads").len(),
+            len,
+            "{name} did not read back before anything was written"
+        );
+        let payload = archive.extract(source, index).expect("extracts");
+        changes.set(
+            archive.path(index).expect("resolves"),
+            Change::Write {
+                contents: Arc::new(Bytes::new(payload.clone())),
+                create: false,
+                allow_encoding_change: false,
+            },
+        );
+        on_disk.push((name, payload));
+    }
+    (on_disk, changes)
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk() {
+    // **Q14's read side and R4.7's write side, meeting.** Nothing else does:
+    // `AES_KEYED_ARCHIVE` appeared once in this file and only on the read path,
+    // and every AES write test goes through `des_canister.rpf`, whose nine
+    // resources are all in the clear. A writer that decrypted a resource and
+    // wrote the plaintext back, or one that sealed a payload that was already
+    // sealed, would leave every one of those green — and would be silent
+    // corruption of 3,022 corpus resources, because "read back what we wrote"
+    // reads back exactly what it wrote.
+    //
+    // `build::is_sealed` answers `false` for a resource because the writer is
+    // handed the payload **as it sits on disk**, not because the payload is in
+    // the clear. This is the row that tells those two reasons apart: here the
+    // bytes on disk *are* under the archive's transform (DR-051), so both
+    // mistakes are visible — the patch stops being byte-identical, and the
+    // rebuilt resources stop inflating to what their flag words declare.
+    let test = "a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk";
+    let Some((held, unlock, mut source)) = keyed_copy(test) else {
+        return;
+    };
+    let original = held.bytes.clone();
+    let archive = Archive::open(&mut source, &unlock).expect("the keyed archive opens");
+    assert_eq!(
+        archive.entries().len(),
+        3,
+        "the corpus archive's shape changed"
+    );
+
+    // Put both resources back exactly as they came out. The payload bytes are
+    // the same bytes, so the archive has to be the same archive.
+    let (on_disk, changes) = keyed_resources_put_back(&archive, &mut source);
+
+    let plan = rpf_core::plan(&mut source, &archive, &changes).expect("a keyed patch is planned");
+    let rpf_core::Plan::Fits(patches) = plan else {
+        panic!("putting a keyed resource back does not fit: {plan:?}");
+    };
+    patches.apply(&mut source).expect("the patch applies");
+    assert_eq!(
+        source.get_ref(),
+        &original,
+        "putting a keyed resource back changed the archive's bytes"
+    );
+
+    // And the other write path, which lays the archive out afresh. The added
+    // entry is what makes it structural.
+    let added = b"added by a rebuild of a keyed-resource archive".to_vec();
+    let mut changes = Changes::new();
+    changes.set(
+        "added.txt",
+        Change::Write {
+            contents: Arc::new(Bytes::new(added.clone())),
+            create: true,
+            allow_encoding_change: false,
+        },
+    );
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::rewrite(
+        &mut source,
+        &archive,
+        &changes,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    )
+    .expect("a keyed-resource archive rebuilds");
+
+    let rebuilt = out.into_inner();
+    let error = Archive::open(&mut Cursor::new(rebuilt.clone()), &Unlock::unkeyed())
+        .expect_err("the rebuilt archive is not in the clear");
+    assert!(
+        matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_AES),
+        "{error:?}"
+    );
+
+    let mut source = Cursor::new(rebuilt);
+    let opened = Archive::open(&mut source, &unlock).expect("the rebuilt archive opens");
+    for (name, payload) in &on_disk {
+        let index = opened
+            .find(name)
+            .unwrap_or_else(|error| panic!("{name} is gone: {error}"));
+        assert_eq!(
+            &opened.extract(&mut source, index).expect("extracts"),
+            payload,
+            "{name} was not written back as it sat on disk"
+        );
+    }
+    // The half the byte comparison alone would not give: the payload still
+    // decrypts and inflates, so what was preserved is a readable resource and
+    // not merely a matching blob.
+    for (name, len) in KEYED_RESOURCES {
+        let index = opened.find(name).expect("resolves");
+        assert_eq!(
+            opened.read(&mut source, index).expect("reads").len(),
+            len,
+            "{name} no longer inflates to what its flag words declare"
+        );
+    }
+    let index = opened.find("added.txt").expect("the added entry resolves");
+    assert_eq!(opened.read(&mut source, index).expect("reads"), added);
+
+    Verified::of(&mut source, &opened, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the rebuilt keyed-resource archive reads back");
 }
 
 // -------------------------------------------------- the nested archive gap ---
@@ -1564,17 +2114,27 @@ fn the_hash_chooses_the_key_a_brute_force_over_all_of_them_finds() {
     any(no_corpus, no_executables),
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
-fn a_resource_payload_is_never_under_the_archives_transform() {
-    // `docs/rpf-format.md`, Encryption, `verified`, and the rule was encoded in
-    // `archive.rs` twice with no test at all — so a change that started
-    // decrypting resources would have shown up as an archive that stopped
-    // loading rather than as a red test.
+fn a_resource_in_the_clear_is_not_read_through_the_archives_key() {
+    // The control for `a_resource_under_the_archives_own_transform_reads_back`.
+    // `des_canister.rpf` carries the same tag and the same key as
+    // `script_release.rpf` and every one of its resources is in the clear, so
+    // "it still reads back" would be no evidence at all — it read back before
+    // any of this existed. What is asserted instead is that the bytes the
+    // reader hands over are the bytes inflating the payload **with no key
+    // applied** gives, computed here rather than by asking the reader again,
+    // and that applying the key to those same bytes gives something else.
     //
-    // The experiment is the raw one: inflate the payload straight out of the
-    // file, sixteen bytes in, with no key applied at all, and compare it with
-    // what the archive answers. Then apply the transform and show that it does
-    // *not* inflate — so the first result is a fact and not a coincidence.
-    let test = "a_resource_payload_is_never_under_the_archives_transform";
+    // What that does and does not catch, measured 2026-08-31: a reader that
+    // decrypted resources unconditionally fails this, and a reader that merely
+    // tried the key *first* does **not**, because no payload is accepted at two
+    // candidates. The try-order is argued in DR-051 and is not pinned by
+    // anything, which is stated there rather than implied away here.
+    //
+    // It was named `a_resource_payload_is_never_under_the_archives_transform`
+    // until 2026-08-31, which is a claim about every resource that the corpus
+    // refutes 3,022 times (DR-051). The archive it actually reads is one, and
+    // what it establishes about that one is unchanged.
+    let test = "a_resource_in_the_clear_is_not_read_through_the_archives_key";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
     };

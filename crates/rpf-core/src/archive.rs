@@ -17,12 +17,13 @@ use std::{
 
 use crate::{
     entry::{Entry, EntryKind},
-    error::{Category, Error, Result},
+    error::{Category, Error, NoWrite, Result},
     format::{
         Header, MAX_HEADER_LEN, Names, Version,
-        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme},
+        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme, Seal},
         folded,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, RESOURCE_HEADER_LENS, resource_len},
+        rpf7::MAX_SIZE_24,
         same_name,
     },
     keys::{Material, Unlock},
@@ -85,6 +86,9 @@ struct Boundary {
     /// Length of the stream: the payload's extent less the header in front of
     /// it.
     len: u64,
+    /// The transform the stream is under, which the probe recovered along with
+    /// the boundary. DR-051.
+    cipher: Option<Cipher>,
     /// What the entry's flag words declare the contents to be, and what the
     /// probe confirmed the stream inflates to.
     expected: u64,
@@ -405,18 +409,32 @@ impl<S: Read + Seek> Seek for Plain<S> {
     }
 }
 
-/// What decrypts a **resource** payload: nothing, in either framing.
+/// No transform: the **file** form of a resource, and the first candidate the
+/// **contents** form tries.
 ///
-/// A resource is never under the archive's transform, whatever the archive's
-/// tag says. Its deflate stream sits in the clear sixteen bytes into the
-/// payload and inflates to exactly the length its two flag words give, and it
-/// has no per-entry encryption field to consult in the first place — offsets 8
-/// and 12 are those flag words (§5). `docs/rpf-format.md`, Encryption,
-/// `verified`: checked on every resource of the AES archive and of an NG one.
+/// Passthrough hands the payload back exactly as it sits on disk, so that an
+/// entry this build cannot interpret still round-trips byte for byte
+/// (`docs/approach.md`, DR-023). That holds whether or not those bytes are
+/// under the archive's transform, so the file form is this and nothing else.
 ///
-/// Named once rather than written as a bare `None` in each of the two framings,
-/// because two spellings of one format fact drift silently and this one decides
-/// whether bytes are transformed (§3).
+/// **It is not a claim about the contents**, and it used to be one. A resource
+/// was taken never to be under the archive's transform; measured over the whole
+/// corpus, 3,022 of 696,578 are — `docs/rpf-format.md`, Encryption, and DR-051.
+/// So for the contents form this is where
+/// [`Archive::resource_stream`] starts rather than where it ends: every
+/// boundary is tried under this before any of them is tried under a key.
+///
+/// Named once rather than written as a bare `None`, because this is the value
+/// that decides whether bytes are transformed and two spellings of it drift
+/// silently (§3).
+///
+/// **`build::is_sealed` is the write side of the same rule**, and not of the
+/// same fact. Both say only that a resource's payload crosses in the form it
+/// sits on disk: this one reads it under no transform, that one writes it back
+/// under none, and neither asks whether those bytes are transformed. So a
+/// change to what [`Archive::resource_stream`] finds is not a reason to change
+/// either — making the writer follow it would double-encrypt the 3,022. DR-054
+/// §3, as amended.
 const RESOURCE_IS_IN_THE_CLEAR: Option<Cipher> = None;
 
 /// Which of the two forms an entry is read in.
@@ -944,25 +962,68 @@ impl Archive {
 
     /// Whether this archive can be written back at all.
     ///
-    /// Reading an encrypted archive and writing one are separate capabilities,
-    /// and this build has only the first: the transform has no inverse here
-    /// (R4.7, `docs/ng-scheme.md`). Every write path asks this before it
-    /// computes a byte, so the one answer serves patching, rebuilding and the
-    /// resolution a buffered change is accepted by — which is what keeps three
-    /// call sites from growing three answers (§3).
+    /// An unencrypted archive can, and so can one under a transform this build
+    /// can run **forwards** — [`Scheme::seals`], which is `true` for AES-256
+    /// and `false` for NG. Every write path asks this before it computes a
+    /// byte, so the one answer serves patching, rebuilding and the resolution a
+    /// buffered change is accepted by, and three call sites cannot grow three
+    /// answers (§3).
     ///
     /// # Errors
     ///
-    /// [`Error::CannotWriteEncrypted`], naming the tag, when the archive is
-    /// under a transform. It is not overridable: a capability that is absent is
-    /// not a safety interlock, and no flag supplies it. DR-041.
+    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`], naming the
+    /// tag, for an archive under a transform with no inverse here. It is not
+    /// overridable: a capability that is absent is not a safety interlock, and
+    /// no flag supplies it. DR-041, DR-054.
     pub const fn writable(&self) -> Result<()> {
         match self.scheme {
             None => Ok(()),
+            Some(scheme) if scheme.seals() => Ok(()),
             Some(_) => Err(Error::CannotWriteEncrypted {
                 tag: self.encryption,
+                reason: NoWrite::NoInverse,
             }),
         }
+    }
+
+    /// What re-encrypts this archive's own bytes, or `None` when it is not
+    /// encrypted.
+    ///
+    /// The one place a write path obtains the forward transform, so that the
+    /// entry table, the names blob and every payload of one archive are sealed
+    /// by the same value (§3). The key is the tag's and takes neither a name
+    /// nor a length — which is why a rebuilt AES archive of a different length,
+    /// or one written under another file name, still opens.
+    ///
+    /// **A sealed archive's entry rows are resealed one at a time**, by both
+    /// write paths, so this refuses a version whose row is not one aligned
+    /// cipher block of the table. Asked once here rather than at each of the
+    /// two (§3), and unreachable at `RPF7`:
+    /// [`Version::row_is_a_cipher_block`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Archive::writable`], and [`Error::WrongKey`] for an archive that is
+    /// encrypted and has no material in hand — which an archive that opened
+    /// under a key never is, because opening keeps what opened it.
+    pub fn seal(&self) -> Result<Option<Seal>> {
+        self.writable()?;
+        let Some(scheme) = self.scheme else {
+            return Ok(None);
+        };
+        if !self.version.row_is_a_cipher_block() {
+            return Err(Error::CannotWriteEncrypted {
+                tag: self.encryption,
+                reason: NoWrite::NoInverse,
+            });
+        }
+        let wrong = || Error::WrongKey {
+            tag: self.encryption,
+            scheme: scheme.named(),
+            tried: 1,
+        };
+        let material = self.unlock.held_material().ok_or_else(wrong)?;
+        Seal::new(scheme, material).map(Some).ok_or_else(wrong)
     }
 
     /// Every entry, in table order. Entry 0 is the root directory.
@@ -1153,9 +1214,15 @@ impl Archive {
         }
     }
 
-    /// Where an entry's payload begins in the source, bounds-checked against
-    /// this archive's own extent.
-    fn payload_span(&self, index: u32) -> Result<(u64, u64)> {
+    /// Where an entry's payload begins, and how long its **row says** it is,
+    /// relative to this archive's base and with nothing checked.
+    ///
+    /// [`Archive::payload_span`] is what a caller wants; this is the row read
+    /// literally, which is a different question and is asked in exactly two
+    /// places. A resource whose compressed-size field has saturated takes its
+    /// length from the room its neighbours leave it, and the neighbours have to
+    /// be placed without being asked the same question back.
+    fn declared_span(&self, index: u32) -> Result<(u64, u64)> {
         let entry = self.entry(index)?;
         let (block, on_disk) = match entry.kind {
             EntryKind::Directory { .. } => {
@@ -1203,6 +1270,62 @@ impl Archive {
                 len: on_disk,
                 archive_len: self.len,
             })?;
+        Ok((relative, on_disk))
+    }
+
+    /// Whether this entry's compressed-size field has run out of room to
+    /// describe its own payload.
+    ///
+    /// `docs/rpf-format.md`, Compression, `verified`: the field is 24 bits, and
+    /// a resource whose payload is longer writes [`MAX_SIZE_24`] into it — 166
+    /// of the corpus's 696,578 resources do. It is a sentinel and not a length,
+    /// so a reader that believes it hands the inflater a truncated stream.
+    ///
+    /// Only a **resource** is asked. A binary entry at the same value is a
+    /// payload of exactly that many bytes, because a binary entry that could
+    /// not say its length has the zero sentinel and its real length at offset 8
+    /// — the asymmetry `declared_span` records.
+    fn size_field_saturated(&self, index: u32) -> Result<bool> {
+        Ok(matches!(
+            self.entry(index)?.kind,
+            EntryKind::Resource { compressed_len, .. } if u64::from(compressed_len) == MAX_SIZE_24
+        ))
+    }
+
+    /// How many bytes a payload beginning at `relative` has before the next one
+    /// begins.
+    ///
+    /// [`Archive::allocation`]'s rule, over what the rows declare rather than
+    /// over what they mean, so that the entry asking cannot be asked back.
+    /// A payload sharing this one's start claims none of it.
+    fn room_from(&self, index: u32, relative: u64) -> u64 {
+        let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        let mut end = self.len;
+        for other in 0..count {
+            if other == index {
+                continue;
+            }
+            let Ok((at, _)) = self.declared_span(other) else {
+                continue;
+            };
+            if at > relative && at < end {
+                end = at;
+            }
+        }
+        end.saturating_sub(relative)
+    }
+
+    /// Where an entry's payload begins in the source, and how long it is,
+    /// bounds-checked against this archive's own extent.
+    ///
+    /// The length is the row's, except where the row could not hold it: a
+    /// resource whose compressed-size field has saturated
+    /// ([`Archive::size_field_saturated`]) takes the room its neighbours leave
+    /// it instead. **That answer is the payload's, not only the stream's**, so
+    /// passthrough and [`Archive::payload_extents`] see the same bytes an
+    /// inflate does. DR-051.
+    fn payload_span(&self, index: u32) -> Result<(u64, u64)> {
+        let (relative, declared) = self.declared_span(index)?;
         // A payload lies after the names blob — `docs/rpf-format.md`, Layout.
         // The upper bound alone leaves the archive's own header, entry table
         // and names blob addressable as file contents: an entry at block 0
@@ -1221,6 +1344,11 @@ impl Archive {
             });
         }
 
+        let on_disk = if self.size_field_saturated(index)? {
+            self.room_from(index, relative)
+        } else {
+            declared
+        };
         let end = relative.checked_add(on_disk).ok_or(Error::OutOfBounds {
             region: "payload",
             offset: relative,
@@ -1403,6 +1531,15 @@ impl Archive {
     /// that length. Over the 7,072 resources of `x64f.rpf` no payload answers
     /// to two candidates, and the first candidate is right for 7,050 of them.
     ///
+    /// **The transform is recovered the same way, and for the same reason.**
+    /// A resource payload may be under the archive's own transform, and nothing
+    /// in the entry or in the archive's header says which: two `0x0FEFFFFF`
+    /// archives, `hollywood.rpf` and `script_rel.rpf`, read 238 of 238 in the
+    /// clear and 1,154 of 1,154 only under the key. So each boundary is tried
+    /// in the clear first — every resource that reads back today reaches its
+    /// stream on the same attempt it does today — and only then under the
+    /// archive's transform. `docs/rpf-format.md`, Encryption; DR-051.
+    ///
     /// Nothing is held: the probe drains into a sink exactly as
     /// [`Archive::read_back`] does, which is why that function takes its answer
     /// from here rather than paying for the decision twice.
@@ -1414,7 +1551,7 @@ impl Archive {
     /// that begins no deflate stream at any known boundary is reported as the
     /// ordinary case it is, rather than as the last candidate's complaint.
     fn resource_stream<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Boundary> {
-        let (offset, _) = self.payload_span(index)?;
+        let (offset, on_disk) = self.payload_span(index)?;
         let EntryKind::Resource {
             compressed_len,
             system_flags,
@@ -1433,42 +1570,76 @@ impl Archive {
             entry: index,
             compressed_len,
         };
+        // A saturated size field bounds nothing, so there is no shortfall to
+        // report against it: the payload's end is then the stream's own, and
+        // what follows to the next payload is slack. `Payload::checked`, R6.10.
+        let saturated = self.size_field_saturated(index)?;
         let mut first: Option<Error> = None;
 
-        for header in RESOURCE_HEADER_LENS {
-            let (Some(stream_len), Some(at)) = (
-                u64::from(compressed_len).checked_sub(header),
-                offset.checked_add(header),
-            ) else {
-                continue;
-            };
-            let mut stream = Extracted::deflated(
-                index,
-                &mut *src,
-                at,
-                stream_len,
-                expected,
-                RESOURCE_IS_IN_THE_CLEAR,
-            );
-            match stream.drained() {
-                Ok(len) => {
-                    let (declared, used) = stream.extent();
-                    return Ok(Boundary {
-                        at,
-                        len: stream_len,
-                        expected,
-                        payload: Payload {
-                            entry: index,
-                            len,
-                            declared,
-                            used,
-                        },
-                    });
+        for keyed in [false, true] {
+            let cipher = if keyed {
+                match self.resource_cipher(index, on_disk)? {
+                    Some(cipher) => Some(cipher),
+                    None => break,
                 }
-                Err(error) => first.get_or_insert(error),
+            } else {
+                RESOURCE_IS_IN_THE_CLEAR
             };
+            for header in RESOURCE_HEADER_LENS {
+                let (Some(stream_len), Some(at)) =
+                    (on_disk.checked_sub(header), offset.checked_add(header))
+                else {
+                    continue;
+                };
+                let mut stream =
+                    Extracted::deflated(index, &mut *src, at, stream_len, expected, cipher.clone());
+                match stream.drained() {
+                    Ok(len) => {
+                        let (declared, used) = stream.extent();
+                        return Ok(Boundary {
+                            at,
+                            len: stream_len,
+                            cipher,
+                            expected,
+                            payload: Payload {
+                                entry: index,
+                                len,
+                                declared: if saturated { used } else { declared },
+                                used,
+                            },
+                        });
+                    }
+                    Err(error) => first.get_or_insert(error),
+                };
+            }
         }
         Err(first.unwrap_or(too_small))
+    }
+
+    /// The archive's own transform, keyed for this **resource** payload, or
+    /// `None` where this build holds nothing to key it with.
+    ///
+    /// `None` rather than [`Error::NeedsKey`] on purpose: a resource that
+    /// begins its stream in the clear reads back out of an unopened archive,
+    /// and a resource that does not is a payload that did not inflate rather
+    /// than a demand for a key. Only [`Archive::payload_cipher`], which knows a
+    /// binary entry's own field said the payload *is* transformed, can say the
+    /// key is missing.
+    ///
+    /// **The length the key is chosen by is the payload's on disk**, which is
+    /// the opposite of the binary-entry rule — a binary entry keys by its
+    /// uncompressed length. `docs/rpf-format.md`, Encryption, `verified`:
+    /// `script_rel.rpf/abigail1.ysc` is 90,775 bytes on disk and inflates to
+    /// the 229,376 its flags declare, and only 90,775 chooses the key that
+    /// decrypts it.
+    fn resource_cipher(&self, index: u32, on_disk: u64) -> Result<Option<Cipher>> {
+        let Some(scheme) = self.scheme else {
+            return Ok(None);
+        };
+        let Some(material) = self.unlock.held_material() else {
+            return Ok(None);
+        };
+        Ok(Cipher::new(scheme, material, self.name(index)?, on_disk))
     }
 
     /// One entry as a stream of the file it is **outside the archive**.
@@ -1503,13 +1674,14 @@ impl Archive {
     ///   two values and no others — 27,276 entries carry 0 and 64,300 carry 1 —
     ///   and 1 is the one whose payload only reads back after the transform.
     ///   `docs/rpf-format.md`, Entry table; `docs/backlog.md` Q10.
-    /// - A **resource** entry never is. Its deflate stream sits in the clear
-    ///   sixteen bytes into the payload and inflates to exactly the length its
-    ///   flag words give, in every archive measured; the sixteen bytes in front
-    ///   of it are not a readable `RSC7` header and no key here recovers one.
-    ///   A resource also has no per-entry encryption field to consult — offsets
-    ///   8 and 12 are its two flag words (§5) — so there would be nothing to
-    ///   ask even if it did.
+    /// - A **resource** entry is not asked here at all, and cannot be. It has
+    ///   no per-entry encryption field — offsets 8 and 12 are its two flag
+    ///   words (§5) — and nothing else in the archive says either: 693,556 of
+    ///   the corpus's 696,578 resources are in the clear and 3,022 are under
+    ///   the archive's transform, in archives carrying the same tag as archives
+    ///   whose resources are not. So it is recovered by reading rather than
+    ///   asked, and the length it is keyed by is the payload's on disk rather
+    ///   than the contents' — [`Archive::resource_cipher`], DR-051.
     fn payload_cipher(&self, index: u32, contents_len: u32) -> Result<Cipher> {
         let scheme = self.scheme.ok_or(Error::NeedsKey {
             tag: self.encryption,
@@ -1582,8 +1754,8 @@ impl Archive {
                 }
                 // The boundary is asked for once and answered whole (§4): the
                 // probe already settled where the stream starts, how long it
-                // is and what it has to inflate to, so nothing here recomputes
-                // any of the three.
+                // is, what transform it is under and what it has to inflate to,
+                // so nothing here recomputes any of the four.
                 Form::Contents => {
                     let mut src = src;
                     let found = self.resource_stream(&mut src, index)?;
@@ -1593,7 +1765,7 @@ impl Archive {
                         found.at,
                         found.len,
                         found.expected,
-                        RESOURCE_IS_IN_THE_CLEAR,
+                        found.cipher,
                     ))
                 }
             },
@@ -2266,8 +2438,8 @@ mod tests {
 
     use std::io::Cursor;
 
-    use super::{Decrypting, Region};
-    use crate::format::crypto::{CIPHER_BLOCK_LEN, Cipher};
+    use super::*;
+    use crate::format::{crypto::AesKey, rpf7};
 
     /// Bytes that are not a pattern the block arithmetic could accidentally
     /// agree with.
@@ -2419,6 +2591,331 @@ mod tests {
             whole.get(..CIPHER_BLOCK_LEN),
             source.get(..CIPHER_BLOCK_LEN),
             "the whole block in front of it was not"
+        );
+    }
+
+    /// An archive over `entries`, with every name resolving to the empty
+    /// string — for tests about layout and transforms rather than naming.
+    fn unnamed_archive(
+        entries: Vec<Entry>,
+        len: u64,
+        scheme: Option<Scheme>,
+        unlock: Unlock,
+    ) -> Archive {
+        let names = Names::parse(Version::Rpf7, vec![0], &entries).expect("the root name resolves");
+        let parents = vec![None; entries.len()];
+        Archive {
+            base: 0,
+            len,
+            version: Version::Rpf7,
+            encryption: rpf7::ENCRYPTION_OPEN,
+            depth: 0,
+            unlock,
+            scheme,
+            entries,
+            names,
+            parents,
+        }
+    }
+
+    /// A stored binary entry with a sixteen-byte payload at `block`.
+    fn binary_at(block: u32) -> Entry {
+        Entry {
+            name_offset: 0,
+            kind: EntryKind::Binary {
+                block,
+                compressed_len: 16,
+                uncompressed_len: 16,
+                encryption: rpf7::ENTRY_OPEN,
+            },
+        }
+    }
+
+    /// An empty directory, for a slot `room_from` is asked to skip over.
+    fn empty_directory() -> Entry {
+        Entry {
+            name_offset: 0,
+            kind: EntryKind::Directory {
+                first_child: 0,
+                child_count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn payload_len_answers_what_it_was_built_with() {
+        let payload = Payload {
+            entry: 0,
+            len: 42,
+            declared: 42,
+            used: 42,
+        };
+        assert_eq!(payload.len(), 42);
+    }
+
+    #[test]
+    fn a_payload_used_exactly_to_its_declared_length_is_not_trailing() {
+        let payload = Payload {
+            entry: 0,
+            len: 10,
+            declared: 10,
+            used: 10,
+        };
+        assert!(payload.checked().is_ok());
+    }
+
+    #[test]
+    fn a_payload_used_short_of_its_declared_length_is_trailing() {
+        let payload = Payload {
+            entry: 0,
+            len: 10,
+            declared: 10,
+            used: 9,
+        };
+        assert!(payload.checked().is_err());
+    }
+
+    #[test]
+    fn reserve_matches_a_stored_payloads_own_length() {
+        let extracted = Extracted::stored(0, Cursor::new(vec![0_u8; 100]), 0, 100, None);
+        assert_eq!(extracted.reserve(), 100);
+    }
+
+    #[test]
+    fn an_entry_of_zero_bytes_is_empty() {
+        let extracted = Extracted::stored(0, Cursor::new(Vec::new()), 0, 0, None);
+        assert!(extracted.is_empty());
+    }
+
+    #[test]
+    fn a_seek_to_a_filled_block_boundary_does_not_read_past_it() {
+        use std::io::{Seek as _, SeekFrom};
+
+        // The source holds exactly one block and nothing past it. A seek to
+        // the boundary must land without needing the block after it — only a
+        // read from there is allowed to ask for that.
+        let source = bytes(CIPHER_BLOCK_LEN);
+        let full = u64::try_from(CIPHER_BLOCK_LEN.saturating_mul(2)).unwrap_or(0);
+        let region = Region::new(Cursor::new(source), 0, full);
+        let mut stream = Decrypting::new(region, Cipher::over_zeros(), full);
+        let at = u64::try_from(CIPHER_BLOCK_LEN).unwrap_or(0);
+        let landed = stream
+            .seek(SeekFrom::Start(at))
+            .expect("lands on the boundary without reading past it");
+        assert_eq!(landed, at);
+    }
+
+    #[test]
+    fn a_deflated_streams_seek_sequence_lands_on_the_bytes_it_names() {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+
+        let plain = bytes(500);
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).expect("deflates");
+        let compressed = encoder.finish().expect("finishes");
+
+        let len = u64::try_from(plain.len()).unwrap_or(0);
+        let on_disk = u64::try_from(compressed.len()).unwrap_or(0);
+        let mut stream = Extracted::deflated(0, Cursor::new(compressed), 0, on_disk, len, None);
+
+        let mut window = vec![0_u8; 10];
+        stream.read_exact(&mut window).expect("reads");
+        assert_eq!(window, plain.get(..10).unwrap_or_default());
+
+        // Seeking to the position already reached must not disturb what comes
+        // next.
+        assert_eq!(stream.seek(SeekFrom::Start(10)).expect("seeks"), 10);
+        stream.read_exact(&mut window).expect("reads");
+        assert_eq!(window, plain.get(10..20).unwrap_or_default());
+
+        // A seek backwards restarts the stream and lands on the named byte.
+        assert_eq!(stream.seek(SeekFrom::Start(5)).expect("seeks"), 5);
+        let mut fifteen = vec![0_u8; 15];
+        stream.read_exact(&mut fifteen).expect("reads");
+        assert_eq!(fifteen, plain.get(5..20).unwrap_or_default());
+
+        // A seek forward past what has been read inflates and discards up to
+        // it.
+        assert_eq!(stream.seek(SeekFrom::Start(300)).expect("seeks"), 300);
+        let mut fifty = vec![0_u8; 50];
+        stream.read_exact(&mut fifty).expect("reads");
+        assert_eq!(fifty, plain.get(300..350).unwrap_or_default());
+
+        assert_eq!(stream.seek(SeekFrom::End(0)).expect("seeks"), len);
+        let mut tail = Vec::new();
+        stream.read_to_end(&mut tail).expect("reads");
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn a_writable_check_is_decided_by_whether_the_scheme_can_run_forwards() {
+        let sealing = unnamed_archive(
+            vec![],
+            64,
+            Some(Scheme::Aes(AesKey::Rage)),
+            Unlock::unkeyed(),
+        );
+        assert!(sealing.writable().is_ok());
+
+        let not_sealing = unnamed_archive(vec![], 64, Some(Scheme::Ng), Unlock::unkeyed());
+        assert!(not_sealing.writable().is_err());
+    }
+
+    #[test]
+    fn seal_produces_a_forward_transform_for_a_scheme_that_has_one() {
+        let unlock = Unlock::held(Arc::new(Material::over_zeros()), "test.rpf");
+        let archive = unnamed_archive(vec![], 64, Some(Scheme::Aes(AesKey::Rage)), unlock);
+        assert!(archive.seal().expect("seals").is_some());
+    }
+
+    #[test]
+    fn resource_cipher_answers_a_transform_when_material_is_in_hand() {
+        let unlock = Unlock::held(Arc::new(Material::over_zeros()), "test.rpf");
+        let entries = vec![Entry {
+            name_offset: 0,
+            kind: EntryKind::Resource {
+                block: 1,
+                compressed_len: 100,
+                system_flags: 0,
+                graphics_flags: 0,
+            },
+        }];
+        let archive = unnamed_archive(entries, 1024, Some(Scheme::Aes(AesKey::Rage)), unlock);
+        let cipher = archive.resource_cipher(0, 100).expect("no error");
+        assert!(cipher.is_some());
+    }
+
+    #[test]
+    fn an_entry_marked_open_is_not_put_through_the_archives_own_transform() {
+        use std::io::Read as _;
+
+        let unlock = Unlock::held(Arc::new(Material::over_zeros()), "test.rpf");
+        let plain = bytes(16);
+        let mut source = vec![0_u8; 512];
+        source.extend_from_slice(&plain);
+        let entries = vec![Entry {
+            name_offset: 0,
+            kind: EntryKind::Binary {
+                block: 1,
+                compressed_len: 0,
+                uncompressed_len: u32::try_from(plain.len()).unwrap_or(0),
+                encryption: rpf7::ENTRY_OPEN,
+            },
+        }];
+        let len = u64::try_from(source.len()).unwrap_or(0);
+        let archive = unnamed_archive(entries, len, Some(Scheme::Aes(AesKey::Rage)), unlock);
+        let mut src = Cursor::new(source);
+        let mut extracted = archive.extracted(&mut src, 0).expect("opens");
+        let mut got = Vec::new();
+        extracted.read_to_end(&mut got).expect("reads");
+        assert_eq!(got, plain);
+    }
+
+    #[test]
+    fn an_entry_sharing_this_ones_start_claims_none_of_the_room() {
+        let entries = vec![empty_directory(), binary_at(2)];
+        let archive = unnamed_archive(entries, 5000, None, Unlock::unkeyed());
+        assert_eq!(archive.room_from(0, 1024), 5000_u64.saturating_sub(1024));
+    }
+
+    #[test]
+    fn an_entry_before_the_one_asking_does_not_shrink_its_room() {
+        let entries = vec![empty_directory(), binary_at(0)];
+        let archive = unnamed_archive(entries, 5000, None, Unlock::unkeyed());
+        assert_eq!(archive.room_from(0, 1024), 5000_u64.saturating_sub(1024));
+    }
+
+    #[test]
+    fn the_nearest_entry_after_this_one_bounds_its_room() {
+        let entries = vec![empty_directory(), binary_at(3)];
+        let archive = unnamed_archive(entries, 5000, None, Unlock::unkeyed());
+        assert_eq!(archive.room_from(0, 1024), 1536_u64.saturating_sub(1024));
+    }
+
+    #[test]
+    fn named_answers_the_entrys_own_path() {
+        let entries = vec![
+            Entry {
+                name_offset: 0,
+                kind: EntryKind::Directory {
+                    first_child: 1,
+                    child_count: 1,
+                },
+            },
+            Entry {
+                name_offset: 1,
+                kind: EntryKind::Binary {
+                    block: 1,
+                    compressed_len: 0,
+                    uncompressed_len: 0,
+                    encryption: rpf7::ENTRY_OPEN,
+                },
+            },
+        ];
+        let blob = b"\0hello\0".to_vec();
+        let parents = parse_parents(&entries).expect("a valid tree");
+        let names = Names::parse(Version::Rpf7, blob, &entries).expect("names resolve");
+        let archive = Archive {
+            base: 0,
+            len: 1024,
+            version: Version::Rpf7,
+            encryption: rpf7::ENCRYPTION_OPEN,
+            depth: 0,
+            unlock: Unlock::unkeyed(),
+            scheme: None,
+            entries,
+            names,
+            parents,
+        };
+        assert_eq!(archive.named(1), "hello");
+    }
+
+    /// A reader that hands out at most `step` bytes per call, so a caller
+    /// that assumes one read fills its buffer is the caller this catches.
+    struct Throttled<R> {
+        inner: R,
+        step: usize,
+    }
+
+    impl<R: Read> Read for Throttled<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let want = buf.len().min(self.step);
+            self.inner.read(buf.get_mut(..want).unwrap_or_default())
+        }
+    }
+
+    impl<R: Seek> Seek for Throttled<R> {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    #[test]
+    fn head_keeps_reading_until_it_has_the_whole_of_what_it_asked_for() {
+        let plain = bytes(Encoding::HEAD_LEN.saturating_add(4));
+        let mut source = vec![0_u8; 512];
+        source.extend_from_slice(&plain);
+        let entries = vec![Entry {
+            name_offset: 0,
+            kind: EntryKind::Binary {
+                block: 1,
+                compressed_len: 0,
+                uncompressed_len: u32::try_from(plain.len()).unwrap_or(0),
+                encryption: rpf7::ENTRY_OPEN,
+            },
+        }];
+        let len = u64::try_from(source.len()).unwrap_or(0);
+        let archive = unnamed_archive(entries, len, None, Unlock::unkeyed());
+        let mut throttled = Throttled {
+            inner: Cursor::new(source),
+            step: 1,
+        };
+        let (head, got) = archive.head(&mut throttled, 0);
+        assert_eq!(got, Encoding::HEAD_LEN);
+        assert_eq!(
+            head.get(..got).unwrap_or_default(),
+            plain.get(..got).unwrap_or_default()
         );
     }
 }

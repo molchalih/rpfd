@@ -1858,15 +1858,17 @@ fn carries_nothing(at: &Path) {
     fs::write(at, vec![0_u8; 1 << 16]).expect("writable");
 }
 
-/// Reports a skip, naming the test and what it would have read.
+/// Reports a skip, naming the test, the gate that was not there, and what it
+/// would have read.
 ///
-/// `RPF_REQUIRE_GAME_EXE` turns the skip into a failure, the way
-/// `RPF_REQUIRE_CORPUS` does for archives: a green suite and a suite that ran
-/// must not be different claims.
-fn skip<T>(test: &str, reason: &str) -> Option<T> {
+/// `RPF_REQUIRE_<GATE>` turns **that** gate's absence into a failure and no
+/// other's: a green suite and a suite that ran must not be different claims,
+/// and asking for an executable must not fail a test that only wanted an image.
+fn skip_gated<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
+    let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
-        std::env::var_os("RPF_REQUIRE_GAME_EXE").is_none(),
-        "RPF_REQUIRE_GAME_EXE is set, but {test} would have skipped: {reason}",
+        std::env::var_os(&required).is_none(),
+        "{required} is set, but {test} would have skipped: {reason}",
     );
     eprintln!("SKIP {test}: {reason}");
     None
@@ -1875,13 +1877,38 @@ fn skip<T>(test: &str, reason: &str) -> Option<T> {
 /// One of the game executables, or `None` with a reason on standard error.
 fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
     let Some(root) = std::env::var_os("RPF_GAME_EXE") else {
-        return skip(test, "RPF_GAME_EXE is not set");
+        return skip_gated(test, "RPF_GAME_EXE", "RPF_GAME_EXE is not set");
     };
     let path = Path::new(&root).join(name);
     if path.is_file() {
         Some(path)
     } else {
-        skip(test, &format!("{} is not a file", path.display()))
+        skip_gated(
+            test,
+            "RPF_GAME_EXE",
+            &format!("{} is not a file", path.display()),
+        )
+    }
+}
+
+/// The memory image the NG material is extracted from, or a loud skip.
+///
+/// A separate gate from `RPF_GAME_EXE` for DR-040's reason: an executable
+/// carries none of that material and an image carries all of it, and a machine
+/// can have one and not the other.
+fn game_image(test: &str) -> Option<std::path::PathBuf> {
+    let Some(named) = std::env::var_os("RPF_GAME_IMAGE") else {
+        return skip_gated(test, "RPF_GAME_IMAGE", "RPF_GAME_IMAGE is not set");
+    };
+    let path = std::path::PathBuf::from(named);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip_gated(
+            test,
+            "RPF_GAME_IMAGE",
+            &format!("{} is not a file", path.display()),
+        )
     }
 }
 
@@ -2515,6 +2542,65 @@ fn put_creates_an_entry_when_it_is_asked_to() {
 }
 
 #[test]
+fn put_creates_an_entry_through_a_view_as_the_daemon_does() {
+    // A path being created has no entry to convert against, so `--as` has
+    // nothing to read an encoding from. The daemon answers that case; the
+    // command line reached `locate` first and refused a request the wire
+    // protocol accepts, which is the crate boundary's own test failing in the
+    // direction it does not usually fail in (§1). DR-053.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let source = dir.path().join("new.xml");
+    fs::write(&source, b"<?xml version=\"1.0\"?>\n<root>\n</root>\n").expect("writable");
+    let source = source.display().to_string();
+
+    // `auto` takes the bytes as they are, exactly as `raw` does.
+    let (code, out) = run(&[
+        "--json",
+        "put",
+        &archive_str,
+        "data/new.xml",
+        &source,
+        "--create",
+        "--as",
+        "auto",
+    ]);
+    assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
+    assert!(
+        listing(&archive).contains(&"data/new.xml".to_owned()),
+        "{:?}",
+        listing(&archive),
+    );
+
+    // `xml` says why it cannot rather than reporting the entry missing: an
+    // entry that is not there holds no encoding for a document to adopt.
+    let (code, message) = run_err(&[
+        "put",
+        &archive_str,
+        "data/second.xml",
+        &source,
+        "--create",
+        "--as",
+        "xml",
+    ]);
+    assert_eq!(code, 6, "{message}");
+
+    // Without --create it is still not found, which is exit 3 and unchanged.
+    let (code, message) = run_err(&[
+        "put",
+        &archive_str,
+        "data/third.xml",
+        &source,
+        "--as",
+        "auto",
+    ]);
+    assert_eq!(code, 3, "{message}");
+}
+
+#[test]
 fn rm_removes_an_entry_and_refuses_a_directory_that_holds_something() {
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
@@ -2805,6 +2891,11 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
 /// it. `docs/corpus.md`.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
+/// The NG-encrypted archive in the corpus, whose **file name is load-bearing**:
+/// an NG key is chosen by the archive's own name, so a copy under another name
+/// does not open. `docs/rpf-format.md`, Encryption.
+const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
+
 /// The Rockstar Games Launcher's own archive, likewise: the only kind here
 /// under the launcher key rather than the RAGE one.
 const LAUNCHER_ARCHIVE: &str = "rockstar_launcher/Launcher.rpf";
@@ -2857,26 +2948,33 @@ fn run_err_homed(home: &Path, args: &[&str]) -> (i32, String) {
 
 #[test]
 #[cfg_attr(
-    any(no_corpus, no_executables),
-    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+    any(no_corpus, no_game_image),
+    ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
-fn no_command_writes_into_an_encrypted_archive() {
-    // The command line's half of the refusal `crates/rpf-core/tests/encrypted.rs`
+fn no_command_writes_into_an_ng_archive() {
+    // The command line's half of the NG refusal `crates/rpf-core/tests/encrypted.rs`
     // pins in the library, and the half that says `--force` does not reach it:
-    // a capability this build does not have is not a safety interlock. R4.7,
-    // DR-041.
-    let test = "no_command_writes_into_an_encrypted_archive";
-    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+    // a capability this build does not have is not a safety interlock. R4.7's
+    // NG half, DR-041, DR-054.
+    //
+    // The AES archive is deliberately **not** the fixture here any more: it is
+    // written back now, and the test beside this one is what says so.
+    let test = "no_command_writes_into_an_ng_archive";
+    let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
     };
-    let Some(source) = executable(test, "GTA5.exe") else {
+    // A memory image, not an executable: no executable carries the NG material
+    // at all, so extracting from one would leave the archive at `NeedsKey` and
+    // this would be testing exit 5 rather than the write guard. DR-040.
+    let Some(source) = game_image(test) else {
         return;
     };
 
     let dir = tempfile::tempdir().expect("temp dir");
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
-    let copy = dir.path().join("des_canister.rpf");
+    // Copied under its own file name, which the NG key is derived from.
+    let copy = dir.path().join("dlc.rpf");
     fs::copy(&archive, &copy).expect("the archive is copyable");
     let donor = dir.path().join("plain.txt");
     fs::write(&donor, b"plain text").expect("donor");
@@ -2891,22 +2989,145 @@ fn no_command_writes_into_an_encrypted_archive() {
     let at = copy.display().to_string();
     let from = donor.display().to_string();
     for args in [
-        vec!["put", &at, "_manifest.ymf", &from],
-        vec!["put", "--force", &at, "_manifest.ymf", &from],
-        vec!["put", "--rebuild", &at, "_manifest.ymf", &from],
-        vec!["put", "--dry-run", &at, "_manifest.ymf", &from],
-        vec!["rm", &at, "_manifest.ymf"],
-        vec!["mv", &at, "_manifest.ymf", "renamed.ymf"],
+        vec!["put", &at, "content.xml", &from],
+        vec!["put", "--force", &at, "content.xml", &from],
+        vec!["put", "--rebuild", &at, "content.xml", &from],
+        vec!["put", "--dry-run", &at, "content.xml", &from],
+        vec!["rm", &at, "content.xml"],
+        vec!["mv", &at, "content.xml", "renamed.xml"],
         vec!["mkdir", &at, "added"],
     ] {
         let (code, message) = run_err_homed(&home, &args);
         assert_eq!(code, 9, "{args:?} answered {message}");
-        assert!(message.contains("cannot write one back"), "{message}");
+        assert!(message.contains("has no inverse"), "{message}");
     }
+
+    // And `pack`, which refuses for its own reason and must not offer the
+    // editing route as the way through: those commands answered exit 9 in the
+    // loop above. An automation told to try them would be sent at a wall.
+    // DR-054 §4.
+    let tree = dir.path().join("tree");
+    let (code, message) = run_err_homed(&home, &["extract", &at, &tree.display().to_string()]);
+    assert_eq!(code, 0, "{message}");
+    let packed = dir.path().join("packed.rpf");
+    let (code, message) = run_err_homed(
+        &home,
+        &[
+            "pack",
+            &tree.display().to_string(),
+            &packed.display().to_string(),
+        ],
+    );
+    assert_eq!(code, 9, "{message}");
+    assert!(message.contains("has no inverse"), "{message}");
+    assert!(
+        !message.contains("Edit through the archive"),
+        "a walled-off remedy was offered: {message}"
+    );
+    assert!(!packed.exists(), "a refused pack wrote an archive");
 
     // "Refused" and "did not write" are different claims. R4.2 leaves the
     // archive as it was, and so does a refusal before any of it runs.
     assert_eq!(fs::read(&copy).expect("readable"), before);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
+    // R4.7's AES half, end to end through the binary: both write paths, and
+    // then the archive read back through a **separate process** that opens it
+    // from the bytes on disk. A rebuild that wrote the table of contents in the
+    // clear, or a patch that wrote a plaintext payload, fails at the `cat`.
+    //
+    // `pack` is the one write that still refuses, and for a different reason:
+    // it builds from a tree and opens no archive, so it holds no key. DR-054.
+    let test = "an_aes_archive_is_written_back_through_the_command_line_and_opens_again";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "GTA5.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    // Deliberately not text and deliberately not a whole number of cipher
+    // blocks: `_manifest.ymf` holds a tokenised encoding, so a textual payload
+    // is refused by R6.6's guardrail before any of this is reached, and a
+    // length that is a multiple of sixteen would leave the tail rule untested.
+    let donor = dir.path().join("payload.bin");
+    let bytes: Vec<u8> = (0..401_u32)
+        .map(|n| u8::try_from(n % 251).unwrap_or(0))
+        .collect();
+    fs::write(&donor, &bytes).expect("donor");
+    let from = donor.display().to_string();
+
+    let (code, message) = run_err_homed(&home, &["keys", "extract", &source.display().to_string()]);
+    assert_eq!(code, 0, "{message}");
+
+    // Patching in place, and then rebuilding, each over its own copy: the two
+    // paths are separate and either could be the one that is wrong.
+    for (what, extra) in [("patch", None), ("rebuild", Some("--rebuild"))] {
+        let copy = dir.path().join(format!("{what}.rpf"));
+        fs::copy(&archive, &copy).expect("the archive is copyable");
+        let at = copy.display().to_string();
+        let mut args = vec!["put"];
+        args.extend(extra);
+        args.extend(["--force", &at, "_manifest.ymf", &from]);
+        let (code, message) = run_err_homed(&home, &args);
+        assert_eq!(code, 0, "{what}: {message}");
+
+        let (code, message) = run_err_homed(&home, &["ls", &at]);
+        assert_eq!(
+            code, 0,
+            "{what}: the written archive does not list: {message}"
+        );
+
+        let output = Command::new(RPF)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("APPDATA", home.join("appdata"))
+            .args(["cat", &at, "_manifest.ymf"])
+            .output()
+            .expect("binary runs");
+        assert_eq!(output.status.code(), Some(0), "{what}");
+        assert_eq!(
+            output.stdout,
+            fs::read(&donor).expect("donor"),
+            "{what}: the entry did not come back out"
+        );
+    }
+
+    // And the one that still refuses, with the reason that is not "no inverse".
+    let tree = dir.path().join("tree");
+    let (code, message) = run_err_homed(
+        &home,
+        &[
+            "extract",
+            &archive.display().to_string(),
+            &tree.display().to_string(),
+        ],
+    );
+    assert_eq!(code, 0, "{message}");
+    let packed = dir.path().join("packed.rpf");
+    let (code, message) = run_err_homed(
+        &home,
+        &[
+            "pack",
+            &tree.display().to_string(),
+            &packed.display().to_string(),
+        ],
+    );
+    assert_eq!(code, 9, "{message}");
+    assert!(
+        message.contains("Edit through the archive instead"),
+        "{message}"
+    );
+    assert!(!packed.exists(), "a refused pack wrote an archive");
 }
 
 #[test]

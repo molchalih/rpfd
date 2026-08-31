@@ -130,8 +130,17 @@ pub(super) const fn scheme(tag: u32) -> Option<Scheme> {
 /// `docs/rpf-format.md`, Entry table, `verified`.
 pub const RESOURCE_FLAG: u32 = 0x0080_0000;
 
-/// Largest value the 24-bit compressed-size field holds.
-const MAX_SIZE_24: u64 = 0x00FF_FFFF;
+/// Largest value the 24-bit compressed-size field holds, and — on a
+/// **resource** — the sentinel it writes when the payload is longer than that.
+///
+/// `docs/rpf-format.md`, Compression, `verified`: 166 of the corpus's 696,578
+/// resources carry exactly this value, none carries more, and every one of the
+/// 166 inflates to the length its flag words declare only when its payload is
+/// taken to run to the next payload rather than to 16,777,215 bytes.
+/// `Archive::size_field_saturated` is what reads it that way, and it reads it
+/// on a resource only: a binary entry that cannot say its length has the zero
+/// sentinel instead.
+pub const MAX_SIZE_24: u64 = 0x00FF_FFFF;
 
 /// Largest block index an entry's offset field holds, the resource bit excluded
 /// — so the largest offset this version addresses is this times [`BLOCK_LEN`],
@@ -530,6 +539,18 @@ mod tests {
     fn a_short_row_is_refused_rather_than_panicking() {
         assert!(decode_row(&[0_u8; ROW_LEN.saturating_sub(1)]).is_none());
         assert!(decode_row(&[]).is_none());
+    }
+
+    #[test]
+    fn a_table_longer_than_one_row_still_decodes_its_first() {
+        // `Archive`'s own key check hands this the whole entry table rather
+        // than one row sliced out of it (`archive::is_root_directory`), so a
+        // slice past `ROW_LEN` must not be refused as too short.
+        let row = directory_row(0, 1, 4);
+        let mut table = row.to_vec();
+        table.extend_from_slice(&row);
+        let entry = decode_row(&table).expect("bytes past the first row do not make it too short");
+        assert!(entry.is_directory());
     }
 
     #[test]

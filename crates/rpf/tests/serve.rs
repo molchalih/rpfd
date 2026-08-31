@@ -3512,11 +3512,17 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
 // daemon's own filesystem, which is the one thing a path on this wire has ever
 // meant. DR-014.
 
-/// Reports a skip, naming the test and what it would have read.
-fn skip<T>(test: &str, reason: &str) -> Option<T> {
+/// Reports a skip, naming the test, the gate that was not there, and what it
+/// would have read.
+///
+/// `RPF_REQUIRE_<GATE>` turns **that** gate's absence into a failure and no
+/// other's, so asking for an executable does not fail a test that only wanted
+/// an image.
+fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
+    let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
-        std::env::var_os("RPF_REQUIRE_GAME_EXE").is_none(),
-        "RPF_REQUIRE_GAME_EXE is set, but {test} would have skipped: {reason}",
+        std::env::var_os(&required).is_none(),
+        "{required} is set, but {test} would have skipped: {reason}",
     );
     eprintln!("SKIP {test}: {reason}");
     None
@@ -3525,13 +3531,37 @@ fn skip<T>(test: &str, reason: &str) -> Option<T> {
 /// One of the game executables, or `None` with a reason on standard error.
 fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
     let Some(root) = std::env::var_os("RPF_GAME_EXE") else {
-        return skip(test, "RPF_GAME_EXE is not set");
+        return skip(test, "RPF_GAME_EXE", "RPF_GAME_EXE is not set");
     };
     let path = Path::new(&root).join(name);
     if path.is_file() {
         Some(path)
     } else {
-        skip(test, &format!("{} is not a file", path.display()))
+        skip(
+            test,
+            "RPF_GAME_EXE",
+            &format!("{} is not a file", path.display()),
+        )
+    }
+}
+
+/// The memory image the NG material is extracted from, or a loud skip.
+///
+/// A gate of its own for DR-040's reason: no executable carries that material
+/// and an image carries all of it.
+fn game_image(test: &str) -> Option<std::path::PathBuf> {
+    let Some(named) = std::env::var_os("RPF_GAME_IMAGE") else {
+        return skip(test, "RPF_GAME_IMAGE", "RPF_GAME_IMAGE is not set");
+    };
+    let path = std::path::PathBuf::from(named);
+    if path.is_file() {
+        Some(path)
+    } else {
+        skip(
+            test,
+            "RPF_GAME_IMAGE",
+            &format!("{} is not a file", path.display()),
+        )
     }
 }
 
@@ -4318,6 +4348,10 @@ fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
 /// it. `docs/corpus.md`.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
+/// The NG-encrypted archive, whose **file name is load-bearing**: an NG key is
+/// chosen by the archive's own name. `docs/rpf-format.md`, Encryption.
+const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
+
 /// One corpus archive by its fixed relative path.
 fn corpus(test: &str, relative: &str) -> Option<std::path::PathBuf> {
     let missing = |reason: String| -> Option<std::path::PathBuf> {
@@ -4352,26 +4386,33 @@ fn talk_homed(home: &Path, requests: &[Value]) -> Vec<Value> {
 
 #[test]
 #[cfg_attr(
-    any(no_corpus, no_executables),
-    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+    any(no_corpus, no_game_image),
+    ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
-fn no_wire_method_writes_into_an_encrypted_archive() {
+fn no_wire_method_writes_into_an_ng_archive() {
     // §1: what `rpf put` refuses, `serve --stdio` refuses, with the same number
     // and the same name. Each buffering method answers where the caller asks
     // rather than at the commit that could never have landed, so an editor is
     // told at the edit.
-    let test = "no_wire_method_writes_into_an_encrypted_archive";
-    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+    //
+    // The NG archive, because the AES one is written back now: R4.7's AES half
+    // landed and its NG half is blocked on the inverse of a white-box
+    // construction. DR-054, `docs/ng-scheme.md`.
+    let test = "no_wire_method_writes_into_an_ng_archive";
+    let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
     };
-    let Some(source) = executable(test, "GTA5.exe") else {
+    // A memory image: no executable carries the NG material, so extracting
+    // from one would leave this at `NeedsKey`. DR-040.
+    let Some(source) = game_image(test) else {
         return;
     };
 
     let dir = tempfile::tempdir().expect("temp dir");
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
-    let copy = dir.path().join("des_canister.rpf");
+    // Its own file name, which the NG key is derived from.
+    let copy = dir.path().join("dlc.rpf");
     fs::copy(&archive, &copy).expect("copyable");
     let at = copy.display().to_string();
     let before = fs::read(&copy).expect("readable");
@@ -4390,11 +4431,11 @@ fn no_wire_method_writes_into_an_encrypted_archive() {
         &[
             json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
             json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-                "handle":1,"path":"_manifest.ymf","bytes":"cGxhaW4="}}),
+                "handle":1,"path":"content.xml","bytes":"cGxhaW4="}}),
             json!({"jsonrpc":"2.0","id":3,"method":"delete","params":{
-                "handle":1,"path":"_manifest.ymf"}}),
+                "handle":1,"path":"content.xml"}}),
             json!({"jsonrpc":"2.0","id":4,"method":"rename","params":{
-                "handle":1,"from":"_manifest.ymf","to":"renamed.ymf"}}),
+                "handle":1,"from":"content.xml","to":"renamed.xml"}}),
             json!({"jsonrpc":"2.0","id":5,"method":"mkdir","params":{
                 "handle":1,"path":"added"}}),
             json!({"jsonrpc":"2.0","id":6,"method":"commit","params":{"handle":1}}),
@@ -4403,7 +4444,7 @@ fn no_wire_method_writes_into_an_encrypted_archive() {
 
     // It opened: this is the write guard answering, not `NeedsKey`.
     let opened = answer(&responses, 1);
-    assert_eq!(opened["result"]["entries"], json!(11), "{opened}");
+    assert_eq!(opened["result"]["entries"], json!(7), "{opened}");
 
     for id in [2, 3, 4, 5] {
         let refused = answer(&responses, id);
@@ -4419,6 +4460,75 @@ fn no_wire_method_writes_into_an_encrypted_archive() {
     assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
 
     assert_eq!(fs::read(&copy).expect("readable"), before);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
+    // §1 in the other direction: what `rpf put` can do over an AES archive,
+    // `serve --stdio` can do, and the archive it left behind is opened by a
+    // **second daemon** from the bytes on disk. R4.7's AES half.
+    let test = "the_wire_writes_into_an_aes_archive_and_it_opens_again";
+    let Some(archive) = corpus(test, AES_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "GTA5.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let copy = dir.path().join("des_canister.rpf");
+    fs::copy(&archive, &copy).expect("copyable");
+    let at = copy.display().to_string();
+
+    let extracted = talk_homed(
+        &home,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
+            "executable": source.display().to_string()}}),
+        ],
+    );
+    assert!(answer(&extracted, 1)["result"].is_object(), "{extracted:?}");
+
+    // Twenty bytes, `00 01 .. 13`, in base64. Deliberately not text:
+    // `_manifest.ymf` holds a tokenised encoding, so R6.6's guardrail refuses a
+    // textual payload into it before any of this is reached.
+    let responses = talk_homed(
+        &home,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"_manifest.ymf",
+                "bytes":"AAECAwQFBgcICQoLDA0ODxAREhM="}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+        ],
+    );
+    assert_eq!(answer(&responses, 1)["result"]["entries"], json!(11));
+    assert!(answer(&responses, 2)["result"].is_object(), "{responses:?}");
+    assert_eq!(answer(&responses, 3)["result"]["committed"], json!(1));
+
+    // A fresh daemon over the file that is now on disk: a table of contents
+    // that went out in the clear does not open, and a payload that did does
+    // not read back.
+    let reopened = talk_homed(
+        &home,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"_manifest.ymf"}}),
+        ],
+    );
+    assert_eq!(answer(&reopened, 1)["result"]["entries"], json!(11));
+    assert_eq!(
+        answer(&reopened, 2)["result"]["bytes"],
+        json!("AAECAwQFBgcICQoLDA0ODxAREhM="),
+        "{reopened:?}"
+    );
 }
 
 #[test]

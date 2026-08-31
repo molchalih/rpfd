@@ -1116,4 +1116,174 @@ mod tests {
             started.elapsed()
         );
     }
+
+    #[test]
+    fn is_inline_holds_for_the_four_inline_layouts_only() {
+        for layout in [
+            Layout::AtFixedArray,
+            Layout::AtRangeArray,
+            Layout::Member,
+            Layout::Wrapped,
+        ] {
+            assert!(layout.is_inline(), "{layout:?}");
+        }
+        for layout in [Layout::AtArray, Layout::PointerWithCount] {
+            assert!(!layout.is_inline(), "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn each_layout_writes_its_own_word() {
+        // `render` writes this as the `ARRAY` member's XML type attribute and
+        // `apply` reads it back to check a document against the schema, so the
+        // word is real output, not a debug label.
+        for (layout, word) in [
+            (Layout::AtArray, "atarray"),
+            (Layout::AtFixedArray, "atfixedarray"),
+            (Layout::AtRangeArray, "atrangearray"),
+            (Layout::Member, "member"),
+            (Layout::PointerWithCount, "pointerwithcount"),
+            (Layout::Wrapped, "wrapped"),
+        ] {
+            assert_eq!(layout.word(), word);
+        }
+    }
+
+    #[test]
+    fn a_wrapped_offset_at_the_maximum_recoverable_multiple_is_accepted() {
+        // `MAX_WRAPS` is where `unwrapped` stops, not where it refuses: the
+        // last multiple that fits may equal it, and only a multiple past it
+        // is a refusal.
+        let step = u64::from(WRAP);
+        let after = step * u64::from(MAX_WRAPS);
+        let length = u32::try_from(after).expect("fits a u32");
+        let structure = Structure {
+            length,
+            members: vec![
+                Member {
+                    name: 1,
+                    offset: u32::try_from(after - 8).expect("fits a u32"),
+                    kind: Kind::Scalar(Scalar::Uint64),
+                },
+                Member {
+                    name: 2,
+                    offset: 0,
+                    kind: Kind::Array {
+                        layout: Layout::Wrapped,
+                        element: 2,
+                        count: 0,
+                    },
+                },
+                Member {
+                    name: ARRAYINFO,
+                    offset: 0,
+                    kind: Kind::Scalar(Scalar::Uint),
+                },
+            ],
+        };
+        let schema = Schema::default();
+        let recovered = schema
+            .unwrapped(&structure, 1, 0)
+            .expect("the last multiple that fits is MAX_WRAPS itself");
+        assert_eq!(recovered, length);
+    }
+
+    #[test]
+    fn member_ends_at_is_the_earlier_members_offset_plus_its_extent() {
+        let structure = Structure {
+            length: 200,
+            members: vec![
+                Member {
+                    name: 1,
+                    offset: 100,
+                    kind: Kind::Scalar(Scalar::Uint),
+                },
+                Member {
+                    name: 2,
+                    offset: 104,
+                    kind: Kind::Scalar(Scalar::Uint),
+                },
+            ],
+        };
+        let schema = Schema::default();
+        assert_eq!(schema.member_ends_at(&structure, 1), 104);
+        assert_eq!(schema.member_ends_at(&structure, 0), 0);
+    }
+
+    #[test]
+    fn extent_stops_only_past_the_nesting_limit() {
+        let owner = Structure {
+            length: 4,
+            members: Vec::new(),
+        };
+        let member = Member {
+            name: 1,
+            offset: 0,
+            kind: Kind::Scalar(Scalar::Uint),
+        };
+        let schema = Schema::default();
+        assert_eq!(
+            schema.extent(&owner, &member, MAX_ELEMENT_NESTING),
+            Some(Scalar::Uint.bytes())
+        );
+        assert_eq!(
+            schema.extent(&owner, &member, MAX_ELEMENT_NESTING + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pointer_with_count_array_is_eight_bytes_not_sixteen() {
+        let owner = Structure {
+            length: 8,
+            members: Vec::new(),
+        };
+        let member = Member {
+            name: 1,
+            offset: 0,
+            kind: Kind::Array {
+                layout: Layout::PointerWithCount,
+                element: 0,
+                count: 0,
+            },
+        };
+        let schema = Schema::default();
+        assert_eq!(schema.extent(&owner, &member, 0), Some(POINTER_LEN));
+    }
+
+    #[test]
+    fn array_of_maps_each_subtype_to_its_own_layout() {
+        let array = |layout| {
+            Some(Kind::Array {
+                layout,
+                element: 0,
+                count: 0,
+            })
+        };
+        assert_eq!(array_of(2, 0), array(Layout::AtRangeArray));
+        assert_eq!(array_of(4, 0), array(Layout::Member));
+        assert_eq!(array_of(6, 0), array(Layout::PointerWithCount));
+    }
+
+    #[test]
+    fn bits_of_needs_both_the_arrayinfo_name_and_its_code() {
+        // `referenceKey`'s low half indexes another member of the same
+        // structure, and that member is only a real `ARRAYINFO` description
+        // when both its name hash and its own type code say so — either alone
+        // is a coincidence, not a description.
+        let described = Raw {
+            name: ARRAYINFO,
+            code: 0x00,
+            subtype: 0,
+            offset: 0,
+            reference: 0xDEAD,
+        };
+        assert_eq!(
+            bits_of(0, 0, &[described]),
+            Some(Kind::Bits {
+                width: Width::ThirtyTwo,
+                table: None,
+            })
+        );
+    }
 }

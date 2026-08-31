@@ -268,6 +268,79 @@ fn a_payload_that_begins_no_stream_reports_the_first_boundarys_failure() {
     );
 }
 
+/// A resource whose stream is whole and stops short of what its flags declare
+/// is **named**, and no candidate rescues it.
+///
+/// This is the shape of the only two entries in the corpus that do not read
+/// back — `x64a.rpf/textures/parachute_decals.ytd`, in both installs and
+/// differently: the Enhanced copy is a clean stream that terminates 68,056
+/// bytes short of the 794,624 its flags declare, and the Legacy copy is a
+/// different payload that breaks mid-stream. `docs/corpus.md`. They are damaged
+/// in the archive Rockstar ships, and what the tool does about them is report
+/// them against the entry they belong to and offer no bytes for them.
+///
+/// It is pinned because the candidate list grew: a boundary and a transform are
+/// now recovered by trying, and a payload that satisfies no candidate must
+/// still come back as the failure it is rather than as whichever attempt got
+/// furthest. DR-045 §1a, DR-051.
+#[test]
+fn a_resource_that_inflates_short_of_its_flags_is_reported_against_its_entry() {
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![0_u8; 256]).expect("deflates");
+    let mut payload = vec![OPAQUE; MEASURED[0]];
+    payload.extend_from_slice(&encoder.finish().expect("finishes"));
+
+    let mut bytes = archive_of(&[MEASURED[0]]);
+    let at = common::BLOCK_LEN as usize;
+    for byte in &mut bytes[at..at + common::BLOCK_LEN as usize] {
+        *byte = 0;
+    }
+    bytes[at..at + payload.len()].copy_from_slice(&payload);
+    let row = common::HEADER_LEN as usize + ROW_LEN;
+    bytes[row..row + ROW_LEN].copy_from_slice(&common::file_row(
+        1,
+        payload.len() as u32,
+        1 | RESOURCE_FLAG,
+        SYSTEM_FLAGS,
+        GRAPHICS_FLAGS,
+    ));
+
+    let mut src = Cursor::new(bytes);
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
+    let refused = archive.read(&mut src, 1);
+    assert!(
+        matches!(
+            refused,
+            Err(rpf_core::Error::LengthMismatch {
+                entry: 1,
+                expected: 512,
+                actual: 256
+            })
+        ),
+        "a stream that stops short is the entry's own failure; got {refused:?}"
+    );
+
+    let walked = rpf_core::Verified::of(&mut src, &archive, &mut Unwatched).expect("walks");
+    assert_eq!(
+        walked
+            .problems
+            .iter()
+            .map(|problem| problem.path.as_str())
+            .collect::<Vec<_>>(),
+        ["r0.ydr"],
+        "the walk names the one entry that did not read back and no other"
+    );
+
+    // Passthrough is untouched by any of it: the payload still leaves the
+    // archive byte for byte, which is what makes the damaged pair rebuildable.
+    assert_eq!(
+        archive.extract(&mut src, 1).expect("extracts")[..payload.len()],
+        payload[..],
+        "the payload comes out whole even though its contents do not"
+    );
+}
+
 /// A resource written into an entry that declares its flag words keeps them,
 /// and the archive that results reads back.
 ///

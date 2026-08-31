@@ -23,9 +23,11 @@ use crate::{
     entry::{Entry, EntryKind},
     error::{Error, Result},
     format::{
-        Content, FileFields, Header, Row, Version, folded,
+        Content, FileFields, Header, Row, Version,
+        crypto::{CIPHER_BLOCK_LEN, Seal},
+        folded,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
-        u32_at,
+        u32_at, widen,
     },
     name,
     scratch::Scratch,
@@ -442,6 +444,190 @@ pub(crate) struct Written {
     pub(crate) reached: u64,
 }
 
+/// Whether a payload written as `kind` goes under the archive's own transform.
+///
+/// **The mirror of what the reader takes it out from**, and the one place the
+/// writer decides it: `archive::Archive::opened` asks the same two questions of
+/// the entry it is reading, and a payload put back under a different rule than
+/// it came out from is an archive that parses and does not load.
+///
+/// - A **binary** entry is under the transform exactly when its own per-entry
+///   encryption field says so. The field takes two values and no others across
+///   91,604 binary entries; in an AES archive it is exactly that and nothing
+///   more, because the correlation with deflation that holds in an NG archive
+///   does not hold there. `docs/rpf-format.md`, Entry table; `docs/backlog.md`
+///   Q10.
+/// - A **resource** goes back exactly as it came out, and `false` is what
+///   achieves that rather than a claim that its payload is in the clear. What
+///   this writer is handed is the payload **as it sits on disk** — a resource
+///   crosses in `archive::Form::File`, which passes the bytes through untouched
+///   — so writing them without a transform is what preserves whatever transform
+///   they were already under. 3,022 of 696,578 resources are under the
+///   archive's own transform (DR-051), and this answer is right for those and
+///   for the clear ones alike *because it does not depend on which they are*.
+///   A resource has no per-entry field to consult in any case: offsets 8 and 12
+///   are its two flag words (§5).
+///
+///   So it does **not** track what the read side found, and "correcting" it to
+///   would seal bytes that are already sealed and double-encrypt those 3,022 on
+///   the next rebuild. What would break the invariant is the other change: a
+///   caller handing this writer a resource in **contents** form — decrypted and
+///   inflated — which is not a payload and which no write path produces.
+///   `archive::RESOURCE_IS_IN_THE_CLEAR` is the read side of the same rule and
+///   not of the same fact: as its own doc says, it is not a claim about the
+///   contents either.
+pub(crate) const fn is_sealed(version: Version, kind: FileKind) -> bool {
+    match kind {
+        FileKind::Binary { encryption, .. } => !version.entry_is_open(encryption),
+        FileKind::Resource { .. } => false,
+    }
+}
+
+/// Where a payload's bytes go, and the transform they go under.
+///
+/// A payload of an encrypted archive is written **through** the archive's seal,
+/// a block at a time from the payload's own start and with a tail shorter than
+/// a block carried through as it stands — which is the extent
+/// `format::crypto::Cipher::apply` reads it back by, stated once there and
+/// obeyed here.
+///
+/// Streaming rather than buffered, because R3.9 is about a payload costing a
+/// buffer rather than its length, and an encrypted one is a payload like any
+/// other. It is sound only because neither transform chains between blocks: a
+/// block is sealed from what is in it and its position, so a `store` that
+/// abandons a speculative deflate stream and writes over it from the payload's
+/// start resumes at block zero and loses nothing.
+enum Sink<'a, W> {
+    /// Straight through.
+    Clear(&'a mut W),
+    /// Through the archive's seal.
+    Sealed(Sealing<'a, W>),
+}
+
+/// The sealing half of a [`Sink`].
+struct Sealing<'a, W> {
+    out: &'a mut W,
+    seal: &'a Seal,
+    /// Where this payload begins in `out`, which is where its blocks are
+    /// counted from.
+    start: u64,
+    /// The block being filled.
+    block: [u8; CIPHER_BLOCK_LEN],
+    /// How much of it is filled.
+    filled: usize,
+    /// Whether the payload has ended, after which bytes are slack and go
+    /// through as they are.
+    past: bool,
+}
+
+impl<'a, W: Write + Seek> Sink<'a, W> {
+    /// A sink at `start`, sealed when `seal` is `Some`.
+    fn new(out: &'a mut W, seal: Option<&'a Seal>, start: u64) -> Self {
+        match seal {
+            None => Self::Clear(out),
+            Some(seal) => Self::Sealed(Sealing {
+                out,
+                seal,
+                start,
+                block: [0; CIPHER_BLOCK_LEN],
+                filled: 0,
+                past: false,
+            }),
+        }
+    }
+
+    /// Ends the payload: a tail shorter than a block goes out as it stands, and
+    /// anything written afterwards is slack rather than payload.
+    ///
+    /// Idempotent, because the deflate fallback ends its payload before it pads
+    /// and `store` ends every payload once more (§4: a function that decides
+    /// something decides it completely).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] from the sink.
+    fn ends(&mut self) -> Result<()> {
+        let Self::Sealed(ref mut sealing) = *self else {
+            return Ok(());
+        };
+        let tail = sealing.block.get(..sealing.filled).unwrap_or_default();
+        let at = sealing.start;
+        sealing
+            .out
+            .write_all(tail)
+            .map_err(|source| Error::Io { offset: at, source })?;
+        sealing.filled = 0;
+        sealing.past = true;
+        Ok(())
+    }
+}
+
+impl<W: Write + Seek> Write for Sink<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let sealing = match *self {
+            Self::Clear(ref mut out) => return out.write(buf),
+            Self::Sealed(ref mut sealing) => sealing,
+        };
+        if sealing.past {
+            return sealing.out.write(buf);
+        }
+        let room = CIPHER_BLOCK_LEN.saturating_sub(sealing.filled);
+        let taking = room.min(buf.len());
+        let Some(taken) = buf.get(..taking) else {
+            return Ok(0);
+        };
+        let Some(into) = sealing
+            .block
+            .get_mut(sealing.filled..sealing.filled.saturating_add(taking))
+        else {
+            return Ok(0);
+        };
+        into.copy_from_slice(taken);
+        sealing.filled = sealing.filled.saturating_add(taking);
+        if sealing.filled == CIPHER_BLOCK_LEN {
+            let mut block = sealing.block;
+            sealing.seal.block(&mut block);
+            sealing.out.write_all(&block)?;
+            sealing.filled = 0;
+        }
+        Ok(taking)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match *self {
+            Self::Clear(ref mut out) => out.flush(),
+            Self::Sealed(ref mut sealing) => sealing.out.flush(),
+        }
+    }
+}
+
+impl<W: Write + Seek> Seek for Sink<'_, W> {
+    /// Seeks the sink under it, abandoning any partly-filled block.
+    ///
+    /// The one seek a `store` makes is back to the payload's own start, to
+    /// write over a deflate stream that did not pay for itself. Anything held
+    /// is about to be overwritten, so it is dropped rather than flushed; a
+    /// destination that is not a block boundary of this payload would leave the
+    /// blocks after it counted from the wrong place, and is refused.
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let sealing = match *self {
+            Self::Clear(ref mut out) => return out.seek(to),
+            Self::Sealed(ref mut sealing) => sealing,
+        };
+        let at = sealing.out.seek(to)?;
+        let within = at.checked_sub(sealing.start);
+        if !within.is_some_and(|by| by.is_multiple_of(widen(CIPHER_BLOCK_LEN))) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a sealed payload seeks only to a block boundary of its own",
+            ));
+        }
+        sealing.filled = 0;
+        sealing.past = false;
+        Ok(at)
+    }
+}
+
 /// The storage rule an existing entry carries, as the [`FileKind`] that spells
 /// it for a write.
 ///
@@ -527,10 +713,14 @@ fn uncompressed_len(path: &str, len: u64) -> Result<u32> {
 /// [`Error::NotAResource`] for a resource whose payload is not one,
 /// [`Error::FieldOverflow`] for contents too long for the entry's fields, and
 /// [`Error::Io`] from either side.
+///
+/// `seal` is the archive's own forward transform where it has one, and whether
+/// this payload goes under it is [`is_sealed`]'s answer and nowhere else's.
 pub(crate) fn store<S, W>(
     version: Version,
     path: &str,
     kind: FileKind,
+    seal: Option<&Seal>,
     src: &mut S,
     out: &mut W,
 ) -> Result<Written>
@@ -546,13 +736,15 @@ where
         source,
     })?;
 
-    match kind {
-        FileKind::Resource { declared } => store_resource(path, declared, src, out, start),
+    let under = if is_sealed(version, kind) { seal } else { None };
+    let mut sink = Sink::new(out, under, start);
+    let written = match kind {
+        FileKind::Resource { declared } => store_resource(path, declared, src, &mut sink, start),
         FileKind::Binary {
             storage: Storage::Stored,
             encryption,
         } => {
-            let len = copy_all(src, out, start)?;
+            let len = copy_all(src, &mut sink, start)?;
             Ok(Written {
                 // Stored: the compressed-size field carries the sentinel zero
                 // and the real length goes with the contents.
@@ -569,8 +761,13 @@ where
         FileKind::Binary {
             storage: Storage::Deflate,
             encryption,
-        } => store_deflated(version, path, encryption, src, out, start),
-    }
+        } => store_deflated(version, path, encryption, src, &mut sink, start),
+    }?;
+    // The payload ends here whatever form it took, so its tail shorter than a
+    // block goes out as it stands. The deflate fallback has already ended its
+    // own before padding, and this is idempotent.
+    sink.ends()?;
+    Ok(written)
 }
 
 /// [`store`] for a resource: written through untouched, with the flag words its
@@ -588,12 +785,12 @@ fn store_resource<S, W>(
     path: &str,
     declared: Option<ResourceFlags>,
     src: &mut S,
-    out: &mut W,
+    out: &mut Sink<'_, W>,
     start: u64,
 ) -> Result<Written>
 where
     S: Payload,
-    W: Write,
+    W: Write + Seek,
 {
     // The head is read before anything goes out, so a payload too short to be a
     // resource is refused with nothing written for it. Read rather than seeked
@@ -655,7 +852,7 @@ fn store_deflated<S, W>(
     path: &str,
     encryption: u32,
     src: &mut S,
-    out: &mut W,
+    out: &mut Sink<'_, W>,
     start: u64,
 ) -> Result<Written>
 where
@@ -708,6 +905,12 @@ where
     let len = copy_all(src, out, start)?;
     let reached = deflated.max(len);
     let overhang = reached.saturating_sub(len);
+    // The payload is `len` bytes, and the zeroing past it is slack rather than
+    // payload — so the seal ends here. Sealing the padding as well would put
+    // the last few bytes of the payload inside a block a reader that stops at
+    // `len` never decrypts, which is the tail rule broken by a byte count the
+    // entry does not declare.
+    out.ends()?;
     if overhang > 0 {
         copy_all(&mut std::io::repeat(0).take(overhang), out, start)?;
     }
@@ -730,6 +933,8 @@ struct Layout<'a> {
     files: &'a [FileSpec],
     planned: &'a [Planned],
     name_offsets: &'a [u32],
+    /// The archive's own forward transform, where it has one.
+    seal: Option<&'a Seal>,
 }
 
 /// Writes every payload at its aligned position, returning the entry rows and
@@ -773,6 +978,7 @@ where
         files,
         planned,
         name_offsets,
+        seal,
     } = *layout;
     let mut rows = Vec::with_capacity(planned.len());
     let total = u32::try_from(files.len()).unwrap_or(u32::MAX);
@@ -802,7 +1008,7 @@ where
         out.seek(SeekFrom::Start(at))
             .map_err(|source| Error::Io { offset: at, source })?;
         let mut payload = fetch.payload(&spec.path)?;
-        let written = store(version, &spec.path, spec.kind, &mut payload, out)?;
+        let written = store(version, &spec.path, spec.kind, seal, &mut payload, out)?;
 
         // The row is built after the payload rather than before it, because a
         // streamed payload's length is not known until it has been streamed.
@@ -871,6 +1077,75 @@ pub fn build<W, F>(
     version: Version,
     files: &[FileSpec],
     directories: &[String],
+    fetch: F,
+    watch: &mut impl Watch,
+) -> Result<Report>
+where
+    W: Write + Seek,
+    F: Fetch,
+{
+    build_under(out, Under::open(version), files, directories, fetch, watch)
+}
+
+/// What an archive is written as: its version, its encryption tag, and the
+/// transform that tag names where it names one.
+///
+/// One value rather than three arguments, because they are one fact and a
+/// caller able to pass a tag without the transform it names would write a
+/// header claiming an encryption the bytes are not under (§4).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Under<'a> {
+    /// The version the archive is written at.
+    version: Version,
+    /// The tag the header carries.
+    tag: u32,
+    /// The forward transform, or `None` for an archive written in the clear.
+    seal: Option<&'a Seal>,
+}
+
+impl<'a> Under<'a> {
+    /// Written in the clear, at this version's "not encrypted" tag.
+    pub(crate) const fn open(version: Version) -> Self {
+        Self {
+            version,
+            tag: version.open(),
+            seal: None,
+        }
+    }
+
+    /// Written under `tag`'s transform.
+    pub(crate) const fn sealed(version: Version, tag: u32, seal: &'a Seal) -> Self {
+        Self {
+            version,
+            tag,
+            seal: Some(seal),
+        }
+    }
+}
+
+/// [`build`], with what the archive's own bytes go under.
+///
+/// The one implementation; [`build`] is it in the clear, and `rebuild` is it
+/// under whatever the archive it is rebuilding was under.
+///
+/// The three regions the tag covers are sealed each from **its own start**, and
+/// that is not the same as sealing the file: the header stays in the clear, the
+/// entry table is one region, the names blob a second, and each payload a third
+/// kind. `docs/rpf-format.md`, Encryption, `verified`.
+///
+/// The entry table is sealed **row by row**, which is sound only where a row is
+/// one aligned cipher block of it. That is [`Archive::seal`]'s to ask and it
+/// refuses a version where it does not hold, so a [`Under`] carrying a seal has
+/// already been answered for (§3).
+///
+/// # Errors
+///
+/// As [`build`].
+fn build_under<W, F>(
+    out: &mut W,
+    under: Under<'_>,
+    files: &[FileSpec],
+    directories: &[String],
     mut fetch: F,
     watch: &mut impl Watch,
 ) -> Result<Report>
@@ -878,6 +1153,7 @@ where
     W: Write + Seek,
     F: Fetch,
 {
+    let Under { version, tag, seal } = under;
     let arena = plan_tree(files, directories)?;
     let planned = plan_entries(&arena)?;
     let names = version.plan_names(planned.iter().map(|entry| entry.name().as_str()))?;
@@ -908,6 +1184,7 @@ where
         files,
         planned: &planned,
         name_offsets: &name_offsets,
+        seal,
     };
     let (rows, payload_end) = write_payloads(out, &layout, &mut cursor, &mut fetch, watch)?;
 
@@ -918,15 +1195,32 @@ where
         version,
         entry_count,
         names_len,
-        encryption: version.open(),
+        encryption: tag,
     };
+    // The header is never under the transform: it is what says there is one.
     out.write_all(&header.write())
         .map_err(|source| Error::Io { offset: 0, source })?;
+    // Row by row rather than table by table, which is what
+    // `Version::row_is_a_cipher_block` buys and why it was asked above: a row
+    // is one whole aligned block of the transform over the entry table, so
+    // sealing each in turn is sealing the region. Nothing is materialised that
+    // was not already.
     for row in &rows {
+        let row = match seal {
+            None => *row,
+            Some(seal) => row.sealed(seal),
+        };
         out.write_all(row.as_bytes()).map_err(|source| Error::Io {
             offset: version.header_len(),
             source,
         })?;
+    }
+    // The names blob is a region of its own, sealed from **its** start and not
+    // from the table's — a build that sealed the two as one gets the table
+    // right and the names wrong. `docs/rpf-format.md`, Encryption, `verified`.
+    let mut names_blob = names_blob;
+    if let Some(seal) = seal {
+        seal.apply(&mut names_blob);
     }
     out.write_all(&names_blob).map_err(|source| Error::Io {
         offset: version.header_len().saturating_add(table_len),
@@ -1110,6 +1404,17 @@ where
 {
     let tree = edit::tree_of(&mut *src, archive, changes)?;
     let files = tree.files();
+    // The archive's own transform, asked once for the whole rebuild: the entry
+    // table, the names blob and every payload that carries the field go under
+    // the same one. An AES key takes neither a name nor a length, so a rebuild
+    // that is longer, shorter, or written under another file name is under the
+    // key it was read under — which is what makes an AES archive writable and
+    // an NG one not. `docs/rpf-format.md`, Encryption; DR-054.
+    let seal = archive.seal()?;
+    let under = match seal {
+        None => Under::open(archive.version()),
+        Some(ref seal) => Under::sealed(archive.version(), archive.encryption(), seal),
+    };
     let fetch = FromArchive {
         src,
         archive,
@@ -1118,14 +1423,7 @@ where
         overrides,
     };
 
-    build(
-        out,
-        archive.version(),
-        &files,
-        &tree.directories,
-        fetch,
-        watch,
-    )
+    build_under(out, under, &files, &tree.directories, fetch, watch)
 }
 
 /// Where a [`rebuild`] takes each payload from: an override the caller
@@ -1259,4 +1557,330 @@ where
             .map_err(|failure| edit::respelled(failure, &group.spellings))?;
     }
     edit::tree_of(src, archive, &here).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    //! What an archive written **under a transform** is, with no key material
+    //! anywhere.
+    //!
+    //! `keys::Material::over_zeros` and the AES tag are what make this run on a
+    //! machine with no game installed: the transform is real, the key is
+    //! thirty-two zero bytes, and DR-006 is untouched because nothing here is or
+    //! came from a key. The gated half — a Rockstar archive under a Rockstar
+    //! key — is `crates/rpf-core/tests/encrypted.rs`.
+    //!
+    //! What this constrains is the whole of the AES write path in one claim: an
+    //! archive written sealed **opens again and reads back**. No single-region
+    //! assertion covers that, because the header, the entry table, the names
+    //! blob and each payload are four different rules and getting any one of
+    //! them wrong reads back as nonsense.
+
+    use std::{
+        cell::Cell,
+        io::{Cursor, Seek, SeekFrom, Write},
+        sync::Arc,
+    };
+
+    use super::{FileKind, FileSpec, Sink, Storage, Under, build_under};
+    use crate::{
+        archive::Archive,
+        entry::EntryKind,
+        error::Error,
+        format::{
+            Version,
+            crypto::{CIPHER_BLOCK_LEN, Scheme, Seal},
+            resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
+            rpf7, widen,
+        },
+        keys::{Material, Unlock},
+        watch::Unwatched,
+    };
+
+    /// The zero-key AES seal, and the [`Unlock`] that opens what it wrote.
+    fn zeroed(named: &str) -> (Seal, Unlock) {
+        let material = Arc::new(Material::over_zeros());
+        let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_AES).expect("AES");
+        let seal = Seal::new(scheme, &material).expect("AES seals");
+        (seal, Unlock::held(material, named))
+    }
+
+    /// Files whose lengths straddle the cipher block: shorter than one, exactly
+    /// one, and one with a tail — plus one that deflates.
+    fn contents() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("short.bin", vec![b'a'; 7]),
+            ("block.bin", vec![b'b'; 16]),
+            ("tail.bin", (0..100_u8).collect()),
+            (
+                "deep/deflated.txt",
+                b"the same words over and over ".repeat(40),
+            ),
+        ]
+    }
+
+    /// The same, as what to write.
+    fn specs() -> Vec<FileSpec> {
+        contents()
+            .iter()
+            .map(|(path, _)| FileSpec {
+                path: (*path).to_owned(),
+                // Stored for the first three, so the payload on disk **is** the
+                // contents and a byte decrypted wrong is a byte compared wrong.
+                // The fourth is deflated, so both storage rules are covered and
+                // the deflate fallback's seek back to the payload's start is
+                // exercised under the seal.
+                kind: FileKind::Binary {
+                    storage: if path.contains(".txt") {
+                        Storage::Deflate
+                    } else {
+                        Storage::Stored
+                    },
+                    // 1: under the archive's own transform. `docs/rpf-format.md`,
+                    // Entry table.
+                    encryption: 1,
+                },
+            })
+            .collect()
+    }
+
+    /// Builds that archive, sealed or not, and answers its bytes.
+    fn built(under: Under<'_>) -> Vec<u8> {
+        let held = contents();
+        let mut out = Cursor::new(Vec::new());
+        build_under(
+            &mut out,
+            under,
+            &specs(),
+            &[],
+            |wanted: &str| {
+                let found = held
+                    .iter()
+                    .find(|(path, _)| *path == wanted)
+                    .map(|(_, bytes)| bytes.clone())
+                    .unwrap_or_default();
+                Ok(Cursor::new(found))
+            },
+            &mut Unwatched,
+        )
+        .expect("the archive builds");
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_sealed_archive_opens_again_and_every_entry_reads_back() {
+        let (seal, unlock) = zeroed("sealed.rpf");
+        let bytes = built(Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal));
+        let mut source = Cursor::new(bytes);
+        let archive = Archive::open(&mut source, &unlock).expect("the sealed archive opens");
+        assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES);
+        assert_eq!(archive.scheme(), Some("AES-256"));
+
+        for (path, expected) in contents() {
+            let index = archive
+                .find(path)
+                .unwrap_or_else(|error| panic!("{path} does not resolve: {error}"));
+            let read = archive
+                .read(&mut source, index)
+                .unwrap_or_else(|error| panic!("{path} does not read back: {error}"));
+            assert_eq!(read, expected, "{path} came back different");
+        }
+    }
+
+    #[test]
+    fn the_header_is_in_the_clear_and_the_entry_table_is_not() {
+        // What a build that sealed nothing, or sealed the header too, would
+        // pass anyway: the tag is in the clear because it is what says there is
+        // a transform, and the row after it is not, because it is under one.
+        let (seal, _) = zeroed("sealed.rpf");
+        let sealed = built(Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal));
+        let open = built(Under::open(Version::Rpf7));
+
+        assert_eq!(
+            sealed.get(..4),
+            open.get(..4),
+            "the magic is not under the transform"
+        );
+        assert_eq!(
+            sealed.get(12..16),
+            Some(&rpf7::ENCRYPTION_AES.to_le_bytes()[..]),
+            "the header does not carry the tag it was sealed under"
+        );
+        assert_eq!(
+            sealed.len(),
+            open.len(),
+            "sealing changed the length of the archive"
+        );
+        assert_ne!(
+            sealed.get(16..32),
+            open.get(16..32),
+            "the root directory row went out in the clear"
+        );
+    }
+
+    #[test]
+    fn a_sealed_archive_does_not_open_without_a_key() {
+        // The other half of the claim above: "it opens with the key" says
+        // nothing unless it does not open without one.
+        let (seal, _) = zeroed("sealed.rpf");
+        let bytes = built(Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal));
+        let error = Archive::open(&mut Cursor::new(bytes), &Unlock::unkeyed())
+            .expect_err("a sealed archive needs a key");
+        assert!(
+            matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_AES),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_ng_tag_has_no_seal_to_be_written_under() {
+        // The split, where the write path decides it: `Seal::new` answers
+        // `None` for NG whatever material it is handed, so an NG seal is not a
+        // value this build can hold. `docs/ng-scheme.md`.
+        let material = Material::over_zeros();
+        assert!(Seal::new(Scheme::Ng, &material).is_none());
+        assert!(!Scheme::Ng.seals());
+        for tag in [rpf7::ENCRYPTION_AES, rpf7::ENCRYPTION_AES_LAUNCHER] {
+            assert!(
+                Version::Rpf7.scheme(tag).expect("an AES tag").seals(),
+                "{tag:#010x} does not seal"
+            );
+        }
+    }
+
+    #[test]
+    fn one_entry_row_is_one_block_of_the_transform_over_the_entry_table() {
+        // What lets an in-place patch reseal a single row. It is a coincidence
+        // of three numbers rather than a rule the format states, so it is
+        // asserted rather than assumed. `docs/rpf-format.md`, Entry table.
+        assert!(Version::Rpf7.row_is_a_cipher_block());
+        assert_eq!(
+            Version::Rpf7.row_len(),
+            crate::format::crypto::CIPHER_BLOCK_LEN as u64
+        );
+    }
+
+    #[test]
+    fn a_resource_payload_is_never_written_through_the_transform() {
+        // `FileKind::Resource` crosses in passthrough form (its own doc
+        // comment above), and `is_sealed` is where that holds even under an
+        // archive written under a seal: a resource says `false` regardless of
+        // the archive's own tag, because a resource has no per-entry field for
+        // the read side to know a transform needs undoing. What lands on disk
+        // must equal what went in, not the seal's transform of it.
+        let (seal, unlock) = zeroed("resource.rpf");
+        let mut resource = vec![0_u8; usize::try_from(RESOURCE_HEADER_LEN).expect("fits")];
+        resource[..4].copy_from_slice(&MAGIC_RSC7);
+        resource[8..12].copy_from_slice(&7_u32.to_le_bytes());
+        resource[12..16].copy_from_slice(&11_u32.to_le_bytes());
+        resource.extend((0..64_u8).cycle().take(48));
+
+        let spec = FileSpec {
+            path: "resource.bin".to_owned(),
+            kind: FileKind::Resource { declared: None },
+        };
+        let mut out = Cursor::new(Vec::new());
+        build_under(
+            &mut out,
+            Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal),
+            std::slice::from_ref(&spec),
+            &[],
+            |wanted: &str| {
+                assert_eq!(wanted, "resource.bin");
+                Ok(Cursor::new(resource.clone()))
+            },
+            &mut Unwatched,
+        )
+        .expect("the archive builds");
+        let bytes = out.into_inner();
+
+        let mut source = Cursor::new(bytes.clone());
+        let archive = Archive::open(&mut source, &unlock).expect("the sealed archive opens");
+        let index = archive.find("resource.bin").expect("resource.bin resolves");
+        let EntryKind::Resource { block, .. } = archive.entry(index).expect("entry").kind else {
+            panic!("resource.bin did not decode as a resource entry");
+        };
+        let at = usize::try_from(u64::from(block).saturating_mul(Version::Rpf7.block_len()))
+            .expect("offset fits");
+        let end = at.saturating_add(resource.len());
+        let on_disk = bytes.get(at..end).expect("payload is in bounds");
+        assert_eq!(
+            on_disk, resource,
+            "a resource payload came out under the archive's transform"
+        );
+    }
+
+    /// A writer that counts the flushes it receives, so a `Write` impl that
+    /// forwards to it can be told apart from one that swallows the call.
+    struct Counting {
+        inner: Cursor<Vec<u8>>,
+        flushes: Cell<u32>,
+    }
+
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes.set(self.flushes.get().saturating_add(1));
+            self.inner.flush()
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    #[test]
+    fn sink_flush_reaches_the_writer_underneath_it_clear_and_sealed_alike() {
+        let (seal, _) = zeroed("flush.rpf");
+
+        let mut clear = Counting {
+            inner: Cursor::new(Vec::new()),
+            flushes: Cell::new(0),
+        };
+        Sink::new(&mut clear, None, 0)
+            .flush()
+            .expect("flush succeeds");
+        assert_eq!(clear.flushes.get(), 1, "a clear Sink swallowed the flush");
+
+        let mut under_seal = Counting {
+            inner: Cursor::new(Vec::new()),
+            flushes: Cell::new(0),
+        };
+        Sink::new(&mut under_seal, Some(&seal), 0)
+            .flush()
+            .expect("flush succeeds");
+        assert_eq!(
+            under_seal.flushes.get(),
+            1,
+            "a sealed Sink swallowed the flush"
+        );
+    }
+
+    #[test]
+    fn a_sealed_sink_seeks_only_to_its_own_block_boundaries() {
+        // `store_deflated`'s fallback seeks a sealed sink back to a payload's
+        // own start when the compressor did not pay for itself, and that start
+        // is always a block boundary of the payload — the one case this method
+        // exists to let through. A target that is not one is refused, because
+        // nothing past it would decrypt right if it were allowed.
+        let (seal, _) = zeroed("seek.rpf");
+        let start = 16_u64;
+        let mut inner = Cursor::new(vec![0_u8; 64]);
+        let mut sink = Sink::new(&mut inner, Some(&seal), start);
+
+        let aligned = start.saturating_add(widen(CIPHER_BLOCK_LEN));
+        let at = sink
+            .seek(SeekFrom::Start(aligned))
+            .expect("a block boundary of the payload is a legal seek target");
+        assert_eq!(at, aligned);
+
+        let misaligned = aligned.saturating_add(1);
+        sink.seek(SeekFrom::Start(misaligned))
+            .expect_err("a non-boundary offset must be refused");
+    }
 }

@@ -477,6 +477,20 @@ mod tests {
     }
 
     #[test]
+    fn len_and_is_empty_track_how_many_names_were_accepted() {
+        // Every other test here loads a dictionary of zero or one names, which
+        // does not tell `len` and `is_empty` apart from constants — a loaded
+        // dictionary of more than one name is the one case that does.
+        let empty = Dictionary::default();
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+
+        let two = Dictionary::load("CMapTypes\nparams\n").dictionary;
+        assert_eq!(two.len(), 2);
+        assert!(!two.is_empty());
+    }
+
+    #[test]
     fn blank_lines_and_comments_are_not_rejections() {
         let loaded = Dictionary::load("\n  \n# a comment\nCMapTypes\n");
         assert!(loaded.rejected.is_empty());

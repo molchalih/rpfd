@@ -461,3 +461,44 @@ fn finish(building: Building) -> std::result::Result<Node, NotRbf> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{NotRbf, read};
+    use crate::error::Error;
+
+    /// The cause `read` refused with, or a panic naming what it did instead.
+    fn refused(document: &[u8]) -> NotRbf {
+        match read(document) {
+            Err(Error::NotRbfXml { cause, .. }) => cause,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whitespace_outside_the_root_is_tolerated_and_anything_else_is_not() {
+        // `push_text`'s only `None` arm — nothing is open to receive the
+        // text — and the one place indentation around the root is told apart
+        // from a stray word there.
+        read(b"<root></root>\n").expect("trailing whitespace is not text");
+        assert_eq!(
+            refused(b"<root></root>stray"),
+            NotRbf::UnexpectedText,
+            "non-whitespace outside the root must be refused"
+        );
+    }
+
+    #[test]
+    fn a_value_element_carrying_stray_text_is_refused_rather_than_read_alone() {
+        // A value record is a name, a type and a value and nothing more
+        // (`NotRbf::ValueNotAlone`'s own doc). `finish` is where children and
+        // body are checked together — either alone is not the empty pair the
+        // record promises.
+        assert_eq!(
+            refused(b"<root><field rbf:uint=\"42\">stray</field></root>"),
+            NotRbf::ValueNotAlone {
+                name: "field".to_owned()
+            },
+        );
+    }
+}

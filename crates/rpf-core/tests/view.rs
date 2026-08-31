@@ -216,6 +216,38 @@ fn a_resource_entry_does_not_claim_an_xml_view_whatever_its_payload_says() {
 }
 
 #[test]
+fn a_resource_entry_takes_no_document_whatever_its_payload_begins_with() {
+    // The write side of the row above, and the half that was missing: `read`
+    // asked `Archive::classify` and `apply` asked only whether the entry was a
+    // directory, leaving `metadata::view::from_xml` to dispatch on the raw
+    // resource payload's own leading bytes. A resource whose first four bytes
+    // are `RBF0` would then take the `rbf` arm and a tokenised payload would be
+    // written into a resource entry — the one thing `Classification::Resource`
+    // carries no encoding to make sayable. Q7, DR-044.
+    //
+    // Not reachable on the corpus, where every resource is high-entropy at its
+    // head, and reachable here in four bytes, which is what a synthetic entry
+    // is for.
+    let bytes = build_with(
+        FileKind::Resource {
+            declared: Some(ResourceFlags {
+                system: 0xA800_0000,
+                graphics: 0x2000_0000,
+            }),
+        },
+        &rbf_payload(DOCUMENT),
+    );
+    let refused = apply(bytes.clone(), View::Xml, EDITED.as_bytes())
+        .expect_err("a resource has no view to write into");
+    assert_eq!(refused.name(), "NoXmlView");
+    assert_eq!(
+        apply(bytes, View::Auto, EDITED.as_bytes()).expect("auto takes the bytes as they are"),
+        EDITED.as_bytes(),
+        "a document was tokenised against a resource payload"
+    );
+}
+
+#[test]
 fn a_pso_entry_is_asked_of_the_pso_codec_and_not_of_the_other_one() {
     // Routing, and only routing: these bytes announce `PSO` and are not one, so
     // what comes back has to be the `PSO` reader's refusal. `NoXmlView` here

@@ -599,3 +599,392 @@ impl Writer<'_> {
 fn reserved(word: &str) -> String {
     format!("{RESERVED_PREFIX}{word}")
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test code; clippy.toml's allow-*-in-tests settings have no \
+              equivalent for this lint. docs/conventions.md §15"
+)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+
+    /// An arbitrary structure name, distinct from any member name used here.
+    const ROOT_NAME: u32 = 0xD98B_B561;
+    /// An arbitrary member name, distinct from [`ROOT_NAME`] and [`ARRAYINFO`].
+    const MEMBER_NAME: u32 = 0x1234_5678;
+    /// The `ARRAYINFO` sentinel, `crate::metadata::pso::model`'s own copy not
+    /// being imported into this module.
+    const ARRAYINFO: u32 = 0x0000_0100;
+
+    /// A one-entry `PMAP` block table naming a block of `length` bytes at
+    /// `offset`.
+    fn one_block_pmap(offset: i32, length: i32) -> Vec<u8> {
+        let mut pmap = vec![0u8; 8];
+        pmap.extend_from_slice(&1i32.to_be_bytes());
+        pmap.extend_from_slice(&1i16.to_be_bytes());
+        pmap.extend_from_slice(&0u16.to_be_bytes());
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&offset.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&length.to_be_bytes());
+        pmap
+    }
+
+    fn trivial_blocks() -> Blocks {
+        Blocks::read(&one_block_pmap(0, 64), 64).expect("a minimal block table reads")
+    }
+
+    // -------------------------------------------------------------------
+    // `Writer::counted` — the `None` arm's `count == 0` guard tells a
+    // legitimately empty array from a null pointer that still declares
+    // items.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn counted_refuses_a_null_pointer_that_declares_a_nonzero_count() {
+        let section = vec![0u8; 8];
+        let blocks = trivial_blocks();
+        let schema = Schema::default();
+        let names = Dictionary::default();
+        let writer = Writer {
+            data: Data {
+                section: &section,
+                blocks: &blocks,
+            },
+            schema: &schema,
+            names: &names,
+            out: String::new(),
+            nodes: 0,
+            budget: document_budget(section.len()),
+        };
+
+        assert_eq!(
+            writer
+                .counted(0, 0)
+                .expect("a null pointer with no items is a legitimately empty array"),
+            (0, 0)
+        );
+        let error = writer
+            .counted(0, 1)
+            .expect_err("a null pointer with one declared item is a contradiction");
+        assert!(
+            matches!(
+                error,
+                Error::BadPso {
+                    cause: Malformed::Pointer,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `Writer::spend` — both ceilings, at their exact boundary.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn spend_refuses_only_past_the_exact_node_ceiling() {
+        let section = Vec::new();
+        let blocks = trivial_blocks();
+        let schema = Schema::default();
+        let names = Dictionary::default();
+        let data = Data {
+            section: &section,
+            blocks: &blocks,
+        };
+
+        let mut at_ceiling = Writer {
+            data,
+            schema: &schema,
+            names: &names,
+            out: String::new(),
+            nodes: MAX_NODES - 1,
+            budget: usize::MAX,
+        };
+        at_ceiling
+            .spend(Place::root())
+            .expect("the ceiling itself is allowed");
+        assert_eq!(at_ceiling.nodes, MAX_NODES);
+
+        let mut past_ceiling = Writer {
+            data,
+            schema: &schema,
+            names: &names,
+            out: String::new(),
+            nodes: MAX_NODES,
+            budget: usize::MAX,
+        };
+        let error = past_ceiling
+            .spend(Place::root())
+            .expect_err("one node past the ceiling is refused");
+        assert!(
+            matches!(
+                error,
+                Error::BadPso {
+                    cause: Malformed::TooManyNodes,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn spend_refuses_only_past_the_exact_byte_budget() {
+        let section = Vec::new();
+        let blocks = trivial_blocks();
+        let schema = Schema::default();
+        let names = Dictionary::default();
+        let data = Data {
+            section: &section,
+            blocks: &blocks,
+        };
+
+        let mut at_budget = Writer {
+            data,
+            schema: &schema,
+            names: &names,
+            out: "x".repeat(10),
+            nodes: 0,
+            budget: 10,
+        };
+        at_budget
+            .spend(Place::root())
+            .expect("output exactly at the budget is still allowed");
+
+        let mut past_budget = Writer {
+            data,
+            schema: &schema,
+            names: &names,
+            out: "x".repeat(11),
+            nodes: 0,
+            budget: 10,
+        };
+        let error = past_budget
+            .spend(Place::root())
+            .expect_err("one byte past the budget is refused");
+        assert!(
+            matches!(
+                error,
+                Error::BadPso {
+                    cause: Malformed::TooLarge,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The `Layout::PointerWithCount` arm — deleting it falls through to the
+    // inline wildcard, so an item is read from the pointer's own bytes
+    // instead of from the block the pointer names.
+    // -------------------------------------------------------------------
+
+    /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`,
+    /// the pointer naming a second block that holds the one item.
+    fn pointer_with_count_pso() -> Vec<u8> {
+        let mut psin = Vec::new();
+        psin.extend_from_slice(&section::PSIN);
+        psin.extend_from_slice(&28u32.to_be_bytes());
+        psin.extend_from_slice(b"pppppppp");
+        psin.extend_from_slice(&2u32.to_be_bytes());
+        psin.extend_from_slice(&0u32.to_be_bytes());
+        psin.extend_from_slice(&42u32.to_be_bytes());
+
+        let mut pmap = Vec::new();
+        pmap.extend_from_slice(b"PMAP");
+        pmap.extend_from_slice(&48u32.to_be_bytes());
+        pmap.extend_from_slice(&1i32.to_be_bytes());
+        pmap.extend_from_slice(&2i16.to_be_bytes());
+        pmap.extend_from_slice(&0x7070u16.to_be_bytes());
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&16i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&8i32.to_be_bytes());
+        pmap.extend_from_slice(&0x0000_0006u32.to_be_bytes());
+        pmap.extend_from_slice(&24i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&4i32.to_be_bytes());
+
+        let mut psch = Vec::new();
+        psch.extend_from_slice(b"PSCH");
+        psch.extend_from_slice(&56u32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        psch.extend_from_slice(&20i32.to_be_bytes());
+        psch.extend_from_slice(&2u32.to_be_bytes());
+        psch.extend_from_slice(&8i32.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+        psch.extend_from_slice(&MEMBER_NAME.to_be_bytes());
+        psch.extend_from_slice(&[0x0D, 0x06]);
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&((1u32 << 16) | 1).to_be_bytes());
+        psch.extend_from_slice(&ARRAYINFO.to_be_bytes());
+        psch.extend_from_slice(&[0x06, 0x00]);
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+
+        let mut payload = psin;
+        payload.extend_from_slice(&pmap);
+        payload.extend_from_slice(&psch);
+        payload
+    }
+
+    #[test]
+    fn a_pointer_with_count_array_reads_through_its_pointer_not_past_it() {
+        let payload = pointer_with_count_pso();
+        let names = Dictionary::default();
+        let xml = String::from_utf8(write(&payload, &names).expect("converts")).expect("utf8");
+        assert!(
+            xml.contains("pso:uint=\"42\""),
+            "the item comes from the block the pointer names, not from the \
+             pointer's own bytes: {xml}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `write`'s own final check — the one `Writer::spend`'s per-element
+    // check cannot make, because it asks before the last element is
+    // written and so cannot see the total the last element leaves behind.
+    // -------------------------------------------------------------------
+
+    /// A distinct member name for the fine-tuning field
+    /// [`calibrated_pso`] carries alongside its bulk array.
+    const FINE_NAME: u32 = 0x4444_4444;
+
+    /// A payload whose root has two fields: an inline array of `outer`
+    /// inline arrays of `inner` zero-length strings, and a fixed inline
+    /// string of `fine` bytes.
+    ///
+    /// Every array item is zero-stride — the innermost element is a
+    /// zero-length inline string, so every level's stride is zero and no
+    /// item ever moves off the structure's own address — so the payload
+    /// itself stays a few dozen bytes regardless of `outer` and `inner`,
+    /// exactly as `nested_arrays_pso` in `crates/rpf-core/tests/metadata.rs`
+    /// does. `fine` is the one knob that costs real payload bytes, one for
+    /// one, which is what makes it the lever for closing the last few bytes
+    /// of a target exactly.
+    fn calibrated_pso(outer: u16, inner: u16, fine: u16) -> Vec<u8> {
+        let fine = usize::from(fine);
+        let mut psin = Vec::new();
+        psin.extend_from_slice(&section::PSIN);
+        let psin_len = u32::try_from(16 + fine).expect("fine is a u16");
+        psin.extend_from_slice(&psin_len.to_be_bytes());
+        psin.extend_from_slice(b"pppppppp");
+        psin.extend(std::iter::repeat_n(b'a', fine));
+
+        let mut pmap = Vec::new();
+        pmap.extend_from_slice(b"PMAP");
+        pmap.extend_from_slice(&32u32.to_be_bytes());
+        pmap.extend_from_slice(&1i32.to_be_bytes());
+        pmap.extend_from_slice(&1i16.to_be_bytes());
+        pmap.extend_from_slice(&0x7070u16.to_be_bytes());
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&16i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&i32::try_from(fine).expect("fine is a u16").to_be_bytes());
+
+        let mut psch = Vec::new();
+        psch.extend_from_slice(b"PSCH");
+        psch.extend_from_slice(&80u32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        psch.extend_from_slice(&20i32.to_be_bytes());
+        psch.extend_from_slice(&4u32.to_be_bytes());
+        psch.extend_from_slice(&i32::try_from(fine).expect("fine is a u16").to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+
+        psch.extend_from_slice(&MEMBER_NAME.to_be_bytes());
+        psch.extend_from_slice(&[0x0D, 0x01]); // ARRAY, ATFIXEDARRAY
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&((u32::from(outer) << 16) | 1).to_be_bytes());
+
+        psch.extend_from_slice(&ARRAYINFO.to_be_bytes());
+        psch.extend_from_slice(&[0x0D, 0x01]);
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&((u32::from(inner) << 16) | 2).to_be_bytes());
+
+        psch.extend_from_slice(&ARRAYINFO.to_be_bytes());
+        psch.extend_from_slice(&[0x0B, 0x00]); // STRING, MEMBER, zero length
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+
+        psch.extend_from_slice(&FINE_NAME.to_be_bytes());
+        psch.extend_from_slice(&[0x0B, 0x00]);
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&(u32::try_from(fine).expect("fine is a u16") << 16).to_be_bytes());
+
+        let mut payload = psin;
+        payload.extend_from_slice(&pmap);
+        payload.extend_from_slice(&psch);
+        payload
+    }
+
+    #[test]
+    fn write_refuses_a_document_past_its_budget_but_accepts_it_exactly_at_the_boundary() {
+        const OUTER: u16 = 700;
+        const PROBE: u16 = 100;
+
+        let names = Dictionary::default();
+
+        // A cheap probe, two renders apart, gives the exact bytes one more
+        // inner item costs at this outer count — real measurement rather
+        // than a hand count of the XML this walk writes.
+        let probe_low = write(&calibrated_pso(OUTER, PROBE, 0), &names)
+            .expect("renders")
+            .len();
+        let probe_high = write(&calibrated_pso(OUTER, PROBE + 1, 0), &names)
+            .expect("renders")
+            .len();
+        let slope = probe_high - probe_low;
+        assert!(slope > 0, "more items must write more bytes");
+
+        let target = document_budget(calibrated_pso(OUTER, PROBE, 0).len());
+        let steps = target.saturating_sub(probe_low) / slope;
+        let inner = u16::try_from(u32::from(PROBE) + u32::try_from(steps).expect("fits"))
+            .expect("stays inside a u16 at this outer count");
+
+        let under = write(&calibrated_pso(OUTER, inner, 0), &names)
+            .expect("renders")
+            .len();
+        assert!(
+            under <= target,
+            "the coarse search must land at or under the target: {under} vs {target}"
+        );
+        let gap = target - under;
+        let fine = u16::try_from(gap).expect("the coarse search leaves less than a u16's worth");
+
+        let boundary_payload = calibrated_pso(OUTER, inner, fine);
+        let boundary_budget = document_budget(boundary_payload.len());
+        let boundary_len = write(&boundary_payload, &names)
+            .expect("a document exactly at its own budget is accepted")
+            .len();
+        assert_eq!(
+            boundary_len, boundary_budget,
+            "the calibration must land exactly on the boundary for the case below to test it"
+        );
+
+        let over_payload = calibrated_pso(OUTER, inner, fine + 1);
+        let over_budget = document_budget(over_payload.len());
+        assert_eq!(
+            over_budget, boundary_budget,
+            "one more fine-tune byte must not itself move the budget"
+        );
+        let error = write(&over_payload, &names)
+            .expect_err("one byte past its own budget is refused, not merely past MAX_NODES");
+        assert!(
+            matches!(
+                error,
+                Error::BadPso {
+                    cause: Malformed::TooLarge,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+}

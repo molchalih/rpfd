@@ -30,8 +30,13 @@ pub enum EntryKind {
         compressed_len: u32,
         /// Length the payload inflates to.
         uncompressed_len: u32,
-        /// Per-entry encryption field. Zero on every entry measured so far;
-        /// its range is Q10 in `docs/backlog.md`.
+        /// Per-entry encryption field: non-zero means the payload is under the
+        /// archive's own transform.
+        ///
+        /// Two values and no others across 91,604 binary entries.
+        /// `docs/rpf-format.md`, Entry table, `verified` — which answered
+        /// `docs/backlog.md` Q10 and superseded the "zero on every entry
+        /// measured so far" this said while the sample was one archive.
         encryption: u32,
     },
     /// A file whose payload is an `RSC7` resource.
@@ -76,5 +81,33 @@ impl Entry {
     #[must_use]
     pub const fn is_directory(&self) -> bool {
         matches!(self.kind, EntryKind::Directory { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EntryKind;
+
+    #[test]
+    fn each_kind_names_itself_distinctly() {
+        let directory = EntryKind::Directory {
+            first_child: 0,
+            child_count: 0,
+        };
+        let binary = EntryKind::Binary {
+            block: 0,
+            compressed_len: 0,
+            uncompressed_len: 0,
+            encryption: 0,
+        };
+        let resource = EntryKind::Resource {
+            block: 0,
+            compressed_len: 0,
+            system_flags: 0,
+            graphics_flags: 0,
+        };
+        assert_eq!(directory.noun(), "directory");
+        assert_eq!(binary.noun(), "binary file");
+        assert_eq!(resource.noun(), "resource file");
     }
 }

@@ -80,7 +80,7 @@ pub enum Codec {
 /// Widening, not narrowing — §6's rule is about the other direction, and
 /// `usize::try_from` is not `const`, which is what the array bounds behind this
 /// need it to be.
-const fn widen(len: usize) -> u64 {
+pub(crate) const fn widen(len: usize) -> u64 {
     len as u64
 }
 
@@ -229,6 +229,24 @@ impl Version {
         self.header_len()
             .saturating_add(entry_count.saturating_mul(self.row_len()))
             .saturating_add(names_len)
+    }
+
+    /// Whether one entry row of this version is **exactly one cipher block**,
+    /// on a block boundary of the transform that covers the entry table.
+    ///
+    /// True for `RPF7`, and it is what lets an in-place patch rewrite one row
+    /// of an encrypted archive without touching the rest of the table: the
+    /// header is 16 bytes, a row is 16, the transform runs from the table's own
+    /// start and neither transform chains between blocks, so row *i* is cipher
+    /// block *i*. `docs/rpf-format.md`, Entry table, `verified`.
+    ///
+    /// Asked rather than assumed, because it is a coincidence of three numbers
+    /// and not a rule the format states: `RPF6`'s row is 20 bytes and `RPF8`'s
+    /// 24 (`secondary`), and neither would divide a block.
+    #[must_use]
+    pub const fn row_is_a_cipher_block(self) -> bool {
+        let block = widen(crypto::CIPHER_BLOCK_LEN);
+        self.row_len() == block && self.header_len().is_multiple_of(block)
     }
 
     /// Where one entry's row begins, relative to the archive's base, or `None`
@@ -423,6 +441,23 @@ impl Row {
     pub fn as_bytes(&self) -> &[u8] {
         match &self.0 {
             RowBytes::Rpf7(row) => row,
+        }
+    }
+
+    /// The same row under `seal`, for an archive whose entry table is
+    /// encrypted.
+    ///
+    /// Sound for one row on its own only where [`Version::row_is_a_cipher_block`]
+    /// holds, which is the caller's to ask: the transform covers the entry
+    /// table from the table's own start, so a row that is not a whole aligned
+    /// block cannot be sealed without the rows around it.
+    #[must_use]
+    pub fn sealed(self, seal: &crypto::Seal) -> Self {
+        match self.0 {
+            RowBytes::Rpf7(mut row) => {
+                seal.apply(&mut row);
+                Self(RowBytes::Rpf7(row))
+            }
         }
     }
 }

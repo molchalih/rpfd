@@ -33,7 +33,7 @@ pub use build::{
 };
 pub use edit::{Bytes, Change, Changes, Contents, Structural, allows};
 pub use entry::{Entry, EntryKind};
-pub use error::{Category, Error, Result};
+pub use error::{Category, Error, NoWrite, Result};
 pub use format::{Codec, Version};
 pub use inspect::{Listed, ListedKind, Problem, Summary, Verified};
 pub use keys::{Material, Unlock};

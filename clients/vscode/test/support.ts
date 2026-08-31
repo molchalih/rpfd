@@ -28,6 +28,62 @@ const here = __dirname;
 /** The binary under test, or `undefined` when there is none to test against. */
 export const RPF: string | undefined = findBinary();
 
+/**
+ * Refuses a binary in `target/` that is older than the sources it was built
+ * from.
+ *
+ * A missing binary is a skip; a **stale** one is a misconfiguration, and
+ * `docs/conventions.md` §12 makes that a failure rather than a skip for the
+ * same reason it does for a corpus variable pointed at the wrong directory.
+ * Measured 2026-08-31: a `target/release/rpf` left over from an earlier commit
+ * produced a 135/3 run that was read as a client regression and was nothing of
+ * the kind. Loud is the whole point — the suite must not be able to pass, or
+ * fail, against a binary that is not this tree.
+ *
+ * Only for a binary this file resolved itself. `RPF_BIN` is a deliberate
+ * choice, and second-guessing it would break testing a released binary.
+ */
+function refuseStale(binaryPath: string): void {
+    if (process.env.RPF_BIN) {
+        return;
+    }
+    const root = path.resolve(here, '../../../..');
+    const built = fs.statSync(binaryPath).mtimeMs;
+    let newest = 0;
+    let newestPath = '';
+    const walk = (at: string): void => {
+        for (const found of fs.readdirSync(at, { withFileTypes: true })) {
+            const full = path.join(at, found.name);
+            if (found.isDirectory()) {
+                walk(full);
+            } else if (found.isFile()) {
+                const seen = fs.statSync(full).mtimeMs;
+                if (seen > newest) {
+                    newest = seen;
+                    newestPath = full;
+                }
+            }
+        }
+    };
+    walk(path.join(root, 'crates'));
+    for (const also of ['Cargo.toml', 'Cargo.lock']) {
+        const full = path.join(root, also);
+        const seen = fs.statSync(full).mtimeMs;
+        if (seen > newest) {
+            newest = seen;
+            newestPath = full;
+        }
+    }
+    if (newest > built) {
+        throw new Error(
+            `${binaryPath} is older than ${newestPath}, so these tests would ` +
+                'run against a binary that is not this tree. Run `cargo build ' +
+                '--release` in the repository root, or set RPF_BIN to the ' +
+                'binary you mean to test.',
+        );
+    }
+}
+
 /** Why the live tests are skipped, or `false` when they are not. */
 export const SKIP: string | false = RPF
     ? false
@@ -44,10 +100,11 @@ function findBinary(): string | undefined {
     for (const candidate of candidates) {
         try {
             fs.accessSync(candidate, fs.constants.X_OK);
-            return candidate;
         } catch {
             continue;
         }
+        refuseStale(candidate);
+        return candidate;
     }
     return undefined;
 }

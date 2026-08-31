@@ -17,7 +17,7 @@
 use std::{fmt, sync::Arc};
 
 use aes::Aes256;
-use cipher::{BlockCipherDecrypt, KeyInit};
+use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 
 use crate::keys::{
     AES_KEY_LEN, HASH_LUT_LEN, LauncherKey, Material, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN,
@@ -147,6 +147,26 @@ impl Scheme {
             Self::Aes(AesKey::Rage) => "AES-256",
             Self::Aes(AesKey::Launcher) => "AES-256 (launcher)",
             Self::Ng => "NG",
+        }
+    }
+
+    /// Whether this transform can be run **forwards**, so that an archive
+    /// under it can be written back.
+    ///
+    /// AES-256 is symmetric: the same key and the same one ECB pass that
+    /// decrypt a table of contents encrypt one, so [`Seal`] exists for it. The
+    /// NG arm is a white-box construction and this build holds only its
+    /// *decrypt* tables; inverting it is Gaussian elimination over GF(2) for
+    /// rounds 0, 1 and 16 and a 2^32 sweep per column for the rest, which is
+    /// not a thing that can be written here. `docs/ng-scheme.md`.
+    ///
+    /// The one place that asymmetry is decided: [`crate::Archive::writable`]
+    /// asks it, and no write path decides it again (§3).
+    #[must_use]
+    pub const fn seals(self) -> bool {
+        match self {
+            Self::Aes(_) => true,
+            Self::Ng => false,
         }
     }
 
@@ -289,6 +309,100 @@ impl Cipher {
                 ..
             } => ng_block(tables, expanded, block),
         }
+    }
+}
+
+/// One region's or one payload's **encryption**: the inverse of a [`Cipher`].
+///
+/// It exists for the AES transform and for nothing else, by construction —
+/// [`Seal::new`] answers `None` for [`Scheme::Ng`], so an NG seal is not a
+/// value this build can hold. [`Scheme::seals`] is the question asked before
+/// one is wanted.
+///
+/// **It takes no name and no length, and that is the asymmetry itself.** A
+/// [`Cipher`] is keyed by what is being decrypted because the NG key index is a
+/// function of a name and a length; the AES key is the archive tag's and
+/// nothing else, so an archive written longer, shorter or under another name is
+/// written under the key it was read under. `docs/rpf-format.md`, Encryption.
+///
+/// Nothing here holds a key of its own and nothing here prints one: `Debug`
+/// says which transform, never a byte of it (DR-020).
+#[derive(Clone)]
+pub struct Seal {
+    /// Which key the tag chose, for `Debug` to name. A discriminant, never a
+    /// key: DR-020.
+    which: AesKey,
+    /// The expanded key schedule.
+    aes: Box<Aes256>,
+}
+
+impl Seal {
+    /// The forward transform for `scheme`, or `None` where this build cannot
+    /// run one — either because `material` does not carry the key, or because
+    /// the transform has no inverse here ([`Scheme::seals`]).
+    #[must_use]
+    pub fn new(scheme: Scheme, material: &Material) -> Option<Self> {
+        match scheme {
+            Scheme::Aes(which) => Some(Self {
+                which,
+                aes: Box::new(Aes256::new_from_slice(which.of(material)?).ok()?),
+            }),
+            Scheme::Ng => None,
+        }
+    }
+
+    /// Encrypts `buf` in place, leaving a tail shorter than
+    /// [`CIPHER_BLOCK_LEN`] exactly as it stands.
+    ///
+    /// The same extent rule as [`Cipher::apply`], and it has to be: what a
+    /// reader leaves alone a writer must leave alone, or what it wrote is not
+    /// what it reads back. `docs/rpf-format.md`, Encryption, `verified`.
+    ///
+    /// `buf` is one whole region — a table of contents, a names blob, or one
+    /// payload — counted from **its own start**, because neither transform
+    /// chains between blocks and both run from the start of what they cover.
+    pub fn apply(&self, buf: &mut [u8]) {
+        let (blocks, _tail) = buf.as_chunks_mut::<CIPHER_BLOCK_LEN>();
+        for block in blocks {
+            self.block(block);
+        }
+    }
+
+    /// Encrypts one whole block in place.
+    ///
+    /// The one implementation of the forward transform, so the buffered form
+    /// above and the streaming form in [`crate::build`] cannot come to
+    /// disagree (§3).
+    pub(crate) fn block(&self, block: &mut [u8; CIPHER_BLOCK_LEN]) {
+        for _ in 0..AES_PASSES {
+            let mut wide = (*block).into();
+            self.aes.encrypt_block(&mut wide);
+            *block = wide.into();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Seal {
+    /// The AES transform over a key of thirty-two zero bytes, forwards.
+    ///
+    /// The counterpart of [`Cipher::over_zeros`], and for the same reason: it
+    /// tests the **framing** with no key material anywhere (DR-006).
+    pub(crate) fn over_zeros() -> Self {
+        Self {
+            which: AesKey::Rage,
+            aes: Box::new(Aes256::new_from_slice(&[0_u8; AES_KEY_LEN]).expect("thirty-two bytes")),
+        }
+    }
+}
+
+/// By hand, so that no key can reach a log, a panic message or a `--json`
+/// payload by being printed. DR-020.
+impl fmt::Debug for Seal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Seal")
+            .field("scheme", &Scheme::Aes(self.which))
+            .finish_non_exhaustive()
     }
 }
 
@@ -680,6 +794,53 @@ mod tests {
         assert_eq!(table_word(&table, 1), Some(0x0807_0605));
         assert_eq!(table_word(&table, 2), None);
         assert_eq!(word_at(&table, 5), None);
+    }
+
+    #[test]
+    fn a_seal_is_the_ciphers_exact_inverse_over_the_same_extent() {
+        // The whole of what makes an AES archive writable: the same key runs
+        // both directions, and both leave the same tail alone. A seal that
+        // covered a byte the cipher does not — or the other way round — writes
+        // an archive that reads back as nonsense from the first short region,
+        // which is every names blob whose length is not a multiple of sixteen.
+        let cipher = Cipher::over_zeros();
+        let seal = Seal::over_zeros();
+        for len in 0..=(CIPHER_BLOCK_LEN * 3 + 1) {
+            let plain: Vec<u8> = (0..len)
+                .map(|n| u8::try_from(n % 251).unwrap_or(0))
+                .collect();
+            let mut sealed = plain.clone();
+            seal.apply(&mut sealed);
+            assert_eq!(sealed.len(), len, "sealing changed the length at {len}");
+
+            // The tail is the bytes past the last whole block, in both
+            // directions.
+            let tail = len - len % CIPHER_BLOCK_LEN;
+            assert_eq!(
+                sealed.get(tail..),
+                plain.get(tail..),
+                "the tail was transformed at {len}"
+            );
+            if len >= CIPHER_BLOCK_LEN {
+                assert_ne!(
+                    sealed.get(..CIPHER_BLOCK_LEN),
+                    plain.get(..CIPHER_BLOCK_LEN),
+                    "the first block was left alone at {len}"
+                );
+            }
+
+            let mut back = sealed;
+            cipher.apply(&mut back);
+            assert_eq!(back, plain, "sealing then opening lost bytes at {len}");
+        }
+    }
+
+    #[test]
+    fn nothing_a_seal_prints_is_a_key() {
+        // DR-020, on the type the write path holds.
+        let rendered = format!("{:?}", Seal::over_zeros());
+        assert!(rendered.contains("Aes"), "{rendered}");
+        assert!(!rendered.contains("00"), "{rendered}");
     }
 
     #[test]

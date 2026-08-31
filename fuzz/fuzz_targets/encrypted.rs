@@ -132,7 +132,55 @@ struct Input<'a> {
     data: &'a [u8],
 }
 
-fuzz_target!(|input: Input| {
+/// The key material every input is opened with. [`synthetic`].
+static MATERIAL: OnceLock<Arc<Material>> = OnceLock::new();
+
+/// The permutation the transform is, and its inverse. [`transform`].
+static SHAPE: OnceLock<([u8; CIPHER_BLOCK_LEN], [u8; CIPHER_BLOCK_LEN])> = OnceLock::new();
+
+/// The encryption tags this build recognises. [`tags`].
+static TAGS: OnceLock<Vec<u32>> = OnceLock::new();
+
+/// Where the encryption tag sits in a header. [`tag_offset`].
+static TAG_AT: OnceLock<usize> = OnceLock::new();
+
+/// Everything this target answers once per process, answered before the first
+/// input rather than on its clock.
+///
+/// **`init` is `LLVMFuzzerInitialize`, which libFuzzer calls before the fuzzing
+/// loop, so nothing here is charged to a unit's `-timeout`.** Lazily, it was:
+/// the [`tags`] scan is the whole of this cost, and the first input of every
+/// worker paid it. Measured on this machine, `cargo fuzz`'s own build flags,
+/// one input executed twice: **1,571 ms then 0 ms before this, 0 ms and 0 ms
+/// after** — and the campaign box, where the scan is 2.68 s, reported that
+/// first input as a `-timeout=5` hang. `docs/backlog.md`, the campaign of
+/// 2026-08-31; DR-055.
+fn setup() {
+    let _ = synthetic();
+    let _ = transform();
+    let _ = tags();
+    let _ = header_len();
+}
+
+/// Whether [`setup`] has already run, which is what the target asserts on every
+/// input.
+///
+/// A value here that is still empty means a per-process answer is being
+/// computed on some input's clock — the defect DR-055 records, which cost a
+/// campaign a finding that said nothing about the library.
+fn ready() -> bool {
+    MATERIAL.get().is_some()
+        && SHAPE.get().is_some()
+        && TAGS.get().is_some()
+        && TAG_AT.get().is_some()
+}
+
+fuzz_target!(init: setup(), |input: Input| {
+    assert!(
+        ready(),
+        "a per-process answer is being computed on this input's clock, not in `init`"
+    );
+
     let Some(data) = bounded(input.data) else {
         return;
     };
@@ -223,7 +271,6 @@ fn ladder() -> [u8; CIPHER_BLOCK_LEN] {
 
 /// The material every input is opened with, built once.
 fn synthetic() -> &'static Arc<Material> {
-    static MATERIAL: OnceLock<Arc<Material>> = OnceLock::new();
     MATERIAL.get_or_init(|| {
         // Zero, so that all 101 expanded keys are one key and each round
         // contributes only its table lookups. A non-zero round key would make
@@ -284,7 +331,6 @@ fn network() -> Vec<u8> {
 /// is built on, and a target that carried on would be fuzzing archives that
 /// cannot open.
 fn transform() -> &'static ([u8; CIPHER_BLOCK_LEN], [u8; CIPHER_BLOCK_LEN]) {
-    static SHAPE: OnceLock<([u8; CIPHER_BLOCK_LEN], [u8; CIPHER_BLOCK_LEN])> = OnceLock::new();
     SHAPE.get_or_init(|| {
         let cipher = Cipher::new(Scheme::Ng, synthetic(), "", 0)
             .expect("the synthetic material carries the NG half");
@@ -340,8 +386,11 @@ fn transform() -> &'static ([u8; CIPHER_BLOCK_LEN], [u8; CIPHER_BLOCK_LEN]) {
 /// `docs/backlog.md` records what a fuzz target that has quietly stopped
 /// testing what it claims costs, which is a whole campaign. The same trade
 /// `nested_to_the_bound` makes, at a higher price.
+///
+/// Paid in [`setup`], which is where the price stops being an input's. On the
+/// first input it read as a `-timeout=5` hang against 218 bytes that cost
+/// nothing — the finding DR-055 is about.
 fn tags() -> &'static [u32] {
-    static TAGS: OnceLock<Vec<u32>> = OnceLock::new();
     TAGS.get_or_init(|| {
         let version = Version::Rpf7;
         let mut found: Vec<(u32, Scheme)> = Vec::new();
@@ -377,8 +426,7 @@ fn tags() -> &'static [u32] {
 /// so a header that grew a second field of the same value fails here instead
 /// of leaving the tag stamped over something else.
 fn tag_offset() -> usize {
-    static AT: OnceLock<usize> = OnceLock::new();
-    *AT.get_or_init(|| {
+    *TAG_AT.get_or_init(|| {
         let header = nested_to_the_bound();
         let open = Version::Rpf7.open().to_le_bytes();
         let hits: Vec<usize> = (0..CIPHER_BLOCK_LEN)

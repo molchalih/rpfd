@@ -201,6 +201,15 @@ pub fn of(
 /// hands them back untouched otherwise: an editor hands back what it was given,
 /// and a payload that is not a document is not one.
 ///
+/// `encoding` is what the **entry** holds, on the same terms as [`of`]'s: it is
+/// the caller's [`Archive::classify`] answer, and `None` is "nothing
+/// recognised", "is a resource", or "there is no entry yet". It is the whole of
+/// whether there is a view, and `held` is never consulted to decide that — the
+/// write side of **a resource is never sniffed** (Q7, DR-044). Without it a
+/// resource whose payload happens to begin `RBF0` would be handed to the
+/// tokeniser and a tokenised payload written into a resource entry, which is
+/// the one thing [`Classification::Resource`] carries no encoding to prevent.
+///
 /// What comes back is a payload of the entry's own encoding, which is why a
 /// converted write needs no `allow_encoding_change`: there is no encoding
 /// change in it. DR-050's rule judges the result, unchanged and unweakened.
@@ -210,15 +219,30 @@ pub fn of(
 /// [`Error::NoXmlView`] when [`View::Xml`] is asked of an entry that has none,
 /// and [`Error::NotRbfXml`] or [`Error::NotPsoXml`] for a document that does
 /// not describe the payload it is applied to.
-pub fn applied(held: &[u8], path: &str, wanted: Wanted<'_>, offered: Vec<u8>) -> Result<Vec<u8>> {
+pub fn applied(
+    held: &[u8],
+    encoding: Option<Encoding>,
+    path: &str,
+    wanted: Wanted<'_>,
+    offered: Vec<u8>,
+) -> Result<Vec<u8>> {
+    // An entry with no encoding has nothing for a document to be applied to,
+    // and that is the entry's answer rather than the payload's: `held` is not
+    // reached at all, so it cannot overturn it.
+    let has_view = encoding.is_some();
     match wanted.view {
         View::Raw => Ok(offered),
+        View::Xml if !has_view => Err(Error::NoXmlView {
+            path: path.to_owned(),
+            held: encoding,
+        }),
         View::Xml => {
             convert::from_xml(held, &offered, wanted.names)?.ok_or_else(|| Error::NoXmlView {
                 path: path.to_owned(),
-                held: Encoding::of(held.get(..Encoding::HEAD_LEN).unwrap_or(held)),
+                held: encoding,
             })
         }
+        View::Auto if !has_view => Ok(offered),
         View::Auto => {
             let announced = Encoding::of(offered.get(..Encoding::HEAD_LEN).unwrap_or(&offered));
             if announced != Some(Encoding::Xml) {
@@ -237,9 +261,14 @@ pub fn applied(held: &[u8], path: &str, wanted: Wanted<'_>, offered: Vec<u8>) ->
 /// is already holding open — never asked about first and read later, which is
 /// the shape that once corrupted an 80 MB archive.
 ///
+/// **A resource is never sniffed**, exactly as in [`read`]: the entry's kind
+/// decides first, so a resource has no view whatever its bytes look like and
+/// its payload is not fetched at all. Q7, DR-044.
+///
 /// # Errors
 ///
-/// As [`applied`], and whatever reading the entry answers.
+/// As [`applied`], plus [`Error::WrongKind`] for a directory, and whatever
+/// reading the entry answers.
 pub fn apply<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -251,15 +280,24 @@ pub fn apply<R: Read + Seek>(
     if wanted.view == View::Raw {
         return Ok(offered);
     }
-    if archive.classify(src, index)? == Classification::Directory {
-        return Err(Error::WrongKind {
-            path: path.to_owned(),
-            found: "directory",
-            wanted: "file",
-        });
-    }
+    let encoding = match archive.classify(src, index)? {
+        Classification::Directory => {
+            return Err(Error::WrongKind {
+                path: path.to_owned(),
+                found: "directory",
+                wanted: "file",
+            });
+        }
+        Classification::Encoded(encoding) => Some(encoding),
+        // Nothing for a document to be applied to, so the payload is neither
+        // read nor sniffed. The empty slice is what a path with no entry at all
+        // offers, and it is the same answer for the same reason.
+        Classification::Resource | Classification::Binary => {
+            return applied(&[], None, path, wanted, offered);
+        }
+    };
     let held = archive.extract(src, index)?;
-    applied(&held, path, wanted, offered)
+    applied(&held, encoding, path, wanted, offered)
 }
 
 #[cfg(test)]
@@ -363,6 +401,7 @@ mod tests {
         assert_eq!(
             applied(
                 b"RBF0\x00\x00\x00\x00",
+                Some(Encoding::Rbf),
                 "x.ymt",
                 Wanted {
                     view: View::Auto,
@@ -376,10 +415,37 @@ mod tests {
     }
 
     #[test]
+    fn auto_converts_recognised_xml_against_an_entry_that_has_a_view() {
+        // `auto_hands_back_bytes_that_are_not_a_document_untouched` covers the
+        // `!has_view` arm and offers bytes `auto` cannot read as XML either
+        // way, so neither tells the two `View::Auto` arms apart. An entry with
+        // a view, offered a document its encoding actually reads, is the one
+        // input only the real conversion answers right.
+        let names = Dictionary::default();
+        let offered = b"<root></root>".to_vec();
+        let converted = applied(
+            b"RBF0\x00\x00\x00\x00",
+            Some(Encoding::Rbf),
+            "x.ymt",
+            Wanted {
+                view: View::Auto,
+                names: &names,
+            },
+            offered.clone(),
+        )
+        .expect("auto converts a document its entry's encoding reads");
+        assert_ne!(
+            converted, offered,
+            "the offered xml passed through unconverted"
+        );
+    }
+
+    #[test]
     fn an_xml_write_into_an_entry_with_no_view_is_refused() {
         let names = Dictionary::default();
         let refused = applied(
             b"Version 1\r\nabcdef",
+            Some(Encoding::Text),
             "notes.txt",
             Wanted {
                 view: View::Xml,
@@ -388,6 +454,46 @@ mod tests {
             b"<?xml version=\"1.0\"?><a/>".to_vec(),
         )
         .expect_err("text has no view");
+        assert_eq!(refused.name(), "NoXmlView");
+    }
+
+    #[test]
+    fn a_payload_the_entry_gives_no_encoding_is_not_sniffed_for_one() {
+        // The write side of Q7. An entry that carries no encoding — a resource,
+        // whose kind `Archive::classify` short-circuits on before any read —
+        // has no view whatever its payload begins with, and `RBF0` is what a
+        // high-entropy resource has a 2^-32 chance of beginning with. Sniffing
+        // `held` instead would take the `rbf` arm and write a tokenised payload
+        // into a resource entry. DR-044.
+        let names = Dictionary::default();
+        let document = b"<?xml version=\"1.0\"?><a/>".to_vec();
+        let held = b"RBF0\x00\x00\x00\x00";
+        assert_eq!(
+            applied(
+                held,
+                None,
+                "x.ytyp",
+                Wanted {
+                    view: View::Auto,
+                    names: &names
+                },
+                document.clone()
+            )
+            .expect("auto takes what it cannot convert"),
+            document,
+            "a document was converted against an entry with no encoding"
+        );
+        let refused = applied(
+            held,
+            None,
+            "x.ytyp",
+            Wanted {
+                view: View::Xml,
+                names: &names,
+            },
+            document,
+        )
+        .expect_err("an entry with no encoding has no view");
         assert_eq!(refused.name(), "NoXmlView");
     }
 }

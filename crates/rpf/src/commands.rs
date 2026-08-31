@@ -541,6 +541,7 @@ pub fn put(
             inside,
             from,
             view,
+            options.create,
             named_cache,
         )?))
     };
@@ -605,6 +606,7 @@ fn convert(
     inside: &str,
     from: &Path,
     view: View,
+    create: bool,
     named_cache: Option<&Path>,
 ) -> Result<Vec<u8>> {
     let document = fs::read(from).map_err(|source| Failure::Io {
@@ -612,7 +614,23 @@ fn convert(
         source,
     })?;
     let (mut file, archive) = open(path, named_cache)?;
-    let (holder, index) = archive.locate(&mut file, inside)?;
+    let (holder, index) = match archive.locate(&mut file, inside) {
+        Ok(found) => found,
+        // A path being created has no entry to convert against: an entry that
+        // is not there holds no encoding for a document to adopt. `auto` takes
+        // the bytes as they are and `xml` says why it cannot, which is what
+        // the daemon answers for the same request.
+        Err(rpf_core::Error::NotFound { .. }) if create => {
+            return Ok(rpf_core::view::applied(
+                &[],
+                None,
+                inside,
+                wanted(view),
+                document,
+            )?);
+        }
+        Err(failure) => return Err(failure.into()),
+    };
     Ok(rpf_core::view::apply(
         &mut file,
         &holder,

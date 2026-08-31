@@ -1235,3 +1235,94 @@ fn named_paths_mut(failure: &mut Error) -> Vec<&mut String> {
 
 /// Nested change groups, by the entry index of the archive they land in.
 pub(crate) type Grouped = BTreeMap<u32, Nested>;
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, io};
+
+    use super::{fill, named_paths_mut, respelled};
+    use crate::error::Error;
+
+    /// A source whose first read fails with an error that is not
+    /// [`io::ErrorKind::Interrupted`], then answers end of file.
+    struct FailsOnceThenEnds {
+        asked: Cell<u32>,
+    }
+
+    impl io::Read for FailsOnceThenEnds {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            let asked = self.asked.get();
+            self.asked.set(asked.saturating_add(1));
+            if asked == 0 {
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "not interrupted",
+                ))
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    #[test]
+    fn fill_does_not_retry_a_read_error_that_is_not_an_interruption() {
+        let mut source = FailsOnceThenEnds {
+            asked: Cell::new(0),
+        };
+        let mut into = [0_u8; 4];
+        fill(&mut source, &mut into).expect_err("a real read error must not be swallowed");
+    }
+
+    /// A source that fills whatever it is handed in one call, and refuses to
+    /// be asked again once there is nothing left to fill.
+    struct FillsOnceAndRefusesAnEmptyAsk;
+
+    impl io::Read for FillsOnceAndRefusesAnEmptyAsk {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Err(io::Error::other("asked to read into an empty buffer"));
+            }
+            buf.fill(0x5A);
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn fill_stops_asking_once_the_buffer_is_full() {
+        let mut into = [0_u8; 4];
+        let filled = fill(&mut FillsOnceAndRefusesAnEmptyAsk, &mut into)
+            .expect("a source that filled the buffer in one call must not be asked again");
+        assert_eq!(filled, 4);
+        assert_eq!(into, [0x5A; 4]);
+    }
+
+    #[test]
+    fn an_overlapping_failure_has_both_its_paths_respelled() {
+        let failure = Error::Overlapping {
+            path: "inner/a.txt".to_owned(),
+            other: "inner/b.txt".to_owned(),
+        };
+        let spellings = [
+            ("inner/a.txt".to_owned(), "archive.rpf/a.txt".to_owned()),
+            ("inner/b.txt".to_owned(), "archive.rpf/b.txt".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+
+        let fixed = respelled(failure, &spellings);
+        let Error::Overlapping { path, other } = fixed else {
+            panic!("respelling an Overlapping failure must keep it Overlapping");
+        };
+        assert_eq!(path, "archive.rpf/a.txt");
+        assert_eq!(other, "archive.rpf/b.txt");
+    }
+
+    #[test]
+    fn named_paths_mut_reaches_both_names_of_an_overlapping_failure() {
+        let mut failure = Error::Overlapping {
+            path: "a".to_owned(),
+            other: "b".to_owned(),
+        };
+        assert_eq!(named_paths_mut(&mut failure).len(), 2);
+    }
+}

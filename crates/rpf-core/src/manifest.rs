@@ -32,7 +32,7 @@ use crate::{
     archive::Archive,
     build::{FileKind, FileSpec, Storage, directories_of, specs_of},
     entry::EntryKind,
-    error::{Error, Result},
+    error::{Error, NoWrite, Result},
     format::{Codec, Version},
     name,
     watch::{Flow, Step, Watch},
@@ -473,14 +473,26 @@ impl Manifest {
                 reason: "was written by a schema version this build does not read",
             });
         }
-        // A tree extracted from an encrypted archive packs back to an
-        // encrypted archive or to nothing, and this build has no inverse
-        // transform to write one with. Not `NeedsKey`, which would send a
-        // caller to extract material that cannot help: the missing part is
-        // here. R4.7, DR-041.
+        // A tree extracted from an encrypted archive packs back to an encrypted
+        // archive or to nothing, and `pack` opens no archive: it has neither
+        // key material nor a name to derive one from, whichever transform the
+        // tag names. R4.7, DR-041.
+        //
+        // Which reason, though, is the transform's question and not `pack`'s,
+        // so it is asked of `Scheme::seals` — the one place that asymmetry is
+        // decided (§3), and what `Archive::writable` asks. Editing through the
+        // archive is a remedy only where editing through the archive works: for
+        // a tag with no inverse here every editing command refuses it too, and
+        // a caller sent that way is sent down a walled-off path. DR-054 §4 is
+        // about the two reasons naming different actions.
         if !manifest.version.is_open(manifest.encryption) {
+            let reason = match manifest.version.scheme(manifest.encryption) {
+                Some(scheme) if scheme.seals() => NoWrite::NotThroughTheArchive,
+                Some(_) | None => NoWrite::NoInverse,
+            };
             return Err(Error::CannotWriteEncrypted {
                 tag: manifest.encryption,
+                reason,
             });
         }
         // Before `pack` opens anything: `build` plans the tree before it
@@ -606,16 +618,35 @@ mod tests {
     }
 
     #[test]
-    fn an_encrypted_manifest_is_refused_rather_than_half_understood() {
-        // Exit 9, not 5: no key material writes this archive back, because the
-        // inverse transform is what is missing and it is missing here. R4.7.
-        let text = r#"{"schema":1,"encryption":268435449,"directories":[],"entries":[]}"#;
-        let error = Manifest::from_json(text).expect_err("an encrypted manifest is refused");
-        assert!(
-            matches!(error, Error::CannotWriteEncrypted { tag: 268_435_449 }),
-            "{error:?}"
-        );
-        assert_eq!(error.category(), crate::error::Category::Unsupported);
+    fn an_encrypted_manifest_is_refused_with_the_reason_its_transform_earns() {
+        // Exit 9, not 5, for both: `pack` opens no archive, so it holds no key
+        // for either tag and no material a caller extracts reaches it. R4.7.
+        //
+        // The reason differs, and that is what this row is for. An AES tag is
+        // `NotThroughTheArchive`, and the remedy the frontend spells beside it
+        // — edit through the archive — is one that works. An NG tag is
+        // `NoInverse`, because every editing command refuses that tag as well:
+        // sending an automation to a command that also refuses is the inverse
+        // of what DR-054 §4 asks a typed reason for.
+        for (tag, want) in [
+            (268_435_449_u32, NoWrite::NotThroughTheArchive),
+            (267_386_879, NoWrite::NoInverse),
+        ] {
+            let text =
+                format!(r#"{{"schema":1,"encryption":{tag},"directories":[],"entries":[]}}"#);
+            let error = Manifest::from_json(&text).expect_err("an encrypted manifest is refused");
+            assert!(
+                matches!(
+                    error,
+                    Error::CannotWriteEncrypted {
+                        tag: found,
+                        reason,
+                    } if found == tag && reason == want
+                ),
+                "{error:?}"
+            );
+            assert_eq!(error.category(), crate::error::Category::Unsupported);
+        }
     }
 
     #[test]

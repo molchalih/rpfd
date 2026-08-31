@@ -194,6 +194,44 @@ mod checksum {
         hash ^= hash >> 11;
         hash.wrapping_add(hash << 15)
     }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "test code; clippy.toml's allow-*-in-tests settings have no \
+                  equivalent for this lint. docs/conventions.md §15"
+    )]
+    mod tests {
+        use super::*;
+
+        /// The write is bounded by the section's own twenty bytes, not by the
+        /// file: a field ending exactly on that boundary is the last one a
+        /// `CHKS` section can hold, and it must still be accepted.
+        #[test]
+        fn put_accepts_a_field_that_ends_exactly_on_the_sections_boundary() {
+            let mut file = vec![0u8; 40];
+            let at = 5;
+            let field = section::CHKS_LEN - 4;
+            put(&mut file, at, field, 0x1234_5678).expect("the boundary itself fits");
+            assert_eq!(
+                &file[at + field..at + field + 4],
+                &0x1234_5678u32.to_be_bytes()
+            );
+        }
+
+        /// One byte past that boundary is refused rather than written into
+        /// whatever follows the section — the defect this bound exists to
+        /// prevent, `docs/metadata-encodings.md`, `CHKS`.
+        #[test]
+        fn put_refuses_a_field_that_reaches_one_byte_past_the_boundary() {
+            let mut file = vec![0xAAu8; 40];
+            let at = 5;
+            let field = section::CHKS_LEN - 3;
+            let before = file.clone();
+            assert!(put(&mut file, at, field, 0xFFFF_FFFF).is_err());
+            assert_eq!(file, before, "a refused write leaves the file untouched");
+        }
+    }
 }
 
 /// One element of the document: its name, its one reserved attribute, and its
@@ -983,4 +1021,405 @@ fn narrow(number: f32) -> Option<u16> {
     }
     let narrowed = u16::try_from(full >> drop).ok()?;
     (narrowed != 0).then_some(sign | narrowed)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "test code; clippy.toml's allow-*-in-tests settings have no \
+              equivalent for this lint. docs/conventions.md §15"
+)]
+mod tests {
+    use super::*;
+
+    /// An arbitrary structure name, distinct from any member name used here.
+    const ROOT_NAME: u32 = 0xD98B_B561;
+    /// An arbitrary member name, distinct from [`ROOT_NAME`] and [`ARRAYINFO`].
+    const MEMBER_NAME: u32 = 0x1234_5678;
+    /// The `ARRAYINFO` sentinel, `crate::metadata::pso::model`'s own copy not
+    /// being imported into this module.
+    const ARRAYINFO: u32 = 0x0000_0100;
+
+    /// A one-entry `PMAP` block table naming a block of `length` bytes at
+    /// `offset`.
+    fn one_block_pmap(offset: i32, length: i32) -> Vec<u8> {
+        let mut pmap = vec![0u8; 8];
+        pmap.extend_from_slice(&1i32.to_be_bytes()); // rootId
+        pmap.extend_from_slice(&1i16.to_be_bytes()); // entriesCount
+        pmap.extend_from_slice(&0u16.to_be_bytes()); // unknown_Eh
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&offset.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes()); // unknown_8h
+        pmap.extend_from_slice(&length.to_be_bytes());
+        pmap
+    }
+
+    /// A block table naming one block, large enough that a landing anywhere
+    /// inside it is in range.
+    fn trivial_blocks() -> Blocks {
+        Blocks::read(&one_block_pmap(0, 64), 64).expect("a minimal block table reads")
+    }
+
+    /// A document node, built directly rather than parsed.
+    fn node(tag: &str, word: &str, value: &str) -> Node {
+        Node {
+            position: 0,
+            tag: tag.to_owned(),
+            word: word.to_owned(),
+            value: value.to_owned(),
+            children: Vec::new(),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // `is_space` — a mutant that always answers `true` would trim a stray
+    // word down to nothing and never see it.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn text_between_elements_that_is_not_whitespace_is_refused() {
+        let error = read_tree(b"<a pso:x=\"y\">not-blank</a>").expect_err("stray text is refused");
+        assert!(
+            matches!(
+                error,
+                Error::NotPsoXml {
+                    cause: NotPsoXml::UnexpectedText,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn text_between_elements_that_is_only_whitespace_is_accepted() {
+        read_tree(b"<a pso:x=\"y\">  \n\t\r  </a>").expect("pure whitespace is not content");
+    }
+
+    // -------------------------------------------------------------------
+    // `Applier::counted` — the `None` arm's `count == 0` guard tells an
+    // array that is legitimately empty from a null pointer with items
+    // nowhere to be, which is the file contradicting itself.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn counted_refuses_a_null_pointer_that_declares_a_nonzero_count() {
+        let section = vec![0u8; 8]; // the word at address 0 is null
+        let blocks = trivial_blocks();
+        let schema = Schema::default();
+        let names = Dictionary::default();
+        let applier = Applier {
+            data: Data {
+                section: &section,
+                blocks: &blocks,
+            },
+            edited: section.clone(),
+            schema: &schema,
+            names: &names,
+        };
+
+        assert_eq!(
+            applier
+                .counted(0, 0)
+                .expect("a null pointer with no items is a legitimately empty array"),
+            (0, 0)
+        );
+        let error = applier
+            .counted(0, 1)
+            .expect_err("a null pointer with one declared item is a contradiction");
+        assert!(
+            matches!(
+                error,
+                Error::BadPso {
+                    cause: Malformed::Pointer,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `Applier::structure` — the depth ceiling accepts a structure exactly
+    // `MAX_DEPTH` deep and refuses only past it.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn structure_refuses_only_past_the_exact_depth_ceiling() {
+        let section = vec![0u8; 8];
+        let blocks = trivial_blocks();
+        let schema = Schema::default();
+        let names = Dictionary::default();
+        let mut applier = Applier {
+            data: Data {
+                section: &section,
+                blocks: &blocks,
+            },
+            edited: section.clone(),
+            schema: &schema,
+            names: &names,
+        };
+        let leaf = node("tag", STRUCT, "whatever");
+
+        // At the ceiling itself, the depth check must not be what refuses:
+        // the schema defines nothing, so what should surface once the depth
+        // check is passed is `UndefinedStructure`, not `TooDeep`.
+        let at_ceiling = applier.structure(0xDEAD_BEEF, 0, "tag", &leaf, MAX_DEPTH);
+        assert!(
+            matches!(
+                at_ceiling,
+                Err(Error::BadPso {
+                    cause: Malformed::UndefinedStructure,
+                    ..
+                })
+            ),
+            "{at_ceiling:?}"
+        );
+
+        let past_ceiling = applier.structure(0xDEAD_BEEF, 0, "tag", &leaf, MAX_DEPTH + 1);
+        assert!(
+            matches!(
+                past_ceiling,
+                Err(Error::BadPso {
+                    cause: Malformed::TooDeep,
+                    ..
+                })
+            ),
+            "{past_ceiling:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `expect_value` and `expect_null` — a refusal that never fires is a
+    // refusal that does not exist.
+    // -------------------------------------------------------------------
+
+    /// A minimal valid `PSO`: one block, one structure, one `UINT` member.
+    ///
+    /// The same shape `crates/rpf-core/tests/metadata.rs`'s `minimal_pso`
+    /// builds, kept local because a test crate and a unit test module share
+    /// no code.
+    fn one_uint_pso() -> Vec<u8> {
+        let mut psin = Vec::new();
+        psin.extend_from_slice(&section::PSIN);
+        psin.extend_from_slice(&20u32.to_be_bytes());
+        psin.extend_from_slice(b"pppppppp");
+        psin.extend_from_slice(&7u32.to_be_bytes());
+
+        let mut pmap = Vec::new();
+        pmap.extend_from_slice(b"PMAP");
+        pmap.extend_from_slice(&32u32.to_be_bytes());
+        pmap.extend_from_slice(&1i32.to_be_bytes());
+        pmap.extend_from_slice(&1i16.to_be_bytes());
+        pmap.extend_from_slice(&0x7070u16.to_be_bytes());
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&16i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&4i32.to_be_bytes());
+
+        let mut psch = Vec::new();
+        psch.extend_from_slice(b"PSCH");
+        psch.extend_from_slice(&44u32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        psch.extend_from_slice(&20i32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&4i32.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+        psch.extend_from_slice(&MEMBER_NAME.to_be_bytes());
+        psch.extend_from_slice(&[0x06, 0x00]);
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+
+        let mut payload = psin;
+        payload.extend_from_slice(&pmap);
+        payload.extend_from_slice(&psch);
+        payload
+    }
+
+    #[test]
+    fn a_structures_own_type_word_must_match_the_schema_exactly() {
+        let payload = one_uint_pso();
+        let names = Dictionary::default();
+        let xml =
+            String::from_utf8(super::super::render::write(&payload, &names).expect("converts"))
+                .expect("utf8");
+        let root_word = format!("pso:struct=\"{}\"", names.render(ROOT_NAME));
+        assert!(xml.contains(&root_word), "{xml}");
+        let wrong = xml.replacen(&root_word, "pso:struct=\"somethingelse\"", 1);
+
+        let error = write(&payload, wrong.as_bytes(), &names)
+            .expect_err("a structure whose own type word disagrees is refused");
+        assert!(
+            matches!(
+                error,
+                Error::NotPsoXml {
+                    cause: NotPsoXml::Word { .. },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A `PSO` whose one member is a null `STRUCT` pointer.
+    fn nullable_struct_pointer_pso() -> Vec<u8> {
+        let mut psin = Vec::new();
+        psin.extend_from_slice(&section::PSIN);
+        psin.extend_from_slice(&20u32.to_be_bytes());
+        psin.extend_from_slice(b"pppppppp");
+        psin.extend_from_slice(&0u32.to_be_bytes()); // a null pointer
+
+        let mut pmap = Vec::new();
+        pmap.extend_from_slice(b"PMAP");
+        pmap.extend_from_slice(&32u32.to_be_bytes());
+        pmap.extend_from_slice(&1i32.to_be_bytes());
+        pmap.extend_from_slice(&1i16.to_be_bytes());
+        pmap.extend_from_slice(&0x7070u16.to_be_bytes());
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&16i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&4i32.to_be_bytes());
+
+        let mut psch = Vec::new();
+        psch.extend_from_slice(b"PSCH");
+        psch.extend_from_slice(&44u32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        psch.extend_from_slice(&20i32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&4i32.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+        psch.extend_from_slice(&MEMBER_NAME.to_be_bytes());
+        psch.extend_from_slice(&[0x0C, 0x03]); // STRUCT, POINTER
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+
+        let mut payload = psin;
+        payload.extend_from_slice(&pmap);
+        payload.extend_from_slice(&psch);
+        payload
+    }
+
+    #[test]
+    fn a_null_pointers_own_word_must_say_null_and_nothing_else() {
+        let payload = nullable_struct_pointer_pso();
+        let names = Dictionary::default();
+        let xml =
+            String::from_utf8(super::super::render::write(&payload, &names).expect("converts"))
+                .expect("utf8");
+        assert!(xml.contains("pso:null=\"struct\""), "{xml}");
+        let wrong = xml.replace("pso:null=\"struct\"", "pso:struct=\"whatever\"");
+
+        let error = write(&payload, wrong.as_bytes(), &names)
+            .expect_err("a null pointer written as anything but pso:null is refused");
+        assert!(
+            matches!(
+                error,
+                Error::NotPsoXml {
+                    cause: NotPsoXml::Word { ref wanted, .. },
+                    ..
+                } if wanted == "null"
+            ),
+            "{error:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The `Layout::PointerWithCount` arm — deleting it falls through to the
+    // inline wildcard, so an edit lands on the pointer's own bytes instead
+    // of on the block the pointer names.
+    // -------------------------------------------------------------------
+
+    /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`,
+    /// the pointer naming a second block that holds the one item.
+    fn pointer_with_count_pso() -> Vec<u8> {
+        let mut psin = Vec::new();
+        psin.extend_from_slice(&section::PSIN);
+        psin.extend_from_slice(&28u32.to_be_bytes());
+        psin.extend_from_slice(b"pppppppp");
+        psin.extend_from_slice(&2u32.to_be_bytes()); // pointer to block 2, offset 0
+        psin.extend_from_slice(&0u32.to_be_bytes()); // the pointer's dead second word
+        psin.extend_from_slice(&42u32.to_be_bytes()); // block 2: one UINT
+
+        let mut pmap = Vec::new();
+        pmap.extend_from_slice(b"PMAP");
+        pmap.extend_from_slice(&48u32.to_be_bytes());
+        pmap.extend_from_slice(&1i32.to_be_bytes());
+        pmap.extend_from_slice(&2i16.to_be_bytes());
+        pmap.extend_from_slice(&0x7070u16.to_be_bytes());
+        pmap.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        pmap.extend_from_slice(&16i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&8i32.to_be_bytes());
+        pmap.extend_from_slice(&0x0000_0006u32.to_be_bytes()); // block 2's tag, unused here
+        pmap.extend_from_slice(&24i32.to_be_bytes());
+        pmap.extend_from_slice(&0i32.to_be_bytes());
+        pmap.extend_from_slice(&4i32.to_be_bytes());
+
+        let mut psch = Vec::new();
+        psch.extend_from_slice(b"PSCH");
+        psch.extend_from_slice(&56u32.to_be_bytes());
+        psch.extend_from_slice(&1u32.to_be_bytes());
+        psch.extend_from_slice(&ROOT_NAME.to_be_bytes());
+        psch.extend_from_slice(&20i32.to_be_bytes());
+        psch.extend_from_slice(&2u32.to_be_bytes());
+        psch.extend_from_slice(&8i32.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+        psch.extend_from_slice(&MEMBER_NAME.to_be_bytes());
+        psch.extend_from_slice(&[0x0D, 0x06]); // ARRAY, PointerWithCount
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&((1u32 << 16) | 1).to_be_bytes()); // count 1, element 1
+        psch.extend_from_slice(&ARRAYINFO.to_be_bytes());
+        psch.extend_from_slice(&[0x06, 0x00]); // UINT
+        psch.extend_from_slice(&0u16.to_be_bytes());
+        psch.extend_from_slice(&0u32.to_be_bytes());
+
+        let mut payload = psin;
+        payload.extend_from_slice(&pmap);
+        payload.extend_from_slice(&psch);
+        payload
+    }
+
+    #[test]
+    fn an_edit_to_a_pointer_with_count_item_lands_through_the_pointer() {
+        let payload = pointer_with_count_pso();
+        let names = Dictionary::default();
+        let xml =
+            String::from_utf8(super::super::render::write(&payload, &names).expect("converts"))
+                .expect("utf8");
+        assert!(xml.contains("pso:uint=\"42\""), "{xml}");
+        let edited_xml = xml.replace("pso:uint=\"42\"", "pso:uint=\"99\"");
+
+        let edited = write(&payload, edited_xml.as_bytes(), &names).expect("the edit applies");
+        assert_eq!(
+            &edited[24..28],
+            &99u32.to_be_bytes(),
+            "the value lands in the block the pointer names"
+        );
+        assert_eq!(
+            &edited[16..20],
+            &2u32.to_be_bytes(),
+            "and the pointer itself is untouched"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // `narrow` — the `||` at the top of the infinity/NaN arm. Its second
+    // half is dead in isolation (see the report), but the disjunction as a
+    // whole is not: a payload with a low bit that would be dropped and a
+    // nonzero high half must still be refused.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn a_nan_whose_low_payload_bits_would_be_lost_is_refused() {
+        let bits = (0xFFu32 << 23) | 0x0000_2001;
+        let value = f32::from_bits(bits);
+        assert!(value.is_nan(), "the chosen bits are a NaN");
+        assert_eq!(
+            narrow(value),
+            None,
+            "narrowing would drop the low bit of the payload"
+        );
+    }
 }
