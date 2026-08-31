@@ -39,6 +39,17 @@ Both are located through **`RPF_METADATA`** rather than `RPF_CORPUS`, because
 they describe payloads that are already out of their archives; the top-level
 README says why that is a separate variable.
 
+**`tools/metadata-dump` is what fills that directory**, and it is the step
+rather than a note about it: it walks a corpus for `*.rpf`, descends every
+nested archive, and writes out every `PSO`, `RBF` and resource `Meta` payload
+it recognises. A dumped file's contents are exactly the payload. A dumped
+resource `Meta` additionally carries **how many of its bytes are system
+pages**, as a `sys` field in its file name — `00002_sys8192_…` — because a
+`Meta` is a paged payload whose every pointer resolves against the boundary
+between its system and its graphics pages, that boundary is the entry's rather
+than the payload's, and `metadata::meta::parse` cannot be run without it.
+`tools/metadata-dump/README.md` says why the name and not a sidecar.
+
 **With `RPF_METADATA` unset the metadata tests are `#[ignore]`d and the harness
 names each one; with it set and pointing somewhere else they fail.** That is not
 the same rule as the one above, and the difference is deliberate:

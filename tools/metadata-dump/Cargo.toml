@@ -1,0 +1,17 @@
+# The dump step for `RPF_METADATA`. A workspace member, unlike `tools/oracle`:
+# it links nothing but `rpf-core`, so the lint set, `cargo fmt` and
+# `cargo clippy --all-targets` reach it, and the layout its library states is
+# the layout `crates/rpf-core/tests/metadata.rs` reads back.
+[package]
+name = "metadata-dump"
+version = "0.0.0"
+publish = false
+license = "MIT OR Apache-2.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rpf-core = { path = "../../crates/rpf-core" }
+
+[lints]
+workspace = true

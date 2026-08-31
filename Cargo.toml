@@ -1,10 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/rpf-core", "crates/rpf"]
+members = ["crates/rpf-core", "crates/rpf", "tools/metadata-dump"]
 # DR-007: the oracle generator links the reference implementation. It must not
 # appear in a default build, in continuous integration, or in anything shipped.
 # It is built deliberately, run once per corpus change, and what gets committed
 # is its output. tools/oracle/README.md says how to run it.
+#
+# `tools/metadata-dump` is a member rather than an exclusion, and the contrast
+# is the point: it links nothing but `rpf-core`, so the lint set, the formatter
+# and `clippy --all-targets` reach it and the layout it states is checked where
+# it is stated. Only the reference implementation has to be kept out.
 #
 # `fuzz` is excluded for a different reason: `cargo-fuzz` needs a nightly
 # compiler, and `rust-toolchain.toml` pins this workspace to stable so that

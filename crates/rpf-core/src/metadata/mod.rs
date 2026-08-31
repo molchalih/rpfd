@@ -20,12 +20,24 @@
 //! encoding, and `docs/metadata-encodings.md` owns those facts. Each takes and
 //! returns bytes for the same reason this module does.
 //!
+//! **Resource `Meta` is deliberately not one of [`Encoding`]'s variants, and
+//! has no magic here.** `docs/rpf-format.md`'s Metadata encodings row says what
+//! the container recognises one by, and it is **not the payload's bytes**: the
+//! entry table's resource bit is the only truth, as Q7 found for `RSC7`. What
+//! the row also records — the `0x50524430` word at offset `0x10` of the
+//! *inflated* payload — is a metadata-layer test on bytes the container has by
+//! then handed over, so it lives with the encoding that owns it, as
+//! [`meta::MAGIC`] at [`meta::MAGIC_AT`]. It could not be one of
+//! [`Encoding::of`]'s signatures in any case: that function judges
+//! [`Encoding::HEAD_LEN`] bytes and the word sits at the sixteenth.
+//!
 //! This layer is also the one place §7's rule does not reach. A container
 //! function takes `impl Read + Seek`; a metadata payload is a whole small
 //! document — the largest `RBF` in the corpus is 57,378 bytes — with nothing to
 //! seek within, because the token stream is read once, front to back.
 
 pub mod hash;
+pub mod meta;
 pub mod pso;
 pub mod rbf;
 pub(crate) mod text;

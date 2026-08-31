@@ -38,6 +38,13 @@ thiserror.workspace = true
 
 [dev-dependencies]
 hex = "0.4"
+# The dump step, for the one fact its layout owns: how a dumped resource `Meta`
+# carries the system length `meta::parse` needs and its payload does not state.
+# `tests/metadata.rs` reads names back through `metadata_dump::system_len_of`
+# rather than spelling the convention a second time (§3). A dev-dependency, so
+# nothing shipped depends on it, and a cycle only through dev-dependencies,
+# which is the one shape Cargo allows.
+metadata-dump = { path = "../../tools/metadata-dump" }
 # docs/conventions.md §14, the property-tests row, chosen for exactly this: the
 # metadata round trip is a law over arbitrary documents, not a list of cases.
 # R5.7.

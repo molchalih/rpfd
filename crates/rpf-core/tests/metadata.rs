@@ -34,7 +34,7 @@ use rpf_core::{
     Category, Error,
     metadata::{
         hash::{self, Dictionary, joaat},
-        pso, rbf,
+        meta, pso, rbf,
     },
 };
 use sha2::{Digest, Sha256};
@@ -2443,4 +2443,212 @@ fn an_array_item_added_or_removed_is_refused_because_the_length_is_the_payloads(
             found: 3
         }
     );
+}
+
+/// How many resource `Meta` files both installs ship.
+///
+/// `docs/metadata-encodings.md`, The corpus, corrected — 39,324 `.ymap`, 5,628
+/// `.ytyp` and 4,662 `.ymt`, in 219 archives. §12: a test whose claim is about
+/// this many files is not satisfied by a directory holding one.
+const META_FILES: usize = 49_614;
+
+/// One dumped resource `Meta` payload: its bytes, and the one fact about it
+/// that its bytes do not carry.
+///
+/// A `Meta` is a *paged* payload — system pages, then graphics pages — and
+/// every resource pointer in it resolves against the boundary between the two.
+/// The boundary is the entry's, from `format::resource::size_from_flags` of
+/// its system flags, and nothing in the payload states it. So the dump records
+/// it, in the file's name, and `metadata_dump::system_len_of` is the one place
+/// that convention is read (§3): `tools/metadata-dump` writes it there and
+/// this reads it back.
+#[derive(Debug)]
+struct Dumped {
+    /// The inflated payload, exactly as the archive holds it.
+    payload: Vec<u8>,
+    /// How many of its leading bytes are system pages.
+    system_len: usize,
+}
+
+/// Every resource `Meta` payload under `RPF_METADATA`, one at a time, and how
+/// many there were.
+///
+/// **One payload is held at a time, deliberately.** The dump is 2.85 GB and
+/// both tests below walk it; collecting it into a map held each test's whole
+/// copy for the length of the test, and `cargo test` runs them in parallel, so
+/// the pair peaked at twice the dump. `visit` is handed each payload and the
+/// bytes are dropped before the next file is opened, which makes the walk's
+/// peak one payload rather than the corpus.
+///
+/// Recognition is `meta::identifies` and nothing else: a `Meta` payload has no
+/// magic at its front, so `payloads` above cannot find one.
+///
+/// Two refusals rather than one, and neither can be reached quietly. A dump of
+/// the wrong size is not the corpus this claims something about (§12); and a
+/// `Meta` payload whose name carries no system length is a dump written by
+/// something other than `tools/metadata-dump --kinds meta`, which is a
+/// misconfiguration rather than a missing corpus — `meta::parse` cannot be run
+/// over it at all, and guessing the boundary would be inventing the answer.
+/// Both are raised after the walk, so a caller's own assertion still comes
+/// second: [`refuse`] does not return.
+fn each_meta_payload(test: &str, mut visit: impl FnMut(&str, &Dumped)) -> usize {
+    let Some(root) = env::var_os("RPF_METADATA") else {
+        refuse(
+            test,
+            "RPF_METADATA is not set, so no payload can be located",
+        );
+    };
+    let root = PathBuf::from(root);
+    let Ok(listing) = fs::read_dir(&root) else {
+        refuse(test, &format!("{} is not a directory", root.display()));
+    };
+    // The names first and sorted, which is what the map this replaced gave for
+    // free: a listing arrives in the filesystem's own order, and a failure
+    // message that changes order between runs is one nobody can diff.
+    let mut paths: Vec<PathBuf> = listing
+        .map(|entry| entry.expect("directory entry readable").path())
+        .filter(|path| path.is_file())
+        .collect();
+    paths.sort();
+
+    let mut found = 0_usize;
+    let mut unlabelled = Vec::new();
+    for path in paths {
+        let bytes = fs::read(&path).expect("payload readable");
+        if !meta::identifies(&bytes) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .expect("a file has a name")
+            .to_string_lossy()
+            .into_owned();
+        let Some(system_len) = metadata_dump::system_len_of(&name) else {
+            unlabelled.push(name);
+            continue;
+        };
+        let dumped = Dumped {
+            payload: bytes,
+            system_len: usize::try_from(system_len).expect("a length fits"),
+        };
+        found += 1;
+        visit(&name, &dumped);
+    }
+    if !unlabelled.is_empty() {
+        refuse(
+            test,
+            &format!(
+                "{} of the Meta payloads in {} carry no system length in their name, \
+                 the first being {}: rerun `tools/metadata-dump --kinds meta`, \
+                 which is what writes it",
+                unlabelled.len(),
+                root.display(),
+                unlabelled.first().expect("one is there"),
+            ),
+        );
+    }
+    if found != META_FILES {
+        refuse(
+            test,
+            &format!(
+                "{} holds {found} inflated resource Meta payloads and the corpus has \
+                 {META_FILES}: `tools/metadata-dump --kinds meta` is what puts them there",
+                root.display(),
+            ),
+        );
+    }
+    found
+}
+
+#[test]
+#[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
+fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
+    // Five `verified` rows of `docs/metadata-encodings.md`'s resource `Meta`
+    // section, as a test that fails if any of them stops being true: the magic
+    // word at 0x10 in 49,614 of 49,614, the two version words and no third, the
+    // zero at 0x18, the root block in range with a value in 1..8, and the three
+    // info-table pointers in the system space.
+    //
+    // The header alone, deliberately: this is the one claim that holds without
+    // the page boundary, so it fails on a header rather than on a pointer that
+    // could not be resolved. Parsing the whole file is the test below.
+    let mut failed = Vec::new();
+    let mut versions: BTreeMap<u32, usize> = BTreeMap::new();
+    let read = |name: &str, dumped: &Dumped| {
+        match meta::Header::read(&dumped.payload) {
+            Ok(header) => {
+                *versions.entry(header.version).or_default() += 1;
+                let roots = 1..=8;
+                if !roots.contains(&header.root.get()) {
+                    failed.push(format!("{name}: root block {}", header.root.get()));
+                }
+                for (table, pointer, count) in [
+                    ("structures", header.structures, header.structure_count),
+                    ("enums", header.enums, header.enum_count),
+                    ("blocks", header.blocks, header.block_count),
+                ] {
+                    // A table of nothing points at nothing. Measured on
+                    // `des_canister.ytyp`, a shipped file with six structures,
+                    // eight data blocks and **no enums**, whose enum pointer is
+                    // null: asking a null pointer for its space answers `None`,
+                    // and reading that as "not system-space" failed the file
+                    // for carrying an empty table.
+                    if count == 0 {
+                        assert!(
+                            pointer.is_null(),
+                            "{name}: the {table} table is empty and its pointer is not null"
+                        );
+                    } else if pointer.space() != Some(meta::Space::System) {
+                        failed.push(format!("{name}: the {table} table is not system-space"));
+                    }
+                }
+            }
+            Err(error) => failed.push(format!("{name}: {error}")),
+        }
+    };
+    let count = each_meta_payload(
+        "every_shipped_meta_file_carries_the_header_the_probe_measured",
+        read,
+    );
+    assert!(
+        failed.is_empty(),
+        "{} of {count} payloads did not read as the document says:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    eprintln!("{count} Meta headers read, versions {versions:?}");
+}
+
+#[test]
+#[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
+fn every_shipped_meta_file_parses_from_the_system_length_its_name_carries() {
+    // What R5.8c is for. `meta::parse` cannot be run over a dumped payload
+    // without the boundary between its system and graphics pages, which is a
+    // fact about the *entry* — `format::resource::size_from_flags` of its
+    // system flags — and appears nowhere in the payload. The dump records it in
+    // each file's name, so the census `docs/metadata-encodings.md` measured by
+    // probe is repeatable here: every file walked from its own tables, with no
+    // builtin table consulted and nothing outside itself referenced.
+    let mut failed = Vec::new();
+    let mut structures = 0_usize;
+    let mut blocks = 0_usize;
+    let parse = |name: &str, dumped: &Dumped| match meta::parse(&dumped.payload, dumped.system_len)
+    {
+        Ok(document) => {
+            structures += document.structures().len();
+            blocks += document.blocks().len();
+        }
+        Err(error) => failed.push(format!("{name}: {error}")),
+    };
+    let count = each_meta_payload(
+        "every_shipped_meta_file_parses_from_the_system_length_its_name_carries",
+        parse,
+    );
+    assert!(
+        failed.is_empty(),
+        "{} of {count} payloads did not parse:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    eprintln!("{count} Meta payloads parsed, {structures} structures and {blocks} data blocks");
 }

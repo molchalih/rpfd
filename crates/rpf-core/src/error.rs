@@ -737,6 +737,20 @@ pub enum Error {
         cause: crate::metadata::pso::Malformed,
     },
 
+    /// A resource `Meta` payload contradicts itself.
+    ///
+    /// The same shape as [`Error::BadPso`] and for the same reason: §10 counts
+    /// **crate** boundaries and there is one, so the metadata layer keeps its
+    /// own vocabulary inside `cause` rather than this enum growing a variant
+    /// per table.
+    #[error("malformed Meta at offset {offset}")]
+    BadMeta {
+        /// Where in the payload the file stopped making sense.
+        offset: u64,
+        /// What was wrong with it.
+        cause: crate::metadata::meta::Malformed,
+    },
+
     /// A `PSO` payload is well formed and carries something this build does not
     /// decode.
     ///
@@ -871,7 +885,8 @@ impl Error {
             | Self::ChecksumMismatch { .. }
             | Self::VerifyFailed { .. }
             | Self::BadRbf { .. }
-            | Self::BadPso { .. } => Category::Corrupt,
+            | Self::BadPso { .. }
+            | Self::BadMeta { .. } => Category::Corrupt,
         }
     }
 
@@ -930,6 +945,7 @@ impl Error {
             Self::Cancelled { .. } => "Cancelled",
             Self::BadRbf { .. } => "BadRbf",
             Self::BadPso { .. } => "BadPso",
+            Self::BadMeta { .. } => "BadMeta",
             Self::UnsupportedPso { .. } => "UnsupportedPso",
             Self::UnrepresentableRbf { .. } => "UnrepresentableRbf",
             Self::NotRbfXml { .. } => "NotRbfXml",
@@ -980,7 +996,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 41;
+    const VARIANTS: usize = 42;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -1082,6 +1098,12 @@ mod tests {
             Error::BadPso {
                 offset: 7,
                 cause: crate::metadata::pso::Malformed::NotPso,
+            },
+            // And for the third encoding, whose bytes are a resource's paged
+            // payload rather than a file with a magic at the front.
+            Error::BadMeta {
+                offset: 0x10,
+                cause: crate::metadata::meta::Malformed::NotMeta,
             },
         ]
     }
