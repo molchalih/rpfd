@@ -1177,7 +1177,7 @@ fn view_of(params: &Value) -> Answer<View> {
 
 /// A view, with the dictionary this frontend offers with it.
 ///
-/// The command line's [`commands::wanted`] is the same one, because a hash
+/// The command line's `commands::wanted` is the same one, because a hash
 /// spelled one way here and another way there would be two products (§1).
 const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
     rpf_core::view::Wanted {

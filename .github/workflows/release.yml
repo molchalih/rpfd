@@ -23,7 +23,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: the release this tag names, created if it is not there yet
         env:
           GH_TOKEN: ${{ github.token }}
@@ -40,11 +40,14 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
           # Cross-compiled from the arm64 runner: one macOS image, both
           # architectures, and the Apple SDK is what makes that ordinary.
+          # `macos-latest` rather than a pinned `macos-14`: `ci.yml` proved the
+          # matrix green on `macos-latest`, and `macos-14` is a deprecated
+          # image on its way out from under a pinned label.
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
           # musl rather than gnu, so the binary carries its own libc and runs on
           # a distribution older than the one that built it. Every dependency is
           # pure Rust — docs/conventions.md §14 rules out C ones — so there is
@@ -57,7 +60,7 @@ jobs:
             # which is the prerequisite this whole track exists to avoid.
             rustflags: -C target-feature=+crt-static
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # As in ci.yml: the toolchain is pinned in rust-toolchain.toml, and
       # `rustup target add` follows that override rather than the default

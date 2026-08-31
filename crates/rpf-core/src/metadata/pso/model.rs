@@ -218,7 +218,7 @@ pub enum NotPsoXml {
     /// The document is longer than any document describing a payload this size
     /// can be.
     ///
-    /// The ceiling [`super::render`] writes under, read as a refusal before the
+    /// The ceiling [`super::to_xml`] writes under, read as a refusal before the
     /// document is parsed: the whole document is materialised into a tree
     /// before the first comparison against the payload, so a document far
     /// larger than the file it edits has to be refusable on sight.
