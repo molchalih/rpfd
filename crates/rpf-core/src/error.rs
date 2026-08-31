@@ -22,14 +22,26 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NoWrite {
-    /// The transform has no inverse in this build.
+    /// Nothing here derives the archive's forward transform.
     ///
-    /// The NG scheme is a white-box construction and this repository holds only
-    /// its decrypt tables; inverting it is Gaussian elimination over GF(2) for
-    /// rounds 0, 1 and 16 and a 2^32 sweep per column for the rest.
-    /// `docs/ng-scheme.md`. Nothing a caller can supply changes it.
+    /// **Re-aimed by DR-062, not retired.** It used to mean the NG transform
+    /// had no inverse at all in this build — a white-box construction whose
+    /// inverse was believed to need a 2^32 sweep per column for fourteen of its
+    /// seventeen rounds. That was measured and is false: every round derives
+    /// from the decrypt tables alone, in milliseconds, and the tool writes an
+    /// NG archive back when it holds them (`docs/ng-scheme.md`, DR-062).
+    ///
+    /// So what it now says is that **this build has nothing to derive the
+    /// transform from**: no NG decrypt tables here, which take a memory image
+    /// of a running game (DR-040); or an encrypted tag this build holds no
+    /// transform for at all; or a container version whose entry-table row is
+    /// not one aligned cipher block, which sealing a table row by row needs.
+    ///
+    /// Distinct from [`Error::NeedsKey`], and the distinction is the whole
+    /// point: `NeedsKey` tells an automation to go and extract a key, and what
+    /// is missing here is not a key and no retry finds it.
     #[error(
-        "the NG transform has no inverse in this build, so an NG archive is \
+        "nothing here derives this archive's forward transform, so it is \
          read and never written"
     )]
     NoInverse,

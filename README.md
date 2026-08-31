@@ -6,8 +6,9 @@ an automated agent — without installing a GUI modding suite.
 
 Status: **the container works, and the game's own loader has accepted what it
 wrote.** An archive can be listed, read, edited and rebuilt from the command
-line, including through nested archives. Encrypted archives can be **read** —
-AES and NG — but not written. An entry's encoding is recognised from its bytes,
+line, including through nested archives. Encrypted archives can be **read and written back** — AES
+and NG alike, though no NG archive this tool wrote has yet been shown to the
+game. An entry's encoding is recognised from its bytes,
 `RBF` and `PSO` metadata convert to XML and back, and either can be **read and
 written as XML** through both frontends. There is a VS Code client, it runs in a
 real editor, and it presents a metadata entry as its XML. See the backlog.
@@ -156,7 +157,7 @@ not what the tool was doing when it noticed. DR-010.
 | 6 | The request or its input was wrong, and the tool declined to act |
 | 7 | Reading or writing failed — the source or the sink, and nobody's input |
 | 8 | The caller stopped the operation part-way |
-| 9 | This build cannot do it: an RPF version it does not read, a source carrying no key material, or writing back an NG-encrypted archive |
+| 9 | This build cannot do it: an RPF version it does not read, or an encrypted archive it has nothing to derive the forward transform from |
 
 The daemon reports the same numbers as a JSON-RPC `error.code`. A negative code
 there is JSON-RPC's own — `-32601` for an unknown method, `-32602` for a bad
@@ -360,31 +361,41 @@ renaming one stops it opening. Which archives a source opens is not something a
 source says, so every candidate is tried and the first whose table of contents
 decodes into a root directory row wins — one 16-byte block per candidate.
 
-**An AES-encrypted archive is written back; an NG-encrypted one is not.**
-AES-256 is symmetric, so the key and the single pass that decrypt a table of
-contents encrypt one: `put`, `rm`, `mv`, `mkdir` and the daemon's `write`,
-`delete`, `rename`, `mkdir` and `commit` all work over a `0x0FFFFFF9` or
-`0x0FFFFFF7` archive, patching in place or rebuilding, and re-encrypt the entry
-table, the names blob and every payload whose own entry field says it is under
-the transform. The NG transform is a white-box construction and this build holds
-only its decrypt tables, so a `0x0FEFFFFF` archive is refused with
-`CannotWriteEncrypted` at exit 9 before a byte is touched — and `--force` does
+**An encrypted archive is written back, under either transform.** AES-256 is
+symmetric, so the key and the single pass that decrypt a table of contents
+encrypt one. NG is not symmetric, and its forward direction is **derived** —
+all seventeen rounds, by Gaussian elimination over GF(2), from the decrypt
+tables your own material already carries, in milliseconds, with nothing
+downloaded, nothing bundled and nothing written to disk. So `put`, `rm`, `mv`,
+`mkdir` and the daemon's `write`, `delete`, `rename`, `mkdir` and `commit` all
+work over a `0x0FFFFFF9`, `0x0FFFFFF7` or `0x0FEFFFFF` archive, patching in
+place or rebuilding, and re-encrypt the entry table, the names blob and every
+payload whose own entry field says it is under the transform.
+
+An NG key is chosen by the **name and length** of what is being written, so an
+entry rewritten at a different size goes back under a different one of the 101
+keys, and a rebuilt archive's table of contents under the key its **new**
+length chooses. That is the format's arithmetic and not ours.
+
+What is still refused, at exit 9 with `CannotWriteEncrypted`, is an archive
+this build has nothing to derive the forward transform from — no NG decrypt
+tables in hand, an encrypted tag it holds no transform for, or a container
+version whose entry-table row is not one aligned cipher block. `--force` does
 not reach it, because a capability that is absent is not a safety interlock.
-The message names which of the two it is. **That refusal is a missing
-capability, not a permanent one**: the forward tables are derived from the
-decrypt tables by code that is published and MIT-licensed, and derives from
-nothing else, so writing NG is work this build has not done rather than work
-nobody can do. It has not been attempted against the tables here.
-`docs/ng-scheme.md` records what is established and what is not.
+`docs/ng-scheme.md` records what is measured.
+
+**Not yet shown to the game.** The loader has accepted archives this tool
+rebuilt, but never an NG-tagged one. `docs/acceptance.md`.
 
 `pack` opens no archive — it builds one from an extracted tree — so it reaches
 key material the way every other command does: `--cache-dir`, or the platform's
 own cache, consulted only where the manifest's tag names a transform this build
 can write forwards. An AES tree packs back under its own tag, and one packed
 where no material is available is `NeedsKey` at exit 5 rather than an archive
-written in the clear under an encrypted tag. An NG manifest is refused at exit 9
-before any material is asked for, because this build cannot write that
-transform forwards yet.
+written in the clear under an encrypted tag. An NG tree packs back too, given
+the material that derives the transform, and is exit 9 without it — a manifest
+carries no material, so the refusal is the pack's rather than the manifest
+reader's.
 
 ## Building and testing
 

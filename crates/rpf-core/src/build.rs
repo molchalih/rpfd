@@ -22,10 +22,10 @@ use crate::{
     archive::{Archive, MAX_DEPTH},
     edit::{self, Changes},
     entry::{Entry, EntryKind},
-    error::{Error, Result},
+    error::{Error, NoWrite, Result},
     format::{
         Content, FileFields, Header, Row, Version,
-        crypto::{CIPHER_BLOCK_LEN, Seal},
+        crypto::{CIPHER_BLOCK_LEN, Seal, Sealer},
         folded,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
         u32_at, widen,
@@ -683,6 +683,18 @@ impl<W: Write + Seek> Seek for Sink<'_, W> {
     }
 }
 
+/// The name an entry carries in the names blob, out of the path it is written
+/// at.
+///
+/// The last `/`-separated segment, which is exactly where [`plan_tree`] splits
+/// a path into parents and a name — so the name a key is chosen by here and the
+/// name the reader finds in the blob are one derivation and not two (§3). A
+/// backslash is a name byte and not a separator, so it is not one of these
+/// (DR-016).
+fn entry_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// The storage rule an existing entry carries, as the [`FileKind`] that spells
 /// it for a write.
 ///
@@ -769,13 +781,25 @@ fn uncompressed_len(path: &str, len: u64) -> Result<u32> {
 /// [`Error::FieldOverflow`] for contents too long for the entry's fields, and
 /// [`Error::Io`] from either side.
 ///
-/// `seal` is the archive's own forward transform where it has one, and whether
-/// this payload goes under it is [`is_sealed`]'s answer and nowhere else's.
+/// `sealer` is the archive's own forward transform where it has one, and
+/// whether this payload goes under it is [`is_sealed`]'s answer and nowhere
+/// else's.
+///
+/// **The seal is keyed here, from this payload's own name and its contents'
+/// length**, because an NG key index is `(hash(name) + length + 61) % 101`
+/// (Q2): an entry rewritten at a size that lands on a different index must be
+/// written under *that* key, or the archive parses and does not load. The
+/// length is the source's, measured before a byte goes out — which is the
+/// entry's uncompressed length in both storage forms, deflated or stored, and
+/// is what the reader hands [`Cipher::new`](crate::format::crypto::Cipher::new)
+/// off the row it will read back. The name is the entry's own, which is the
+/// last `/`-separated segment of `path`: [`plan_tree`] splits it exactly there,
+/// so the two cannot drift.
 pub(crate) fn store<S, W>(
     version: Version,
     path: &str,
     kind: FileKind,
-    seal: Option<&Seal>,
+    sealed: Option<Sealed<'_>>,
     src: &mut S,
     out: &mut W,
 ) -> Result<Written>
@@ -786,12 +810,20 @@ where
     let start = out
         .stream_position()
         .map_err(|source| Error::Io { offset: 0, source })?;
+    let contents_len = src.seek(SeekFrom::End(0)).map_err(|source| Error::Io {
+        offset: start,
+        source,
+    })?;
     src.rewind().map_err(|source| Error::Io {
         offset: start,
         source,
     })?;
 
-    let under = if is_sealed(version, kind) { seal } else { None };
+    let under = match sealed.filter(|_| is_sealed(version, kind)) {
+        None => None,
+        Some(sealed) => Some(sealed.of(entry_name(path), contents_len)?),
+    };
+    let under = under.as_ref();
     let mut sink = Sink::new(out, under, start);
     let written = match kind {
         FileKind::Resource { declared } => store_resource(path, declared, src, &mut sink, start),
@@ -988,8 +1020,9 @@ struct Layout<'a> {
     files: &'a [FileSpec],
     planned: &'a [Planned],
     name_offsets: &'a [u32],
-    /// The archive's own forward transform, where it has one.
-    seal: Option<&'a Seal>,
+    /// The archive's own forward transform, where it has one. One seal per
+    /// payload is minted from it, keyed by that entry's own name and length.
+    sealed: Option<Sealed<'a>>,
 }
 
 /// Writes every payload at its aligned position, returning the entry rows and
@@ -1045,7 +1078,7 @@ where
         files,
         planned,
         name_offsets,
-        seal,
+        sealed,
     } = *layout;
     let mut rows = Vec::with_capacity(planned.len());
     let total = u32::try_from(files.len()).unwrap_or(u32::MAX);
@@ -1075,7 +1108,7 @@ where
         out.seek(SeekFrom::Start(at))
             .map_err(|source| Error::Io { offset: at, source })?;
         let mut payload = fetch.payload(&spec.path)?;
-        let written = store(version, &spec.path, spec.kind, seal, &mut payload, out)?;
+        let written = store(version, &spec.path, spec.kind, sealed, &mut payload, out)?;
 
         // The row is built after the payload rather than before it, because a
         // streamed payload's length is not known until it has been streamed.
@@ -1167,7 +1200,15 @@ pub(crate) struct Under<'a> {
     /// The tag the header carries.
     tag: u32,
     /// The forward transform, or `None` for an archive written in the clear.
-    seal: Option<&'a Seal>,
+    sealer: Option<&'a Sealer>,
+    /// The name the archive will be **read back** under, which is half of what
+    /// its table of contents and its names blob are keyed by.
+    ///
+    /// Empty for an archive written in the clear, which has no key and so no
+    /// name to be right or wrong about. For a rebuild it is the original's
+    /// name and not the scratch file's: a rebuild renames over the original
+    /// (DR-035), and the reader keys by the name it finds the archive under.
+    name: &'a str,
 }
 
 impl<'a> Under<'a> {
@@ -1176,17 +1217,66 @@ impl<'a> Under<'a> {
         Self {
             version,
             tag: version.open(),
-            seal: None,
+            sealer: None,
+            name: "",
         }
     }
 
-    /// Written under `tag`'s transform.
-    pub(crate) const fn sealed(version: Version, tag: u32, seal: &'a Seal) -> Self {
+    /// Written under `tag`'s transform, into a file that will be read back
+    /// under `name`.
+    pub(crate) const fn sealed(
+        version: Version,
+        tag: u32,
+        sealer: &'a Sealer,
+        name: &'a str,
+    ) -> Self {
         Self {
             version,
             tag,
-            seal: Some(seal),
+            sealer: Some(sealer),
+            name,
         }
+    }
+}
+
+/// A forward transform and the tag a refusal to run it names.
+///
+/// One value rather than two arguments, and it exists so that the one place a
+/// region's key is chosen is also the one place a missing key is refused:
+/// [`Sealed::of`] is where a name and a length become a [`Seal`], and it is the
+/// only way to obtain one inside a write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sealed<'a> {
+    /// The archive's forward transform.
+    sealer: &'a Sealer,
+    /// The tag the header carries, which a refusal names.
+    tag: u32,
+}
+
+impl<'a> Sealed<'a> {
+    /// The transform for an archive carrying `tag`.
+    pub(crate) const fn new(sealer: &'a Sealer, tag: u32) -> Self {
+        Self { sealer, tag }
+    }
+
+    /// The seal for one region, keyed by the name and length of what is being
+    /// written into it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] where the
+    /// material holds no key at the index that name and length chose — which
+    /// material of the shape `NgKeys` promises never is, and which is refused
+    /// rather than written in the clear because writing plaintext into a region
+    /// the format requires to be ciphertext is the failure this whole path
+    /// exists to make impossible.
+    pub(crate) fn of(self, name: &str, len: u64) -> Result<Seal> {
+        self.sealer
+            .seal(name, len)
+            .ok_or(Error::CannotWriteEncrypted {
+                tag: self.tag,
+                reason: NoWrite::NoInverse,
+            })
     }
 }
 
@@ -1222,7 +1312,13 @@ where
     W: Write + Seek,
     F: Fetch,
 {
-    let Under { version, tag, seal } = under;
+    let Under {
+        version,
+        tag,
+        sealer,
+        name,
+    } = under;
+    let sealed = sealer.map(|sealer| Sealed::new(sealer, tag));
     let arena = plan_tree(files, directories)?;
     let planned = plan_entries(&arena)?;
     let names = version.plan_names(planned.iter().map(|entry| entry.name().as_str()))?;
@@ -1253,9 +1349,24 @@ where
         files,
         planned: &planned,
         name_offsets: &name_offsets,
-        seal,
+        sealed,
     };
     let (rows, payload_end) = write_payloads(out, &layout, &mut cursor, &mut fetch, watch)?;
+
+    // **The table of contents and the names blob are keyed by the archive's own
+    // name and its *finished* length**, which is why this is minted here and
+    // not before a payload was written: `cursor` is where the last payload
+    // ended, rounded up to the block the padding below fills, and that is the
+    // length the file has on disk and the length the reader will hand
+    // `Cipher::new`. Keying by the length the archive had *before* it was
+    // rebuilt picks a different one of the 101 NG keys and writes an archive
+    // that parses and does not load (Q2, DR-062). The AES arm ignores both and
+    // is unaffected either way.
+    let regions = match sealed {
+        None => None,
+        Some(sealed) => Some(sealed.of(name, cursor)?),
+    };
+    let regions = regions.as_ref();
 
     // Then the header, the table and the names, now that every offset is known.
     out.seek(SeekFrom::Start(0))
@@ -1275,7 +1386,7 @@ where
     // sealing each in turn is sealing the region. Nothing is materialised that
     // was not already.
     for row in &rows {
-        let row = match seal {
+        let row = match regions {
             None => *row,
             Some(seal) => row.sealed(seal),
         };
@@ -1288,7 +1399,7 @@ where
     // from the table's — a build that sealed the two as one gets the table
     // right and the names wrong. `docs/rpf-format.md`, Encryption, `verified`.
     let mut names_blob = names_blob;
-    if let Some(seal) = seal {
+    if let Some(seal) = regions {
         seal.apply(&mut names_blob);
     }
     out.write_all(&names_blob).map_err(|source| Error::Io {
@@ -1479,10 +1590,19 @@ where
     // that is longer, shorter, or written under another file name is under the
     // key it was read under — which is what makes an AES archive writable and
     // an NG one not. `docs/rpf-format.md`, Encryption; DR-054.
-    let seal = archive.seal()?;
-    let under = match seal {
+    let sealer = archive.seal()?;
+    let under = match sealer {
         None => Under::open(archive.version()),
-        Some(ref seal) => Under::sealed(archive.version(), archive.encryption(), seal),
+        // The name is the one the archive was **opened** under, not the scratch
+        // file this is written into: a rebuild renames over the original
+        // (DR-035), so that is the name the reader will key the table of
+        // contents by.
+        Some(ref sealer) => Under::sealed(
+            archive.version(),
+            archive.encryption(),
+            sealer,
+            archive.keyed_name(),
+        ),
     };
     let fetch = FromArchive {
         src,
@@ -1658,7 +1778,7 @@ mod tests {
         error::Error,
         format::{
             Version,
-            crypto::{CIPHER_BLOCK_LEN, Scheme, Seal},
+            crypto::{CIPHER_BLOCK_LEN, Scheme, Seal, Sealer, synthetic},
             resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN},
             rpf7, widen,
         },
@@ -1666,12 +1786,13 @@ mod tests {
         watch::Unwatched,
     };
 
-    /// The zero-key AES seal, and the [`Unlock`] that opens what it wrote.
-    fn zeroed(named: &str) -> (Seal, Unlock) {
+    /// The zero-key AES forward transform, and the [`Unlock`] that opens what
+    /// it wrote.
+    fn zeroed(named: &str) -> (Sealer, Unlock) {
         let material = Arc::new(Material::over_zeros());
         let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_AES).expect("AES");
-        let seal = Seal::new(scheme, &material).expect("AES seals");
-        (seal, Unlock::held(material, named))
+        let sealer = Sealer::new(scheme, &material).expect("AES seals");
+        (sealer, Unlock::held(material, named))
     }
 
     /// Files whose lengths straddle the cipher block: shorter than one, exactly
@@ -1738,8 +1859,13 @@ mod tests {
 
     #[test]
     fn a_sealed_archive_opens_again_and_every_entry_reads_back() {
-        let (seal, unlock) = zeroed("sealed.rpf");
-        let bytes = built(Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal));
+        let (sealer, unlock) = zeroed("sealed.rpf");
+        let bytes = built(Under::sealed(
+            Version::Rpf7,
+            rpf7::ENCRYPTION_AES,
+            &sealer,
+            "sealed.rpf",
+        ));
         let mut source = Cursor::new(bytes);
         let archive = Archive::open(&mut source, &unlock).expect("the sealed archive opens");
         assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES);
@@ -1761,8 +1887,13 @@ mod tests {
         // What a build that sealed nothing, or sealed the header too, would
         // pass anyway: the tag is in the clear because it is what says there is
         // a transform, and the row after it is not, because it is under one.
-        let (seal, _) = zeroed("sealed.rpf");
-        let sealed = built(Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal));
+        let (forward, _) = zeroed("sealed.rpf");
+        let sealed = built(Under::sealed(
+            Version::Rpf7,
+            rpf7::ENCRYPTION_AES,
+            &forward,
+            "sealed.rpf",
+        ));
         let open = built(Under::open(Version::Rpf7));
 
         assert_eq!(
@@ -1791,8 +1922,13 @@ mod tests {
     fn a_sealed_archive_does_not_open_without_a_key() {
         // The other half of the claim above: "it opens with the key" says
         // nothing unless it does not open without one.
-        let (seal, _) = zeroed("sealed.rpf");
-        let bytes = built(Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal));
+        let (sealer, _) = zeroed("sealed.rpf");
+        let bytes = built(Under::sealed(
+            Version::Rpf7,
+            rpf7::ENCRYPTION_AES,
+            &sealer,
+            "sealed.rpf",
+        ));
         let error = Archive::open(&mut Cursor::new(bytes), &Unlock::unkeyed())
             .expect_err("a sealed archive needs a key");
         assert!(
@@ -1802,19 +1938,168 @@ mod tests {
     }
 
     #[test]
-    fn an_ng_tag_has_no_seal_to_be_written_under() {
-        // The split, where the write path decides it: `Seal::new` answers
-        // `None` for NG whatever material it is handed, so an NG seal is not a
-        // value this build can hold. `docs/ng-scheme.md`.
-        let material = Material::over_zeros();
-        assert!(Seal::new(Scheme::Ng, &material).is_none());
-        assert!(!Scheme::Ng.seals());
+    fn an_ng_tag_seals_only_where_the_material_derives_the_transform() {
+        // **The re-aimed refusal, ungated.** Until DR-062 `Scheme::Ng.seals()`
+        // was `false` for the tag, whatever anyone held: the answer was "this
+        // build has no forward direction". It now asks the material, because
+        // the seventeen rounds derive from the decrypt tables in milliseconds
+        // and derive from nothing else — so the refusal means "this build has
+        // nothing to derive it from", and it still fires for material that
+        // carries no NG half. `Material::over_zeros` is exactly that material:
+        // an AES key and a hash table and no memory image behind it.
+        let empty = Material::over_zeros();
+        assert!(!Scheme::Ng.seals(Some(&empty)));
+        assert!(!Scheme::Ng.seals(None));
+        assert!(Sealer::new(Scheme::Ng, &empty).is_none());
+        assert!(Seal::new(Scheme::Ng, &empty, "a.bin", 16).is_none());
+
+        // And it seals where the tables are there, which is the half that was
+        // impossible before.
+        let held = synthetic::ng_material(0x51EA_1000);
+        assert!(Scheme::Ng.seals(Some(&held)));
+        assert!(Sealer::new(Scheme::Ng, &held).is_some());
+
+        // The AES arm is unchanged and is not a question about material: the
+        // key is the tag's, and a caller holding none is answered by
+        // `Error::WrongKey`, which says something else entirely.
         for tag in [rpf7::ENCRYPTION_AES, rpf7::ENCRYPTION_AES_LAUNCHER] {
-            assert!(
-                Version::Rpf7.scheme(tag).expect("an AES tag").seals(),
-                "{tag:#010x} does not seal"
+            let scheme = Version::Rpf7.scheme(tag).expect("an AES tag");
+            assert!(scheme.seals(None), "{tag:#010x} does not seal");
+            assert!(scheme.seals(Some(&empty)), "{tag:#010x} does not seal");
+        }
+    }
+
+    /// The synthetic NG transform, and the [`Unlock`] that opens what it wrote.
+    ///
+    /// No key material anywhere and none possible: `synthetic::ng_material` is
+    /// arithmetic over a seed (DR-006), and what it makes testable is the write
+    /// path rather than any value.
+    fn ng_zeroed(named: &str) -> (Sealer, Unlock) {
+        let material = Arc::new(synthetic::ng_material(0x0DE1_2A55));
+        let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_NG).expect("NG");
+        let sealer = Sealer::new(scheme, &material).expect("synthetic tables derive");
+        (sealer, Unlock::held(material, named))
+    }
+
+    #[test]
+    fn an_ng_archive_is_written_and_opens_again_with_every_entry_intact() {
+        // **R4.7's own claim, ungated.** An NG-tagged archive written by this
+        // build — header, entry table, names blob and four payloads, three
+        // stored and one deflated — opened again from the bytes it wrote and
+        // read back entry by entry. A build that sealed the table under the
+        // wrong one of the 101 keys does not open at all; one that sealed a
+        // payload under the wrong key opens and hands back rubbish, so both
+        // halves are claimed.
+        let (sealer, unlock) = ng_zeroed("written.rpf");
+        let bytes = built(Under::sealed(
+            Version::Rpf7,
+            rpf7::ENCRYPTION_NG,
+            &sealer,
+            "written.rpf",
+        ));
+        let mut source = Cursor::new(bytes);
+        let archive = Archive::open(&mut source, &unlock).expect("the NG archive opens");
+        assert_eq!(archive.encryption(), rpf7::ENCRYPTION_NG);
+        assert_eq!(archive.scheme(), Some("NG"));
+        archive
+            .writable()
+            .expect("an NG archive with material writes");
+
+        for (path, expected) in contents() {
+            let index = archive
+                .find(path)
+                .unwrap_or_else(|error| panic!("{path} does not resolve: {error}"));
+            let read = archive
+                .read(&mut source, index)
+                .unwrap_or_else(|error| panic!("{path} does not read back: {error}"));
+            assert_eq!(read, expected, "{path} came back different");
+        }
+    }
+
+    #[test]
+    fn an_ng_archive_does_not_open_without_the_material_that_wrote_it() {
+        // The other half: "it opens with the material" says nothing unless it
+        // does not open without it — which is also the claim that the bytes
+        // went out under the transform rather than in the clear under an NG
+        // tag, which is the shape that parses and does not load.
+        let (sealer, _) = ng_zeroed("written.rpf");
+        let bytes = built(Under::sealed(
+            Version::Rpf7,
+            rpf7::ENCRYPTION_NG,
+            &sealer,
+            "written.rpf",
+        ));
+        let error = Archive::open(&mut Cursor::new(bytes), &Unlock::unkeyed())
+            .expect_err("an NG archive needs its material");
+        assert!(
+            matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_NG),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_ng_entry_written_at_a_new_size_picks_the_new_key_and_reads_back() {
+        // **Q2, and the failure it names.** The NG key index is
+        // `(hash(name) + length + 61) % 101`, so an entry rewritten at a
+        // different uncompressed length picks a *different* one of the 101
+        // keys. A writer that sealed it under the key the entry had before
+        // produces an archive that parses — the table of contents is right,
+        // the row is right, the length is right — and does not load, because
+        // the payload decrypts to noise.
+        //
+        // The two sizes below are chosen so that the index actually moves:
+        // asserted rather than assumed, because a test where both sizes chose
+        // the same key would pass against a writer that never re-keyed at all.
+        let (sealer, unlock) = ng_zeroed("resized.rpf");
+        // 48 and 49 move the **payload's** key while leaving the archive's own
+        // length alone; 700 also moves the archive past a block boundary, so
+        // the table of contents and the names blob are re-keyed too — the
+        // second of the two re-derivations, and the one a rebuild depends on.
+        let sizes = [48_usize, 49, 700];
+        assert_ne!(
+            sealer.seal("grows.bin", 48).and_then(|s| s.key_index()),
+            sealer.seal("grows.bin", 49).and_then(|s| s.key_index()),
+            "the two sizes chose the same key, so this test proves nothing"
+        );
+
+        let spec = FileSpec {
+            path: "grows.bin".to_owned(),
+            kind: FileKind::Binary {
+                storage: Storage::Stored,
+                encryption: 1,
+            },
+        };
+        let mut lengths = Vec::new();
+        for size in sizes {
+            let held = vec![b'z'; size];
+            let mut out = Cursor::new(Vec::new());
+            build_under(
+                &mut out,
+                Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_NG, &sealer, "resized.rpf"),
+                std::slice::from_ref(&spec),
+                &[],
+                |_: &str| Ok(Cursor::new(held.clone())),
+                &mut Unwatched,
+            )
+            .expect("the archive builds");
+            let written = out.into_inner();
+            lengths.push(written.len());
+            let mut source = Cursor::new(written);
+            let archive = Archive::open(&mut source, &unlock).expect("it opens");
+            let index = archive.find("grows.bin").expect("grows.bin resolves");
+            assert_eq!(
+                archive.read(&mut source, index).expect("it reads back"),
+                held,
+                "an entry of {size} bytes did not read back"
             );
         }
+        lengths.sort_unstable();
+        lengths.dedup();
+        assert!(
+            lengths.len() > 1,
+            "every size wrote an archive of the same length, so the table of \
+             contents was never re-keyed"
+        );
     }
 
     #[test]
@@ -1837,7 +2122,7 @@ mod tests {
         // the archive's own tag, because a resource has no per-entry field for
         // the read side to know a transform needs undoing. What lands on disk
         // must equal what went in, not the seal's transform of it.
-        let (seal, unlock) = zeroed("resource.rpf");
+        let (sealer, unlock) = zeroed("resource.rpf");
         let mut resource = vec![0_u8; usize::try_from(RESOURCE_HEADER_LEN).expect("fits")];
         resource[..4].copy_from_slice(&MAGIC_RSC7);
         resource[8..12].copy_from_slice(&7_u32.to_le_bytes());
@@ -1851,7 +2136,7 @@ mod tests {
         let mut out = Cursor::new(Vec::new());
         build_under(
             &mut out,
-            Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal),
+            Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &sealer, "resource.rpf"),
             std::slice::from_ref(&spec),
             &[],
             |wanted: &str| {
@@ -1905,8 +2190,6 @@ mod tests {
 
     #[test]
     fn sink_flush_reaches_the_writer_underneath_it_clear_and_sealed_alike() {
-        let (seal, _) = zeroed("flush.rpf");
-
         let mut clear = Counting {
             inner: Cursor::new(Vec::new()),
             flushes: Cell::new(0),
@@ -1920,7 +2203,7 @@ mod tests {
             inner: Cursor::new(Vec::new()),
             flushes: Cell::new(0),
         };
-        Sink::new(&mut under_seal, Some(&seal), 0)
+        Sink::new(&mut under_seal, Some(&Seal::over_zeros()), 0)
             .flush()
             .expect("flush succeeds");
         assert_eq!(
@@ -1937,7 +2220,7 @@ mod tests {
         // is always a block boundary of the payload — the one case this method
         // exists to let through. A target that is not one is refused, because
         // nothing past it would decrypt right if it were allowed.
-        let (seal, _) = zeroed("seek.rpf");
+        let seal = Seal::over_zeros();
         let start = 16_u64;
         let mut inner = Cursor::new(vec![0_u8; 64]);
         let mut sink = Sink::new(&mut inner, Some(&seal), start);

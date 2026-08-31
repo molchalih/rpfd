@@ -20,8 +20,8 @@ use aes::Aes256;
 use cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 
 use crate::keys::{
-    AES_KEY_LEN, HASH_LUT_LEN, LauncherKey, Material, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN,
-    NG_ROUNDS, NgKeys,
+    AES_KEY_LEN, HASH_LUT_LEN, LauncherKey, Material, NG_COLUMNS, NG_EXPANDED_KEY_COUNT,
+    NG_EXPANDED_KEY_LEN, NG_ROUNDS, NgKeys,
 };
 
 /// The block both transforms work in, in bytes.
@@ -150,23 +150,30 @@ impl Scheme {
         }
     }
 
-    /// Whether this transform can be run **forwards**, so that an archive
-    /// under it can be written back.
+    /// Whether this transform can be run **forwards** over `material`, so
+    /// that an archive under it can be written back.
     ///
     /// AES-256 is symmetric: the same key and the same one ECB pass that
-    /// decrypt a table of contents encrypt one, so [`Seal`] exists for it. The
-    /// NG arm is a white-box construction and this build holds only its
-    /// *decrypt* tables; inverting it is Gaussian elimination over GF(2) for
-    /// rounds 0, 1 and 16 and a 2^32 sweep per column for the rest, which is
-    /// not a thing that can be written here. `docs/ng-scheme.md`.
+    /// decrypt a table of contents encrypt one, and the key is the tag's, so
+    /// the AES arm answers `true` whatever is in hand — a caller with no key
+    /// is answered by [`Error::WrongKey`](crate::Error::WrongKey), which says
+    /// something different.
+    ///
+    /// **The NG arm is a question about the material and no longer about the
+    /// tag.** [`NgForward`] derives the whole seventeen-round forward
+    /// transform from the decrypt tables alone, in milliseconds, with nothing
+    /// bundled and nothing stored (DR-062) — so NG seals exactly when the
+    /// decrypt tables are here to derive it from, and refuses when they are
+    /// not. That is what [`NoWrite::NoInverse`](crate::NoWrite::NoInverse) now
+    /// means.
     ///
     /// The one place that asymmetry is decided: [`crate::Archive::writable`]
     /// asks it, and no write path decides it again (§3).
     #[must_use]
-    pub const fn seals(self) -> bool {
+    pub fn seals(self, material: Option<&Material>) -> bool {
         match self {
             Self::Aes(_) => true,
-            Self::Ng => false,
+            Self::Ng => material.is_some_and(|held| held.ng().is_some()),
         }
     }
 
@@ -312,42 +319,208 @@ impl Cipher {
     }
 }
 
-/// One region's or one payload's **encryption**: the inverse of a [`Cipher`].
+/// What mints a [`Seal`] for one **region** of one archive.
 ///
-/// It exists for the AES transform and for nothing else, by construction —
-/// [`Seal::new`] answers `None` for [`Scheme::Ng`], so an NG seal is not a
-/// value this build can hold. [`Scheme::seals`] is the question asked before
-/// one is wanted.
+/// The forward transform is a property of the archive; the key is a property of
+/// the region, because the NG key index is a function of the **name and length**
+/// of what is being written (Q2). So the material-derived half is made once —
+/// for NG that is [`NgForward::derive`], all seventeen rounds, milliseconds and
+/// nothing on disk (DR-062) — and one [`Seal`] is minted per table of contents,
+/// per names blob and per payload.
 ///
-/// **It takes no name and no length, and that is the asymmetry itself.** A
-/// [`Cipher`] is keyed by what is being decrypted because the NG key index is a
-/// function of a name and a length; the AES key is the archive tag's and
-/// nothing else, so an archive written longer, shorter or under another name is
-/// written under the key it was read under. `docs/rpf-format.md`, Encryption.
+/// **That split is what makes the wrong key unrepresentable.** A single seal
+/// carried through a rebuild would be keyed by the length the archive had
+/// before it was rebuilt, and an NG archive sealed under it parses and does not
+/// load. A `Sealer` cannot seal anything without being handed a name and a
+/// length, so a write path that forgot to re-derive would not compile
+/// (`docs/conventions.md` §5).
 ///
 /// Nothing here holds a key of its own and nothing here prints one: `Debug`
 /// says which transform, never a byte of it (DR-020).
+pub struct Sealer {
+    inner: SealerInner,
+}
+
+/// The forward transform, and whatever minting a key for a region needs.
+enum SealerInner {
+    /// An AES key, expanded once. It takes neither a name nor a length: the key
+    /// is the tag's and nothing else, so an archive written longer, shorter or
+    /// under another file name is written under the key it was read under.
+    Aes {
+        /// Which key the tag chose, for `Debug` to name. A discriminant, never
+        /// a key: DR-020.
+        which: AesKey,
+        /// The expanded key schedule, shared by every region's seal.
+        aes: Arc<Aes256>,
+    },
+    /// The derived forward transform, and what a region's key is chosen out of.
+    Ng {
+        /// The material's own expanded keys, one of which each region picks.
+        tables: Arc<NgKeys>,
+        /// All seventeen rounds, derived once from the decrypt tables in
+        /// `tables` and shared by every region's seal.
+        forward: Arc<NgForward>,
+        /// The name-hash lookup table, which is half of the key index.
+        lut: Box<[u8; HASH_LUT_LEN]>,
+    },
+}
+
+impl Sealer {
+    /// The forward transform for `scheme` over `material`, or `None` where
+    /// this build cannot run one.
+    ///
+    /// `None` has exactly two causes, and a caller has to tell them apart
+    /// because they name different things to do about it:
+    ///
+    /// - `material` does not carry what the transform needs — no AES key of the
+    ///   tag's kind, or no NG decrypt tables. For NG that is the whole of
+    ///   [`NoWrite::NoInverse`](crate::NoWrite::NoInverse)'s meaning since
+    ///   DR-062: **this build has nothing to derive the transform from**, not
+    ///   that the transform has no inverse.
+    /// - the decrypt tables are there and do not derive, which
+    ///   [`NgNotInvertible`] would name and which no material measured here
+    ///   has ever been.
+    #[must_use]
+    pub fn new(scheme: Scheme, material: &Material) -> Option<Self> {
+        let inner = match scheme {
+            Scheme::Aes(which) => SealerInner::Aes {
+                which,
+                aes: Arc::new(Aes256::new_from_slice(which.of(material)?).ok()?),
+            },
+            Scheme::Ng => {
+                let tables = Arc::clone(material.ng_shared()?);
+                let forward = Arc::new(NgForward::derive(&tables).ok()?);
+                SealerInner::Ng {
+                    tables,
+                    forward,
+                    lut: Box::new(*material.keys().hash_lut()),
+                }
+            }
+        };
+        Some(Self { inner })
+    }
+
+    /// Which transform this runs.
+    #[must_use]
+    pub const fn scheme(&self) -> Scheme {
+        match self.inner {
+            SealerInner::Aes { which, .. } => Scheme::Aes(which),
+            SealerInner::Ng { .. } => Scheme::Ng,
+        }
+    }
+
+    /// The seal for one region, keyed by the name and length of what is being
+    /// written.
+    ///
+    /// `name` is the archive's own file name for its table of contents and its
+    /// names blob, and the entry's own name for a payload; `len` is that
+    /// archive's **new** length or that entry's **new** uncompressed length.
+    /// Both are what the NG key index is a function of, and both are what the
+    /// reader will choose the key by — [`Cipher::new`] is the same two
+    /// arguments on the other side. An entry rewritten at a different size
+    /// picks a different key, and picking the old one writes an archive that
+    /// parses and does not load.
+    ///
+    /// `None` only where the material holds no key at the index the name and
+    /// length chose, which material of the shape [`NgKeys`] promises never is.
+    #[must_use]
+    pub fn seal(&self, name: &str, len: u64) -> Option<Seal> {
+        let inner = match self.inner {
+            SealerInner::Aes { which, ref aes } => SealInner::Aes {
+                which,
+                aes: Arc::clone(aes),
+            },
+            SealerInner::Ng {
+                ref tables,
+                ref forward,
+                ref lut,
+            } => {
+                let key = ng_key_index(lut, name.as_bytes(), len);
+                SealInner::Ng {
+                    forward: Arc::clone(forward),
+                    key,
+                    expanded: Box::new((*tables.expanded_key(key)?).try_into().ok()?),
+                }
+            }
+        };
+        Some(Seal { inner })
+    }
+}
+
+/// By hand, so that no key can reach a log, a panic message or a `--json`
+/// payload by being printed. DR-020.
+impl fmt::Debug for Sealer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sealer")
+            .field("scheme", &self.scheme())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One region's or one payload's **encryption**: the inverse of a [`Cipher`].
+///
+/// It exists for both transforms since DR-062: the AES arm is the same key and
+/// the same single ECB pass that decrypt, and the NG arm is [`NgForward`], all
+/// seventeen rounds derived from the decrypt tables the user's own material
+/// already carries and run backwards. Nothing is bundled, nothing is fetched
+/// and nothing derived touches disk (DR-006).
+///
+/// **It is keyed for one region and cannot be reused across regions**, because
+/// the NG key index is a function of a name and a length. [`Sealer`] is what
+/// mints one, and is the value a write path holds.
+///
+/// Nothing here holds a key of its own and nothing here prints one: `Debug`
+/// says which transform and which of the 101 expanded keys, never a byte of
+/// either (DR-020).
 #[derive(Clone)]
 pub struct Seal {
-    /// Which key the tag chose, for `Debug` to name. A discriminant, never a
-    /// key: DR-020.
-    which: AesKey,
-    /// The expanded key schedule.
-    aes: Box<Aes256>,
+    inner: SealInner,
+}
+
+/// The forward transform, keyed for one region.
+#[derive(Clone)]
+enum SealInner {
+    /// The expanded AES key schedule, and which key the tag chose.
+    Aes {
+        /// A discriminant, never a key: DR-020.
+        which: AesKey,
+        /// The expanded key schedule.
+        aes: Arc<Aes256>,
+    },
+    /// The derived transform and the expanded key this region chose.
+    Ng {
+        /// All seventeen rounds, shared with every other region's seal.
+        forward: Arc<NgForward>,
+        /// Which expanded key, in `0..NG_EXPANDED_KEY_COUNT`. An index for
+        /// `Debug` to print, never a key: DR-020.
+        key: usize,
+        /// The key itself, resolved when the seal was minted rather than at
+        /// every block — the rule [`Cipher`]'s own arm states.
+        expanded: Box<[u8; NG_EXPANDED_KEY_LEN]>,
+    },
 }
 
 impl Seal {
-    /// The forward transform for `scheme`, or `None` where this build cannot
-    /// run one — either because `material` does not carry the key, or because
-    /// the transform has no inverse here ([`Scheme::seals`]).
+    /// The forward transform for `scheme`, keyed by the name and length of
+    /// what is being written, or `None` where this build cannot run one.
+    ///
+    /// [`Sealer::new`] and [`Sealer::seal`] in one call, for a caller that
+    /// seals a single region and has the material in hand. A caller sealing a
+    /// whole archive holds the [`Sealer`] instead, so that seventeen rounds are
+    /// derived once rather than per payload.
     #[must_use]
-    pub fn new(scheme: Scheme, material: &Material) -> Option<Self> {
-        match scheme {
-            Scheme::Aes(which) => Some(Self {
-                which,
-                aes: Box::new(Aes256::new_from_slice(which.of(material)?).ok()?),
-            }),
-            Scheme::Ng => None,
+    pub fn new(scheme: Scheme, material: &Material, name: &str, len: u64) -> Option<Self> {
+        Sealer::new(scheme, material)?.seal(name, len)
+    }
+
+    /// Which of the 101 NG expanded keys this chose, where it chose one.
+    ///
+    /// An index, never a key: DR-020.
+    #[must_use]
+    pub const fn key_index(&self) -> Option<usize> {
+        match self.inner {
+            SealInner::Aes { .. } => None,
+            SealInner::Ng { key, .. } => Some(key),
         }
     }
 
@@ -374,10 +547,19 @@ impl Seal {
     /// above and the streaming form in [`crate::build`] cannot come to
     /// disagree (§3).
     pub(crate) fn block(&self, block: &mut [u8; CIPHER_BLOCK_LEN]) {
-        for _ in 0..AES_PASSES {
-            let mut wide = (*block).into();
-            self.aes.encrypt_block(&mut wide);
-            *block = wide.into();
+        match self.inner {
+            SealInner::Aes { ref aes, .. } => {
+                for _ in 0..AES_PASSES {
+                    let mut wide = (*block).into();
+                    aes.encrypt_block(&mut wide);
+                    *block = wide.into();
+                }
+            }
+            SealInner::Ng {
+                ref forward,
+                ref expanded,
+                ..
+            } => forward.block(expanded, block),
         }
     }
 }
@@ -390,8 +572,12 @@ impl Seal {
     /// tests the **framing** with no key material anywhere (DR-006).
     pub(crate) fn over_zeros() -> Self {
         Self {
-            which: AesKey::Rage,
-            aes: Box::new(Aes256::new_from_slice(&[0_u8; AES_KEY_LEN]).expect("thirty-two bytes")),
+            inner: SealInner::Aes {
+                which: AesKey::Rage,
+                aes: Arc::new(
+                    Aes256::new_from_slice(&[0_u8; AES_KEY_LEN]).expect("thirty-two bytes"),
+                ),
+            },
         }
     }
 }
@@ -400,9 +586,17 @@ impl Seal {
 /// payload by being printed. DR-020.
 impl fmt::Debug for Seal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Seal")
-            .field("scheme", &Scheme::Aes(self.which))
-            .finish_non_exhaustive()
+        match self.inner {
+            SealInner::Aes { which, .. } => f
+                .debug_struct("Seal")
+                .field("scheme", &Scheme::Aes(which))
+                .finish_non_exhaustive(),
+            SealInner::Ng { key, .. } => f
+                .debug_struct("Seal")
+                .field("scheme", &Scheme::Ng)
+                .field("key_index", &key)
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -500,9 +694,13 @@ fn table_word(table: &[u8], byte: u8) -> Option<u32> {
 
 /// One round: four output words, each the exclusive-or of four table lookups
 /// and one round-key word.
-fn ng_round(
-    ng: &NgKeys,
-    round: usize,
+///
+/// `lookup` answers what the round's table for a column holds for one byte.
+/// The round is written over that rather than over [`NgKeys`] because
+/// [`NgRound`] runs the very round it inverts, and a second spelling of
+/// this loop is a second implementation to keep correct (§3).
+fn ng_round_over(
+    lookup: impl Fn(usize, u8) -> u32,
     round_key: &[u8; NG_ROUND_KEY_LEN],
     order: &[[usize; 4]; 4],
     block: &mut [u8; CIPHER_BLOCK_LEN],
@@ -515,13 +713,44 @@ fn ng_round(
     for ((columns, key_word), out) in order.iter().zip(round_words).zip(out_words) {
         let mut word = u32::from_le_bytes(*key_word);
         for &column in columns {
-            let (Some(table), Some(byte)) = (ng.decrypt_table(round, column), source.get(column))
-            else {
+            let Some(byte) = source.get(column) else {
                 continue;
             };
-            word ^= table_word(table, *byte).unwrap_or_default();
+            word ^= lookup(column, *byte);
         }
         *out = word.to_le_bytes();
+    }
+}
+
+/// One round of the decrypt direction, over the material's own tables.
+fn ng_round(
+    ng: &NgKeys,
+    round: usize,
+    round_key: &[u8; NG_ROUND_KEY_LEN],
+    order: &[[usize; 4]; 4],
+    block: &mut [u8; CIPHER_BLOCK_LEN],
+) {
+    ng_round_over(
+        |column, byte| {
+            ng.decrypt_table(round, column)
+                .and_then(|table| table_word(table, byte))
+                .unwrap_or_default()
+        },
+        round_key,
+        order,
+        block,
+    );
+}
+
+/// Which of the two column orders a round reads its bytes in.
+///
+/// The one owner of that split (§3): [`ng_block`] and [`NgRound`] both
+/// ask it, and a round whose inverse read the other order would invert nothing.
+const fn ng_order(round: usize) -> &'static [[usize; 4]; 4] {
+    if round < NG_LEADING_ROUNDS || round == NG_LAST_ROUND {
+        &NG_COLUMN_ORDER
+    } else {
+        &NG_SHIFTED_ORDER
     }
 }
 
@@ -536,19 +765,749 @@ fn ng_block(ng: &NgKeys, expanded: &[u8; NG_EXPANDED_KEY_LEN], block: &mut [u8; 
     // its key.
     let (round_keys, _) = expanded.as_chunks::<NG_ROUND_KEY_LEN>();
     for (round, round_key) in round_keys.iter().enumerate() {
-        let order = if round < NG_LEADING_ROUNDS || round == NG_LAST_ROUND {
-            &NG_COLUMN_ORDER
-        } else {
-            &NG_SHIFTED_ORDER
-        };
-        ng_round(ng, round, round_key, order, block);
+        ng_round(ng, round, round_key, ng_order(round), block);
+    }
+}
+
+/// How many words one decrypt table holds — one per value the byte it reads
+/// can take.
+///
+/// [`crate::keys::NG_DECRYPT_TABLE_LEN`] is the same fact in bytes, and
+/// `a_decrypt_table_holds_one_word_per_value_of_the_byte_it_reads` is what
+/// stops the two drifting (§3).
+const NG_TABLE_ENTRIES: usize = 0x100;
+
+/// How many bits one output word of a round is made of, which is how many
+/// unknowns one group's system has.
+const NG_WORD_BITS: usize = 32;
+
+/// How many bits of a word one column supplies.
+const NG_COLUMN_BITS: usize = 8;
+
+/// How many output words a block is, which is how many independent systems a
+/// round is.
+const NG_WORDS: usize = NG_COLUMN_ORDER.len();
+
+/// One round's sixteen tables, as words rather than as bytes.
+type RoundTables = [[u32; NG_TABLE_ENTRIES]; NG_COLUMNS];
+
+/// One round's sixteen byte permutations.
+type RoundBytes = [[u8; NG_TABLE_ENTRIES]; NG_COLUMNS];
+
+/// A linear map on the thirty-two bits of one word over GF(2), as the images
+/// of its thirty-two unit vectors.
+///
+/// A map in this form is applied by [`image_of`] and inverted by
+/// [`inverse_of`], and the inverse comes back in the same form — which is what
+/// lets the derived tables be built by applying it to one shifted byte at a
+/// time.
+type WordMap = [u32; NG_WORD_BITS];
+
+/// Why a round's forward tables could not be derived from its decrypt tables.
+///
+/// Not a [`crate::Error`], and deliberately: the variants say what is wrong
+/// with a *table*, which is a fact about key material rather than about an
+/// archive, and no exit code is derived from them (§2, §10). A caller that
+/// wires this into a write path converts it at that seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NgNotInvertible {
+    /// There is no such round: the transform has [`crate::keys::NG_ROUNDS`] of
+    /// them, or the material is short of one of this round's tables.
+    NoSuchRound {
+        /// The round that was asked for.
+        round: usize,
+    },
+    /// A column's table is not a byte permutation into an eight-dimensional
+    /// space, so the round does not factor and no inverse can be built from it.
+    ///
+    /// Measured against the real material, all 272 tables are: their 256
+    /// entries differ from the first by 256 **distinct** words spanning
+    /// **eight** dimensions. A table that is not is either not this cipher's
+    /// or was read wrong, and both are worth naming rather than sweeping for.
+    NotASubstitution {
+        /// The round whose table it is.
+        round: usize,
+        /// Which of the sixteen columns.
+        column: usize,
+        /// How many dimensions its differences actually span. Eight is the
+        /// only value that factors.
+        rank: usize,
+        /// How many of the 256 differences are distinct. Fewer than 256 means
+        /// two input bytes are indistinguishable in the output.
+        distinct: usize,
+    },
+    /// The four columns of one output word span the word between them but not
+    /// independently, so the round loses information and has no inverse.
+    Singular {
+        /// The round whose map it is.
+        round: usize,
+        /// Which of the four output words.
+        word: usize,
+    },
+}
+
+/// One round of the NG transform, in both directions.
+///
+/// **Every round factors, and this is measured rather than assumed.** Each of
+/// a round's sixteen decrypt tables turns the byte it reads into one of 256
+/// distinct words, and those words differ from the table's first entry by an
+/// eight-dimensional GF(2) subspace — so a table is a byte permutation
+/// followed by an injection into a subspace, the shape an AES T-box has. The
+/// four columns of an output word contribute four independent subspaces that
+/// span the word, so a round is a byte substitution and an invertible linear
+/// map, and its inverse is the substitutions read backwards and the map
+/// inverted by Gaussian elimination over GF(2).
+///
+/// **Its only input is the decrypt tables this build already holds** — no
+/// second key, no scraped constant, nothing bundled and nothing downloaded.
+/// DR-006, and `docs/ng-scheme.md`. It costs milliseconds, so a derived round
+/// is a value a caller makes when it needs one rather than an artefact anyone
+/// has to store.
+///
+/// That is a stronger result than the reference implementation's, which solves
+/// rounds 0, 1 and 16 this way and brute-forces the other fourteen with a 2^32
+/// sweep each. The sweep is unnecessary: what it is searching for is the
+/// substitution this derives.
+///
+/// Nothing here prints a table: `Debug` says which round, never a word or a
+/// byte of either direction (DR-020).
+pub struct NgRound {
+    /// Which round, which is also which of the two column orders it reads in.
+    round: usize,
+    /// The round's decrypt tables, copied out of the material as words.
+    ///
+    /// Copied rather than borrowed so that the round and the inverse derived
+    /// from it cannot come to read different tables (§3), and so that a
+    /// derived round outlives the scan that produced it.
+    opening: Box<RoundTables>,
+    /// The inverse of each column's linear part, in the decrypt tables' own
+    /// shape: what the forward direction looks a byte of the stripped output
+    /// word up in.
+    sealing: Box<RoundTables>,
+    /// The inverse of each column's byte substitution: what turns a recovered
+    /// coordinate back into the byte the decrypt round read.
+    substitution: Box<RoundBytes>,
+    /// What each output word carries when the round key is zero: the
+    /// exclusive-or of the four tables' entries for a zero byte.
+    ///
+    /// The affine part, held apart from the linear part because only the
+    /// linear part is inverted. The forward direction removes it, and the
+    /// round key, before it looks anything up.
+    constants: [u32; NG_WORDS],
+}
+
+impl NgRound {
+    /// Derives the forward direction of `round` from the decrypt tables in
+    /// `ng`.
+    ///
+    /// # Errors
+    ///
+    /// [`NgNotInvertible::NoSuchRound`] where the material holds no such
+    /// round; [`NgNotInvertible::NotASubstitution`] naming the column whose
+    /// table does not factor, and by how much; and
+    /// [`NgNotInvertible::Singular`] where the four columns of a word do not
+    /// span it independently.
+    ///
+    /// Milliseconds: sixteen eliminations of 256 words each, and four of
+    /// thirty-two.
+    pub fn solve(ng: &NgKeys, round: usize) -> Result<Self, NgNotInvertible> {
+        let absent = NgNotInvertible::NoSuchRound { round };
+        let opening = round_tables(ng, round).ok_or(absent)?;
+        let order = ng_order(round);
+        let mut sealing = Box::new([[0_u32; NG_TABLE_ENTRIES]; NG_COLUMNS]);
+        let mut substitution = Box::new([[0_u8; NG_TABLE_ENTRIES]; NG_COLUMNS]);
+        let mut constants = [0_u32; NG_WORDS];
+
+        for (word, columns) in order.iter().enumerate() {
+            // The map of one output word, as the images of the thirty-two
+            // coordinates the four columns contribute — bit `8 * place + bit`
+            // of the word's own space is basis vector `bit` of the column at
+            // `columns[place]`.
+            let mut map = [0_u32; NG_WORD_BITS];
+            let mut constant = 0_u32;
+            for (place, &column) in columns.iter().enumerate() {
+                let table = opening.get(column).ok_or(absent)?;
+                let base = *table.first().ok_or(absent)?;
+                constant ^= base;
+                let start = place.checked_mul(NG_COLUMN_BITS).ok_or(absent)?;
+                let shape = NgNotInvertible::NotASubstitution {
+                    round,
+                    column,
+                    rank: rank_of(table, base),
+                    distinct: distinct_of(table, base),
+                };
+                if distinct_of(table, base) != NG_TABLE_ENTRIES {
+                    return Err(shape);
+                }
+                let basis = basis_of(table, base).ok_or(shape)?;
+                for (bit, vector) in basis.iter().enumerate() {
+                    let at = start.checked_add(bit).ok_or(absent)?;
+                    *map.get_mut(at).ok_or(absent)? = *vector;
+                }
+
+                // The substitution, backwards: the coordinates of entry `b` in
+                // this column's own basis are what the forward direction
+                // recovers, and `b` is what it has to hand back. Read the other
+                // way round it is also the check that the table is a
+                // permutation — every coordinate is written exactly once, and
+                // `basis_of` has already said there are 256 distinct ones.
+                let inverse = substitution.get_mut(column).ok_or(absent)?;
+                for (value, entry) in table.iter().enumerate() {
+                    let byte = u8::try_from(value).map_err(|_| absent)?;
+                    let coordinates = coordinates_of(&basis, entry ^ base).ok_or(shape)?;
+                    *inverse.get_mut(usize::from(coordinates)).ok_or(absent)? = byte;
+                }
+            }
+
+            let inverse = inverse_of(&map).ok_or(NgNotInvertible::Singular { round, word })?;
+            *constants.get_mut(word).ok_or(absent)? = constant;
+
+            // The forward table for a column is the inverse applied to that
+            // column's own byte, in that column's own place in the word — so a
+            // word's four lookups exclusive-or to the inverse of the whole
+            // word, which is what makes the forward direction the same shape
+            // as the backward one.
+            for (place, &column) in columns.iter().enumerate() {
+                let shift = u32::try_from(place.checked_mul(NG_COLUMN_BITS).ok_or(absent)?)
+                    .map_err(|_| absent)?;
+                let table = sealing.get_mut(column).ok_or(absent)?;
+                for (value, slot) in table.iter_mut().enumerate() {
+                    let byte = u8::try_from(value).map_err(|_| absent)?;
+                    *slot = image_of(&inverse, u32::from(byte).wrapping_shl(shift));
+                }
+            }
+        }
+
+        Ok(Self {
+            round,
+            opening,
+            sealing,
+            substitution,
+            constants,
+        })
+    }
+
+    /// Which round this is.
+    #[must_use]
+    pub const fn round(&self) -> usize {
+        self.round
+    }
+
+    /// Runs the round's **decrypt** direction over one block.
+    ///
+    /// The same code the whole transform runs — `ng_round_over` — over the
+    /// same tables the inverse was derived from, so that a round trip measures
+    /// the derivation rather than two implementations agreeing (§3).
+    pub fn open(&self, round_key: &[u8; NG_ROUND_KEY_LEN], block: &mut [u8; CIPHER_BLOCK_LEN]) {
+        ng_round_over(
+            |column, byte| entry_of(&self.opening, column, byte),
+            round_key,
+            ng_order(self.round),
+            block,
+        );
+    }
+
+    /// Runs the round's **encrypt** direction over one block: the exact
+    /// inverse of [`NgRound::open`] under the same round key.
+    ///
+    /// The round key and the affine constant come off the output word first,
+    /// because only what is left is linear; then four lookups rebuild the
+    /// word's coordinates, the substitution turns each coordinate back into
+    /// the byte it came from, and each byte lands at the column the decrypt
+    /// round read it from — which for a permuted round is not the word's own
+    /// four bytes.
+    pub fn seal(&self, round_key: &[u8; NG_ROUND_KEY_LEN], block: &mut [u8; CIPHER_BLOCK_LEN]) {
+        let source = *block;
+        let (source_words, _) = source.as_chunks::<4>();
+        let (key_words, _) = round_key.as_chunks::<4>();
+        for (((columns, source_word), key_word), constant) in ng_order(self.round)
+            .iter()
+            .zip(source_words)
+            .zip(key_words)
+            .zip(self.constants)
+        {
+            let stripped =
+                u32::from_le_bytes(*source_word) ^ u32::from_le_bytes(*key_word) ^ constant;
+            let mut recovered = 0_u32;
+            for (&column, &byte) in columns.iter().zip(stripped.to_le_bytes().iter()) {
+                recovered ^= entry_of(&self.sealing, column, byte);
+            }
+            for (&column, &coordinates) in columns.iter().zip(recovered.to_le_bytes().iter()) {
+                let byte = self
+                    .substitution
+                    .get(column)
+                    .and_then(|table| table.get(usize::from(coordinates)))
+                    .copied()
+                    .unwrap_or_default();
+                let Some(slot) = block.get_mut(column) else {
+                    continue;
+                };
+                *slot = byte;
+            }
+        }
+    }
+}
+
+/// By hand, so that no derived table can reach a log or a panic message by
+/// being printed. DR-020, which is about material and not about where it came
+/// from: a table solved for is as much key material as one that was scanned.
+impl fmt::Debug for NgRound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NgRound")
+            .field("scheme", &Scheme::Ng)
+            .field("round", &self.round)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The whole NG transform's **forward** direction: all seventeen rounds,
+/// derived from the decrypt tables.
+///
+/// The decrypt direction runs round 0 first and round 16 last, so this runs
+/// round 16 first and round 0 last. That is the only thing it adds to
+/// [`NgRound`], and it is the thing a writer must not get wrong.
+pub struct NgForward {
+    /// One derived round per round of the transform, in the decrypt
+    /// direction's order.
+    rounds: Vec<NgRound>,
+}
+
+impl NgForward {
+    /// Derives every round from the decrypt tables in `ng`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`NgRound::solve`] answers for the first round that does not
+    /// derive — the whole transform or none of it, because a transform missing
+    /// one round writes an archive nothing reads (§4).
+    pub fn derive(ng: &NgKeys) -> Result<Self, NgNotInvertible> {
+        let mut rounds = Vec::with_capacity(NG_ROUNDS);
+        for round in 0..NG_ROUNDS {
+            rounds.push(NgRound::solve(ng, round)?);
+        }
+        Ok(Self { rounds })
+    }
+
+    /// Encrypts one whole block in place, under `expanded`.
+    ///
+    /// The exact inverse of the decrypt transform [`Cipher`] runs, under the
+    /// same expanded key.
+    pub fn block(&self, expanded: &[u8; NG_EXPANDED_KEY_LEN], block: &mut [u8; CIPHER_BLOCK_LEN]) {
+        let (round_keys, _) = expanded.as_chunks::<NG_ROUND_KEY_LEN>();
+        for (round, round_key) in self.rounds.iter().zip(round_keys).rev() {
+            round.seal(round_key, block);
+        }
+    }
+}
+
+/// By hand, for the reason [`NgRound`]'s is.
+impl fmt::Debug for NgForward {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NgForward")
+            .field("scheme", &Scheme::Ng)
+            .field("rounds", &self.rounds.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A basis of the space one column's entries differ from its first by, in
+/// echelon form and highest leading bit first, or `None` where that space is
+/// not eight-dimensional.
+///
+/// Eight dimensions and 256 distinct differences together are the whole
+/// factorisation: 256 distinct vectors in a space of exactly 256 elements are
+/// all of it, so the coordinate map is a bijection and the table is a
+/// permutation of the 256 coordinate values. [`coordinates_of`] is the half
+/// that reads one out; [`distinct_of`] is where the second half is checked.
+fn basis_of(table: &[u32; NG_TABLE_ENTRIES], base: u32) -> Option<[u32; NG_COLUMN_BITS]> {
+    let mut slots = [0_u32; NG_WORD_BITS];
+    let mut found = 0_usize;
+    for entry in table {
+        let mut left = entry ^ base;
+        while left != 0 {
+            let at = usize::try_from(leading_bit(left)).ok()?;
+            let slot = slots.get_mut(at)?;
+            if *slot == 0 {
+                *slot = left;
+                found = found.checked_add(1)?;
+                break;
+            }
+            left ^= *slot;
+        }
+        if found > NG_COLUMN_BITS {
+            return None;
+        }
+    }
+    if found != NG_COLUMN_BITS {
+        return None;
+    }
+    let mut basis = [0_u32; NG_COLUMN_BITS];
+    let mut filled = basis.iter_mut();
+    for vector in slots.iter().rev() {
+        if *vector == 0 {
+            continue;
+        }
+        *filled.next()? = *vector;
+    }
+    Some(basis)
+}
+
+/// Which bit of `word` is its highest set one. Zero for zero, which no caller
+/// asks about.
+const fn leading_bit(word: u32) -> u32 {
+    u32::BITS
+        .saturating_sub(1)
+        .saturating_sub(word.leading_zeros())
+}
+
+/// The coordinates of `vector` in `basis`, or `None` where it is not in the
+/// space the basis spans.
+///
+/// The basis is in echelon form with its leading bits descending, so one pass
+/// in that order both reduces the vector and reads its coordinates off.
+fn coordinates_of(basis: &[u32; NG_COLUMN_BITS], vector: u32) -> Option<u8> {
+    let mut left = vector;
+    let mut coordinates = 0_u8;
+    for (bit, &pivot) in basis.iter().enumerate() {
+        if pivot == 0 || left == 0 || leading_bit(left) != leading_bit(pivot) {
+            continue;
+        }
+        left ^= pivot;
+        coordinates |= 1_u8.wrapping_shl(u32::try_from(bit).unwrap_or(u32::MAX));
+    }
+    (left == 0).then_some(coordinates)
+}
+
+/// How many dimensions a column's differences span, for a refusal to say so.
+fn rank_of(table: &[u32; NG_TABLE_ENTRIES], base: u32) -> usize {
+    let mut slots = [0_u32; NG_WORD_BITS];
+    let mut found = 0_usize;
+    for entry in table {
+        let mut left = entry ^ base;
+        while left != 0 {
+            let Ok(at) = usize::try_from(leading_bit(left)) else {
+                break;
+            };
+            let Some(slot) = slots.get_mut(at) else {
+                break;
+            };
+            if *slot == 0 {
+                *slot = left;
+                found = found.saturating_add(1);
+                break;
+            }
+            left ^= *slot;
+        }
+    }
+    found
+}
+
+/// How many of a column's differences are distinct, for the same reason.
+fn distinct_of(table: &[u32; NG_TABLE_ENTRIES], base: u32) -> usize {
+    let mut seen: Vec<u32> = table.iter().map(|entry| entry ^ base).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len()
+}
+
+/// What one round's table for `column` holds for `byte`.
+fn entry_of(tables: &RoundTables, column: usize, byte: u8) -> u32 {
+    tables
+        .get(column)
+        .and_then(|table| table.get(usize::from(byte)))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// One round's sixteen decrypt tables as words, or `None` where the material
+/// has no such round.
+fn round_tables(ng: &NgKeys, round: usize) -> Option<Box<RoundTables>> {
+    let mut tables = Box::new([[0_u32; NG_TABLE_ENTRIES]; NG_COLUMNS]);
+    for (column, slot) in tables.iter_mut().enumerate() {
+        let table = ng.decrypt_table(round, column)?;
+        for (value, word) in slot.iter_mut().enumerate() {
+            *word = table_word(table, u8::try_from(value).ok()?)?;
+        }
+    }
+    Some(tables)
+}
+
+/// The image of `vector` under `map`: the exclusive-or of the images of the
+/// bits it has set.
+fn image_of(map: &WordMap, vector: u32) -> u32 {
+    let mut out = 0_u32;
+    for (bit, image) in map.iter().enumerate() {
+        let shift = u32::try_from(bit).unwrap_or(u32::MAX);
+        if vector.wrapping_shr(shift) & 1 == 1 {
+            out ^= *image;
+        }
+    }
+    out
+}
+
+/// The inverse of `map` over GF(2), or `None` where it is singular.
+///
+/// Gauss-Jordan elimination on thirty-two rows, each carried alongside the
+/// unit vector it started as. The invariant every step preserves is
+/// `map(source[row]) == image[row]`: exclusive-oring one row into another is
+/// linear, so it holds on both sides at once. When elimination has turned
+/// every `image[row]` into that row's unit vector, `source[row]` is what `map`
+/// sends to it — which is the inverse in the same form.
+///
+/// This is the port of the reference implementation's `RandomGauss.Solve`, and
+/// it is not a transcription of it: that one feeds random blocks through the
+/// decrypt round and collects pivots for 128 systems of 1024 unknowns, where
+/// each output word here depends on four bytes and no more, so the basis
+/// vectors give the map directly and the systems are four of thirty-two.
+/// `docs/ng-scheme.md`.
+fn inverse_of(map: &WordMap) -> Option<WordMap> {
+    let mut image = *map;
+    let mut source: WordMap =
+        std::array::from_fn(|bit| 1_u32.wrapping_shl(u32::try_from(bit).unwrap_or(u32::MAX)));
+    for bit in 0..NG_WORD_BITS {
+        let shift = u32::try_from(bit).ok()?;
+        let set = |word: &u32| word.wrapping_shr(shift) & 1 == 1;
+        let pivot = (bit..NG_WORD_BITS).find(|&row| image.get(row).is_some_and(set))?;
+        image.swap(bit, pivot);
+        source.swap(bit, pivot);
+        let lead_image = *image.get(bit)?;
+        let lead_source = *source.get(bit)?;
+        for row in 0..NG_WORD_BITS {
+            if row == bit || !image.get(row).is_some_and(set) {
+                continue;
+            }
+            *image.get_mut(row)? ^= lead_image;
+            *source.get_mut(row)? ^= lead_source;
+        }
+    }
+    Some(source)
+}
+
+/// Synthetic NG material, for tests that need the transform and no key
+/// material.
+///
+/// Outside `mod tests` because two modules want it: this module's own tests and
+/// `build`'s, which is where an NG-tagged archive is written and read back with
+/// nothing extracted from anything. `#[cfg(test)]`, so none of it is in a
+/// release build or in anything a dependent compiles — the same confinement
+/// DR-048 puts on the fuzz seam and `Material::over_zeros` on its own.
+///
+/// **None of it is key material and none of it came from any** (DR-006): every
+/// value is drawn from a named seed by three lines of arithmetic, and what the
+/// tables pin is that the derivation inverts whatever tables of the measured
+/// shape it is handed.
+#[cfg(test)]
+pub(crate) mod synthetic {
+    use super::*;
+    use crate::keys::{NG_COLUMNS, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN};
+
+    /// A decrypt table set of the length [`NgKeys`] promises, answering zero
+    /// for every input byte of every round and column.
+    ///
+    /// The NG transform used to be reachable only with the real material, so
+    /// every fact about it below this line was defensible on the one machine
+    /// that has a memory image and nowhere else. `NgKeys::restored` takes the
+    /// tables as bytes, so tables chosen to make the wiring readable cost no
+    /// key material at all and are not any (DR-006): what they pin is which
+    /// byte reaches which word, and that is arithmetic rather than a value.
+    pub(crate) fn no_tables() -> Vec<u8> {
+        vec![0; NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN)]
+    }
+
+    /// An expanded key set of the promised length, all zero.
+    pub(crate) fn no_expanded() -> Vec<u8> {
+        vec![0; NG_EXPANDED_KEY_COUNT.saturating_mul(NG_EXPANDED_KEY_LEN)]
+    }
+
+    /// Where one decrypt table begins, in the order `NgKeys::decrypt_table`
+    /// reads them.
+    pub(crate) fn table_at(round: usize, column: usize) -> usize {
+        round
+            .saturating_mul(NG_COLUMNS)
+            .saturating_add(column)
+            .saturating_mul(NG_DECRYPT_TABLE_LEN)
+    }
+
+    /// Material of exactly these tables and expanded keys.
+    pub(crate) fn ng_over(tables: Vec<u8>, expanded: Vec<u8>) -> NgKeys {
+        NgKeys::restored(expanded, tables, 0, 0).expect("the lengths this type promises")
+    }
+
+    /// A deterministic stream of words, so that "random tables" is a fixture
+    /// rather than a flake.
+    ///
+    /// No key material is involved and none could be: what these tests measure
+    /// is that the derivation inverts *whatever* affine tables it is given, and
+    /// that is arithmetic (DR-006).
+    pub(crate) struct Stream(pub(crate) u32);
+
+    impl Stream {
+        /// The next word.
+        pub(crate) fn next(&mut self) -> u32 {
+            let mut state = self.0;
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            self.0 = state;
+            state
+        }
+
+        /// The next byte, off the top of a word so that the low bits of the
+        /// generator are not what a block is made of.
+        pub(crate) fn byte(&mut self) -> u8 {
+            u8::try_from(self.next() >> 24).unwrap_or(0)
+        }
+
+        /// The next block.
+        pub(crate) fn block(&mut self) -> [u8; CIPHER_BLOCK_LEN] {
+            std::array::from_fn(|_| self.byte())
+        }
+    }
+
+    /// Writes a table for `round` and `column`: entry `b` is `base`
+    /// exclusive-ored with the images of the bits set in `substitution[b]`.
+    ///
+    /// Which is the shape every one of the 272 real tables has —
+    /// `a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column`
+    /// in `crates/rpf-core/tests/ng_inverse.rs` is where that is measured. A
+    /// `substitution` of the identity is the special case rounds 0, 1 and 16
+    /// are: affine on the byte, and so linear on the block.
+    pub(crate) fn answers_by_substitution(
+        tables: &mut [u8],
+        round: usize,
+        column: usize,
+        base: u32,
+        images: &[u32; NG_COLUMN_BITS],
+        substitution: &[u8; NG_TABLE_ENTRIES],
+    ) {
+        let start = table_at(round, column);
+        for (value, &substituted) in substitution.iter().enumerate() {
+            let coordinates = usize::from(substituted);
+            let mut word = base;
+            for (bit, image) in images.iter().enumerate() {
+                if coordinates >> bit & 1 == 1 {
+                    word ^= *image;
+                }
+            }
+            let at = start.saturating_add(value.saturating_mul(4));
+            let Some(slot) = tables.get_mut(at..at.saturating_add(4)) else {
+                continue;
+            };
+            slot.copy_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// A whole table set whose every round derives.
+    ///
+    /// Built one output word at a time, and **retried per word**: a random
+    /// 32 x 32 matrix over GF(2) is invertible about 29% of the time, so a
+    /// draw that is singular is discarded and the next taken. Retrying a whole
+    /// round instead would be a 0.7% chance a hundred and thirty-six times
+    /// over, which is a test that never finishes.
+    ///
+    /// `substituted` says whether each column's byte substitution is a shuffle
+    /// or the identity. The identity gives affine tables — what rounds 0, 1
+    /// and 16 are — and a shuffle gives what rounds 2 through 15 are.
+    pub(crate) fn table_set(seed: u32, substituted: bool) -> Vec<u8> {
+        let mut stream = Stream(seed);
+        let mut tables = no_tables();
+        for round in 0..NG_ROUNDS {
+            for columns in ng_order(round) {
+                loop {
+                    let bases: [u32; 4] = std::array::from_fn(|_| stream.next());
+                    let images: [[u32; NG_COLUMN_BITS]; 4] =
+                        std::array::from_fn(|_| std::array::from_fn(|_| stream.next()));
+                    let map: WordMap = std::array::from_fn(|bit| {
+                        images[bit / NG_COLUMN_BITS][bit % NG_COLUMN_BITS]
+                    });
+                    if inverse_of(&map).is_none() {
+                        continue;
+                    }
+                    for ((&column, base), image) in columns.iter().zip(bases).zip(&images) {
+                        let substitution = if substituted {
+                            shuffle(&mut stream)
+                        } else {
+                            std::array::from_fn(|value| u8::try_from(value).unwrap_or(0))
+                        };
+                        answers_by_substitution(
+                            &mut tables,
+                            round,
+                            column,
+                            base,
+                            image,
+                            &substitution,
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        tables
+    }
+
+    /// A permutation of the 256 byte values, drawn from `stream`.
+    pub(crate) fn shuffle(stream: &mut Stream) -> [u8; NG_TABLE_ENTRIES] {
+        let mut values: [u8; NG_TABLE_ENTRIES] =
+            std::array::from_fn(|value| u8::try_from(value).unwrap_or(0));
+        for at in (1..NG_TABLE_ENTRIES).rev() {
+            let with = usize::try_from(stream.next())
+                .unwrap_or(0)
+                .checked_rem(at.saturating_add(1))
+                .unwrap_or(0);
+            values.swap(at, with);
+        }
+        values
+    }
+
+    /// The affine table set, which is what most of these tests want.
+    pub(crate) fn affine_tables(seed: u32) -> Vec<u8> {
+        table_set(seed, false)
+    }
+
+    /// One hundred and one distinct expanded keys, so that a region keyed to a
+    /// different index is written under **different bytes** rather than the
+    /// same bytes under another name — which is the only way a test can tell a
+    /// re-keyed write from one that forgot to re-key.
+    pub(crate) fn distinct_expanded(seed: u32) -> Vec<u8> {
+        let mut stream = Stream(seed);
+        let mut out = no_expanded();
+        for slot in &mut out {
+            *slot = stream.byte();
+        }
+        out
+    }
+
+    /// Material of the shape only a memory image carries, with **no key
+    /// material in it**: substituted decrypt tables that derive, 101 expanded
+    /// keys, an AES key and a hash lookup table, all drawn from `seed`.
+    ///
+    /// What it makes testable is the whole NG write path with no game
+    /// installation and no memory image anywhere — the counterpart of
+    /// [`Material::over_zeros`](crate::keys::Material::over_zeros) for the arm
+    /// that one deliberately leaves empty. Nothing here is or came from a key
+    /// (DR-006): the tables are arithmetic, and what they pin is that the
+    /// derivation inverts whatever tables it is given.
+    pub(crate) fn ng_material(seed: u32) -> Material {
+        let mut stream = Stream(seed);
+        let mut lut = [0_u8; HASH_LUT_LEN];
+        for slot in &mut lut {
+            *slot = stream.byte();
+        }
+        Material::over_ng(
+            lut,
+            ng_over(
+                table_set(seed, true),
+                distinct_expanded(seed.wrapping_add(1)),
+            ),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::synthetic::*;
     use super::*;
-    use crate::keys::{NG_COLUMNS, NG_DECRYPT_TABLE_COUNT, NG_DECRYPT_TABLE_LEN};
+    use crate::keys::{NG_COLUMNS, NG_DECRYPT_TABLE_LEN};
 
     /// What `ng_key_index` answers for `dlc.rpf` at 6,144 bytes over a lookup
     /// table of the identity. Measured, and the number the real table gives for
@@ -562,33 +1521,6 @@ mod tests {
     /// As [`Cipher::over_zeros`], under the name these tests read by.
     fn framing_only() -> Cipher {
         Cipher::over_zeros()
-    }
-
-    /// A decrypt table set of the length [`NgKeys`] promises, answering zero
-    /// for every input byte of every round and column.
-    ///
-    /// The NG transform used to be reachable only with the real material, so
-    /// every fact about it below this line was defensible on the one machine
-    /// that has a memory image and nowhere else. `NgKeys::restored` takes the
-    /// tables as bytes, so tables chosen to make the wiring readable cost no
-    /// key material at all and are not any (DR-006): what they pin is which
-    /// byte reaches which word, and that is arithmetic rather than a value.
-    fn no_tables() -> Vec<u8> {
-        vec![0; NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN)]
-    }
-
-    /// An expanded key set of the promised length, all zero.
-    fn no_expanded() -> Vec<u8> {
-        vec![0; NG_EXPANDED_KEY_COUNT.saturating_mul(NG_EXPANDED_KEY_LEN)]
-    }
-
-    /// Where one decrypt table begins, in the order `NgKeys::decrypt_table`
-    /// reads them.
-    fn table_at(round: usize, column: usize) -> usize {
-        round
-            .saturating_mul(NG_COLUMNS)
-            .saturating_add(column)
-            .saturating_mul(NG_DECRYPT_TABLE_LEN)
     }
 
     /// Makes the table for `round` and `column` answer `word` whatever byte it
@@ -617,11 +1549,6 @@ mod tests {
             };
             slot.copy_from_slice(&word.to_le_bytes());
         }
-    }
-
-    /// Material of exactly these tables and expanded keys.
-    fn ng_over(tables: Vec<u8>, expanded: Vec<u8>) -> NgKeys {
-        NgKeys::restored(expanded, tables, 0, 0).expect("the lengths this type promises")
     }
 
     /// The four little-endian words of a block.
@@ -1065,6 +1992,300 @@ mod tests {
         assert_ne!(block, shifted_times(start, 13), "one round too few");
         assert_ne!(block, shifted_times(start, 15), "one round too many");
         assert_ne!(block, start, "no round permuted anything");
+    }
+
+    #[test]
+    fn a_decrypt_table_holds_one_word_per_value_of_the_byte_it_reads() {
+        // `NG_TABLE_ENTRIES` and `NG_DECRYPT_TABLE_LEN` are the same fact in
+        // two units, and the solver counts in the first while the material is
+        // stored in the second (§3). A drift between them reads a table short
+        // and derives an inverse for a map that is not the round's.
+        assert_eq!(NG_DECRYPT_TABLE_LEN, NG_TABLE_ENTRIES.saturating_mul(4));
+        assert_eq!(NG_TABLE_ENTRIES, usize::from(u8::MAX).saturating_add(1));
+        assert_eq!(NG_WORD_BITS, NG_COLUMN_BITS.saturating_mul(4));
+        assert_eq!(NG_WORDS, 4);
+    }
+
+    #[test]
+    fn the_order_a_round_reads_in_has_one_owner() {
+        // `ng_block` and `NgRound` both ask `ng_order`, and a forward round
+        // that read the other order would invert nothing. This says the one
+        // owner answers what `docs/rpf-format.md`, Encryption, records: rounds
+        // 0, 1 and 16 in column order, 2 through 15 permuted.
+        for round in 0..NG_ROUNDS {
+            let column_order = round < NG_LEADING_ROUNDS || round == NG_LAST_ROUND;
+            assert_eq!(
+                *ng_order(round) == NG_COLUMN_ORDER,
+                column_order,
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_solver_inverts_an_invertible_map_and_refuses_a_singular_one() {
+        // The Gaussian elimination on its own, over a matrix that is no part of
+        // any cipher — the one half of this work that needs no game material of
+        // any kind, and so the one half a machine with no memory image can
+        // still be told is wrong.
+        let mut stream = Stream(0x1234_5678);
+        let mut inverted = 0_usize;
+        for _ in 0..64 {
+            let map: WordMap = std::array::from_fn(|_| stream.next());
+            let Some(inverse) = inverse_of(&map) else {
+                continue;
+            };
+            inverted += 1;
+            for _ in 0..64 {
+                let vector = stream.next();
+                assert_eq!(
+                    image_of(&inverse, image_of(&map, vector)),
+                    vector,
+                    "the inverse did not undo the map"
+                );
+                assert_eq!(
+                    image_of(&map, image_of(&inverse, vector)),
+                    vector,
+                    "the map did not undo the inverse"
+                );
+            }
+        }
+        assert!(inverted > 0, "no map in the sample was invertible");
+
+        // A map with two equal images loses a bit, so no inverse exists and one
+        // must not be invented: an invented one silently corrupts every block.
+        let mut singular: WordMap =
+            std::array::from_fn(|bit| 1_u32 << u32::try_from(bit).unwrap_or(0));
+        singular[3] = singular[7];
+        assert_eq!(inverse_of(&singular), None);
+
+        // And the identity is its own inverse, which is the one answer that can
+        // be written down rather than checked.
+        let identity: WordMap = std::array::from_fn(|bit| 1_u32 << u32::try_from(bit).unwrap_or(0));
+        assert_eq!(inverse_of(&identity), Some(identity));
+    }
+
+    #[test]
+    fn a_derived_round_is_the_exact_inverse_of_the_decrypt_round_it_came_from() {
+        // **The experiment, with no key material in it.** Affine tables of the
+        // shape rounds 0, 1 and 16 have, a round key that is not zero, and the
+        // round trip that decides R4.7: what the decrypt round turns a block
+        // into, the derived forward round turns back.
+        //
+        // Both a column-order round and a permuted one, because the forward
+        // direction has to put each recovered byte back at the column the
+        // decrypt round read it from — and for a permuted round that is not the
+        // word's own four bytes. A `seal` that ignored the permutation passes
+        // the first of these and fails the second.
+        let tables = affine_tables(0x9E37_79B9);
+        let ng = ng_over(tables, no_expanded());
+        let mut stream = Stream(0x0BAD_F00D);
+        for round in [0_usize, 1, 5, NG_LAST_ROUND] {
+            let derived = NgRound::solve(&ng, round).expect("affine and invertible");
+            assert_eq!(derived.round(), round);
+            for _ in 0..64 {
+                let round_key: [u8; NG_ROUND_KEY_LEN] = std::array::from_fn(|_| stream.byte());
+                let plain = stream.block();
+
+                let mut opened = plain;
+                derived.open(&round_key, &mut opened);
+                assert_ne!(opened, plain, "round {round} changed nothing");
+
+                let mut back = opened;
+                derived.seal(&round_key, &mut back);
+                assert_eq!(back, plain, "round {round} did not come back");
+
+                // And the other way round, which is the direction a writer
+                // actually runs: seal first, then open.
+                let mut sealed = plain;
+                derived.seal(&round_key, &mut sealed);
+                let mut reopened = sealed;
+                derived.open(&round_key, &mut reopened);
+                assert_eq!(reopened, plain, "round {round} did not seal and reopen");
+            }
+        }
+    }
+
+    #[test]
+    fn a_round_that_substitutes_its_bytes_inverts_without_any_sweep() {
+        // **The result that removes the 2^32 sweep from R4.7.** These tables
+        // are not affine on the byte they read — each puts the byte through a
+        // shuffle first, which is what rounds 2 through 15 do and what the
+        // reference implementation brute-forces the inverse of. The
+        // factorisation finds the shuffle instead, and the round trip closes
+        // in milliseconds.
+        //
+        // The fixture is checked for being what it claims: an affine table set
+        // would pass this test while proving nothing about the substituted
+        // case, so the two are compared and must differ.
+        let substituted = table_set(0x00C0_FFEE, true);
+        assert_ne!(
+            substituted,
+            table_set(0x00C0_FFEE, false),
+            "the substituted fixture is the affine one, so nothing new is measured"
+        );
+        let ng = ng_over(substituted, no_expanded());
+        let mut stream = Stream(0x1CE1_CE1C);
+        for round in 0..NG_ROUNDS {
+            let derived = NgRound::solve(&ng, round).expect("a substitution round derives");
+            for _ in 0..32 {
+                let round_key: [u8; NG_ROUND_KEY_LEN] = std::array::from_fn(|_| stream.byte());
+                let plain = stream.block();
+                let mut opened = plain;
+                derived.open(&round_key, &mut opened);
+                let mut back = opened;
+                derived.seal(&round_key, &mut back);
+                assert_eq!(back, plain, "round {round} did not come back");
+            }
+        }
+    }
+
+    #[test]
+    fn the_derived_transform_undoes_the_whole_decrypt_transform() {
+        // Seventeen rounds, in the order a writer runs them: round 16 first
+        // and round 0 last, which is the decrypt order reversed. A forward
+        // transform that ran them the same way round as the decrypt one
+        // inverts each round and none of the composition, and every test above
+        // this line would still pass.
+        let ng = ng_over(table_set(0x5150_5150, true), no_expanded());
+        let forward = NgForward::derive(&ng).expect("every round derives");
+        let mut stream = Stream(0x7E57_7E57);
+        let expanded: [u8; NG_EXPANDED_KEY_LEN] = std::array::from_fn(|_| stream.byte());
+        for _ in 0..64 {
+            let plain = stream.block();
+            let mut opened = plain;
+            ng_block(&ng, &expanded, &mut opened);
+            assert_ne!(opened, plain, "the transform changed nothing");
+            let mut back = opened;
+            forward.block(&expanded, &mut back);
+            assert_eq!(back, plain, "the whole transform did not come back");
+        }
+    }
+
+    #[test]
+    fn nothing_a_derived_transform_prints_is_a_table() {
+        // DR-020 again, on the type that holds all seventeen rounds of it.
+        let ng = ng_over(affine_tables(0xFEED_FACE), no_expanded());
+        let rendered = format!("{:?}", NgForward::derive(&ng).expect("every round derives"));
+        assert!(rendered.contains("Ng"), "{rendered}");
+        assert!(!rendered.contains("00"), "{rendered}");
+    }
+
+    #[test]
+    fn a_derived_rounds_decrypt_is_the_transforms_own_round() {
+        // `NgRound::open` exists so that a round trip measures the
+        // derivation rather than two implementations of the decrypt round
+        // agreeing with each other. This says it is the same round: the same
+        // tables, the same order, the same answer as `ng_round`, which is what
+        // `ng_block` runs.
+        let ng = ng_over(affine_tables(0x5EED_1234), no_expanded());
+        let mut stream = Stream(0x2468_ACE0);
+        for round in [0_usize, 5, NG_LAST_ROUND] {
+            let derived = NgRound::solve(&ng, round).expect("affine and invertible");
+            let round_key: [u8; NG_ROUND_KEY_LEN] = std::array::from_fn(|_| stream.byte());
+            let start = stream.block();
+
+            let mut theirs = start;
+            ng_round(&ng, round, &round_key, ng_order(round), &mut theirs);
+            let mut ours = start;
+            derived.open(&round_key, &mut ours);
+            assert_eq!(ours, theirs, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_table_that_is_not_a_substitution_is_named_with_the_shape_it_has() {
+        // A refusal has to say *what* is wrong with the table, because the two
+        // ways it can be wrong have different answers: differences that span
+        // more than eight dimensions mean the round does not factor at all,
+        // and differences that repeat mean two input bytes are
+        // indistinguishable. One entry moved by one bit takes the rank to nine.
+        let mut tables = affine_tables(0x1357_9BDF);
+        let at = table_at(3, 9).saturating_add(usize::from(0xC3_u8).saturating_mul(4));
+        tables[at] ^= 0x40;
+        let ng = ng_over(tables, no_expanded());
+        match NgRound::solve(&ng, 3) {
+            Err(NgNotInvertible::NotASubstitution {
+                round,
+                column,
+                rank,
+                distinct,
+            }) => {
+                assert_eq!((round, column), (3, 9));
+                assert_ne!(rank, NG_COLUMN_BITS, "the rank is what is wrong");
+                assert_eq!(distinct, NG_TABLE_ENTRIES);
+            }
+            other => panic!("{other:?}"),
+        }
+        // And no other round is disturbed by it.
+        assert!(NgRound::solve(&ng, 0).is_ok());
+    }
+
+    #[test]
+    fn a_round_that_loses_information_is_refused_rather_than_inverted_wrongly() {
+        // An affine round whose map is singular has no inverse at all. The one
+        // answer that must never be given is a table set: it would be the
+        // inverse of some other map, and every block written under it would
+        // read back as noise.
+        let mut tables = affine_tables(0x0F0F_0F0F);
+        // Column 1's table becomes column 0's, so two of the word's eight-bit
+        // blocks have the same image and the thirty-two bits collapse to
+        // twenty-four.
+        let (from, to) = (table_at(0, 0), table_at(0, 1));
+        let copied = tables
+            .get(from..from.saturating_add(NG_DECRYPT_TABLE_LEN))
+            .expect("a whole table")
+            .to_vec();
+        tables
+            .get_mut(to..to.saturating_add(NG_DECRYPT_TABLE_LEN))
+            .expect("a whole table")
+            .copy_from_slice(&copied);
+        let ng = ng_over(tables, no_expanded());
+        assert_eq!(
+            NgRound::solve(&ng, 0).err(),
+            Some(NgNotInvertible::Singular { round: 0, word: 0 })
+        );
+    }
+
+    #[test]
+    fn there_is_no_eighteenth_round_to_derive() {
+        let ng = ng_over(no_tables(), no_expanded());
+        assert_eq!(
+            NgRound::solve(&ng, NG_ROUNDS).err(),
+            Some(NgNotInvertible::NoSuchRound { round: NG_ROUNDS })
+        );
+    }
+
+    #[test]
+    fn a_round_of_tables_answering_zero_is_refused_rather_than_derived() {
+        // The all-zero fixture every other test here uses answers one word for
+        // all 256 bytes, so it is neither a permutation nor eight-dimensional.
+        // It is worth pinning because it is the fixture a mistake reaches
+        // first, and because a solver that read no table at all would answer
+        // exactly this.
+        let ng = ng_over(no_tables(), no_expanded());
+        assert_eq!(
+            NgRound::solve(&ng, 0).err(),
+            Some(NgNotInvertible::NotASubstitution {
+                round: 0,
+                column: 0,
+                rank: 0,
+                distinct: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_a_derived_round_prints_is_a_table() {
+        // DR-020 is about material, not about where it came from: a table
+        // solved for is as much key material as one that was scanned, and this
+        // is the type that holds both directions of it.
+        let ng = ng_over(affine_tables(0xDEAD_BEEF), no_expanded());
+        let derived = NgRound::solve(&ng, 0).expect("affine and invertible");
+        let rendered = format!("{derived:?}");
+        assert!(rendered.contains("Ng"), "{rendered}");
+        assert!(rendered.contains("round"), "{rendered}");
+        assert!(!rendered.contains("00"), "{rendered}");
     }
 
     /// `block` with the shift-rows permutation applied `times` times.

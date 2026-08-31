@@ -39,8 +39,11 @@ pub fn render(failure: &Failure) -> String {
 /// own — `--force` means "write into a detected game install" and says so in
 /// its own sentence (DR-050).
 ///
-/// [`rpf_core::NoWrite::NoInverse`] deliberately has none. There is no way through it,
-/// and offering one would be worse than saying nothing. `pack` over an
+/// [`rpf_core::NoWrite::NoInverse`] deliberately has none. Since DR-062 it says
+/// that this build has nothing to derive the archive's forward transform from —
+/// for NG that is a memory image of a running game (DR-040) — and naming a
+/// command as the way through would be a lie, because there is not one. `pack`
+/// over an
 /// AES-tagged tree had one until DR-057 — "edit through the archive instead" —
 /// and no longer needs it: it packs, given the material every other command
 /// already reaches, and says [`Error::NeedsKey`] when there is none, which is a
@@ -158,14 +161,20 @@ mod tests {
     /// DR-054, DR-057.
     #[test]
     fn the_encrypted_refusal_that_has_no_way_through_offers_none() {
-        // NG has no way through, and offering one would be a lie.
+        // Nothing here derives the transform, and no command changes that:
+        // offering one would be a lie. DR-062 re-aimed what the reason means
+        // and did not give it a route through.
         let ng = Failure::Container(Error::CannotWriteEncrypted {
             tag: 0x0FEF_FFFF,
             reason: rpf_core::NoWrite::NoInverse,
         });
         assert_eq!(remedy(&ng), None);
         assert_eq!(render(&ng), ng.to_string());
-        assert!(ng.to_string().contains("has no inverse"), "{ng}");
+        assert!(
+            ng.to_string()
+                .contains("derives this archive's forward transform"),
+            "{ng}"
+        );
         assert!(
             !render(&ng).contains("Edit through the archive"),
             "a walled-off remedy was offered: {ng}"

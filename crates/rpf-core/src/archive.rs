@@ -20,7 +20,7 @@ use crate::{
     error::{Category, Error, NoWrite, Result},
     format::{
         Header, MAX_HEADER_LEN, Names, Version,
-        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme, Seal},
+        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme, Seal, Sealer},
         folded,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, RESOURCE_HEADER_LENS, resource_len},
         rpf7::MAX_SIZE_24,
@@ -985,22 +985,24 @@ impl Archive {
     /// Whether this archive can be written back at all.
     ///
     /// An unencrypted archive can, and so can one under a transform this build
-    /// can run **forwards** — [`Scheme::seals`], which is `true` for AES-256
-    /// and `false` for NG. Every write path asks this before it computes a
-    /// byte, so the one answer serves patching, rebuilding and the resolution a
-    /// buffered change is accepted by, and three call sites cannot grow three
-    /// answers (§3).
+    /// can run **forwards** over the material this archive was opened with —
+    /// [`Scheme::seals`], which is `true` for AES-256 and, since DR-062, `true`
+    /// for NG **when the decrypt tables the transform derives from are in
+    /// hand**. Every write path asks this before it computes a byte, so the one
+    /// answer serves patching, rebuilding and the resolution a buffered change
+    /// is accepted by, and three call sites cannot grow three answers (§3).
     ///
     /// # Errors
     ///
     /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`], naming the
-    /// tag, for an archive under a transform with no inverse here. It is not
-    /// overridable: a capability that is absent is not a safety interlock, and
-    /// no flag supplies it. DR-041, DR-054.
-    pub const fn writable(&self) -> Result<()> {
+    /// tag, for an archive whose transform this build has nothing to derive a
+    /// forward direction from. It is not overridable: a capability that is
+    /// absent is not a safety interlock, and no flag supplies it. DR-041,
+    /// DR-054, DR-062.
+    pub fn writable(&self) -> Result<()> {
         match self.scheme {
             None => Ok(()),
-            Some(scheme) if scheme.seals() => Ok(()),
+            Some(scheme) if scheme.seals(self.unlock.held_material().map(AsRef::as_ref)) => Ok(()),
             Some(_) => Err(Error::CannotWriteEncrypted {
                 tag: self.encryption,
                 reason: NoWrite::NoInverse,
@@ -1013,9 +1015,12 @@ impl Archive {
     ///
     /// The one place a write path obtains the forward transform, so that the
     /// entry table, the names blob and every payload of one archive are sealed
-    /// by the same value (§3). The key is the tag's and takes neither a name
-    /// nor a length — which is why a rebuilt AES archive of a different length,
-    /// or one written under another file name, still opens.
+    /// by the same **transform** (§3). It is a [`Sealer`] and not a
+    /// [`crate::format::crypto::Seal`] because the key is the region's rather
+    /// than the archive's: an NG key is chosen by the name and length of what
+    /// is being written, so each region asks for its own. The AES arm ignores
+    /// both, which is why a rebuilt AES archive of a different length, or one
+    /// written under another file name, still opens.
     ///
     /// **A sealed archive's entry rows are resealed one at a time**, by both
     /// write paths, so this refuses a version whose row is not one aligned
@@ -1027,8 +1032,12 @@ impl Archive {
     ///
     /// As [`Archive::writable`], and [`Error::WrongKey`] for an archive that is
     /// encrypted and has no material in hand — which an archive that opened
-    /// under a key never is, because opening keeps what opened it.
-    pub fn seal(&self) -> Result<Option<Seal>> {
+    /// under a key never is, because opening keeps what opened it. Material
+    /// that is in hand and does not derive a forward transform is
+    /// [`NoWrite::NoInverse`] rather than [`Error::WrongKey`]: the key is
+    /// right and the tables are not what this build can invert
+    /// ([`crate::format::crypto::NgNotInvertible`], DR-062).
+    pub fn seal(&self) -> Result<Option<Sealer>> {
         self.writable()?;
         let Some(scheme) = self.scheme else {
             return Ok(None);
@@ -1045,7 +1054,26 @@ impl Archive {
             tried: 1,
         };
         let material = self.unlock.held_material().ok_or_else(wrong)?;
-        Seal::new(scheme, material).map(Some).ok_or_else(wrong)
+        Sealer::new(scheme, material)
+            .map(Some)
+            .ok_or_else(|| match scheme {
+                Scheme::Ng => Error::CannotWriteEncrypted {
+                    tag: self.encryption,
+                    reason: NoWrite::NoInverse,
+                },
+                Scheme::Aes(_) => wrong(),
+            })
+    }
+
+    /// The archive's own name, which is half of what its table of contents and
+    /// its names blob are keyed by.
+    ///
+    /// The name it was **opened** under, which is the name a rebuild lands
+    /// back at: a rebuild writes to scratch space and renames over the
+    /// original (DR-035), so the name the reader will key by is this one and
+    /// not the scratch file's.
+    pub(crate) fn keyed_name(&self) -> &str {
+        self.unlock.name()
     }
 
     /// Every entry, in table order. Entry 0 is the root directory.
@@ -1600,10 +1628,20 @@ impl Archive {
             Some(len) => len,
             None => self.payload_span(index)?.1,
         };
-        let seal = match self.seal() {
-            Ok(seal) => seal,
+        let sealer = match self.seal() {
+            Ok(sealer) => sealer,
             Err(Error::CannotWriteEncrypted { .. }) => None,
             Err(other) => return Err(other),
+        };
+        // Keyed by the same two values the cipher beside it is keyed by — this
+        // entry's own name and the payload's length **on disk** — so a
+        // converted resource goes back under the key it came out from. For a
+        // payload the caller holds rather than the one the entry carries, that
+        // length is `in_hand`, and re-deriving the key from it is what makes a
+        // resource written at a new size read back (Q2, DR-051, DR-062).
+        let seal = match sealer {
+            None => None,
+            Some(sealer) => sealer.seal(self.name(index)?, len),
         };
         Ok((self.resource_cipher(index, len)?, seal))
     }

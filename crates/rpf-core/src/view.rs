@@ -1277,7 +1277,7 @@ mod tests {
             edit::{Bytes, Change, Changes},
             format::{
                 Version,
-                crypto::{Cipher, Seal},
+                crypto::{Cipher, Seal, Sealer},
                 rpf7,
             },
             keys::{Material, Unlock},
@@ -1355,12 +1355,17 @@ mod tests {
             encoder.finish().expect("the encoder finishes")
         }
 
-        /// The zero-key AES seal, and the [`Unlock`] that opens what it wrote.
-        fn zeroed(named: &str) -> (Seal, Unlock) {
+        /// The zero-key AES forward transform, one seal off it, and the
+        /// [`Unlock`] that opens what it wrote.
+        ///
+        /// The AES key is the tag's, so the name and length a seal is keyed by
+        /// are ignored on this arm — the NG arm is the one they are for.
+        fn zeroed(named: &str) -> (Sealer, Seal, Unlock) {
             let material = Arc::new(Material::over_zeros());
             let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_AES).expect("AES");
-            let seal = Seal::new(scheme, &material).expect("AES seals");
-            (seal, Unlock::held(material, named))
+            let sealer = Sealer::new(scheme, &material).expect("AES seals");
+            let seal = sealer.seal(named, 0).expect("AES seals");
+            (sealer, seal, Unlock::held(material, named))
         }
 
         /// An AES-sealed archive holding one resource whose payload is under
@@ -1385,7 +1390,7 @@ mod tests {
         /// sealed from 24 does. DR-060 §2, and what
         /// `RESOURCE_HEADER_LENS`'s 22-in-7,072 case costs.
         fn sealed_archive_behind(prefix: &[u8], from: usize) -> (Vec<u8>, Unlock, Vec<u8>) {
-            let (seal, unlock) = zeroed("meta.rpf");
+            let (sealer, seal, unlock) = zeroed("meta.rpf");
             let mut payload = prefix.to_vec();
             payload.extend_from_slice(&deflated(&meta_page()));
             seal.apply(payload.get_mut(from..).expect("the stream is there"));
@@ -1393,7 +1398,7 @@ mod tests {
             let mut out = Cursor::new(Vec::new());
             build_under(
                 &mut out,
-                Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &seal),
+                Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_AES, &sealer, "meta.rpf"),
                 &[FileSpec {
                     path: AT.to_owned(),
                     kind: FileKind::Resource {

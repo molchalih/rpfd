@@ -4177,16 +4177,12 @@ fn talk_homed(home: &Path, requests: &[Value]) -> Vec<Value> {
     any(no_corpus, no_game_image),
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
-fn no_wire_method_writes_into_an_ng_archive() {
-    // §1: what `rpf put` refuses, `serve --stdio` refuses, with the same number
-    // and the same name. Each buffering method answers where the caller asks
-    // rather than at the commit that could never have landed, so an editor is
-    // told at the edit.
-    //
-    // The NG archive, because the AES one is written back now: R4.7's AES half
-    // landed and its NG half is blocked on the inverse of a white-box
-    // construction. DR-054, `docs/ng-scheme.md`.
-    let test = "no_wire_method_writes_into_an_ng_archive";
+fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
+    // **`no_wire_method_writes_into_an_ng_archive`, re-aimed.** §1 in both
+    // directions: what `rpf put` can now do over an NG archive, `serve --stdio`
+    // can do, and the archive it left behind is opened by a **second daemon**
+    // from the bytes on disk. R4.7's NG half, DR-062.
+    let test = "the_wire_writes_into_an_ng_archive_and_it_opens_again";
     let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
     };
@@ -4203,7 +4199,6 @@ fn no_wire_method_writes_into_an_ng_archive() {
     let copy = dir.path().join("dlc.rpf");
     fs::copy(&archive, &copy).expect("copyable");
     let at = copy.display().to_string();
-    let before = fs::read(&copy).expect("readable");
 
     let extracted = talk_homed(
         &home,
@@ -4214,40 +4209,41 @@ fn no_wire_method_writes_into_an_ng_archive() {
     );
     assert!(answer(&extracted, 1)["result"].is_object(), "{extracted:?}");
 
+    // Twenty bytes, `00 01 .. 13`, in base64 — a length the entry did not have,
+    // so the payload goes back under a different one of the 101 keys than it
+    // came out from (Q2).
     let responses = talk_homed(
         &home,
         &[
             json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
             json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-                "handle":1,"path":"content.xml","bytes":"cGxhaW4="}}),
-            json!({"jsonrpc":"2.0","id":3,"method":"delete","params":{
-                "handle":1,"path":"content.xml"}}),
-            json!({"jsonrpc":"2.0","id":4,"method":"rename","params":{
-                "handle":1,"from":"content.xml","to":"renamed.xml"}}),
-            json!({"jsonrpc":"2.0","id":5,"method":"mkdir","params":{
-                "handle":1,"path":"added"}}),
-            json!({"jsonrpc":"2.0","id":6,"method":"commit","params":{"handle":1}}),
+                "handle":1,"path":"content.xml",
+                "bytes":"AAECAwQFBgcICQoLDA0ODxAREhM="}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
         ],
     );
+    assert_eq!(answer(&responses, 1)["result"]["entries"], json!(7));
+    assert!(answer(&responses, 2)["result"].is_object(), "{responses:?}");
+    assert_eq!(answer(&responses, 3)["result"]["committed"], json!(1));
 
-    // It opened: this is the write guard answering, not `NeedsKey`.
-    let opened = answer(&responses, 1);
-    assert_eq!(opened["result"]["entries"], json!(7), "{opened}");
-
-    for id in [2, 3, 4, 5] {
-        let refused = answer(&responses, id);
-        assert_eq!(refused["error"]["code"], json!(9), "{refused}");
-        assert_eq!(
-            refused["error"]["data"]["reason"],
-            json!("CannotWriteEncrypted"),
-            "{refused}"
-        );
-    }
-    // Nothing was ever buffered, so the commit has nothing to refuse.
-    let committed = answer(&responses, 6);
-    assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
-
-    assert_eq!(fs::read(&copy).expect("readable"), before);
+    // A fresh daemon over the file that is now on disk: a table of contents
+    // that went out in the clear does not open, one sealed under the wrong key
+    // does not either, and a payload keyed by the size it used to be does not
+    // read back.
+    let reopened = talk_homed(
+        &home,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"content.xml"}}),
+        ],
+    );
+    assert_eq!(answer(&reopened, 1)["result"]["entries"], json!(7));
+    assert_eq!(
+        answer(&reopened, 2)["result"]["bytes"],
+        json!("AAECAwQFBgcICQoLDA0ODxAREhM="),
+        "{reopened:?}"
+    );
 }
 
 #[test]

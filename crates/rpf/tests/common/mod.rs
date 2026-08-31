@@ -314,7 +314,9 @@ pub fn zeroed_seal(cache: &rpf_core::keys::Cache) -> rpf_core::format::crypto::S
     let scheme = rpf_core::Version::Rpf7
         .scheme(rpf_core::format::rpf7::ENCRYPTION_AES)
         .expect("the AES tag has a scheme");
-    rpf_core::format::crypto::Seal::new(scheme, &material).expect("AES seals")
+    // The AES key is the tag's and nothing else, so the name and length a seal
+    // is keyed by are ignored on this arm — the NG arm is the one they are for.
+    rpf_core::format::crypto::Seal::new(scheme, &material, "", 0).expect("AES seals")
 }
 
 /// [`meta_resource`] behind `prefix` opaque bytes, with its **stream** under

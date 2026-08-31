@@ -29,7 +29,7 @@ use std::{
 
 use crate::{
     archive::Archive,
-    build::{file_row, kind_of, store},
+    build::{Sealed, file_row, kind_of, store},
     edit::{self, Change, Changes, Structural},
     error::{Error, Result},
     format::Row,
@@ -269,7 +269,9 @@ where
         // cipher block of the table, which is what makes rewriting one row
         // without the rest of the table sound and which `Archive::seal` is what
         // asks.
-        let seal = holder.seal()?;
+        let transform = holder.seal()?;
+        let tag = holder.encryption_tag();
+        let under = transform.as_ref().map(|forward| Sealed::new(forward, tag));
         let entry = *holder.entry(index)?;
 
         // The storage rule is the entry's, not the caller's: one that was
@@ -290,7 +292,7 @@ where
             holder.version(),
             path,
             kind_of(path, &entry)?,
-            seal.as_ref(),
+            under,
             &mut opened,
             &mut buffer,
         )?;
@@ -318,9 +320,14 @@ where
                 archive_len: holder.len_bytes(),
             })?;
         let row = file_row(holder.version(), path, entry.name_offset, block, &written)?;
-        let row = match seal {
+        // The row goes back under the **table of contents'** key, which is the
+        // archive's own name and its length: a patch does not change either,
+        // so it is the key the row was read under. The payload above is keyed
+        // by this entry's own name and its new uncompressed length instead, and
+        // conflating the two writes a row nothing decodes (Q2, DR-062).
+        let row = match under {
             None => row,
-            Some(ref seal) => row.sealed(seal),
+            Some(under) => row.sealed(&under.of(holder.keyed_name(), holder.len_bytes())?),
         };
 
         // Claimed whether or not it fits, so that the same set of edits always

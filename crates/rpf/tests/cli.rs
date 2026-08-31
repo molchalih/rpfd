@@ -776,15 +776,17 @@ fn an_encrypted_tree_packs_for_material_or_refuses_for_the_algorithm() {
     let cache = dir.path().join("keys").display().to_string();
 
     // Rewritten through `Manifest` rather than as text, so this does not encode
-    // how the field is spelled on disk a second time. It is read once, because
-    // an NG manifest is refused by the reader and could not be read back.
+    // how the field is spelled on disk a second time. Read once and edited per
+    // tag; since DR-062 an NG manifest reads back rather than being refused at
+    // parse time, and the refusal below is the pack's, with nothing in this
+    // test's own empty cache to derive the transform from.
     let extracted =
         rpf_core::Manifest::from_json(&fs::read_to_string(&at).expect("manifest readable"))
             .expect("manifest parses");
 
     for (tag, code, says) in [
         (0x0FFF_FFF9_u32, 5, "no key material available"),
-        (0x0FEF_FFFF, 9, "has no inverse"),
+        (0x0FEF_FFFF, 9, "derives this archive's forward transform"),
     ] {
         let mut manifest = extracted.clone();
         manifest.encryption = tag;
@@ -3121,21 +3123,25 @@ fn run_err_homed(home: &Path, args: &[&str]) -> (i32, String) {
     any(no_corpus, no_game_image),
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
-fn no_command_writes_into_an_ng_archive() {
-    // The command line's half of the NG refusal `crates/rpf-core/tests/encrypted.rs`
-    // pins in the library, and the half that says `--force` does not reach it:
-    // a capability this build does not have is not a safety interlock. R4.7's
-    // NG half, DR-041, DR-054.
+fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
+    // **`no_command_writes_into_an_ng_archive`, re-aimed.** It used to pin that
+    // every command refused an NG archive, because the transform had no forward
+    // direction in this build. It has one since DR-062, derived from the
+    // decrypt tables the memory image carries and from nothing else — so the
+    // command line writes one back, and the refusal that remains is about
+    // *material* rather than about an algorithm. Both halves are here.
     //
-    // The AES archive is deliberately **not** the fixture here any more: it is
-    // written back now, and the test beside this one is what says so.
-    let test = "no_command_writes_into_an_ng_archive";
+    // The read-back is through a **separate process** that opens the archive
+    // from the bytes on disk: a rebuild that sealed the table of contents under
+    // the length the archive had before, or a patch that keyed a payload by the
+    // size it used to be, fails at the `cat`.
+    let test = "an_ng_archive_is_written_back_through_the_command_line_and_opens_again";
     let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
     };
     // A memory image, not an executable: no executable carries the NG material
-    // at all, so extracting from one would leave the archive at `NeedsKey` and
-    // this would be testing exit 5 rather than the write guard. DR-040.
+    // at all, so extracting from one would leave the archive at `NeedsKey`.
+    // DR-040.
     let Some(source) = game_image(test) else {
         return;
     };
@@ -3143,62 +3149,103 @@ fn no_command_writes_into_an_ng_archive() {
     let dir = tempfile::tempdir().expect("temp dir");
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
-    // Copied under its own file name, which the NG key is derived from.
-    let copy = dir.path().join("dlc.rpf");
-    fs::copy(&archive, &copy).expect("the archive is copyable");
-    let donor = dir.path().join("plain.txt");
-    fs::write(&donor, b"plain text").expect("donor");
+    // Not compressible and not a whole number of cipher blocks, so the tail
+    // rule is exercised; and not the length the entry had, so the payload goes
+    // back under a different one of the 101 keys than it came out from (Q2).
+    let donor = dir.path().join("payload.bin");
+    let bytes: Vec<u8> = (0..401_u32)
+        .map(|n| u8::try_from(n % 251).unwrap_or(0))
+        .collect();
+    fs::write(&donor, &bytes).expect("donor");
+    let from = donor.display().to_string();
 
-    // The material goes where opening looks for it, which is what makes the
-    // archive open at all — and therefore what makes this a test of the write
-    // guard rather than of `NeedsKey`.
     let (code, message) = run_err_homed(&home, &["keys", "extract", &source.display().to_string()]);
     assert_eq!(code, 0, "{message}");
 
-    let before = fs::read(&copy).expect("readable");
-    let at = copy.display().to_string();
-    let from = donor.display().to_string();
-    for args in [
-        vec!["put", &at, "content.xml", &from],
-        vec!["put", "--force", &at, "content.xml", &from],
-        vec!["put", "--rebuild", &at, "content.xml", &from],
-        vec!["put", "--dry-run", &at, "content.xml", &from],
-        vec!["rm", &at, "content.xml"],
-        vec!["mv", &at, "content.xml", "renamed.xml"],
-        vec!["mkdir", &at, "added"],
-    ] {
+    // Patching in place, and then rebuilding, each over its own copy — each in
+    // a directory of its own and each keeping the **file name `dlc.rpf`**,
+    // because the NG key for a table of contents is a function of the
+    // archive's own name: copied as `patch.rpf` it would not open at all, and
+    // that is the format's behaviour rather than ours.
+    for (what, extra) in [("patch", None), ("rebuild", Some("--rebuild"))] {
+        let at_dir = dir.path().join(what);
+        fs::create_dir_all(&at_dir).expect("a directory per write path");
+        let copy = at_dir.join("dlc.rpf");
+        fs::copy(&archive, &copy).expect("the archive is copyable");
+        let at = copy.display().to_string();
+        let mut args = vec!["put"];
+        args.extend(extra);
+        args.extend(["--force", &at, "content.xml", &from]);
         let (code, message) = run_err_homed(&home, &args);
-        assert_eq!(code, 9, "{args:?} answered {message}");
-        assert!(message.contains("has no inverse"), "{message}");
+        assert_eq!(code, 0, "{what}: {message}");
+
+        let (code, message) = run_err_homed(&home, &["verify", &at]);
+        assert_eq!(
+            code, 0,
+            "{what}: the written NG archive does not verify: {message}"
+        );
+
+        let output = Command::new(RPF)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("APPDATA", home.join("appdata"))
+            .args(["cat", &at, "content.xml"])
+            .output()
+            .expect("binary runs");
+        assert_eq!(output.status.code(), Some(0), "{what}");
+        assert_eq!(
+            output.stdout,
+            fs::read(&donor).expect("donor"),
+            "{what}: the entry did not come back out"
+        );
     }
 
-    // And `pack`, which refuses for its own reason and must not offer the
-    // editing route as the way through: those commands answered exit 9 in the
-    // loop above. An automation told to try them would be sent at a wall.
-    // DR-054 §4.
+    // And the third write path. `pack` opens no archive, so it reaches the same
+    // cache `keys extract` filled above (DR-057) and packs the tree back under
+    // the NG tag its manifest names.
     let tree = dir.path().join("tree");
-    let (code, message) = run_err_homed(&home, &["extract", &at, &tree.display().to_string()]);
-    assert_eq!(code, 0, "{message}");
-    let packed = dir.path().join("packed.rpf");
     let (code, message) = run_err_homed(
         &home,
         &[
+            "extract",
+            &archive.display().to_string(),
+            &tree.display().to_string(),
+        ],
+    );
+    assert_eq!(code, 0, "{message}");
+    let packed = dir.path().join("packed.rpf");
+    let at = packed.display().to_string();
+    let (code, message) = run_err_homed(&home, &["pack", &tree.display().to_string(), &at]);
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = run_err_homed(&home, &["verify", &at]);
+    assert_eq!(code, 0, "the packed NG archive does not verify: {message}");
+
+    // **The re-aimed refusal, through the binary.** The same tree, from a home
+    // with nothing in it: exit 9, and a message that names material rather than
+    // an algorithm. `--force` does not reach it — a capability that is absent
+    // is not a safety interlock (DR-041) — and no remedy is offered, because
+    // there is no command that supplies a memory image.
+    let bare = dir.path().join("no-keys");
+    fs::create_dir_all(&bare).expect("home");
+    let unpacked = dir.path().join("unkeyed.rpf");
+    let (code, message) = run_err_homed(
+        &bare,
+        &[
             "pack",
             &tree.display().to_string(),
-            &packed.display().to_string(),
+            &unpacked.display().to_string(),
         ],
     );
     assert_eq!(code, 9, "{message}");
-    assert!(message.contains("has no inverse"), "{message}");
+    assert!(
+        message.contains("derives this archive's forward transform"),
+        "{message}"
+    );
     assert!(
         !message.contains("Edit through the archive"),
         "a walled-off remedy was offered: {message}"
     );
-    assert!(!packed.exists(), "a refused pack wrote an archive");
-
-    // "Refused" and "did not write" are different claims. R4.2 leaves the
-    // archive as it was, and so does a refusal before any of it runs.
-    assert_eq!(fs::read(&copy).expect("readable"), before);
+    assert!(!unpacked.exists(), "a refused pack wrote an archive");
 }
 
 #[test]

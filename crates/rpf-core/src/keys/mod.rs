@@ -626,6 +626,33 @@ impl Material {
         )
     }
 
+    /// Material whose AES half is zero bytes and whose NG half is `ng`, over
+    /// the name-hash table `lut`.
+    ///
+    /// The NG counterpart of [`Material::over_zeros`], which deliberately
+    /// carries no NG half: it makes an **NG**-tagged archive writable and
+    /// readable in the crate's own tests with no game installation and no
+    /// memory image (DR-040). What it is handed is
+    /// `format::crypto::synthetic::ng_material`'s arithmetic and not key
+    /// material of any kind (DR-006).
+    ///
+    /// `#[cfg(test)]`, so it is in no release build and in nothing a dependent
+    /// compiles.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn over_ng(lut: [u8; HASH_LUT_LEN], ng: NgKeys) -> Self {
+        Self::restored(
+            Keys {
+                aes: [0; AES_KEY_LEN],
+                aes_at: 0,
+                lut,
+                lut_at: 0,
+            },
+            Some(ng),
+            None,
+        )
+    }
+
     /// The material as the cache read it back.
     pub(super) fn restored(keys: Keys, ng: Option<NgKeys>, launcher: Option<LauncherKey>) -> Self {
         Self {

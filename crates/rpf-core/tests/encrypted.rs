@@ -1198,50 +1198,6 @@ fn an_encrypted_archive_extracts_the_bytes_a_second_read_agrees_with() {
 /// The entry of the NG corpus archive every refusal below is asked about.
 const NG_ENTRY: &str = "content.xml";
 
-/// Every change a write path can be asked for, by the name a report uses, over
-/// an entry the archive holds.
-///
-/// One table so that a path added later has to be added here rather than
-/// quietly go unchecked.
-fn every_change(held: &str) -> Vec<(&'static str, Changes)> {
-    let mut replace = Changes::new();
-    replace.set(
-        held,
-        Change::Write {
-            contents: Arc::new(Bytes::new(b"plain text".to_vec())),
-            create: false,
-            allow_encoding_change: false,
-        },
-    );
-    let mut create = Changes::new();
-    create.set(
-        "added.txt",
-        Change::Write {
-            contents: Arc::new(Bytes::new(b"plain text".to_vec())),
-            create: true,
-            allow_encoding_change: false,
-        },
-    );
-    let mut remove = Changes::new();
-    remove.set(held, Change::Remove { recursive: false });
-    let mut rename = Changes::new();
-    rename.set(held, Change::RenameTo("renamed.bin".to_owned()));
-    let mut directory = Changes::new();
-    directory.set("added", Change::MakeDirectory);
-    vec![
-        ("write", replace),
-        ("create", create),
-        ("remove", remove),
-        ("rename", rename),
-        ("mkdir", directory),
-    ]
-}
-
-/// The same, over the NG archive's own entry.
-fn ng_changes() -> Vec<(&'static str, Changes)> {
-    every_change(NG_ENTRY)
-}
-
 /// What every write path answers about an archive that cannot be written back.
 fn refuses_the_write(what: &str, error: &Error, tag: u32, reason: NoWrite) {
     assert!(
@@ -1268,97 +1224,313 @@ fn refuses_the_write(what: &str, error: &Error, tag: u32, reason: NoWrite) {
     any(no_corpus, no_game_image),
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
-fn no_write_path_touches_an_ng_archive() {
-    // **The NG half of R4.7, enforced.** The AES half landed; this one is
-    // blocked on the inverse of a white-box construction (`docs/ng-scheme.md`),
-    // so every write path refuses ahead of the first byte and names *why* —
-    // `NoWrite::NoInverse`, which no material a caller extracts can change.
+fn the_ng_write_refusal_names_material_that_is_missing() {
+    // **`no_write_path_touches_an_ng_archive`, re-aimed rather than deleted.**
+    // It used to pin that every write path refused an NG archive because the
+    // transform had no forward direction here. It has one since DR-062 — all
+    // seventeen rounds derived from the decrypt tables in milliseconds — so
+    // `NoWrite::NoInverse` no longer means "this is impossible". It means
+    // **this build has nothing to derive the transform from**, and it still
+    // fires, which is what this test now pins.
     //
-    // The failure this exists for: `plan` decided a patch fitted, `apply` wrote
+    // The failure it exists for is unchanged and is the reason the refusal was
+    // re-aimed instead of removed: `plan` decided a patch fitted, `apply` wrote
     // plaintext into a region the format requires to be ciphertext, and the
-    // command exited 0 over an archive that no longer opened. DR-041, DR-054.
-    let test = "no_write_path_touches_an_ng_archive";
+    // command exited 0 over an archive that no longer opened. A refusal that
+    // silently stops firing is how that ships. DR-041, DR-054, DR-062.
+    let test = "the_ng_write_refusal_names_material_that_is_missing";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
     };
     let unlock = held.unlock();
-    let original = held.bytes.clone();
     let mut source = Cursor::new(held.bytes.clone());
     let archive = Archive::open(&mut source, &unlock).expect("the NG archive opens");
     let tag = archive.encryption();
     assert_eq!(tag, rpf7::ENCRYPTION_NG);
+
+    // With the material in hand the archive is writable and hands out a
+    // forward transform. That is the half that changed, and asserting it here
+    // is what stops this test from passing for the wrong reason: a build where
+    // NG never seals would satisfy the refusal below and nothing else.
+    archive
+        .writable()
+        .expect("an NG archive with its material is writable");
     assert!(
-        archive.seal().is_err(),
-        "an NG archive handed out a forward transform"
+        archive.seal().expect("a seal is derivable").is_some(),
+        "an NG archive with its material handed out no forward transform"
     );
 
-    for (what, changes) in ng_changes() {
-        // Patching in place, which is the one that wrote into the live file.
-        let error = rpf_core::plan(&mut source, &archive, &changes)
-            .err()
-            .unwrap_or_else(|| panic!("{what}: plan did not refuse"));
-        refuses_the_write(&format!("plan {what}"), &error, tag, NoWrite::NoInverse);
-
-        // Rebuilding, which would have written the archive out as `OPEN` with
-        // every payload in the clear.
-        let mut out = Cursor::new(Vec::new());
-        let error = rpf_core::rewrite(
-            &mut source,
-            &archive,
-            &changes,
-            &mut out,
-            &mut rpf_core::InMemory,
-            &mut Unwatched,
-        )
-        .err()
-        .unwrap_or_else(|| panic!("{what}: rewrite did not refuse"));
-        refuses_the_write(&format!("rewrite {what}"), &error, tag, NoWrite::NoInverse);
-        assert!(
-            out.into_inner().is_empty(),
-            "{what}: a refused rebuild wrote bytes"
-        );
-    }
-
-    // The resolution the daemon accepts a buffered change by, so an editor is
-    // told at the edit rather than at the save.
-    for (what, changes) in ng_changes() {
-        for (path, change) in &changes {
-            let error = rpf_core::allows(&mut source, &archive, &Changes::new(), path, change)
-                .err()
-                .unwrap_or_else(|| panic!("{what}: allows did not refuse"));
-            refuses_the_write(&format!("allows {what}"), &error, tag, NoWrite::NoInverse);
-        }
-    }
-
-    // And `pack`, which reaches key material now (DR-057) and still refuses
-    // this tag: the material is in hand here and it changes nothing, because
-    // what is missing is the transform's forward direction rather than a key.
+    // Without it, `pack` is the write path a caller can still reach — it opens
+    // no archive, so a manifest naming the NG tag is packable material-free
+    // input. It refuses, and it names the reason.
     let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
     let mut out = Cursor::new(Vec::new());
     let error = manifest
         .pack_into(
             &mut out,
-            &unlock,
+            &Unlock::unkeyed(),
             |_: &str| Ok(Cursor::new(Vec::new())),
             &mut Unwatched,
         )
-        .expect_err("pack did not refuse an NG tree");
+        .expect_err("a pack with nothing to derive the transform from must refuse");
     refuses_the_write("pack", &error, tag, NoWrite::NoInverse);
     assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
-    // The refusal is the tag's and not the manifest reader's, so the text a
-    // tree on disk carries is refused the same way and for the same reason.
-    let error = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
-        .expect_err("an NG manifest does not read back as packable");
-    refuses_the_write("manifest", &error, tag, NoWrite::NoInverse);
 
-    // "Returned an error" and "did not write" are different claims, so both
-    // are made. The source is the archive's own bytes and nothing here has a
-    // handle on anything else.
+    // And it is `NoInverse` rather than `NeedsKey`: the two name different
+    // things to do, and telling an automation to extract a key it cannot
+    // extract — the material is in a memory image of a running game (DR-040) —
+    // is a loop it never leaves.
+    assert_ne!(error.category(), Category::NeedsKey);
+
+    // The manifest itself is no longer refused at parse time (DR-057,
+    // revisited): a manifest carries no material, so the tag alone can no
+    // longer answer, and refusing here would refuse a tree that packs on the
+    // machine that holds what packs it.
+    let read_back = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
+        .expect("an NG manifest reads back rather than being refused at parse time");
+    assert_eq!(read_back, manifest);
+
+    // Nothing above wrote anything into the archive's own bytes.
     assert_eq!(
         source.into_inner(),
-        original,
+        held.bytes,
         "a refused write changed the archive"
     );
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_game_image),
+    ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
+)]
+fn an_ng_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
+    // **R4.7, against Rockstar's own NG archive.** The payload seal and the row
+    // seal, in the path that writes into the live archive, under a transform
+    // derived from the decrypt tables and nothing else (DR-062).
+    //
+    // The new contents are deliberately a **different length** from the old
+    // ones, which is the case Q2 is about: the NG key index is
+    // `(hash(name) + length + 61) % 101`, so the payload goes back under a key
+    // the entry did not have before. A writer that reused the old key writes an
+    // archive that parses — the table is right, the row is right — and does not
+    // load.
+    let test = "an_ng_archive_patched_in_place_opens_again_and_reads_the_new_bytes";
+    let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the NG archive opens");
+    let index = archive.find(NG_ENTRY).expect("content.xml resolves");
+    let was = archive.read(&mut source, index).expect("reads");
+
+    // Not compressible, not a whole number of cipher blocks, and not the length
+    // it had — all three at once, so the tail rule and the re-keying are both
+    // exercised rather than avoided.
+    let wanted: Vec<u8> = (0..401_u32)
+        .map(|n| u8::try_from(n % 251).expect("a byte"))
+        .collect();
+    assert_ne!(
+        wanted.len(),
+        was.len(),
+        "the new contents are the old length"
+    );
+
+    let mut changes = Changes::new();
+    changes.set(
+        NG_ENTRY,
+        Change::Write {
+            contents: Arc::new(Bytes::new(wanted.clone())),
+            create: false,
+            allow_encoding_change: false,
+        },
+    );
+    let plan = rpf_core::plan(&mut source, &archive, &changes).expect("an NG patch is planned");
+    let rpf_core::Plan::Fits(patches) = plan else {
+        panic!("the edit does not fit: {plan:?}");
+    };
+    patches.apply(&mut source).expect("the patch applies");
+
+    let reopened = Archive::open(&mut source, &unlock).expect("the patched archive opens again");
+    assert_eq!(reopened.encryption(), rpf7::ENCRYPTION_NG);
+    let index = reopened.find(NG_ENTRY).expect("resolves");
+    assert_eq!(
+        reopened.read(&mut source, index).expect("reads"),
+        wanted,
+        "the patched entry did not read back"
+    );
+    Verified::of(&mut source, &reopened, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the patched NG archive still reads back");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_game_image),
+    ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
+)]
+fn an_ng_archive_rebuilt_opens_again_with_every_entry_intact() {
+    // The other write path, and the one with the second re-keying in it: a
+    // rebuild lays the archive out afresh, so the **archive's own length**
+    // changes — and the table of contents and the names blob are keyed by that
+    // length. A rebuild that sealed them under the length the archive had
+    // before writes a file that does not open at all.
+    //
+    // The claim is per entry contents, never per archive: our deflate is not
+    // the producer's and slack is not reconstructed.
+    let test = "an_ng_archive_rebuilt_opens_again_with_every_entry_intact";
+    let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the NG archive opens");
+
+    let mut before = Vec::new();
+    let mut fields = Vec::new();
+    for index in 0..u32::try_from(archive.entries().len()).expect("small") {
+        let entry = archive.entry(index).expect("in range");
+        if entry.is_directory() {
+            continue;
+        }
+        let path = archive.path(index).expect("resolves");
+        if let rpf_core::EntryKind::Binary { encryption, .. } = entry.kind {
+            fields.push((path.clone(), encryption));
+        }
+        let bytes = archive.extract(&mut source, index).expect("extracts");
+        before.push((path, bytes));
+    }
+    assert!(
+        fields.iter().any(|&(_, encryption)| encryption != 0),
+        "no binary entry of the NG archive is under the transform, so this \
+         claim would hold for a writer that zeroed every field"
+    );
+
+    let added = b"added by a rebuild of an NG archive".to_vec();
+    let mut changes = Changes::new();
+    changes.set(
+        "added.txt",
+        Change::Write {
+            contents: Arc::new(Bytes::new(added.clone())),
+            create: true,
+            allow_encoding_change: false,
+        },
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::rewrite(
+        &mut source,
+        &archive,
+        &changes,
+        &mut out,
+        &mut rpf_core::InMemory,
+        &mut Unwatched,
+    )
+    .expect("an NG archive rebuilds");
+
+    // Still encrypted, still under the same tag, and still not readable without
+    // the material: a rebuild that wrote it out in the clear would open under
+    // `Unlock::unkeyed` and every assertion below would pass anyway.
+    let rebuilt = out.into_inner();
+    let error = Archive::open(&mut Cursor::new(rebuilt.clone()), &Unlock::unkeyed())
+        .expect_err("the rebuilt archive is not in the clear");
+    assert!(
+        matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_NG),
+        "{error:?}"
+    );
+
+    let mut source = Cursor::new(rebuilt);
+    let opened = Archive::open(&mut source, &unlock).expect("the rebuilt archive opens");
+    assert_eq!(opened.encryption(), rpf7::ENCRYPTION_NG);
+    for (path, expected) in &before {
+        let index = opened
+            .find(path)
+            .unwrap_or_else(|error| panic!("{path} is gone: {error}"));
+        assert_eq!(
+            &opened.extract(&mut source, index).expect("extracts"),
+            expected,
+            "{path} came back different"
+        );
+    }
+    let index = opened.find("added.txt").expect("the added entry is there");
+    assert_eq!(opened.read(&mut source, index).expect("reads"), added);
+    for (path, encryption) in &fields {
+        let index = opened.find(path).expect("resolves");
+        let rpf_core::EntryKind::Binary {
+            encryption: found, ..
+        } = opened.entry(index).expect("in range").kind
+        else {
+            panic!("{path} stopped being a binary entry");
+        };
+        assert_eq!(found, *encryption, "{path}'s encryption field changed");
+    }
+    Verified::of(&mut source, &opened, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the rebuilt NG archive reads back");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_game_image),
+    ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
+)]
+fn a_tree_extracted_from_an_ng_archive_packs_back_and_opens_again() {
+    // `pack`'s NG half: a manifest naming the NG tag, packed back under the
+    // material `unlock` reaches, and opened again. It is the third region rule
+    // in one claim — the table of contents, the names blob and every payload,
+    // each keyed by its own name and its own new length.
+    let test = "a_tree_extracted_from_an_ng_archive_packs_back_and_opens_again";
+    let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the NG archive opens");
+    let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
+
+    let mut held_files: Vec<(String, Vec<u8>)> = Vec::new();
+    for index in 0..u32::try_from(archive.entries().len()).expect("small") {
+        if archive.entry(index).expect("in range").is_directory() {
+            continue;
+        }
+        let path = archive.path(index).expect("resolves");
+        let bytes = archive.extract(&mut source, index).expect("extracts");
+        held_files.push((path, bytes));
+    }
+
+    let mut out = Cursor::new(Vec::new());
+    let files = held_files.clone();
+    manifest
+        .pack_into(
+            &mut out,
+            &unlock,
+            move |wanted: &str| {
+                let found = files
+                    .iter()
+                    .find(|(path, _)| path == wanted)
+                    .map(|(_, bytes)| bytes.clone())
+                    .unwrap_or_default();
+                Ok(Cursor::new(found))
+            },
+            &mut Unwatched,
+        )
+        .expect("an NG tree packs back");
+
+    let mut packed = Cursor::new(out.into_inner());
+    let opened = Archive::open(&mut packed, &unlock).expect("the packed archive opens");
+    assert_eq!(opened.encryption(), rpf7::ENCRYPTION_NG);
+    for (path, expected) in &held_files {
+        let index = opened
+            .find(path)
+            .unwrap_or_else(|error| panic!("{path} is gone: {error}"));
+        assert_eq!(
+            &opened.extract(&mut packed, index).expect("extracts"),
+            expected,
+            "{path} came back different"
+        );
+    }
 }
 
 #[test]

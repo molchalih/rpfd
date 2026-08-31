@@ -42,7 +42,7 @@ use crate::{
     error::{Error, NoWrite, Result},
     format::{
         Codec, Version,
-        crypto::{Scheme, Seal},
+        crypto::{Scheme, Sealer},
     },
     keys::Unlock,
     name,
@@ -499,29 +499,31 @@ impl Manifest {
     /// Which transform this manifest's tree packs back under, or `None` for a
     /// tree that packs in the clear.
     ///
-    /// The one place `pack` decides whether an encrypted tree can be written at
-    /// all, asked of [`Scheme::seals`] — the same question `Archive::writable`
-    /// asks, and the one place DR-054 §1 put that asymmetry (§3). Nothing here
-    /// consults a cache: a tag this build cannot write forwards is refused
-    /// whatever material is available, and a tag it can is answered by
-    /// [`Manifest::pack_into`] once there is something to run it with (R2.6,
-    /// DR-041, DR-057).
+    /// **What a tag alone can decide, decided at parse time.** An encrypted tag
+    /// this build holds no scheme for has no forward direction whatever anyone
+    /// extracts, and a version whose entry-table row is not one aligned cipher
+    /// block cannot have its table sealed row by row (`Archive::seal` asks the
+    /// same of a rebuild). Both are refused here, before a byte of the tree is
+    /// read and before any key material is wanted.
+    ///
+    /// **What it cannot decide is left to [`Manifest::pack_into`].** Since
+    /// DR-062 the NG arm of [`Scheme::seals`] is a question about *material*
+    /// rather than about the tag — the seventeen rounds derive from the decrypt
+    /// tables and there are none in a manifest — so an NG tag is no longer
+    /// refused at parse time. It is refused at the pack, where there is an
+    /// [`Unlock`] to ask (R2.6, DR-041, DR-057).
     ///
     /// # Errors
     ///
-    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for a tag
-    /// whose transform has no forward direction in this build — NG, and any
-    /// encrypted tag this build holds no scheme for — and for a version whose
-    /// entry-table row is not one aligned cipher block, which is what sealing a
-    /// table row by row needs (`Archive::seal` asks the same of a rebuild).
+    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for an
+    /// encrypted tag this build holds no scheme for, and for a version whose
+    /// entry-table row is not one aligned cipher block.
     fn sealing(&self) -> Result<Option<Scheme>> {
         if self.version.is_open(self.encryption) {
             return Ok(None);
         }
         match self.version.scheme(self.encryption) {
-            Some(scheme) if scheme.seals() && self.version.row_is_a_cipher_block() => {
-                Ok(Some(scheme))
-            }
+            Some(scheme) if self.version.row_is_a_cipher_block() => Ok(Some(scheme)),
             Some(_) | None => Err(Error::CannotWriteEncrypted {
                 tag: self.encryption,
                 reason: NoWrite::NoInverse,
@@ -534,17 +536,36 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// [`Error::NeedsKey`] when no material available carries what the
-    /// transform needs, which is the answer `Archive::open` already gives for
-    /// the same archive and the same empty cache, and [`Error::Io`] if a cache
-    /// directory exists and cannot be read.
-    fn seal(&self, scheme: Scheme, unlock: &Unlock) -> Result<Seal> {
+    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] where no
+    /// material available carries what the transform derives from — which for
+    /// NG is what that reason now means, and is the refusal a caller with no
+    /// memory image gets (DR-062). [`Error::NeedsKey`] where the transform is
+    /// one every source carries a key for and this `unlock` reached none, which
+    /// is the answer `Archive::open` already gives for the same archive and the
+    /// same empty cache, and [`Error::Io`] if a cache directory exists and
+    /// cannot be read.
+    fn sealer(&self, scheme: Scheme, unlock: &Unlock) -> Result<Sealer> {
         unlock
             .candidates(scheme)?
             .iter()
-            .find_map(|material| Seal::new(scheme, material))
-            .ok_or(Error::NeedsKey {
-                tag: self.encryption,
+            .find_map(|material| Sealer::new(scheme, material))
+            .ok_or(match scheme {
+                // Nothing here derives the seventeen rounds, which is the whole
+                // of what the refusal means since DR-062. `NeedsKey` would be
+                // wrong: it tells an automation to go and extract a key, and
+                // what is missing is a memory image of a running game (DR-040),
+                // which is not a key and not something a retry finds.
+                Scheme::Ng => Error::CannotWriteEncrypted {
+                    tag: self.encryption,
+                    reason: NoWrite::NoInverse,
+                },
+                // The AES key is one every source carries, so a caller that
+                // reached none is told to go and extract one — the same answer
+                // `Archive::open` gives for the same archive and the same empty
+                // cache.
+                Scheme::Aes(_) => Error::NeedsKey {
+                    tag: self.encryption,
+                },
             })
     }
 
@@ -577,13 +598,17 @@ impl Manifest {
         W: Write + Seek,
         F: Fetch,
     {
-        let seal = match self.sealing()? {
+        let sealer = match self.sealing()? {
             None => None,
-            Some(scheme) => Some(self.seal(scheme, unlock)?),
+            Some(scheme) => Some(self.sealer(scheme, unlock)?),
         };
-        let under = seal.as_ref().map_or_else(
+        // The name the packed archive will be read back under, which is half of
+        // what its table of contents is keyed by. It is the `Unlock`'s, because
+        // that is the name every other command already addresses an archive by
+        // (DR-021, DR-057) and the name the reader will find this file at.
+        let under = sealer.as_ref().map_or_else(
             || Under::open(self.version),
-            |seal| Under::sealed(self.version, self.encryption, seal),
+            |sealer| Under::sealed(self.version, self.encryption, sealer, unlock.name()),
         );
         build_under(out, under, &self.specs(), &self.directories, fetch, watch)
     }
@@ -839,14 +864,22 @@ mod tests {
     }
 
     #[test]
-    fn an_ng_manifest_is_refused_before_any_material_is_asked_for() {
-        // Exit 9 and not 5: NG's transform has no forward direction in this
-        // build, so no material a caller extracts reaches it and the refusal is
-        // made from the tag alone, before a cache is consulted or a byte of the
-        // tree is read. R4.7, DR-054, DR-057.
+    fn an_ng_manifest_refuses_the_pack_when_nothing_derives_the_transform() {
+        // **The re-aimed refusal.** Until DR-062 this said the refusal was made
+        // "from the tag alone, before a cache is consulted", because NG had no
+        // forward direction whatever anyone held. It has one, derived from the
+        // decrypt tables in milliseconds — so the tag no longer decides, and
+        // `NoWrite::NoInverse` now means *this build has nothing to derive the
+        // transform from*. It fires here because `keyed` reaches thirty-two
+        // zero bytes and no memory image (DR-040).
+        //
+        // Exit 9 and not 5, still: `NeedsKey` tells an automation to go and
+        // extract a key, and what is missing is not a key.
         let tag = 267_386_879_u32;
-        let text = format!(r#"{{"schema":1,"encryption":{tag},"directories":[],"entries":[]}}"#);
-        let error = Manifest::from_json(&text).expect_err("an NG manifest is refused");
+        let mut out = Cursor::new(Vec::new());
+        let error = packable(tag)
+            .pack_into(&mut out, &keyed("packed.rpf"), fetching(), &mut Unwatched)
+            .expect_err("an NG manifest does not pack without the material");
         assert!(
             matches!(
                 error,
@@ -858,25 +891,76 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(error.category(), crate::error::Category::Unsupported);
+        assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
+    }
 
-        // And the same refusal from the pack path itself, over a manifest that
-        // never went through `from_json`: a caller holding a `Manifest` value
-        // cannot reach the write by assembling one.
-        let mut out = Cursor::new(Vec::new());
-        let error = packable(tag)
-            .pack_into(&mut out, &keyed("packed.rpf"), fetching(), &mut Unwatched)
-            .expect_err("an NG manifest does not pack");
+    #[test]
+    fn an_ng_manifest_is_read_back_rather_than_refused_at_parse_time() {
+        // **DR-057's parse-time refusal, revisited.** It refused an NG tag in
+        // `from_json` on the ground that no material reaches the transform. A
+        // manifest carries no material at all, so with DR-062 the tag alone can
+        // no longer answer: refusing here would refuse a tree a caller *can*
+        // pack, on a machine that holds what packs it. The refusal moved to the
+        // pack, where there is an `Unlock` to ask — the test above.
+        //
+        // What still refuses at parse time is a tag this build holds no scheme
+        // for at all, which no material changes: `a_manifest_naming_a_container
+        // _this_build_cannot_write_is_refused` and the arm below.
+        let tag = 267_386_879_u32;
+        let text = format!(r#"{{"schema":1,"encryption":{tag},"directories":[],"entries":[]}}"#);
+        let manifest = Manifest::from_json(&text).expect("an NG manifest reads back");
+        assert_eq!(manifest.encryption, tag);
+
+        let unknown = 0x0FAB_CDEF_u32;
+        assert!(Version::Rpf7.scheme(unknown).is_none());
+        let text =
+            format!(r#"{{"schema":1,"encryption":{unknown},"directories":[],"entries":[]}}"#);
+        let error = Manifest::from_json(&text).expect_err("an unknown encrypted tag is refused");
         assert!(
             matches!(
                 error,
                 Error::CannotWriteEncrypted {
+                    tag: found,
                     reason: NoWrite::NoInverse,
-                    ..
-                }
+                } if found == unknown
             ),
             "{error:?}"
         );
-        assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
+    }
+
+    #[test]
+    fn an_ng_manifest_packs_back_under_its_own_transform_and_opens_again() {
+        // **R4.7 through `pack`.** A tree whose manifest names the NG tag packs
+        // back sealed under the derived transform, and what it wrote opens
+        // again under the same material — table of contents, names blob and
+        // every payload, each keyed by its own name and its own new length.
+        //
+        // No key material anywhere and none possible: the tables and the 101
+        // expanded keys are arithmetic over a seed (DR-006), and the gated half
+        // — a Rockstar archive under Rockstar's own material — is
+        // `crates/rpf-core/tests/encrypted.rs`.
+        let tag = crate::format::rpf7::ENCRYPTION_NG;
+        let manifest = packable(tag);
+        let unlock = Unlock::held(
+            Arc::new(crate::format::crypto::synthetic::ng_material(0x4A17_0000)),
+            "packed.rpf",
+        );
+        let mut out = Cursor::new(Vec::new());
+        manifest
+            .pack_into(&mut out, &unlock, fetching(), &mut Unwatched)
+            .expect("an NG tree packs");
+        let mut source = Cursor::new(out.into_inner());
+        let archive = crate::Archive::open(&mut source, &unlock).expect("it opens again");
+        assert_eq!(archive.encryption(), tag);
+        for (path, expected) in contents() {
+            let index = archive
+                .find(path)
+                .unwrap_or_else(|error| panic!("{path} does not resolve: {error}"));
+            let read = archive
+                .read(&mut source, index)
+                .unwrap_or_else(|error| panic!("{path} does not read back: {error}"));
+            assert_eq!(read, expected, "{path} came back different");
+        }
     }
 
     #[test]
