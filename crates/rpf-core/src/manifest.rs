@@ -22,7 +22,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    io::{Read, Seek},
+    io::{Read, Seek, Write},
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
@@ -30,10 +30,16 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{
     archive::Archive,
-    build::{FileKind, FileSpec, Storage, directories_of, specs_of},
+    build::{
+        Fetch, FileKind, FileSpec, Report, Storage, Under, build_under, directories_of, specs_of,
+    },
     entry::EntryKind,
     error::{Error, NoWrite, Result},
-    format::{Codec, Version},
+    format::{
+        Codec, Version,
+        crypto::{Scheme, Seal},
+    },
+    keys::Unlock,
     name,
     watch::{Flow, Step, Watch},
 };
@@ -424,6 +430,98 @@ impl Manifest {
             .collect()
     }
 
+    /// Which transform this manifest's tree packs back under, or `None` for a
+    /// tree that packs in the clear.
+    ///
+    /// The one place `pack` decides whether an encrypted tree can be written at
+    /// all, asked of [`Scheme::seals`] — the same question `Archive::writable`
+    /// asks, and the one place DR-054 §1 put that asymmetry (§3). Nothing here
+    /// consults a cache: a tag this build cannot write forwards is refused
+    /// whatever material is available, and a tag it can is answered by
+    /// [`Manifest::pack_into`] once there is something to run it with (R2.6,
+    /// DR-041, DR-057).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for a tag
+    /// whose transform has no forward direction in this build — NG, and any
+    /// encrypted tag this build holds no scheme for — and for a version whose
+    /// entry-table row is not one aligned cipher block, which is what sealing a
+    /// table row by row needs (`Archive::seal` asks the same of a rebuild).
+    fn sealing(&self) -> Result<Option<Scheme>> {
+        if self.version.is_open(self.encryption) {
+            return Ok(None);
+        }
+        match self.version.scheme(self.encryption) {
+            Some(scheme) if scheme.seals() && self.version.row_is_a_cipher_block() => {
+                Ok(Some(scheme))
+            }
+            Some(_) | None => Err(Error::CannotWriteEncrypted {
+                tag: self.encryption,
+                reason: NoWrite::NoInverse,
+            }),
+        }
+    }
+
+    /// The forward transform for a tag that has one, from whatever material
+    /// `unlock` reaches.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NeedsKey`] when no material available carries what the
+    /// transform needs, which is the answer `Archive::open` already gives for
+    /// the same archive and the same empty cache, and [`Error::Io`] if a cache
+    /// directory exists and cannot be read.
+    fn seal(&self, scheme: Scheme, unlock: &Unlock) -> Result<Seal> {
+        unlock
+            .candidates(scheme)?
+            .iter()
+            .find_map(|material| Seal::new(scheme, material))
+            .ok_or(Error::NeedsKey {
+                tag: self.encryption,
+            })
+    }
+
+    /// Writes the archive this manifest describes, taking each file's contents
+    /// from `fetch` at the moment it is written.
+    ///
+    /// `pack`, in one call: the tree's own record decides the version, the
+    /// encryption tag and every entry's kind, so a caller cannot pack a tree as
+    /// something it was not (§4, DR-018). `unlock` is what the archive's own
+    /// transform is run with where it has one, and is not consulted at all
+    /// where the tag is open — the same on-demand rule `Archive::open` follows
+    /// (R2.6, DR-041). Where it has one, the archive is written under
+    /// `Under::sealed`, which is the same machinery a rebuild seals with
+    /// (§3, DR-054, DR-057).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for a tag
+    /// this build cannot write forwards, [`Error::NeedsKey`] when it can and no
+    /// material available runs it — in both cases before anything is written —
+    /// and as [`crate::build::build`] otherwise.
+    pub fn pack_into<W, F>(
+        &self,
+        out: &mut W,
+        unlock: &Unlock,
+        fetch: F,
+        watch: &mut impl Watch,
+    ) -> Result<Report>
+    where
+        W: Write + Seek,
+        F: Fetch,
+    {
+        let seal = match self.sealing()? {
+            None => None,
+            Some(scheme) => Some(self.seal(scheme, unlock)?),
+        };
+        let under = seal.as_ref().map_or_else(
+            || Under::open(self.version),
+            |seal| Under::sealed(self.version, self.encryption, seal),
+        );
+        build_under(out, under, &self.specs(), &self.directories, fetch, watch)
+    }
+
     /// Renders the manifest.
     ///
     /// # Errors
@@ -473,28 +571,15 @@ impl Manifest {
                 reason: "was written by a schema version this build does not read",
             });
         }
-        // A tree extracted from an encrypted archive packs back to an encrypted
-        // archive or to nothing, and `pack` opens no archive: it has neither
-        // key material nor a name to derive one from, whichever transform the
-        // tag names. R4.7, DR-041.
-        //
-        // Which reason, though, is the transform's question and not `pack`'s,
-        // so it is asked of `Scheme::seals` — the one place that asymmetry is
-        // decided (§3), and what `Archive::writable` asks. Editing through the
-        // archive is a remedy only where editing through the archive works: for
-        // a tag with no inverse here every editing command refuses it too, and
-        // a caller sent that way is sent down a walled-off path. DR-054 §4 is
-        // about the two reasons naming different actions.
-        if !manifest.version.is_open(manifest.encryption) {
-            let reason = match manifest.version.scheme(manifest.encryption) {
-                Some(scheme) if scheme.seals() => NoWrite::NotThroughTheArchive,
-                Some(_) | None => NoWrite::NoInverse,
-            };
-            return Err(Error::CannotWriteEncrypted {
-                tag: manifest.encryption,
-                reason,
-            });
-        }
+        // A tree extracted from an encrypted archive packs back under that
+        // archive's own transform or not at all, and whether it can is the
+        // transform's question rather than `pack`'s: [`Manifest::sealing`] is
+        // where it is asked, once. A tag with no forward direction here is
+        // refused now, before a byte of the tree is read and before any key
+        // material is wanted; one that has a forward direction is not refused
+        // here at all, and waits to be handed the material that runs it.
+        // DR-057.
+        manifest.sealing()?;
         // Before `pack` opens anything: `build` plans the tree before it
         // fetches a payload, and this is earlier still, so a read from a name
         // no host should hold does not happen at all.
@@ -505,7 +590,71 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
+    use std::{io::Cursor, sync::Arc};
+
     use super::*;
+    use crate::{keys::Material, watch::Unwatched};
+
+    /// The files a packed tree holds, and what each one's contents are.
+    ///
+    /// One stored and one deflated, and one of them shorter than a cipher
+    /// block, so a payload's tail rule is exercised by the sealed pack.
+    fn contents() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("short.bin", vec![b'a'; 7]),
+            (
+                "deep/words.txt",
+                b"the same words over and over ".repeat(40),
+            ),
+        ]
+    }
+
+    /// A manifest describing that tree, at `tag`.
+    fn packable(tag: u32) -> Manifest {
+        let sealed = !Version::Rpf7.is_open(tag);
+        Manifest {
+            schema: SCHEMA_VERSION,
+            version: Version::Rpf7,
+            codec: Codec::Deflate,
+            encryption: tag,
+            directories: vec!["deep".to_owned()],
+            entries: contents()
+                .iter()
+                .map(|(path, _)| ManifestEntry {
+                    path: (*path).to_owned(),
+                    class: EntryClass::Binary,
+                    storage: if path.contains(".txt") {
+                        StorageKind::Deflate
+                    } else {
+                        StorageKind::Stored
+                    },
+                    // 1 is "under the archive's own transform", which is what
+                    // an entry of an encrypted archive carries.
+                    // `docs/rpf-format.md`, Entry table.
+                    encryption: u32::from(sealed),
+                    checksum: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// That tree, as somewhere to fetch each payload from.
+    fn fetching() -> impl Fetch {
+        move |wanted: &str| {
+            let found = contents()
+                .iter()
+                .find(|(path, _)| *path == wanted)
+                .map(|(_, bytes)| bytes.clone())
+                .unwrap_or_default();
+            Ok(Cursor::new(found))
+        }
+    }
+
+    /// What packs and opens a sealed archive here: thirty-two zero bytes, which
+    /// are not key material and did not come from any. DR-006.
+    fn keyed(named: &str) -> Unlock {
+        Unlock::held(Arc::new(Material::over_zeros()), named)
+    }
 
     #[test]
     fn a_manifest_round_trips_through_its_own_json() {
@@ -618,34 +767,128 @@ mod tests {
     }
 
     #[test]
-    fn an_encrypted_manifest_is_refused_with_the_reason_its_transform_earns() {
-        // Exit 9, not 5, for both: `pack` opens no archive, so it holds no key
-        // for either tag and no material a caller extracts reaches it. R4.7.
+    fn an_ng_manifest_is_refused_before_any_material_is_asked_for() {
+        // Exit 9 and not 5: NG's transform has no forward direction in this
+        // build, so no material a caller extracts reaches it and the refusal is
+        // made from the tag alone, before a cache is consulted or a byte of the
+        // tree is read. R4.7, DR-054, DR-057.
+        let tag = 267_386_879_u32;
+        let text = format!(r#"{{"schema":1,"encryption":{tag},"directories":[],"entries":[]}}"#);
+        let error = Manifest::from_json(&text).expect_err("an NG manifest is refused");
+        assert!(
+            matches!(
+                error,
+                Error::CannotWriteEncrypted {
+                    tag: found,
+                    reason: NoWrite::NoInverse,
+                } if found == tag
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.category(), crate::error::Category::Unsupported);
+
+        // And the same refusal from the pack path itself, over a manifest that
+        // never went through `from_json`: a caller holding a `Manifest` value
+        // cannot reach the write by assembling one.
+        let mut out = Cursor::new(Vec::new());
+        let error = packable(tag)
+            .pack_into(&mut out, &keyed("packed.rpf"), fetching(), &mut Unwatched)
+            .expect_err("an NG manifest does not pack");
+        assert!(
+            matches!(
+                error,
+                Error::CannotWriteEncrypted {
+                    reason: NoWrite::NoInverse,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
+    }
+
+    #[test]
+    fn an_aes_manifest_packs_back_under_its_own_transform_and_opens_again() {
+        // The whole of DR-057 in one claim: a tree whose manifest names a tag
+        // this build can write forwards packs back **sealed**, and what it
+        // wrote opens again under the same material. A pack that wrote the
+        // table of contents or a payload in the clear fails at the read back,
+        // and one that wrote a cleartext archive under an encrypted tag fails
+        // at the open.
         //
-        // The reason differs, and that is what this row is for. An AES tag is
-        // `NotThroughTheArchive`, and the remedy the frontend spells beside it
-        // — edit through the archive — is one that works. An NG tag is
-        // `NoInverse`, because every editing command refuses that tag as well:
-        // sending an automation to a command that also refuses is the inverse
-        // of what DR-054 §4 asks a typed reason for.
-        for (tag, want) in [
-            (268_435_449_u32, NoWrite::NotThroughTheArchive),
-            (267_386_879, NoWrite::NoInverse),
-        ] {
-            let text =
-                format!(r#"{{"schema":1,"encryption":{tag},"directories":[],"entries":[]}}"#);
-            let error = Manifest::from_json(&text).expect_err("an encrypted manifest is refused");
-            assert!(
-                matches!(
-                    error,
-                    Error::CannotWriteEncrypted {
-                        tag: found,
-                        reason,
-                    } if found == tag && reason == want
-                ),
-                "{error:?}"
-            );
-            assert_eq!(error.category(), crate::error::Category::Unsupported);
+        // No key material anywhere: `Material::over_zeros` is thirty-two zero
+        // bytes and the transform is real. DR-006 is untouched, and the gated
+        // half — a Rockstar archive under a Rockstar key — is
+        // `crates/rpf-core/tests/encrypted.rs`.
+        let manifest = packable(crate::format::rpf7::ENCRYPTION_AES);
+        let text = manifest.to_json().expect("renders");
+        assert_eq!(
+            Manifest::from_json(&text).expect("an AES manifest is read"),
+            manifest,
+            "an AES manifest is no longer refused at parse time"
+        );
+
+        let mut out = Cursor::new(Vec::new());
+        manifest
+            .pack_into(&mut out, &keyed("packed.rpf"), fetching(), &mut Unwatched)
+            .expect("the tree packs back");
+
+        let mut source = Cursor::new(out.into_inner());
+        let archive =
+            Archive::open(&mut source, &keyed("packed.rpf")).expect("the packed archive opens");
+        assert_eq!(archive.encryption(), crate::format::rpf7::ENCRYPTION_AES);
+        for (path, expected) in contents() {
+            let index = archive.find(path).expect("the entry resolves");
+            let read = archive.read(&mut source, index).expect("the entry reads");
+            assert_eq!(read, expected, "{path} came back different");
+        }
+
+        // "It opens under the key" and "it is not in the clear" are different
+        // claims, so both are made: an archive written in the clear under an
+        // encrypted tag opens for nobody, and this one refuses only the caller
+        // with no material.
+        let error = Archive::open(&mut source, &Unlock::unkeyed())
+            .expect_err("a sealed archive opens for no one unkeyed");
+        assert!(matches!(error, Error::NeedsKey { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_pack_with_no_key_material_refuses_rather_than_writing_in_the_clear() {
+        // The failure this exists for is silent and expensive: an AES manifest
+        // packed as a plaintext archive carrying an AES tag, exit 0, opening
+        // for nobody afterwards. `pack` answers what `open` answers for the
+        // same empty cache instead — exit 5, which names material as the thing
+        // that is missing. DR-041, DR-057.
+        let tag = crate::format::rpf7::ENCRYPTION_AES;
+        let mut out = Cursor::new(Vec::new());
+        let error = packable(tag)
+            .pack_into(&mut out, &Unlock::unkeyed(), fetching(), &mut Unwatched)
+            .expect_err("a pack with no material does not write an archive");
+        assert!(
+            matches!(error, Error::NeedsKey { tag: found } if found == tag),
+            "{error:?}"
+        );
+        assert_eq!(error.category(), crate::error::Category::NeedsKey);
+        assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
+    }
+
+    #[test]
+    fn a_manifest_naming_no_transform_packs_in_the_clear_and_reaches_no_cache() {
+        // The other half of R2.6: an unencrypted tree packs on a machine that
+        // has no material at all, and `Unlock::unkeyed` is what says the pack
+        // path asked for none.
+        let manifest = packable(Version::Rpf7.open());
+        let mut out = Cursor::new(Vec::new());
+        manifest
+            .pack_into(&mut out, &Unlock::unkeyed(), fetching(), &mut Unwatched)
+            .expect("an unencrypted tree packs with no material");
+
+        let mut source = Cursor::new(out.into_inner());
+        let archive = Archive::open(&mut source, &Unlock::unkeyed()).expect("it opens");
+        assert!(Version::Rpf7.is_open(archive.encryption()));
+        for (path, expected) in contents() {
+            let index = archive.find(path).expect("the entry resolves");
+            assert_eq!(archive.read(&mut source, index).expect("reads"), expected);
         }
     }
 

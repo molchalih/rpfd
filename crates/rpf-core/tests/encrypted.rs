@@ -1224,6 +1224,27 @@ fn no_write_path_touches_an_ng_archive() {
         }
     }
 
+    // And `pack`, which reaches key material now (DR-057) and still refuses
+    // this tag: the material is in hand here and it changes nothing, because
+    // what is missing is the transform's forward direction rather than a key.
+    let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
+    let mut out = Cursor::new(Vec::new());
+    let error = manifest
+        .pack_into(
+            &mut out,
+            &unlock,
+            |_: &str| Ok(Cursor::new(Vec::new())),
+            &mut Unwatched,
+        )
+        .expect_err("pack did not refuse an NG tree");
+    refuses_the_write("pack", &error, tag, NoWrite::NoInverse);
+    assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
+    // The refusal is the tag's and not the manifest reader's, so the text a
+    // tree on disk carries is refused the same way and for the same reason.
+    let error = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
+        .expect_err("an NG manifest does not read back as packable");
+    refuses_the_write("manifest", &error, tag, NoWrite::NoInverse);
+
     // "Returned an error" and "did not write" are different claims, so both
     // are made. The source is the archive's own bytes and nothing here has a
     // handle on anything else.
@@ -1239,27 +1260,205 @@ fn no_write_path_touches_an_ng_archive() {
     any(no_corpus, no_executables),
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
-fn a_tree_extracted_from_an_encrypted_archive_will_not_pack_back() {
-    // `pack` never opens the archive it replaces — it builds from a tree — so
-    // it holds no key for either tag and no name to derive one from, whichever
-    // transform the tag names. Exit 9, and the reason is
-    // `NotThroughTheArchive` rather than `NoInverse`: this is AES, which *is*
-    // written back, through the archive it came out of. DR-054.
-    let test = "a_tree_extracted_from_an_encrypted_archive_will_not_pack_back";
+fn a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again() {
+    // `pack` builds from a tree and opens no archive, so until DR-057 it held
+    // no key and refused every encrypted manifest from the tag alone. It now
+    // asks for material the way `open` does and writes the archive back under
+    // the tag's own transform — the same `Under::sealed` a rebuild uses.
+    //
+    // **The archive is the launcher's, and which archive it is carries the
+    // claim.** `docs/corpus.md` records `Launcher.rpf` as the only archive here
+    // with no resource entry at all, and a tree holding a Rockstar resource
+    // does not pack back at all: schema 3 records *that* an entry is a resource
+    // and not its flag words, so `store` refuses a payload that carries no
+    // `RSC7` header of its own — which is every Rockstar resource (Q7). The
+    // test after this one is that limitation, pinned against the corpus archive
+    // that has it. DR-004, DR-046, DR-057.
+    //
+    // The tree here is the archive's own entries, held in memory rather than on
+    // disk: what `pack` is given is a manifest and something to fetch each
+    // path's contents from, and `crates/rpf/tests/cli.rs` is where the same run
+    // goes through a real extracted tree and a real cache.
+    let test = "a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again";
+    let Some(material) = material_of(test, LAUNCHER_EXE) else {
+        return;
+    };
+    let (relative, ..) = LAUNCHER_ARCHIVES[0];
+    let Some(path) = archive_path(test, relative) else {
+        return;
+    };
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .expect("a corpus path names a file");
+    let unlock = Unlock::held(Arc::clone(&material), name);
+    let mut source = Cursor::new(fs::read(&path).expect("the archive is readable"));
+    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+    assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES_LAUNCHER);
+
+    let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
+    let mut tree: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in &manifest.entries {
+        let index = archive.find(&entry.path).expect("the entry resolves");
+        let bytes = archive.extract(&mut source, index).expect("extracts");
+        tree.push((entry.path.clone(), bytes));
+    }
+
+    // Through the JSON, because that is what a tree on disk carries and the
+    // refusal this record narrowed was `from_json`'s.
+    let manifest = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
+        .expect("an AES manifest is no longer refused at parse time");
+
+    let mut out = Cursor::new(Vec::new());
+    manifest
+        .pack_into(
+            &mut out,
+            &unlock,
+            |wanted: &str| {
+                let found = tree
+                    .iter()
+                    .find(|(path, _)| path == wanted)
+                    .map(|(_, bytes)| bytes.clone())
+                    .unwrap_or_default();
+                Ok(Cursor::new(found))
+            },
+            &mut Unwatched,
+        )
+        .expect("the tree packs back");
+
+    // Still encrypted, still under the same tag, and still needing a key: a
+    // pack that wrote it out in the clear would open here under no material at
+    // all and every assertion below would pass anyway.
+    let packed = out.into_inner();
+    let error = Archive::open(&mut Cursor::new(packed.clone()), &Unlock::unkeyed())
+        .expect_err("the packed archive is not in the clear");
+    assert!(
+        matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_AES_LAUNCHER),
+        "{error:?}"
+    );
+
+    let mut source = Cursor::new(packed);
+    let opened = Archive::open(&mut source, &unlock).expect("the packed archive opens");
+    assert_eq!(opened.encryption(), rpf7::ENCRYPTION_AES_LAUNCHER);
+    for (path, expected) in &tree {
+        let index = opened
+            .find(path)
+            .unwrap_or_else(|error| panic!("{path} is gone: {error}"));
+        assert_eq!(
+            &opened.extract(&mut source, index).expect("extracts"),
+            expected,
+            "{path} did not survive the pack"
+        );
+    }
+    Verified::of(&mut source, &opened, &mut Unwatched)
+        .expect("verifies")
+        .outcome()
+        .expect("every entry of the packed archive reads back");
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_tree_holding_a_rockstar_resource_does_not_pack_back_whatever_key_is_held() {
+    // The half of R4.16 DR-057 does **not** close, pinned so that it is a
+    // measured limitation rather than an untested belief. `des_canister.rpf`
+    // holds nine resources, none of which carries an `RSC7` header of its own —
+    // 696,578 of 696,578 corpus resource payloads do not (Q7) — and the
+    // manifest schema records only *that* an entry is a resource, so
+    // `Manifest::specs` answers `FileKind::Resource { declared: None }` and
+    // `build::store` has neither a header nor a declaration to take the page
+    // flags from.
+    //
+    // The refusal is `Error::NotAResource` and not `Error::NeedsKey`: material
+    // was in hand and the seal was made, so what is missing is a field of
+    // DR-004's schema rather than a key. Closing it is DR-004's to reopen, not
+    // DR-057's.
+    let test = "a_tree_holding_a_rockstar_resource_does_not_pack_back_whatever_key_is_held";
+    let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+    assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES);
+
+    let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
+    let mut tree: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut headerless = 0_usize;
+    for entry in &manifest.entries {
+        let index = archive.find(&entry.path).expect("the entry resolves");
+        let bytes = archive.extract(&mut source, index).expect("extracts");
+        let kind = archive.entry(index).expect("the entry is there").kind;
+        if matches!(kind, rpf_core::EntryKind::Resource { .. }) && bytes.get(0..4) != Some(b"RSC7")
+        {
+            headerless += 1;
+        }
+        tree.push((entry.path.clone(), bytes));
+    }
+    assert!(
+        headerless > 0,
+        "every resource here carries its own header, so the refusal below would say nothing"
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    let error = manifest
+        .pack_into(
+            &mut out,
+            &unlock,
+            |wanted: &str| {
+                let found = tree
+                    .iter()
+                    .find(|(path, _)| path == wanted)
+                    .map(|(_, bytes)| bytes.clone())
+                    .unwrap_or_default();
+                Ok(Cursor::new(found))
+            },
+            &mut Unwatched,
+        )
+        .expect_err("a tree of headerless resources does not pack back");
+    assert!(
+        matches!(error, Error::NotAResource { .. }),
+        "the refusal is the resource's and not the key's: {error:?}"
+    );
+    assert_eq!(error.category(), Category::Refused);
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn a_tree_extracted_from_an_aes_archive_needs_a_key_to_pack_back() {
+    // The one that matters most: with no material available, `pack` must refuse
+    // rather than write a plaintext archive carrying an encrypted tag — which
+    // would exit 0 and open for nobody afterwards. `Error::NeedsKey`, exit 5,
+    // which is what `open` answers for the same archive and the same empty
+    // cache. DR-041, DR-057.
+    let test = "a_tree_extracted_from_an_aes_archive_needs_a_key_to_pack_back";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
     };
     let mut source = Cursor::new(held.bytes.clone());
     let archive = Archive::open(&mut source, &held.unlock()).expect("opens");
     let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
-    let error = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
-        .expect_err("an encrypted manifest does not pack back");
-    refuses_the_write(
-        "manifest",
-        &error,
-        archive.encryption(),
-        NoWrite::NotThroughTheArchive,
+
+    let mut out = Cursor::new(Vec::new());
+    let error = manifest
+        .pack_into(
+            &mut out,
+            &Unlock::unkeyed(),
+            |_: &str| Ok(Cursor::new(Vec::new())),
+            &mut Unwatched,
+        )
+        .expect_err("a pack with no material does not write an archive");
+    assert!(
+        matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_AES),
+        "{error:?}"
     );
+    assert_eq!(error.category(), Category::NeedsKey);
+    assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
 }
 
 // ------------------------------------------------- the AES write path, R4.7 ---

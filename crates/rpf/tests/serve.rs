@@ -1537,124 +1537,6 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
 }
 
 #[test]
-fn a_cancel_during_a_commit_that_patches_is_told_why_it_cannot() {
-    // Two registrations that only exist in the running daemon, and that the
-    // unit tests around `Cancellation` cannot reach: the commit registers
-    // itself before it has decided anything, because deciding reads and
-    // compresses every buffered edit and a cancel arriving then must not be
-    // told nothing is running; and the patch it decides on registers itself as
-    // one that cannot be stopped, because a half-applied patch is the corrupt
-    // archive §8 exists to prevent. Neither is asserted anywhere else, and
-    // dropping either leaves every other test green.
-    //
-    // Four thousand entries so that both phases last long enough for a cancel
-    // to arrive inside them: deciding deflates every edit, and applying seeks,
-    // writes and flushes twice per entry.
-    let dir = tempfile::tempdir().expect("temp dir");
-    let archive = dir.path().join("many.rpf");
-    make_bulk_archive(&archive, 4000, 512);
-
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-
-    let (lines, received) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if lines.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    writeln!(
-        stdin,
-        "{}",
-        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
-            "path": archive.display().to_string()}})
-    )
-    .expect("writable");
-    // An edit per entry, each small enough to fit where its entry already sits,
-    // so the commit decides to patch rather than to rebuild.
-    for index in 0..4000_u64 {
-        let request = json!({"jsonrpc":"2.0","id": 100 + index,"method":"write","params":{
-            "handle":1,"path": format!("bulk/{index:04}.bin"),
-            "bytes": BASE64.encode(vec![9_u8; 512])}});
-        writeln!(stdin, "{request}").expect("writable");
-    }
-    writeln!(
-        stdin,
-        "{}",
-        json!({"jsonrpc":"2.0","id":9,"method":"commit","params":{"handle":1}})
-    )
-    .expect("writable");
-
-    let mut commit = None;
-    let mut answers = Vec::new();
-    let mut sent = 0;
-    while commit.is_none() {
-        let cancel = json!({"jsonrpc":"2.0","id":1_000_000,"method":"cancel","params":{}});
-        if writeln!(stdin, "{cancel}").is_err() {
-            break;
-        }
-        sent += 1;
-        assert!(sent < 40_000, "the commit never answered");
-        std::thread::sleep(std::time::Duration::from_micros(125));
-
-        while let Ok(line) = received.try_recv() {
-            let object: Value = serde_json::from_str(&line).expect("a JSON object per line");
-            if object["id"] == json!(9) {
-                commit = Some(object);
-            } else if object["id"] == json!(1_000_000) {
-                answers.push(object);
-            }
-        }
-    }
-    drop(stdin);
-    let commit = commit.expect("the commit answered");
-    let _ = child.wait();
-    let _ = reader.join();
-
-    assert_eq!(
-        commit["result"]["method"],
-        json!("patch"),
-        "the edits did not fit where their entries sit: {commit}"
-    );
-    assert_eq!(commit["result"]["committed"], json!(4000), "{commit}");
-
-    // Nothing in a commit that patches can be stopped, at either stage.
-    for object in &answers {
-        assert_eq!(
-            object["result"]["cancelling"],
-            json!(false),
-            "a commit that patches said it was stopping: {object}"
-        );
-    }
-    let reason_while = |running: &str| -> Option<String> {
-        answers
-            .iter()
-            .find(|object| object["result"]["running"] == json!(running))
-            .map(|object| object["result"]["reason"].to_string())
-    };
-    let deciding = reason_while("commit").expect("no cancel arrived while the commit was deciding");
-    assert!(
-        deciding.contains("whether every edit fits"),
-        "a cancel during the decision was answered without saying why: {deciding}"
-    );
-    let patching = reason_while("patch").expect("no cancel arrived while the patch was running");
-    assert!(
-        patching.contains("no part-way to stop at"),
-        "a cancel during the patch was answered without saying why: {patching}"
-    );
-}
-
-#[test]
 fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
     // The job is registered for exactly as long as there is something to name.
     // Left registered, a cancel arriving afterwards is answered as though the
@@ -1722,106 +1604,6 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
         "a finished commit was still registered as the thing to cancel: {answered}"
     );
     let _ = child.wait();
-}
-
-#[test]
-fn a_client_that_stops_reading_cannot_wedge_the_daemon() {
-    // Standard output was written under a lock held across the write, so a
-    // client that stopped draining it blocked the worker with the lock held —
-    // and the reading thread then blocked on the same lock answering the
-    // cancel, which is what turned backpressure into a deadlock. Nothing was
-    // read from standard input again, the cancel included.
-    let dir = tempfile::tempdir().expect("temp dir");
-    let archive = dir.path().join("many.rpf");
-    // Enough entries, and small enough ones, that a rebuild has written more
-    // progress than a pipe holds within the first few hundred milliseconds:
-    // the daemon has to be blocked in that write before the cancel arrives,
-    // because that is the moment the deadlock is made of.
-    make_bulk_archive(&archive, 3000, 1024);
-
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-
-    for request in [
-        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
-            "path": archive.display().to_string()}}),
-        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-            "handle":1,"path":"bulk/0000.bin","bytes": BASE64.encode(b"replaced")}}),
-        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"rebuild":true}}),
-    ] {
-        writeln!(stdin, "{request}").expect("writable");
-    }
-    // Nothing has read a byte of standard output, and nothing will until the
-    // 1 MB request below has been accepted.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let (done, finished) = std::sync::mpsc::channel();
-    let writer = std::thread::spawn(move || {
-        let cancel = json!({"jsonrpc":"2.0","id":4,"method":"cancel","params":{"handle":1}});
-        let outcome = writeln!(stdin, "{cancel}").and_then(|()| {
-            let big = json!({"jsonrpc":"2.0","id":5,"method":"write","params":{
-                "handle":1,"path":"bulk/0001.bin","bytes": BASE64.encode(vec![7_u8; 1 << 20])}});
-            writeln!(stdin, "{big}")
-        });
-        let _ = done.send(outcome.is_ok());
-        stdin
-    });
-
-    let wedged = finished
-        .recv_timeout(std::time::Duration::from_secs(8))
-        .is_err();
-
-    // Drain before anything is joined, so that a daemon that *is* wedged comes
-    // unstuck and this test fails rather than hangs.
-    let drain = std::thread::spawn(move || {
-        let mut lines = Vec::new();
-        for line in std::io::BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            lines.push(line);
-        }
-        lines
-    });
-    assert!(
-        !wedged,
-        "a 1 MB request was not accepted in eight seconds: the daemon is wedged"
-    );
-
-    let sending = writer.join().expect("the writing thread finished");
-    drop(sending);
-    let status = child.wait().expect("the daemon exits");
-    let lines = drain.join().expect("the draining thread finished");
-    assert!(status.success(), "the daemon exited with {status}");
-
-    let objects: Vec<Value> = lines
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<Value>(line).expect("a JSON object per line"))
-        .collect();
-    assert!(
-        objects.iter().any(|object| object["id"] == json!(4)),
-        "the cancel was never answered"
-    );
-    assert!(
-        objects.iter().any(|object| object["id"] == json!(3)),
-        "the commit was never answered"
-    );
-    // Progress is dropped rather than queued without bound, so a client that
-    // was not reading does not receive one notification per entry after the
-    // fact either.
-    let progress = objects
-        .iter()
-        .filter(|object| object["method"] == json!("progress"))
-        .count();
-    assert!(
-        progress < 3000,
-        "every notification was kept for a client that was not reading: {progress}"
-    );
 }
 
 #[test]
@@ -4348,6 +4130,12 @@ fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
 /// it. `docs/corpus.md`.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
+/// The Rockstar Games Launcher's own archive: AES-tagged under the launcher key
+/// and, alone in the corpus, holding **no resource entry at all**, which is
+/// what makes an extracted tree of it one this packer can rebuild whole.
+/// `docs/corpus.md`; DR-042, DR-057.
+const LAUNCHER_ARCHIVE: &str = "rockstar_launcher/Launcher.rpf";
+
 /// The NG-encrypted archive, whose **file name is load-bearing**: an NG key is
 /// chosen by the archive's own name. `docs/rpf-format.md`, Encryption.
 const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
@@ -4575,6 +4363,153 @@ fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
     assert_eq!(extracted["result"]["cache"], json!(named), "{extracted}");
     let opened = answer(&responses, 2);
     assert_eq!(opened["result"]["entries"], json!(11), "{opened}");
+
+    // And the same flag reaches `pack`, which is §1 for DR-057: the daemon
+    // takes the cache from the process it was started with, exactly as `open`
+    // does — DR-041 is what says the wire is not widened per method. What says
+    // the flag arrived is **which** refusal comes back: this archive holds nine
+    // resources whose payloads carry no `RSC7` header, and the manifest schema
+    // records only that an entry is a resource, so the material is found, the
+    // seal is made, and the build stops at the first resource for want of its
+    // page flags (`NotAResource`) rather than at the key (`NeedsKey`, below).
+    // The tree that packs all the way back over this wire is the launcher's, in
+    // `the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource`.
+    // DR-004 owns the missing half.
+    let tree = dir.path().join("tree").display().to_string();
+    let packed = dir.path().join("packed.rpf").display().to_string();
+    let mut started = daemon();
+    started
+        .args(["--cache-dir", &named])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"));
+    let responses = drive(
+        started,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": at}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+                "handle":1,"into": tree, "progress": false}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+                "from": tree, "archive": packed, "progress": false}}),
+        ],
+    )
+    .0;
+    let repacked = answer(&responses, 3);
+    assert_eq!(repacked["error"]["code"], json!(6), "{repacked}");
+    assert_eq!(
+        repacked["error"]["data"]["reason"],
+        json!("NotAResource"),
+        "{repacked}"
+    );
+    assert!(
+        !Path::new(&packed).exists(),
+        "a refused pack wrote an archive"
+    );
+
+    // With no cache to reach, the same request answers for the material rather
+    // than writing a cleartext archive under an encrypted tag: exit code 5's
+    // reason over the wire.
+    let bare = dir.path().join("bare.rpf").display().to_string();
+    let mut started = daemon();
+    started
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"));
+    let responses = drive(
+        started,
+        &[json!({"jsonrpc":"2.0","id":1,"method":"pack","params":{
+                "from": tree, "archive": bare, "progress": false}})],
+    )
+    .0;
+    let refused = answer(&responses, 1);
+    assert_eq!(refused["error"]["code"], json!(5), "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["reason"],
+        json!("NeedsKey"),
+        "{refused}"
+    );
+    assert!(
+        !Path::new(&bare).exists(),
+        "a refused pack wrote an archive"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource() {
+    // The half of DR-057 that goes all the way through over the wire, on the
+    // one corpus archive it can: `docs/corpus.md` records `Launcher.rpf` as the
+    // only archive here with no resource entry at all, so every entry of an
+    // extracted tree of it is one this packer can rebuild. Extract, pack, and
+    // open what was written — under the launcher's own AES key, which only
+    // `Launcher.exe` carries (DR-042).
+    let test = "the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource";
+    let Some(archive) = corpus(test, LAUNCHER_ARCHIVE) else {
+        return;
+    };
+    let Some(source) = executable(test, "Launcher.exe") else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    let named = dir.path().join("keys").display().to_string();
+    let at = archive.display().to_string();
+    let tree = dir.path().join("tree").display().to_string();
+    let packed = dir.path().join("packed.rpf").display().to_string();
+
+    let mut started = daemon();
+    started
+        .args(["--cache-dir", &named])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"));
+    let responses = drive(
+        started,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
+                "executable": source.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"open","params":{"path": at}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"extract","params":{
+                "handle":1,"into": tree, "progress": false}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"pack","params":{
+                "from": tree, "archive": packed, "progress": false}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"open","params":{"path": packed}}),
+        ],
+    )
+    .0;
+    let opened = answer(&responses, 2);
+    assert_eq!(opened["result"]["entries"], json!(118), "{opened}");
+    let repacked = answer(&responses, 4);
+    assert!(repacked["result"].is_object(), "{repacked}");
+    // Against what the source archive answered rather than against 118 again:
+    // whether a packed tree reproduces the entry *count* is `build`'s question
+    // and not this test's, and the claim here is that what was written opens.
+    let reopened = answer(&responses, 5);
+    assert!(reopened["result"].is_object(), "{reopened}");
+    assert_eq!(
+        reopened["result"]["entries"], opened["result"]["entries"],
+        "{reopened}"
+    );
+
+    // And it was written sealed: a daemon with no cache to reach opens nothing,
+    // where a cleartext archive under an encrypted tag would open for anyone.
+    let mut started = daemon();
+    started
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"));
+    let responses = drive(
+        started,
+        &[json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": packed}})],
+    )
+    .0;
+    let refused = answer(&responses, 1);
+    assert_eq!(refused["error"]["code"], json!(5), "{refused}");
 }
 
 #[test]

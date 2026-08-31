@@ -1137,8 +1137,10 @@ impl<'a> Under<'a> {
 
 /// [`build`], with what the archive's own bytes go under.
 ///
-/// The one implementation; [`build`] is it in the clear, and `rebuild` is it
-/// under whatever the archive it is rebuilding was under.
+/// The one implementation; [`build`] is it in the clear, `rebuild` is it under
+/// whatever the archive it is rebuilding was under, and
+/// [`Manifest::pack_into`](crate::manifest::Manifest::pack_into) is it under
+/// whatever the manifest's tag names.
 ///
 /// The three regions the tag covers are sealed each from **its own start**, and
 /// that is not the same as sealing the file: the header stays in the clear, the
@@ -1153,7 +1155,7 @@ impl<'a> Under<'a> {
 /// # Errors
 ///
 /// As [`build`].
-fn build_under<W, F>(
+pub(crate) fn build_under<W, F>(
     out: &mut W,
     under: Under<'_>,
     files: &[FileSpec],

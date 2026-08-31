@@ -12,11 +12,13 @@ use crate::{
     manifest::Checksum,
 };
 
-/// Why an encrypted archive cannot be written, in the two ways it cannot.
+/// Why an encrypted archive cannot be written.
 ///
-/// A typed reason rather than a rendered sentence (§10), because the two name
-/// different things for a caller to do: one is a wall, and the other is a
-/// different command. DR-054.
+/// A typed reason rather than a rendered sentence (§10). It carried a second
+/// value until DR-057 — `pack` refusing an AES tree because it held no key —
+/// and that is now a state rather than a wall: `pack` asks for material like
+/// every other command and answers [`Error::NeedsKey`] when there is none, so
+/// what is left here is the wall. DR-054, DR-057.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NoWrite {
@@ -31,21 +33,6 @@ pub enum NoWrite {
          read and never written"
     )]
     NoInverse,
-
-    /// The bytes are not being written **through the archive they came from**,
-    /// so nothing here holds the key its tag chose.
-    ///
-    /// `pack` builds an archive out of a tree and a manifest and opens no
-    /// archive at all, so it has no key material and no name to derive one
-    /// from. Editing through the archive — `put`, `rm`, `mv`, `mkdir` — does,
-    /// and **that remedy is the frontend's to spell**: `rpf`'s `advice` module
-    /// names the commands, because a command name is a frontend's vocabulary
-    /// and §10 keeps a rendered sentence out of a variant. DR-050's pattern.
-    #[error(
-        "pack builds from a tree and opens no archive, so it holds no key for \
-         this tag"
-    )]
-    NotThroughTheArchive,
 }
 
 /// Anything that can go wrong reading a container.
@@ -156,10 +143,9 @@ pub enum Error {
 
     /// The archive is encrypted and this write cannot produce one.
     ///
-    /// Two situations, and `reason` tells them apart because they are two
-    /// different things to do about it — [`NoWrite`]. An AES-tagged archive is
-    /// written back through the archive it was read from; an NG-tagged one is
-    /// written back by nobody outside Rockstar.
+    /// `reason` says which gap it is — [`NoWrite`]. An AES-tagged archive is
+    /// written back, by every write path there is; an NG-tagged one is written
+    /// back by nobody outside Rockstar.
     ///
     /// Every write path answers this before it touches a byte, so an archive
     /// refused here is exactly as it was.

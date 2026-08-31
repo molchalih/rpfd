@@ -373,12 +373,14 @@ not reach it, because a capability that is absent is not a safety interlock.
 The message names which of the two it is; `docs/ng-scheme.md` is why the second
 one stands.
 
-`pack` is the exception on both counts: it builds from an extracted tree and
-opens no archive, so it holds no key for either tag and refuses any encrypted
-manifest at the same exit 9. The reason it gives is the tag's own, not `pack`'s:
-an AES manifest is told to edit through the archive instead, because that route
-works, and an NG one is told there is no inverse, because every editing command
-refuses it too and a remedy that is walled off is worse than none.
+`pack` opens no archive — it builds one from an extracted tree — so it reaches
+key material the way every other command does: `--cache-dir`, or the platform's
+own cache, consulted only where the manifest's tag names a transform this build
+can write forwards. An AES tree packs back under its own tag, and one packed
+where no material is available is `NeedsKey` at exit 5 rather than an archive
+written in the clear under an encrypted tag. An NG manifest is refused at exit 9
+before any material is asked for, because there is no inverse to ask for it
+for.
 
 ## Building and testing
 

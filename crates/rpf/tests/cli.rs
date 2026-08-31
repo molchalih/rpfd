@@ -718,6 +718,82 @@ fn pack_writes_the_version_the_manifest_names() {
     }
 }
 
+/// What `pack` answers for a tree whose manifest names a transform, on a
+/// machine with no key material at all — which is every machine in continuous
+/// integration.
+///
+/// Two answers and they are different: a tag this build can write forwards is
+/// missing **material**, exit 5, and a tag it cannot is missing the
+/// **algorithm**, exit 9. Neither writes an archive, and the first is the one
+/// that matters most: a `pack` that fell back to writing the tree in the clear
+/// under an encrypted tag would exit 0 over an archive that opens for nobody.
+/// DR-057.
+#[test]
+fn an_encrypted_tree_packs_for_material_or_refuses_for_the_algorithm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let tree = dir.path().join("tree");
+    assert_eq!(
+        run(&[
+            "extract",
+            &archive.display().to_string(),
+            &tree.display().to_string(),
+        ])
+        .0,
+        0,
+        "extract"
+    );
+    let at = tree.join(rpf_core::MANIFEST_NAME);
+    // An empty cache of this test's own, so the answer does not depend on
+    // whether the machine running it has a game installed.
+    let cache = dir.path().join("keys").display().to_string();
+
+    // Rewritten through `Manifest` rather than as text, so this does not encode
+    // how the field is spelled on disk a second time. It is read once, because
+    // an NG manifest is refused by the reader and could not be read back.
+    let extracted =
+        rpf_core::Manifest::from_json(&fs::read_to_string(&at).expect("manifest readable"))
+            .expect("manifest parses");
+
+    for (tag, code, says) in [
+        (0x0FFF_FFF9_u32, 5, "no key material available"),
+        (0x0FEF_FFFF, 9, "has no inverse"),
+    ] {
+        let mut manifest = extracted.clone();
+        manifest.encryption = tag;
+        fs::write(&at, manifest.to_json().expect("renders")).expect("manifest writable");
+
+        let packed = dir.path().join(format!("packed-{tag:#x}.rpf"));
+        let (answered, message) = run_err(&[
+            "pack",
+            &tree.display().to_string(),
+            &packed.display().to_string(),
+            "--cache-dir",
+            &cache,
+        ]);
+        assert_eq!(answered, code, "{tag:#010x}: {message}");
+        assert!(message.contains(says), "{tag:#010x}: {message}");
+        assert!(
+            !packed.exists(),
+            "{tag:#010x}: a refused pack wrote an archive"
+        );
+    }
+
+    // And the plain tag still packs, on the same machine with the same empty
+    // cache: nothing was made to depend on material that has no reason to be
+    // wanted (R2.6).
+    fs::write(&at, extracted.to_json().expect("renders")).expect("manifest writable");
+    let packed = dir.path().join("packed-open.rpf");
+    let (code, message) = run_err(&[
+        "pack",
+        &tree.display().to_string(),
+        &packed.display().to_string(),
+    ]);
+    assert_eq!(code, 0, "{message}");
+    assert_eq!(run(&["verify", &packed.display().to_string()]).0, 0);
+}
+
 #[test]
 fn extract_then_pack_preserves_the_tree() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3102,7 +3178,17 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
         );
     }
 
-    // And the one that still refuses, with the reason that is not "no inverse".
+    // And the third write path, which used to be refused from the tag alone:
+    // `pack` now reaches the same cache `keys extract` filled above, with no
+    // flag anywhere. What it reaches is **not** a packed archive here, and that
+    // is the honest half of DR-057: this archive holds nine resources, none of
+    // which carries an `RSC7` header of its own, and the manifest schema
+    // records only that an entry is a resource. So the build refuses the first
+    // resource for want of its page flags — exit 6, not the exit 5 the same
+    // command answers below with no material at all, which is what says the key
+    // was found and the schema is what is missing. Closing it is DR-004's, not
+    // this record's. `crates/rpf/tests/cli.rs`'s launcher test is the tree that
+    // does pack back.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(
         &home,
@@ -3114,20 +3200,33 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
     );
     assert_eq!(code, 0, "{message}");
     let packed = dir.path().join("packed.rpf");
-    let (code, message) = run_err_homed(
-        &home,
-        &[
-            "pack",
-            &tree.display().to_string(),
-            &packed.display().to_string(),
-        ],
-    );
-    assert_eq!(code, 9, "{message}");
+    let at = packed.display().to_string();
+    let (code, message) = run_err_homed(&home, &["pack", &tree.display().to_string(), &at]);
+    assert_eq!(code, 6, "{message}");
     assert!(
-        message.contains("Edit through the archive instead"),
+        message.contains("cannot be written into a resource entry"),
         "{message}"
     );
     assert!(!packed.exists(), "a refused pack wrote an archive");
+
+    // And the pack that must not silently succeed: no material anywhere is exit
+    // 5, naming the missing material, with no archive left behind — and it is
+    // answered before a payload is read, which is why it is the key's refusal
+    // and not the resource's.
+    let bare = dir.path().join("no-keys");
+    fs::create_dir_all(&bare).expect("home");
+    let unpacked = dir.path().join("unkeyed.rpf");
+    let (code, message) = run_err_homed(
+        &bare,
+        &[
+            "pack",
+            &tree.display().to_string(),
+            &unpacked.display().to_string(),
+        ],
+    );
+    assert_eq!(code, 5, "{message}");
+    assert!(message.contains("no key material available"), "{message}");
+    assert!(!unpacked.exists(), "a refused pack wrote an archive");
 }
 
 #[test]
@@ -3174,6 +3273,32 @@ fn the_launcher_archive_opens_once_the_launcher_key_is_extracted() {
     assert_eq!(code, 0, "{message}");
     let (code, message) = run_err_homed(&home, &["ls", "-R", &at]);
     assert_eq!(code, 0, "{message}");
+
+    // And the whole of DR-057 through the binary, on the one corpus archive it
+    // can be shown on: `docs/corpus.md` records `Launcher.rpf` as the only
+    // archive here with no resource entry at all, so an extracted tree of it is
+    // a tree this packer can rebuild entirely. Extract, pack, and list what was
+    // written — reaching the same cache `keys extract` filled above, with no
+    // flag anywhere.
+    let tree = dir.path().join("tree");
+    let (code, message) = run_err_homed(&home, &["extract", &at, &tree.display().to_string()]);
+    assert_eq!(code, 0, "{message}");
+    let packed = dir.path().join("packed.rpf");
+    let to = packed.display().to_string();
+    let (code, message) = run_err_homed(&home, &["pack", &tree.display().to_string(), &to]);
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = run_err_homed(&home, &["ls", "-R", &to]);
+    assert_eq!(code, 0, "the packed archive does not list: {message}");
+    let (code, message) = run_err_homed(&home, &["verify", &to]);
+    assert_eq!(code, 0, "the packed archive does not verify: {message}");
+
+    // A separate process with no cache at all is what says it was written
+    // sealed: a plaintext archive under an encrypted tag opens for nobody.
+    let bare = dir.path().join("no-keys");
+    fs::create_dir_all(&bare).expect("home");
+    let (code, message) = run_err_homed(&bare, &["ls", &to]);
+    assert_eq!(code, 5, "the packed archive is in the clear: {message}");
+    assert!(message.contains("no key material available"), "{message}");
 }
 
 #[test]
@@ -3224,6 +3349,49 @@ fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
     let (code, message) = run_err_homed(&home, &["ls", &at]);
     assert_eq!(code, 5, "{message}");
     assert!(message.contains("no key material available"), "{message}");
+
+    // `pack` was the one command the flag did not reach at all — it was refused
+    // from the manifest's tag before a cache could matter. Both ends of that
+    // are pinned here, and the difference between the two answers is what says
+    // the flag reached the key: **with** the flag the material is found and the
+    // build gets as far as the first resource, which this schema cannot describe
+    // (exit 6, DR-004); **without** it, on the same machine, the answer is for
+    // the material and nothing is read at all (exit 5). The archive that packs
+    // all the way back is the launcher's, in the test above — it is the only one
+    // here holding no resource. DR-057.
+    let tree = dir.path().join("tree");
+    let (code, message) = run_err_homed(
+        &home,
+        &[
+            "extract",
+            &at,
+            &tree.display().to_string(),
+            "--cache-dir",
+            &named,
+        ],
+    );
+    assert_eq!(code, 0, "{message}");
+    let from = tree.display().to_string();
+    let packed = dir.path().join("packed.rpf").display().to_string();
+    let (code, message) = run_err_homed(&home, &["pack", &from, &packed, "--cache-dir", &named]);
+    assert_eq!(code, 6, "{message}");
+    assert!(
+        message.contains("cannot be written into a resource entry"),
+        "{message}"
+    );
+    assert!(
+        !Path::new(&packed).exists(),
+        "a refused pack wrote an archive"
+    );
+
+    let without = dir.path().join("no-flag.rpf").display().to_string();
+    let (code, message) = run_err_homed(&home, &["pack", &from, &without]);
+    assert_eq!(code, 5, "{message}");
+    assert!(message.contains("no key material available"), "{message}");
+    assert!(
+        !Path::new(&without).exists(),
+        "a refused pack wrote an archive"
+    );
 }
 
 /// R7.4 on the command line: a metadata entry reads as XML and takes one back.

@@ -35,17 +35,30 @@
 # honours it.
 additional_cargo_args = ["--workspace"]
 
-# The one test excluded, and the only exclusion in this file.
+# No test is excluded, and none needs to be.
 #
-# `serve::a_cancel_during_a_commit_that_patches_is_told_why_it_cannot` spins on
-# 125-microsecond sleeps. It fails on unmodified `main` on a 32-core machine at
-# load 76 and passes at load 35, so it is the machine and not the change. A
-# mutation run is where that costs the most: a test that fails on its own makes
-# cargo-mutants record the mutant as caught, so an intermittent test does not
-# add noise — it reports a clean line exactly where a real gap is, which is the
-# one error direction that makes a sweep worse than not running one. Skipped by
-# name until it no longer depends on the machine it runs on.
-additional_cargo_test_args = ["--", "--skip", "a_cancel_during_a_commit_that_patches_is_told_why_it_cannot"]
+# `serve::a_cancel_during_a_commit_that_patches_is_told_why_it_cannot` was, from
+# here, until 2026-08-31. It drove the daemon over a pipe and sprayed cancels at
+# a 4,000-entry commit on 125-microsecond sleeps, hoping one would land in each
+# of the two phases; it failed on unmodified `main` on a 32-core machine at load
+# 76 and passed at load 35, and then failed on a two-core continuous-integration
+# runner. A mutation run is where that costs the most: a test that fails on its
+# own makes cargo-mutants record the mutant as caught, so an intermittent test
+# reports a clean line exactly where a real gap is, which is the one error
+# direction that makes a sweep worse than not running one.
+#
+# It no longer depends on the machine it runs on. `commit_now` takes the way its
+# patch target is opened, so the same two registrations are asked from inside
+# the commit — the opener is called while the decision is still being taken, and
+# the target's first write is the patch under way — with no client, no thread
+# and no sleep. It is a unit test in `crates/rpf/src/serve.rs` now.
+#
+# `serve::a_client_that_stops_reading_cannot_wedge_the_daemon` was the same
+# shape and was never excluded, which is worse: it rebuilt a 3,000-entry
+# archive over a pipe, slept 500 milliseconds hoping the worker was blocked in
+# a write by then, and gave a megabyte 8 seconds to be accepted, so a sweep
+# that hit a busy machine recorded a caught mutant either way. It is a unit
+# test now too — `reading` takes what it reads — and it does not sleep.
 
 # No source file is excluded, and that is a finding rather than an omission.
 # 840 mutants over `rpf-core` is not a flood, and the four places that looked

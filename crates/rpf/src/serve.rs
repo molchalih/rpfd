@@ -17,7 +17,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Seek, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
@@ -756,13 +756,13 @@ pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
     });
     let (queue, requests) = mpsc::channel::<Incoming>();
 
-    let reading = Arc::clone(&wire);
+    let reading_wire = Arc::clone(&wire);
     let reader = thread::spawn(move || {
-        reading_stdin(&reading, &queue);
+        reading(io::stdin().lock(), &reading_wire, &queue);
         // Every way out of that loop means the same thing: no more requests
         // are coming.
-        reading.backlog.ending.store(true, Ordering::SeqCst);
-        reading.backlog.room.notify_all();
+        reading_wire.backlog.ending.store(true, Ordering::SeqCst);
+        reading_wire.backlog.room.notify_all();
     });
 
     let mut state = State {
@@ -841,9 +841,13 @@ fn drain(drained: &mpsc::Receiver<()>, backlog: &Backlog) -> bool {
 }
 
 /// The reading thread: one line at a time, cancels answered where they stand.
-fn reading_stdin(wire: &Wire, queue: &mpsc::Sender<Incoming>) {
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
+///
+/// `input` is standard input in the daemon and the requests a test wants read
+/// in a test. It is a parameter for the same reason [`Opening`] is one: the
+/// property this thread carries — that it waits on nothing the client controls
+/// — is otherwise only observable through a pipe and a clock.
+fn reading(input: impl BufRead, wire: &Wire, queue: &mpsc::Sender<Incoming>) {
+    for line in input.lines() {
         let line = match line {
             Ok(line) => line,
             Err(source) => {
@@ -1915,6 +1919,12 @@ fn pack(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answ
     if let Some((holder, held)) = state.holder_of(&target, identity_of(&target)) {
         return Err(packing_over_held(&target, held, holder).into());
     }
+    // The cache this daemon was started with, which is the one every session it
+    // opens an archive under already uses: a tree whose manifest names an
+    // encrypted tag packs back under that tag's transform here exactly as it
+    // does on the command line, or the two frontends would differ about what
+    // can be written (§1, DR-057).
+    let cache = state.cache.clone();
 
     let mut watch = Notifying {
         wire,
@@ -1925,7 +1935,7 @@ fn pack(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answ
         stopped: None,
     };
     wire.cancel.begin(request, None, "pack", Stoppable::Yes);
-    let outcome = commands::pack_from(&from, &archive, force, &mut watch);
+    let outcome = commands::pack_from(&from, &archive, force, cache.as_deref(), &mut watch);
     wire.cancel.finish();
     let report = outcome.map_err(|failure| watch.explain(failure))?;
 
@@ -2102,19 +2112,19 @@ fn forget(state: &mut State, params: &Value) -> Answered {
 }
 
 /// Which of the two ways a commit will go, decided without writing anything.
-enum Decision {
+///
+/// `F` is what the patch writes through, which [`commit`] answers with the
+/// archive itself. [`Opening`] says why it is a parameter.
+enum Decision<F> {
     /// Every edit fits where its entry already sits, and the archive can be
     /// opened for writing.
-    Patch {
-        patches: rpf_core::Patches,
-        file: fs::File,
-    },
+    Patch { patches: rpf_core::Patches, file: F },
     /// One of them does not fit, or the caller asked for a rebuild, or the
     /// archive cannot be opened for writing at all.
     Rebuild,
 }
 
-impl Decision {
+impl<F> Decision<F> {
     /// What the response will report, and what a `cancel` will be told is
     /// running.
     const fn method(&self) -> &'static str {
@@ -2148,11 +2158,55 @@ struct Asked<'a> {
     rebuild: bool,
 }
 
+/// How a commit opens the archive the patch writes through.
+///
+/// A parameter of [`decide`] rather than a call inside it, because the two
+/// registrations a commit makes are only visible from *inside* the operation
+/// they cover: the job is `"commit"` while the decision is being taken, and
+/// `"patch"` from the first byte written. A test that watches for either from
+/// outside is watching a clock — 4,000 entries are patched in the time it takes
+/// a client to be scheduled — and the one that did fails on a loaded machine
+/// and passes on an idle one. Called while the commit is still deciding, and
+/// answering something whose first write is the patch under way, this is where
+/// both are asked deterministically. `commit` answers the archive itself.
+/// DR-008.
+trait Opening<F> {
+    /// Opens the archive at `path` for writing, or says it cannot be.
+    ///
+    /// # Errors
+    ///
+    /// Whatever opening it failed with. A commit reads that as "rebuild
+    /// instead" rather than as a failure.
+    fn open(self, path: &Path) -> io::Result<F>;
+}
+
+impl<F, O> Opening<F> for O
+where
+    O: FnOnce(&Path) -> io::Result<F>,
+{
+    fn open(self, path: &Path) -> io::Result<F> {
+        self(path)
+    }
+}
+
+/// The archive itself, which is what a commit patches. [`Opening`].
+///
+/// A second handle, because the warm one is open for reading: a session that
+/// only lists an archive must not need write permission on it. An archive that
+/// cannot be opened for writing can still be rebuilt beside itself.
+fn archive_for_writing(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).open(path)
+}
+
 /// Decides between patching in place and rebuilding, and writes nothing.
 ///
 /// Taken before the operation is registered as the one a `cancel` can name,
 /// because only one of the two can be stopped. DR-008.
-fn decide(session: &mut Session, asked_to_rebuild: bool) -> crate::exit::Result<Decision> {
+fn decide<F>(
+    session: &mut Session,
+    asked_to_rebuild: bool,
+    open: impl Opening<F>,
+) -> crate::exit::Result<Decision<F>> {
     if asked_to_rebuild {
         return Ok(Decision::Rebuild);
     }
@@ -2160,10 +2214,7 @@ fn decide(session: &mut Session, asked_to_rebuild: bool) -> crate::exit::Result<
     let rpf_core::Plan::Fits(patches) = plan else {
         return Ok(Decision::Rebuild);
     };
-    // A second handle, because the warm one is open for reading: a session that
-    // only lists an archive must not need write permission on it. An archive
-    // that cannot be opened for writing can still be rebuilt beside itself.
-    let Ok(file) = fs::OpenOptions::new().write(true).open(&session.path) else {
+    let Ok(file) = open.open(&session.path) else {
         return Ok(Decision::Rebuild);
     };
     Ok(Decision::Patch { patches, file })
@@ -2222,15 +2273,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 
     let committed = session.pending.len();
 
-    // Registered before the decision as well, because deciding reads and
-    // compresses every buffered edit, and forgotten whatever the outcome.
-    wire.cancel.begin(
-        asked.request,
-        Some(asked.handle),
-        "commit",
-        Stoppable::No(DECIDING),
-    );
-    let outcome = commit_now(session, wire, &asked);
+    let outcome = commit_now(session, wire, &asked, archive_for_writing);
     wire.cancel.finish();
     let method = outcome?;
 
@@ -2254,16 +2297,27 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     }))
 }
 
-/// Decides, registers what it decided so a `cancel` can name it, and does it.
+/// Registers itself, decides, registers what it decided so a `cancel` can name
+/// it, and does it.
 ///
 /// Separate from [`commit`] so that the job is forgotten on the way out whether
 /// this succeeded or not.
-fn commit_now(
+fn commit_now<F: Write + Seek>(
     session: &mut Session,
     wire: &Wire,
     asked: &Asked<'_>,
+    open: impl Opening<F>,
 ) -> crate::exit::Result<&'static str> {
-    let decision = decide(session, asked.rebuild)?;
+    // Registered before the decision as well, because deciding reads and
+    // compresses every buffered edit, and forgotten by the caller whatever the
+    // outcome.
+    wire.cancel.begin(
+        asked.request,
+        Some(asked.handle),
+        "commit",
+        Stoppable::No(DECIDING),
+    );
+    let decision = decide(session, asked.rebuild, open)?;
     let method = decision.method();
     wire.cancel.begin(
         asked.request,
@@ -2391,8 +2445,18 @@ fn rebuild(session: &mut Session, wire: &Wire, asked: &Asked<'_>) -> crate::exit
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::exit::Code;
+
+    /// How long a thread that should never wait is given before it is called
+    /// wedged.
+    ///
+    /// Not a budget for work: every wait these tests forbid is on a channel or
+    /// a condvar and is either taken at once or never. It is here so that a
+    /// thread that does wait fails an assertion instead of hanging a sweep.
+    const WEDGED: Duration = Duration::from_secs(60);
 
     /// A cancelled write, as the library reports one.
     fn cancelled() -> Failure {
@@ -2553,6 +2617,144 @@ mod tests {
         assert_eq!(answer["cancelling"], json!(false), "{answer}");
         assert_eq!(answer["running"], json!("commit"), "{answer}");
         assert_eq!(answer["reason"], json!(DECIDING), "{answer}");
+    }
+
+    /// The archive a commit patches, which answers a `cancel` as it is written
+    /// through.
+    ///
+    /// The first write is the first byte of the patch, so the answer it takes
+    /// is the answer a client would get with the patch under way — without a
+    /// client, a thread, or a sleep. [`Opening`].
+    struct Asking<'a> {
+        file: fs::File,
+        cancel: &'a Cancellation,
+        answered: &'a RefCell<Option<Value>>,
+    }
+
+    impl Write for Asking<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut answered = self.answered.borrow_mut();
+            if answered.is_none() {
+                *answered = Some(self.cancel.ask(None, None));
+            }
+            self.file.write(bytes)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    impl Seek for Asking<'_> {
+        fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+            self.file.seek(to)
+        }
+    }
+
+    #[test]
+    fn a_cancel_during_a_commit_that_patches_is_told_why_it_cannot() {
+        // Two registrations the commit makes for itself, and that the two tests
+        // above cannot reach: it registers before it has decided anything,
+        // because deciding reads and compresses every buffered edit and a
+        // cancel arriving then must not be told nothing is running; and the
+        // patch it decides on registers as one that cannot be stopped, because
+        // a half-applied patch is the corrupt archive §8 exists to prevent.
+        // Dropping either `begin` leaves every other test green.
+        //
+        // Asked from inside the commit, at the two moments a cancel can arrive
+        // in it. Until 2026-08-31 this drove the daemon over a pipe and sprayed
+        // cancels at a 4,000-entry commit on 125-microsecond sleeps, hoping one
+        // would land in each phase, which asserted the speed of the machine
+        // rather than the daemon: it failed on unmodified `main` on a 32-core
+        // box at load 76, passed at load 35, and failed on a two-core runner.
+        // The windows it was racing are these two calls.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test.rpf");
+        let files: Vec<rpf_core::FileSpec> = ["a.txt", "b.txt"]
+            .into_iter()
+            .map(|name| rpf_core::FileSpec {
+                path: name.to_owned(),
+                kind: rpf_core::FileKind::Binary {
+                    storage: rpf_core::Storage::Stored,
+                    encryption: 0,
+                },
+            })
+            .collect();
+        let mut out = fs::File::create(&path).expect("creatable");
+        rpf_core::build(
+            &mut out,
+            rpf_core::Version::Rpf7,
+            &files,
+            &[],
+            |_: &str| Ok(std::io::Cursor::new(b"contents".to_vec())),
+            &mut rpf_core::Unwatched,
+        )
+        .expect("builds");
+        drop(out);
+
+        let (file, archive) = commands::open(&path, None).expect("opens");
+        let id = FileId::of(&file, &path).expect("named");
+        // The same length the entry already holds, so the commit decides to
+        // patch rather than to rebuild.
+        let mut session = Session {
+            path,
+            id,
+            file,
+            archive,
+            pending: Changes::one(
+                "a.txt",
+                Change::Write {
+                    contents: std::sync::Arc::new(rpf_core::Bytes::new(b"replaced".to_vec())),
+                    create: false,
+                    allow_encoding_change: false,
+                },
+            ),
+        };
+
+        let (lines, _queued) = mpsc::channel();
+        let wire = Wire {
+            lines,
+            backlog: Arc::new(Backlog::default()),
+            cancel: Cancellation::default(),
+        };
+        let request = json!(9);
+        let asked = Asked {
+            handle: 1,
+            request: &request,
+            name: &request,
+            progress: false,
+            rebuild: false,
+        };
+
+        let deciding = RefCell::new(None);
+        let patching = RefCell::new(None);
+        let method = commit_now(&mut session, &wire, &asked, |path: &Path| {
+            // Called while the decision is still being taken: the patch is
+            // registered only once this has answered one.
+            *deciding.borrow_mut() = Some(wire.cancel.ask(None, None));
+            archive_for_writing(path).map(|file| Asking {
+                file,
+                cancel: &wire.cancel,
+                answered: &patching,
+            })
+        })
+        .expect("the edit fits where its entry sits");
+        assert_eq!(method, "patch");
+
+        // Nothing in a commit that patches can be stopped, at either moment,
+        // and each says which of the two it is refusing from.
+        let deciding = deciding.into_inner().expect("the commit opened its target");
+        assert_eq!(deciding["cancelling"], json!(false), "{deciding}");
+        assert_eq!(deciding["running"], json!("commit"), "{deciding}");
+        assert_eq!(deciding["reason"], json!(DECIDING), "{deciding}");
+
+        let patching = patching.into_inner().expect("the patch wrote nothing");
+        assert_eq!(patching["cancelling"], json!(false), "{patching}");
+        assert_eq!(patching["running"], json!("patch"), "{patching}");
+        assert_eq!(patching["reason"], json!(PATCHING), "{patching}");
+        assert_eq!(patching["handle"], json!(1), "{patching}");
+
+        assert!(!wire.cancel.stopped(), "a patch was marked cancelled");
     }
 
     #[test]
@@ -2781,5 +2983,126 @@ mod tests {
             .filter(|line| matches!(**line, Outgoing::Answer { counted: true, .. }))
             .count();
         assert_eq!(counted, 1, "only the worker's answer is counted");
+    }
+
+    #[test]
+    fn a_client_that_stops_reading_cannot_wedge_the_daemon() {
+        // Standard output was written under a lock held across the write, so a
+        // client that stopped draining it blocked the worker with the lock
+        // held — and the reading thread then blocked on the same lock
+        // answering the cancel, which is what turned backpressure into a
+        // deadlock. Nothing was read from standard input again, the cancel
+        // included.
+        //
+        // Asked of the reading thread directly, with the wire as far behind as
+        // it can be. Until 2026-08-31 this drove the daemon over a pipe,
+        // rebuilt a 3,000-entry archive, slept 500 milliseconds hoping the
+        // worker was blocked in a write by then, and gave a megabyte 8 seconds
+        // to be accepted — which asserted the speed of the machine as much as
+        // the daemon. What it was racing is this: `reading` reaches the end of
+        // its input while an answer bigger than the whole allowance sits
+        // unread, because nothing it does waits for the client.
+        //
+        // Nobody reads a byte of standard output for the rest of this test.
+        let (wire, backlog, queued) = unread();
+        wire.answer(&json!({"jsonrpc": "2.0", "id": 2, "result": {
+            "bytes": "x".repeat(ANSWER_BACKLOG)}}));
+        assert!(*backlog.answers() > ANSWER_BACKLOG);
+        let held = *backlog.answers();
+
+        // A rebuild is running, and it is the one the cancel below names.
+        wire.cancel
+            .begin(&json!(3), Some(1), "rebuild", Stoppable::Yes);
+
+        // It goes on reporting progress the whole time, and progress is the one
+        // thing on this wire that may be dropped: a client that was not reading
+        // does not receive one notification per entry after the fact either.
+        let reported = 3000;
+        let kept = (0..reported)
+            .filter(|done| {
+                wire.progress(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "progress",
+                    "params": {"handle": 1, "done": done, "total": reported},
+                }))
+            })
+            .count();
+        assert_eq!(
+            kept, PROGRESS_BACKLOG,
+            "notifications were kept for a client that was not reading"
+        );
+
+        // The commit's own answer waits for room, because the worker is the one
+        // thread that may.
+        let (done, finished) = mpsc::channel::<()>();
+        let committing = Arc::clone(&wire);
+        let worker = thread::spawn(move || {
+            committing.answer(&json!({"jsonrpc": "2.0", "id": 3, "result": {"method": "rebuild"}}));
+            let _ = done.send(());
+        });
+
+        // The reading thread does not: it answers the cancel where it stands
+        // and accepts the megabyte behind it. A wedged one never reaches the
+        // end of this input.
+        let requests = format!(
+            "{}\n{}\n",
+            json!({"jsonrpc": "2.0", "id": 4, "method": "cancel", "params": {"handle": 1}}),
+            json!({"jsonrpc": "2.0", "id": 5, "method": "write", "params": {
+                "handle": 1, "path": "bulk/0001.bin", "bytes": BASE64.encode(vec![7_u8; 1 << 20])}}),
+        );
+        let (queue, incoming) = mpsc::channel::<Incoming>();
+        let reader = Arc::clone(&wire);
+        let reading_thread = thread::spawn(move || {
+            reading(io::Cursor::new(requests), &reader, &queue);
+        });
+
+        // A budget only so that a reading thread that does wait fails here
+        // rather than hanging for ever: a correct one does no waiting at all,
+        // so what it measures is not the speed of this machine.
+        let accepted = incoming
+            .recv_timeout(WEDGED)
+            .expect("the megabyte behind the cancel was accepted");
+        let Incoming::Request(line) = accepted else {
+            panic!("standard input ended instead of carrying the request");
+        };
+        assert!(
+            line.contains("\"id\":5"),
+            "the wrong line reached the worker"
+        );
+        reading_thread.join().expect("the reading thread finished");
+
+        assert!(
+            wire.cancel.stopped(),
+            "the cancel never reached the rebuild"
+        );
+        assert_eq!(
+            *backlog.answers(),
+            held,
+            "the reading thread's answer was counted against the backlog"
+        );
+
+        // Every line is queued and the cancel's is the last of them: the
+        // worker's answer, sixty-four notifications, then the cancel answer.
+        let written: Vec<Outgoing> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
+        assert_eq!(written.len(), 1 + PROGRESS_BACKLOG + 1);
+        let Some(Outgoing::Answer { text, counted }) = written.last() else {
+            panic!("the cancel was never answered");
+        };
+        assert!(!counted, "a cancel answer was weighed against the backlog");
+        let answer: Value = serde_json::from_str(text).expect("a JSON object");
+        assert_eq!(answer["id"], json!(4), "{answer}");
+        assert_eq!(answer["result"]["cancelling"], json!(true), "{answer}");
+
+        // And the commit is answered as soon as the client reads what it was
+        // holding: waiting for room is backpressure, not a deadlock.
+        let Some(Outgoing::Answer { text, .. }) = written.first() else {
+            panic!("the answer the client was not reading was not queued");
+        };
+        backlog.wrote(text.len());
+        assert!(
+            finished.recv_timeout(WEDGED).is_ok(),
+            "the commit was never answered once there was room for it"
+        );
+        worker.join().expect("the worker finished");
     }
 }

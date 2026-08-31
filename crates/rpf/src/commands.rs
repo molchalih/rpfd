@@ -1178,8 +1178,14 @@ pub fn extract_into<R: std::io::Read + std::io::Seek>(
 }
 
 /// `pack` — build an archive from a tree and its manifest.
-pub fn pack(from: &Path, archive_path: &Path, force: bool, json_out: bool) -> Result<()> {
-    let report = pack_from(from, archive_path, force, &mut OnStderr::new())?;
+pub fn pack(
+    from: &Path,
+    archive_path: &Path,
+    force: bool,
+    named_cache: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
+    let report = pack_from(from, archive_path, force, named_cache, &mut OnStderr::new())?;
 
     if json_out {
         emit(&json!({
@@ -1202,20 +1208,29 @@ pub fn pack(from: &Path, archive_path: &Path, force: bool, json_out: bool) -> Re
 /// The archive is written at the version the manifest names, so a tree
 /// extracted from one version cannot be packed as another. DR-018.
 ///
+/// A tree whose manifest names an encrypted tag packs back under that tag's own
+/// transform, and reaches key material the way every other command does:
+/// [`unlock_for`], over `--cache-dir` or the platform's own cache, read only
+/// where the tag names a transform this build can write forwards. `pack` opens
+/// no archive, so the name that unlock carries is the **output** archive's —
+/// which no AES key is a function of, and no tag this route accepts is
+/// (DR-054 §2, DR-057).
+///
 /// # Errors
 ///
 /// [`Failure::GameInstall`] unless `force`, [`Failure::Io`] for a file in the
-/// manifest that is not in the tree, and as `rpf_core::build`.
+/// manifest that is not in the tree, and as `rpf_core::Manifest::pack_into`.
 pub fn pack_from(
     from: &Path,
     archive_path: &Path,
     force: bool,
+    named_cache: Option<&Path>,
     watch: &mut impl Watch,
 ) -> Result<rpf_core::Report> {
     refuse_game_install(archive_path, force)?;
 
     let manifest = manifest_in(from)?;
-    let specs = manifest.specs();
+    let unlock = unlock_for(archive_path, named_cache);
 
     let directory = archive_path.parent().unwrap_or_else(|| Path::new("."));
     let mut scratch = tempfile::NamedTempFile::new_in(directory).map_err(|source| Failure::Io {
@@ -1230,11 +1245,9 @@ pub fn pack_from(
     // schema 2 and which a schema-1 manifest is read as. DR-018: a tree
     // extracted from one version must not be packed as another, and this is
     // where that is honoured rather than defaulted.
-    let report = rpf_core::build(
+    let report = manifest.pack_into(
         scratch.as_file_mut(),
-        manifest.version,
-        &specs,
-        &manifest.directories,
+        &unlock,
         |wanted: &str| {
             let source_path = from.join(wanted);
             match fs::File::open(&source_path) {

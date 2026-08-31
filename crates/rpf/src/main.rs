@@ -251,7 +251,7 @@ fn main() -> ExitCode {
             ref from,
             ref archive,
             force,
-        } => commands::pack(from, archive, force, cli.json),
+        } => commands::pack(from, archive, force, cache, cli.json),
         Command::Serve { stdio } => {
             if stdio {
                 serve::run(cache)
