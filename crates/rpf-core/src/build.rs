@@ -16,6 +16,7 @@ use std::{
 };
 
 use flate2::{Compression, write::DeflateEncoder};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     archive::{Archive, MAX_DEPTH},
@@ -72,12 +73,57 @@ pub enum FileKind {
 /// `docs/rpf-format.md`, Resource page flags: [`crate::format::resource_len`]
 /// reads a length out of them and the version is their two top nibbles, so
 /// carrying the pair carries both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceFlags {
     /// System page flags — offset 8 of the entry row, and of the header.
+    #[serde(with = "flag_word")]
     pub system: u32,
     /// Graphics page flags — offset 12 of the entry row, and of the header.
+    #[serde(with = "flag_word")]
     pub graphics: u32,
+}
+
+/// A flag word as anything outside the archive spells it: `0x` and eight
+/// lower-case hexadecimal digits, fixed width.
+///
+/// This is the one value the sidecar manifest holds whose *bits* mean things —
+/// `page_count` decodes nine fields out of one word — so it is written the way
+/// `docs/rpf-format.md`, DR-046 and this module's own tests write it, and a
+/// reviewer comparing a manifest line against any of them reads the same
+/// characters. A width that is not eight is refused rather than padded or
+/// truncated, because a dropped digit in a fixed-width word is a resource of
+/// another length and another version. DR-058 §1.
+mod flag_word {
+    use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "the signature is serde's, not this module's"
+    )]
+    pub(super) fn serialize<S: Serializer>(
+        word: &u32,
+        out: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        out.collect_str(&format_args!("{word:#010x}"))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        text: D,
+    ) -> std::result::Result<u32, D::Error> {
+        let text = String::deserialize(text)?;
+        let spelled = "a page-flag word is 0x and eight lower-case hexadecimal digits";
+        let digits = text
+            .strip_prefix("0x")
+            .ok_or_else(|| D::Error::custom(spelled))?;
+        if digits.len() != 8
+            || !digits
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return Err(D::Error::custom(spelled));
+        }
+        u32::from_str_radix(digits, 16).map_err(|_| D::Error::custom(spelled))
+    }
 }
 
 /// One file to put in the archive.

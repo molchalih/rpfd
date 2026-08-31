@@ -688,6 +688,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_row_is_a_cipher_block_only_because_three_numbers_agree() {
+        // `Version::row_is_a_cipher_block` reads as a property of the format
+        // and is a coincidence of three constants, which is what its doc
+        // comment says and what nothing checked. A mutation sweep of `93c5006`
+        // found both of its operands unkillable — `Version` has one variant, so
+        // `-> true` and `&& -> ||` are indistinguishable for every input that
+        // exists — and an equivalent mutant is not a missing test for the
+        // function. It is a missing test for the coincidence: an in-place patch
+        // of one row of an encrypted table is sound only while these three
+        // agree, so a change to any of them fails here rather than in an
+        // archive the game refuses to load.
+        assert_eq!(rpf7::ROW_LEN, crypto::CIPHER_BLOCK_LEN);
+        assert_eq!(rpf7::HEADER_LEN % crypto::CIPHER_BLOCK_LEN, 0);
+        assert!(Version::Rpf7.row_is_a_cipher_block());
+    }
+
+    #[test]
     fn a_field_read_past_the_end_is_none_rather_than_a_panic() {
         // §6: the buffer is an archive's bytes, and an entry table can end
         // mid-row. Every one of these is a slice index in disguise.

@@ -28,7 +28,7 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, FileKind, FileSpec, ResourceFlags, Unlock, Unwatched,
+    Archive, EntryKind, FileKind, FileSpec, Manifest, ResourceFlags, Unlock, Unwatched,
     format::{
         resource::{RESOURCE_HEADER_LEN, RESOURCE_HEADER_LENS, resource_len},
         rpf7::{RESOURCE_FLAG, ROW_LEN},
@@ -613,6 +613,150 @@ fn a_verify_inflates_a_resource_once_where_a_read_of_it_pays_twice() {
          peeks at for a nested archive; it asked for {walked} against a \
          {once}-byte stream"
     );
+}
+
+/// The flag words of every resource entry of an archive, by path.
+fn rows_of(bytes: &[u8]) -> BTreeMap<String, (u32, u32)> {
+    let mut src = Cursor::new(bytes.to_vec());
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
+    (1..archive.entries().len() as u32)
+        .filter_map(|index| match archive.entry(index).expect("in range").kind {
+            EntryKind::Resource {
+                system_flags,
+                graphics_flags,
+                ..
+            } => Some((
+                archive.path(index).expect("named"),
+                (system_flags, graphics_flags),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every entry of an archive as the file `extract` writes into a tree, by path
+/// — the payload itself for a resource, which is what packing it back reads.
+fn extracted_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let mut src = Cursor::new(bytes.to_vec());
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
+    (1..archive.entries().len() as u32)
+        .map(|index| {
+            let name = archive.path(index).expect("named");
+            (name, archive.extract(&mut src, index).expect("extracts"))
+        })
+        .collect()
+}
+
+/// Packs the tree `manifest` describes, taking each payload from `contents`.
+fn pack(manifest: &Manifest, contents: &BTreeMap<String, Vec<u8>>) -> rpf_core::Result<Vec<u8>> {
+    let held = contents.clone();
+    let mut out = Cursor::new(Vec::new());
+    manifest.pack_into(
+        &mut out,
+        &Unlock::unkeyed(),
+        move |wanted: &str| Ok(Cursor::new(held.get(wanted).cloned().unwrap_or_default())),
+        &mut Unwatched,
+    )?;
+    Ok(out.into_inner())
+}
+
+/// The round trip DR-058 exists for, and the one `extract` followed by `pack`
+/// has never been: a resource whose payload carries no `RSC7` header packs back
+/// from the words its manifest recorded, into the row it came out of.
+#[test]
+fn a_resource_packs_from_the_flag_words_its_manifest_records() {
+    let bytes = archive_of(&[MEASURED[0]]);
+    let mut src = Cursor::new(bytes.clone());
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
+    let manifest = Manifest::of(&archive).expect("derives");
+    assert_eq!(
+        manifest.entries.first().and_then(|entry| entry.flags),
+        Some(ResourceFlags {
+            system: SYSTEM_FLAGS,
+            graphics: GRAPHICS_FLAGS,
+        }),
+        "the words the row declared are what the manifest records"
+    );
+
+    let extracted = extracted_of(&bytes);
+    let packed = pack(&manifest, &extracted).expect("the tree packs back");
+
+    assert_eq!(
+        rows_of(&packed),
+        rows_of(&bytes),
+        "the rebuilt row must declare what the one it came from declared"
+    );
+    assert_eq!(
+        extracted_of(&packed),
+        extracted,
+        "and the payload goes through untouched"
+    );
+}
+
+/// A tree extracted by a build that recorded no flag words still reads, and is
+/// refused where the fact is missing rather than where the file is.
+///
+/// The refusal is the unchanged [`rpf_core::Error::NotAResource`]: what is not
+/// recorded is never guessed at, because a guessed version produces an archive
+/// that parses, packs, verifies and does not load. DR-058 §3.
+#[test]
+fn a_tree_whose_manifest_records_no_flag_words_is_refused_at_the_entry_that_lacks_them() {
+    let bytes = archive_of(&[MEASURED[0]]);
+    let mut src = Cursor::new(bytes.clone());
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
+    let mut manifest = Manifest::of(&archive).expect("derives");
+    manifest.schema = 3;
+    for entry in &mut manifest.entries {
+        entry.flags = None;
+    }
+
+    let extracted = extracted_of(&bytes);
+    match pack(&manifest, &extracted) {
+        Err(rpf_core::Error::NotAResource { ref path, reason }) => {
+            assert_eq!(path, "r0.ydr", "the refusal names the entry that lacks it");
+            assert_eq!(
+                reason,
+                "the payload carries no RSC7 header and no entry declares its \
+                 page flags"
+            );
+        }
+        other => panic!("expected a refusal naming the entry, got {other:?}"),
+    }
+}
+
+/// DR-046 §1's first arm still wins, so a schema-3 tree of resources that carry
+/// their own headers keeps packing: the field records what a payload cannot
+/// say, and says nothing about one that can.
+#[test]
+fn a_resource_that_carries_its_own_header_packs_from_a_manifest_that_records_none() {
+    let mut payload = b"RSC7".to_vec();
+    payload.extend_from_slice(&162_u32.to_le_bytes());
+    payload.extend_from_slice(&SYSTEM_FLAGS.to_le_bytes());
+    payload.extend_from_slice(&GRAPHICS_FLAGS.to_le_bytes());
+    payload.extend_from_slice(&deflated_page());
+    let bytes = build_one(
+        FileKind::Resource {
+            declared: Some(ResourceFlags {
+                system: SYSTEM_FLAGS,
+                graphics: GRAPHICS_FLAGS,
+            }),
+        },
+        &payload,
+    )
+    .expect("builds");
+
+    let mut src = Cursor::new(bytes.clone());
+    let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
+    let mut manifest = Manifest::of(&archive).expect("derives");
+    manifest.schema = 3;
+    for entry in &mut manifest.entries {
+        entry.flags = None;
+    }
+
+    let extracted = extracted_of(&bytes);
+    let packed = pack(&manifest, &extracted).expect("a header-carrying resource packs");
+    assert_eq!(rows_of(&packed), rows_of(&bytes));
+    assert_eq!(extracted_of(&packed), extracted);
 }
 
 /// Builds a one-entry archive holding `payload` at `r0.ydr`.

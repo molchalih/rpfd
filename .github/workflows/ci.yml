@@ -110,8 +110,8 @@ jobs:
           cargo test --all 2>&1 | tee suite.log
           skipped=$(grep -c 'ignored, no RPF_CORPUS' suite.log || true)
           grep 'ignored, no RPF_CORPUS' suite.log || true
-          test "$skipped" -eq 12 \
-            || { echo "expected 12 corpus tests to report themselves skipped, got $skipped"; exit 1; }
+          test "$skipped" -eq 13 \
+            || { echo "expected 13 corpus tests to report themselves skipped, got $skipped"; exit 1; }
 
   # `missing_docs` is on, so every public item has a doc comment, and a doc
   # comment is where a reader looks for a contract. A broken link in one is

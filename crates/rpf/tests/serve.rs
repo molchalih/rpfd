@@ -4367,14 +4367,11 @@ fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
     // And the same flag reaches `pack`, which is §1 for DR-057: the daemon
     // takes the cache from the process it was started with, exactly as `open`
     // does — DR-041 is what says the wire is not widened per method. What says
-    // the flag arrived is **which** refusal comes back: this archive holds nine
-    // resources whose payloads carry no `RSC7` header, and the manifest schema
-    // records only that an entry is a resource, so the material is found, the
-    // seal is made, and the build stops at the first resource for want of its
-    // page flags (`NotAResource`) rather than at the key (`NeedsKey`, below).
-    // The tree that packs all the way back over this wire is the launcher's, in
-    // `the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource`.
-    // DR-004 owns the missing half.
+    // the flag arrived is that the tree packs at all: this archive holds nine
+    // resources whose payloads carry no `RSC7` header, so the material has to
+    // be found for the seal and the manifest's page-flag words have to be read
+    // for the rows (DR-058). Without the cache the same request answers
+    // `NeedsKey` instead, below.
     let tree = dir.path().join("tree").display().to_string();
     let packed = dir.path().join("packed.rpf").display().to_string();
     let mut started = daemon();
@@ -4395,16 +4392,8 @@ fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
     )
     .0;
     let repacked = answer(&responses, 3);
-    assert_eq!(repacked["error"]["code"], json!(6), "{repacked}");
-    assert_eq!(
-        repacked["error"]["data"]["reason"],
-        json!("NotAResource"),
-        "{repacked}"
-    );
-    assert!(
-        !Path::new(&packed).exists(),
-        "a refused pack wrote an archive"
-    );
+    assert_eq!(repacked["result"]["entries"], json!(11), "{repacked}");
+    assert!(Path::new(&packed).exists(), "the pack wrote no archive");
 
     // With no cache to reach, the same request answers for the material rather
     // than writing a cleartext archive under an encrypted tag: exit code 5's

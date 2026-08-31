@@ -1,13 +1,17 @@
 //! The sidecar manifest: what an extracted tree cannot say for itself.
 //!
-//! DR-004. An extracted file carries its own contents, and a resource carries
-//! its flags and version inside its `RSC7` header, so the manifest is not the
-//! route for those. What it is the only route for:
+//! DR-004. An extracted file carries its own contents, and a resource that
+//! carries an `RSC7` header of its own carries its flags and version in it, so
+//! for those the manifest is the second route rather than the first. What it is
+//! the only route for:
 //!
 //! - whether an entry was **stored or deflated**, which the contents cannot say;
 //! - the per-entry **encryption** word;
-//! - the **resource bit** for an entry whose payload is not `RSC7`, which is
-//!   `docs/backlog.md` Q7 and has no observed instance yet;
+//! - the **resource bit** for an entry whose payload is not `RSC7`, which
+//!   `docs/backlog.md` Q7 measured at 696,578 of 696,578 Rockstar resources;
+//! - that entry's two **page-flag words**, which are its whole statement of its
+//!   own length and version and which a payload with no header of its own
+//!   states nowhere else. DR-058;
 //! - **empty directories**, which a tree of files loses;
 //! - the **container version** and the **codec** the tree came out of, which
 //!   nothing on disk carries and which a tree extracted from one version must
@@ -31,7 +35,8 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     archive::Archive,
     build::{
-        Fetch, FileKind, FileSpec, Report, Storage, Under, build_under, directories_of, specs_of,
+        Fetch, FileKind, FileSpec, Report, ResourceFlags, Storage, Under, build_under,
+        directories_of, specs_of,
     },
     entry::EntryKind,
     error::{Error, NoWrite, Result},
@@ -54,7 +59,14 @@ pub const MANIFEST_NAME: &str = ".rpf-manifest.json";
 /// reader that does packs a tree as a version nobody said it was. R11.3.
 /// [`ManifestEntry::checksum`] took it to 3 for the reason DR-023 gives: a
 /// reader that ignores it verifies less than it says it did.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// [`ManifestEntry::flags`] took it to 4 for a fact only the number can carry:
+/// the same tree packs differently depending on which build extracted it, and
+/// its files are byte-identical either way. A tree extracted at schema 3
+/// refuses at its first Rockstar resource and the same tree re-extracted
+/// refuses nothing, so a caller who has to be told to re-extract has to be told
+/// it from the manifest. DR-058 §2.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The oldest schema this build reads.
 ///
@@ -69,6 +81,12 @@ pub const SCHEMA_VERSION: u32 = 3;
 /// Schema 2 carried no checksum, and 1 is still the oldest read: a manifest
 /// without one is a manifest that recorded none, which is a thing a reader can
 /// act on rather than a thing it has to guess. `schema_2_checksum`, DR-023.
+///
+/// Schema 3 carried no page-flag words, and 1 is still the oldest read for the
+/// same reason and one more: refusing such a manifest would refuse whole trees
+/// that pack correctly today — a resource whose payload carries its own `RSC7`
+/// header needs no field here at all — over entries that are fine.
+/// `schema_3_flags`, DR-058 §3.
 pub const OLDEST_SCHEMA: u32 = 1;
 
 /// The container version a manifest that does not name one was written from.
@@ -90,6 +108,20 @@ fn schema_1_codec() -> Codec {
 /// a stated migration rule with a record attached, never the `Default` impl of
 /// an unrelated type. DR-023.
 fn schema_2_checksum() -> Option<Checksum> {
+    None
+}
+
+/// The page flags an entry that does not carry them has: **none were
+/// recorded**.
+///
+/// Not zeros, and not a value derived from the payload. Both of those are a
+/// guess at a resource's length and its version, and the version is what tells
+/// the game's loader which deserialiser to run — so a guess produces an archive
+/// that parses, packs, verifies and does not load. What is not recorded is
+/// refused at the entry that lacks it instead. `schema_2_checksum` is the same
+/// rule for the same reason, DR-018 is why it is a named function, and DR-058
+/// §3 is why the value is `None`.
+fn schema_3_flags() -> Option<ResourceFlags> {
     None
 }
 
@@ -214,6 +246,18 @@ pub struct ManifestEntry {
     pub path: String,
     /// Binary or resource.
     pub class: EntryClass,
+    /// The two page-flag words the entry's row declared, when they were
+    /// recorded.
+    ///
+    /// A resource's whole statement of its own length and version
+    /// (`docs/rpf-format.md`, Resource page flags), verbatim, because the
+    /// mapping from a word to a page count and a base page size is many-to-one
+    /// and a decomposition could not be put back. `None` means **none were
+    /// recorded**, which is every schema-3 manifest and what a binary entry
+    /// always says; a binary entry that carries them is refused rather than
+    /// read. `schema_3_flags`, DR-058.
+    #[serde(default = "schema_3_flags", skip_serializing_if = "Option::is_none")]
+    pub flags: Option<ResourceFlags>,
     /// Stored or deflated. A resource is always stored as it is; the field is
     /// recorded anyway so the row reads the same for both kinds.
     pub storage: StorageKind,
@@ -353,10 +397,19 @@ impl Manifest {
                 FileKind::Binary { encryption, .. } => encryption,
                 FileKind::Resource { .. } => 0,
             };
+            // From the specification and not from the entry a second time:
+            // `build::kind_of` is the one place a row's flag words are read off
+            // an entry, and asking twice is two encodings of one fact
+            // (§3, DR-046).
+            let flags = match spec.kind {
+                FileKind::Resource { declared } => declared,
+                FileKind::Binary { .. } => None,
+            };
             entries.push(ManifestEntry {
                 checksum: recorded.get(&spec.path).copied(),
                 path: spec.path,
                 class,
+                flags,
                 storage,
                 encryption,
             });
@@ -403,6 +456,23 @@ impl Manifest {
         Ok(())
     }
 
+    /// Refuses a binary entry that declares page flags.
+    ///
+    /// Not ignored: no manifest this build has ever written can carry one, so
+    /// there is no migration to weigh against it, and the value would otherwise
+    /// sit in the file reading as though something used it. DR-058 §4.
+    fn check_flags(&self) -> Result<()> {
+        for entry in &self.entries {
+            if entry.class == EntryClass::Binary && entry.flags.is_some() {
+                return Err(Error::BadPath {
+                    path: entry.path.clone(),
+                    reason: "is a binary entry and declares resource page flags",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The build specification this manifest describes.
     #[must_use]
     pub fn specs(&self) -> Vec<FileSpec> {
@@ -411,13 +481,9 @@ impl Manifest {
             .map(|entry| FileSpec {
                 path: entry.path.clone(),
                 kind: match entry.class {
-                    // `None`, because schema 3 records that an entry is a
-                    // resource and not what its flag words are. A tree packed
-                    // from an archive whose resources carry no `RSC7` header —
-                    // every Rockstar archive (Q7) — is therefore still refused
-                    // by `store`, and the sidecar is where that would be
-                    // answered. DR-004, DR-046.
-                    EntryClass::Resource => FileKind::Resource { declared: None },
+                    EntryClass::Resource => FileKind::Resource {
+                        declared: entry.flags,
+                    },
                     EntryClass::Binary => FileKind::Binary {
                         storage: match entry.storage {
                             StorageKind::Stored => Storage::Stored,
@@ -552,13 +618,15 @@ impl Manifest {
     ///
     /// A schema-1 or schema-2 manifest records no checksum for any entry, and a
     /// schema-3 one may record none for some of them. Both read, and both mean
-    /// the same thing — [`ManifestEntry::checksum`].
+    /// the same thing — [`ManifestEntry::checksum`]. A manifest below schema 4
+    /// records no page-flag words either, and reads the same way:
+    /// [`ManifestEntry::flags`].
     ///
     /// # Errors
     ///
     /// [`Error::BadPath`] when the text is not a manifest, names a schema this
-    /// build does not read, or names a path that could not be one file on a
-    /// host, and [`Error::CannotWriteEncrypted`] when it describes an encrypted
+    /// build does not read, names a path that could not be one file on a host,
+    /// or declares page flags on a binary entry, and [`Error::CannotWriteEncrypted`] when it describes an encrypted
     /// archive, which nothing here can write back yet.
     pub fn from_json(text: &str) -> Result<Self> {
         let manifest: Self = serde_json::from_str(text).map_err(|_| Error::BadPath {
@@ -584,6 +652,7 @@ impl Manifest {
         // fetches a payload, and this is earlier still, so a read from a name
         // no host should hold does not happen at all.
         manifest.check_host_names()?;
+        manifest.check_flags()?;
         Ok(manifest)
     }
 }
@@ -623,6 +692,7 @@ mod tests {
                 .map(|(path, _)| ManifestEntry {
                     path: (*path).to_owned(),
                     class: EntryClass::Binary,
+                    flags: None,
                     storage: if path.contains(".txt") {
                         StorageKind::Deflate
                     } else {
@@ -668,6 +738,7 @@ mod tests {
                 ManifestEntry {
                     path: "data/vehicles.meta".to_owned(),
                     class: EntryClass::Binary,
+                    flags: None,
                     storage: StorageKind::Deflate,
                     encryption: 0,
                     checksum: Some(Checksum::of(b"hello there")),
@@ -675,6 +746,7 @@ mod tests {
                 ManifestEntry {
                     path: "x64/a.yft".to_owned(),
                     class: EntryClass::Resource,
+                    flags: None,
                     storage: StorageKind::Stored,
                     encryption: 0,
                     checksum: None,
@@ -890,6 +962,118 @@ mod tests {
             let index = archive.find(path).expect("the entry resolves");
             assert_eq!(archive.read(&mut source, index).expect("reads"), expected);
         }
+    }
+
+    #[test]
+    fn a_resources_flag_words_survive_the_manifests_own_json() {
+        // The fact a tree cannot carry: a Rockstar resource's payload begins
+        // with no `RSC7` header (Q7), so its two flag words exist nowhere but
+        // the row it came out of. DR-058.
+        let manifest = Manifest {
+            schema: SCHEMA_VERSION,
+            version: Version::Rpf7,
+            codec: Codec::Deflate,
+            encryption: Version::Rpf7.open(),
+            directories: vec![],
+            entries: vec![ManifestEntry {
+                path: "des_canister.ytyp".to_owned(),
+                class: EntryClass::Resource,
+                flags: Some(ResourceFlags {
+                    system: 0x0002_0000,
+                    graphics: 0xd000_0000,
+                }),
+                storage: StorageKind::Stored,
+                encryption: 0,
+                checksum: None,
+            }],
+        };
+        let text = manifest.to_json().expect("renders");
+        // The spelling is pinned and not just the value: `docs/rpf-format.md`,
+        // DR-046 and `rpf ls --json` all write these words this way, so a
+        // reviewer comparing a manifest line against any of them is reading the
+        // same characters.
+        assert!(text.contains("\"system\": \"0x00020000\""), "{text}");
+        assert!(text.contains("\"graphics\": \"0xd0000000\""), "{text}");
+        assert_eq!(Manifest::from_json(&text).expect("parses"), manifest);
+
+        // And it reaches the build specification, which is the whole point of
+        // recording it: the row is created from the manifest's words.
+        assert_eq!(
+            manifest.specs().first().map(|spec| spec.kind),
+            Some(FileKind::Resource {
+                declared: Some(ResourceFlags {
+                    system: 0x0002_0000,
+                    graphics: 0xd000_0000,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn a_flag_word_that_is_not_eight_hex_digits_is_refused_rather_than_padded() {
+        // A dropped digit is what this refusal is for. Every bit of these words
+        // is spoken for — nine fields decoded out of one of them — so a value
+        // read as anything but the eight digits written is a resource of
+        // another length and another version. DR-058 §1.
+        for bad in [
+            "",
+            "0x2000",
+            "131072",
+            "0xzzzzzzzz",
+            "0X00020000",
+            "0x0002000A",
+        ] {
+            let text = format!(
+                r#"{{"schema":4,"version":"rpf7","codec":"deflate",
+                     "encryption":1313165391,"directories":[],
+                     "entries":[{{"path":"a.ydr","class":"resource",
+                                  "flags":{{"system":"{bad}","graphics":"0xd0000000"}},
+                                  "storage":"stored","encryption":0}}]}}"#
+            );
+            assert!(
+                matches!(Manifest::from_json(&text), Err(Error::BadPath { .. })),
+                "{bad:?} is not a flag word"
+            );
+        }
+    }
+
+    #[test]
+    fn a_schema_3_manifest_reads_and_records_no_flag_words() {
+        // Every tree extracted before DR-058, and the reason `OLDEST_SCHEMA`
+        // stays 1: a manifest that recorded no flag words is read as having
+        // recorded none, and refuses at the entry that lacks them rather than
+        // at the file. DR-018.
+        let text = r#"{"schema":3,"version":"rpf7","codec":"deflate",
+                       "encryption":1313165391,"directories":[],
+                       "entries":[{"path":"a.ydr","class":"resource",
+                                   "storage":"stored","encryption":0}]}"#;
+        let manifest = Manifest::from_json(text).expect("schema 3 still reads");
+        assert_eq!(manifest.schema, 3);
+        assert_eq!(manifest.entries.first().and_then(|entry| entry.flags), None);
+        assert_eq!(
+            manifest.specs().first().map(|spec| spec.kind),
+            Some(FileKind::Resource { declared: None }),
+            "a manifest that recorded none says exactly that, at both ends",
+        );
+    }
+
+    #[test]
+    fn a_binary_entry_that_carries_flag_words_is_refused() {
+        // Not ignored: no manifest that has ever been written can carry one, so
+        // the value would sit in the file reading as though it did something.
+        // The asymmetry with the schema-3 rule above is the difference between
+        // a fact not recorded and a contradiction. DR-058 §4.
+        let text = r#"{"schema":4,"version":"rpf7","codec":"deflate",
+                       "encryption":1313165391,"directories":[],
+                       "entries":[{"path":"a.txt","class":"binary",
+                                   "flags":{"system":"0x00020000",
+                                            "graphics":"0xd0000000"},
+                                   "storage":"stored","encryption":0}]}"#;
+        let error = Manifest::from_json(text).expect_err("a binary entry declares no page flags");
+        assert!(
+            matches!(error, Error::BadPath { ref path, .. } if path == "a.txt"),
+            "{error:?}"
+        );
     }
 
     #[test]

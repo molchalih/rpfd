@@ -836,6 +836,74 @@ fn extract_then_pack_preserves_the_tree() {
     }
 }
 
+/// R4.17 and DR-058, through the binary: a tree extracted from an archive
+/// holding a Rockstar resource packs back, and the row it packs back into
+/// declares the words the row it came out of declared.
+///
+/// Here rather than only in `rpf-core` for the reason DR-046 measured on this
+/// same rule: a mutation of where a resource's flag words come from left the
+/// whole of `rpf-core` green and failed only a subprocess test.
+#[test]
+fn extract_then_pack_preserves_a_resources_page_flags() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    let resource = make_rockstar_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let tree = dir.path().join("tree");
+    let (code, err) = run_err(&["extract", &archive, &tree.display().to_string()]);
+    assert_eq!(code, 0, "extract: {err}");
+
+    // The manifest carries them in the spelling every other document uses, so
+    // a reader diffing it against `docs/rpf-format.md` reads the same
+    // characters. DR-058 §1.
+    let manifest = fs::read_to_string(tree.join(rpf_core::MANIFEST_NAME)).expect("manifest");
+    assert!(
+        manifest.contains("\"system\": \"0xa8000000\""),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("\"graphics\": \"0x20000000\""),
+        "{manifest}"
+    );
+
+    let packed = dir.path().join("packed.rpf");
+    let (code, err) = run_err(&[
+        "pack",
+        &tree.display().to_string(),
+        &packed.display().to_string(),
+    ]);
+    assert_eq!(code, 0, "pack: {err}");
+    assert_eq!(
+        run(&["verify", &packed.display().to_string()]).0,
+        0,
+        "verify"
+    );
+
+    // The payload went through untouched, and the row still describes it.
+    assert_eq!(
+        run(&["cat", &packed.display().to_string(), "art.ydr"]).1,
+        resource,
+        "the resource changed across extract and pack"
+    );
+    let mut file = fs::File::open(&packed).expect("the packed archive opens");
+    let opened =
+        rpf_core::Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("it parses");
+    let index = opened.find("art.ydr").expect("resolves");
+    let kind = opened.entry(index).expect("in range").kind;
+    assert!(
+        matches!(
+            kind,
+            rpf_core::EntryKind::Resource {
+                system_flags: 0xA800_0000,
+                graphics_flags: 0x2000_0000,
+                ..
+            }
+        ),
+        "the packed row declares something else: {kind:?}"
+    );
+}
+
 #[test]
 fn an_empty_directory_survives_extract_and_pack() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3118,8 +3186,10 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
     // from the bytes on disk. A rebuild that wrote the table of contents in the
     // clear, or a patch that wrote a plaintext payload, fails at the `cat`.
     //
-    // `pack` is the one write that still refuses, and for a different reason:
-    // it builds from a tree and opens no archive, so it holds no key. DR-054.
+    // All three write paths, `pack` included: it builds from a tree and opens
+    // no archive, so what it packs back is what the tree's own manifest says
+    // — the key from the cache (DR-057) and the resources' page flags from the
+    // manifest (DR-058).
     let test = "an_aes_archive_is_written_back_through_the_command_line_and_opens_again";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -3178,17 +3248,13 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
         );
     }
 
-    // And the third write path, which used to be refused from the tag alone:
-    // `pack` now reaches the same cache `keys extract` filled above, with no
-    // flag anywhere. What it reaches is **not** a packed archive here, and that
-    // is the honest half of DR-057: this archive holds nine resources, none of
-    // which carries an `RSC7` header of its own, and the manifest schema
-    // records only that an entry is a resource. So the build refuses the first
-    // resource for want of its page flags — exit 6, not the exit 5 the same
-    // command answers below with no material at all, which is what says the key
-    // was found and the schema is what is missing. Closing it is DR-004's, not
-    // this record's. `crates/rpf/tests/cli.rs`'s launcher test is the tree that
-    // does pack back.
+    // And the third write path, which is the round trip R4.17 was measured
+    // failing on: this archive's nine resources carry no `RSC7` header of their
+    // own (Q7), so before DR-058 the manifest recorded that they were resources
+    // and not what their rows declared, and the pack was refused at the first
+    // of them. It now reaches the same cache `keys extract` filled above with
+    // no flag anywhere, packs back sealed under the archive's own transform,
+    // and opens again in a separate process. DR-057, DR-058.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(
         &home,
@@ -3202,12 +3268,22 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
     let packed = dir.path().join("packed.rpf");
     let at = packed.display().to_string();
     let (code, message) = run_err_homed(&home, &["pack", &tree.display().to_string(), &at]);
-    assert_eq!(code, 6, "{message}");
-    assert!(
-        message.contains("cannot be written into a resource entry"),
-        "{message}"
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = run_err_homed(&home, &["ls", &at]);
+    assert_eq!(code, 0, "the packed archive does not list: {message}");
+    let output = Command::new(RPF)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("APPDATA", home.join("appdata"))
+        .args(["cat", &at, "_manifest.ymf"])
+        .output()
+        .expect("binary runs");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.stdout,
+        fs::read(tree.join("_manifest.ymf")).expect("the extracted file"),
+        "the entry did not survive extract and pack"
     );
-    assert!(!packed.exists(), "a refused pack wrote an archive");
 
     // And the pack that must not silently succeed: no material anywhere is exit
     // 5, naming the missing material, with no archive left behind — and it is
@@ -3354,11 +3430,9 @@ fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
     // from the manifest's tag before a cache could matter. Both ends of that
     // are pinned here, and the difference between the two answers is what says
     // the flag reached the key: **with** the flag the material is found and the
-    // build gets as far as the first resource, which this schema cannot describe
-    // (exit 6, DR-004); **without** it, on the same machine, the answer is for
-    // the material and nothing is read at all (exit 5). The archive that packs
-    // all the way back is the launcher's, in the test above — it is the only one
-    // here holding no resource. DR-057.
+    // tree packs all the way back (exit 0); **without** it, on the same
+    // machine, the answer is for the material and nothing is read at all
+    // (exit 5). DR-057, DR-058.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(
         &home,
@@ -3374,15 +3448,9 @@ fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
     let from = tree.display().to_string();
     let packed = dir.path().join("packed.rpf").display().to_string();
     let (code, message) = run_err_homed(&home, &["pack", &from, &packed, "--cache-dir", &named]);
-    assert_eq!(code, 6, "{message}");
-    assert!(
-        message.contains("cannot be written into a resource entry"),
-        "{message}"
-    );
-    assert!(
-        !Path::new(&packed).exists(),
-        "a refused pack wrote an archive"
-    );
+    assert_eq!(code, 0, "{message}");
+    let (code, message) = run_err_homed(&home, &["ls", &packed, "--cache-dir", &named]);
+    assert_eq!(code, 0, "the packed archive does not list: {message}");
 
     let without = dir.path().join("no-flag.rpf").display().to_string();
     let (code, message) = run_err_homed(&home, &["pack", &from, &without]);

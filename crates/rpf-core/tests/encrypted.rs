@@ -31,6 +31,7 @@
 )]
 
 use std::{
+    collections::BTreeMap,
     env, fs,
     io::{Cursor, Read as _, Seek as _, SeekFrom, Write as _},
     path::{Path, PathBuf},
@@ -38,7 +39,8 @@ use std::{
 };
 
 use rpf_core::{
-    Archive, Bytes, Category, Change, Changes, Error, NoWrite, Unlock, Unwatched, Verified,
+    Archive, Bytes, Category, Change, Changes, EntryKind, Error, Manifest, NoWrite, Unlock,
+    Unwatched, Verified,
     format::{Version, crypto, rpf7},
     keys::Material,
 };
@@ -401,6 +403,110 @@ fn the_aes_archive_opens_and_every_entry_reads_back() {
         .expect("verifies")
         .outcome()
         .expect("every entry of the AES archive reads back");
+}
+
+/// The flag words of every resource entry, by path.
+fn resource_rows(bytes: &[u8], unlock: &Unlock) -> BTreeMap<String, (u32, u32)> {
+    let mut source = Cursor::new(bytes.to_vec());
+    let archive = Archive::open(&mut source, unlock).expect("the archive opens");
+    (1..u32::try_from(archive.entries().len()).expect("fits"))
+        .filter_map(|index| match archive.entry(index).expect("in range").kind {
+            EntryKind::Resource {
+                system_flags,
+                graphics_flags,
+                ..
+            } => Some((
+                archive.path(index).expect("named"),
+                (system_flags, graphics_flags),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+#[cfg_attr(
+    any(no_corpus, no_executables),
+    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
+)]
+fn the_aes_archives_nine_resources_extract_and_pack_back_with_their_flag_words() {
+    // R4.17, on the archive it was measured failing on. Its nine resources
+    // carry no `RSC7` header of their own — `docs/backlog.md` Q7, 696,578 of
+    // 696,578 — so before DR-058 the manifest recorded that they were resources
+    // and not what their rows declared, and packing the tree back was refused
+    // at the first of them. What makes this the whole round trip rather than
+    // half of it is DR-057: the tag names a transform this build can run
+    // forwards, so the tree packs back sealed under the archive's own key.
+    let test = "the_aes_archives_nine_resources_extract_and_pack_back_with_their_flag_words";
+    let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
+        return;
+    };
+    let unlock = held.unlock();
+    let mut source = Cursor::new(held.bytes.clone());
+    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
+
+    let manifest = Manifest::of(&archive).expect("the manifest derives");
+    assert_eq!(
+        manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.flags.is_some())
+            .count(),
+        9,
+        "every resource of the archive records its own words"
+    );
+
+    // The tree, as `extract` writes it: a resource's file is its payload.
+    let mut tree = BTreeMap::new();
+    let mut headerless = 0_usize;
+    for (spec, index) in rpf_core::specs_of(&archive).expect("specs") {
+        let extracted = archive.extract(&mut source, index).expect("extracts");
+        let kind = archive.entry(index).expect("in range").kind;
+        if matches!(kind, EntryKind::Resource { .. }) && extracted.get(0..4) != Some(b"RSC7") {
+            headerless += 1;
+        }
+        tree.insert(spec.path, extracted);
+    }
+    assert_eq!(
+        headerless, 9,
+        "every resource here would carry its own flags, and the manifest's \
+         would not be what the pack read"
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    let held_tree = tree.clone();
+    manifest
+        .pack_into(
+            &mut out,
+            &unlock,
+            move |wanted: &str| {
+                Ok(Cursor::new(
+                    held_tree.get(wanted).cloned().unwrap_or_default(),
+                ))
+            },
+            &mut Unwatched,
+        )
+        .expect("the extracted tree packs back");
+    let packed = out.into_inner();
+
+    assert_eq!(
+        resource_rows(&packed, &unlock),
+        resource_rows(&held.bytes, &unlock),
+        "a rebuilt row must declare what the row it came from declared"
+    );
+
+    let mut source = Cursor::new(packed);
+    let archive = Archive::open(&mut source, &unlock).expect("the packed archive opens again");
+    assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES);
+    for (path, expected) in &tree {
+        let index = archive.find(path).expect("the entry resolves");
+        let extracted = archive.extract(&mut source, index).expect("extracts");
+        assert_eq!(&extracted, expected, "{path} changed across the round trip");
+    }
+    Verified::of(&mut source, &archive, &mut Unwatched)
+        .expect("walks")
+        .outcome()
+        .expect("every entry of the packed archive reads back against its row");
 }
 
 #[test]
@@ -1354,75 +1460,6 @@ fn a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again() {
         .expect("verifies")
         .outcome()
         .expect("every entry of the packed archive reads back");
-}
-
-#[test]
-#[cfg_attr(
-    any(no_corpus, no_executables),
-    ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
-)]
-fn a_tree_holding_a_rockstar_resource_does_not_pack_back_whatever_key_is_held() {
-    // The half of R4.16 DR-057 does **not** close, pinned so that it is a
-    // measured limitation rather than an untested belief. `des_canister.rpf`
-    // holds nine resources, none of which carries an `RSC7` header of its own —
-    // 696,578 of 696,578 corpus resource payloads do not (Q7) — and the
-    // manifest schema records only *that* an entry is a resource, so
-    // `Manifest::specs` answers `FileKind::Resource { declared: None }` and
-    // `build::store` has neither a header nor a declaration to take the page
-    // flags from.
-    //
-    // The refusal is `Error::NotAResource` and not `Error::NeedsKey`: material
-    // was in hand and the seal was made, so what is missing is a field of
-    // DR-004's schema rather than a key. Closing it is DR-004's to reopen, not
-    // DR-057's.
-    let test = "a_tree_holding_a_rockstar_resource_does_not_pack_back_whatever_key_is_held";
-    let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
-        return;
-    };
-    let unlock = held.unlock();
-    let mut source = Cursor::new(held.bytes.clone());
-    let archive = Archive::open(&mut source, &unlock).expect("the AES archive opens");
-    assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES);
-
-    let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
-    let mut tree: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut headerless = 0_usize;
-    for entry in &manifest.entries {
-        let index = archive.find(&entry.path).expect("the entry resolves");
-        let bytes = archive.extract(&mut source, index).expect("extracts");
-        let kind = archive.entry(index).expect("the entry is there").kind;
-        if matches!(kind, rpf_core::EntryKind::Resource { .. }) && bytes.get(0..4) != Some(b"RSC7")
-        {
-            headerless += 1;
-        }
-        tree.push((entry.path.clone(), bytes));
-    }
-    assert!(
-        headerless > 0,
-        "every resource here carries its own header, so the refusal below would say nothing"
-    );
-
-    let mut out = Cursor::new(Vec::new());
-    let error = manifest
-        .pack_into(
-            &mut out,
-            &unlock,
-            |wanted: &str| {
-                let found = tree
-                    .iter()
-                    .find(|(path, _)| path == wanted)
-                    .map(|(_, bytes)| bytes.clone())
-                    .unwrap_or_default();
-                Ok(Cursor::new(found))
-            },
-            &mut Unwatched,
-        )
-        .expect_err("a tree of headerless resources does not pack back");
-    assert!(
-        matches!(error, Error::NotAResource { .. }),
-        "the refusal is the resource's and not the key's: {error:?}"
-    );
-    assert_eq!(error.category(), Category::Refused);
 }
 
 #[test]

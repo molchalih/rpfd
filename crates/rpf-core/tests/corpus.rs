@@ -26,7 +26,7 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{Read, Seek},
+    io::{Cursor, Read, Seek},
     path::PathBuf,
 };
 
@@ -393,6 +393,107 @@ fn read_all<R: Read + Seek>(
             }
         }
     }
+}
+
+/// Every resource of the sample, extracted and packed back, keeps the row it
+/// had.
+///
+/// It proves the flag words survive `extract` and `pack` over real data. It
+/// does **not** prove the manifest field is what carried them: all 20 of these
+/// resources carry their own `RSC7` header — this sample is the third-party
+/// packer's archive, not Rockstar's — so DR-046 §1's first arm answers them and
+/// would answer them with no manifest at all. The archive that needs the field
+/// is `gtav_aes/des_canister.rpf`, in `crates/rpf-core/tests/encrypted.rs`.
+#[test]
+#[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
+fn every_resource_of_the_sample_packs_back_with_the_row_it_had() {
+    let Some((path, _)) =
+        corpus_archive("every_resource_of_the_sample_packs_back_with_the_row_it_had")
+    else {
+        return;
+    };
+    let mut file = fs::File::open(&path).expect("archive opens");
+    let outer = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("archive parses");
+
+    // The resources live in the two nested archives, so each one is read out
+    // whole and packed as the archive it is.
+    let mut resources = 0_u32;
+    for index in 1..u32::try_from(outer.entries().len()).expect("fits") {
+        let name = outer.name(index).expect("name resolved").to_lowercase();
+        if !is_nested_archive(&name) {
+            continue;
+        }
+        let bytes = outer
+            .read(&mut file, index)
+            .expect("the nested archive reads");
+        resources += packs_back_unchanged(&bytes);
+    }
+    assert_eq!(resources, 20, "the sample's resources");
+}
+
+/// Packs one archive's own extracted tree back and checks every resource row
+/// and payload against the original. Returns how many resources it saw.
+fn packs_back_unchanged(bytes: &[u8]) -> u32 {
+    let unlock = rpf_core::Unlock::unkeyed();
+    let mut source = Cursor::new(bytes.to_vec());
+    let archive = Archive::open(&mut source, &unlock).expect("the nested archive parses");
+    let manifest = Manifest::of(&archive).expect("the manifest derives");
+
+    let mut tree = BTreeMap::new();
+    for (spec, index) in rpf_core::specs_of(&archive).expect("specs") {
+        let extracted = archive.extract(&mut source, index).expect("extracts");
+        tree.insert(spec.path, extracted);
+    }
+
+    let held = tree.clone();
+    let mut out = Cursor::new(Vec::new());
+    manifest
+        .pack_into(
+            &mut out,
+            &unlock,
+            move |wanted: &str| Ok(Cursor::new(held.get(wanted).cloned().unwrap_or_default())),
+            &mut Unwatched,
+        )
+        .expect("the extracted tree packs back");
+
+    let packed = out.into_inner();
+    let mut source = Cursor::new(packed);
+    let repacked = Archive::open(&mut source, &unlock).expect("the packed archive opens");
+
+    let mut seen = 0_u32;
+    for (path, expected) in &tree {
+        let index = repacked.find(path).expect("the entry resolves");
+        let extracted = repacked.extract(&mut source, index).expect("extracts");
+        assert_eq!(&extracted, expected, "{path} changed across the round trip");
+
+        let mut original = Cursor::new(bytes.to_vec());
+        let before = Archive::open(&mut original, &unlock).expect("parses");
+        let was = before
+            .entry(before.find(path).expect("resolves"))
+            .expect("in range")
+            .kind;
+        let now = repacked.entry(index).expect("in range").kind;
+        if let EntryKind::Resource {
+            system_flags,
+            graphics_flags,
+            ..
+        } = was
+        {
+            assert!(
+                matches!(
+                    now,
+                    EntryKind::Resource {
+                        system_flags: system,
+                        graphics_flags: graphics,
+                        ..
+                    } if (system, graphics) == (system_flags, graphics_flags)
+                ),
+                "{path}: the rebuilt row declares something else: {now:?}"
+            );
+            seen += 1;
+        }
+    }
+    seen
 }
 
 /// R3.5a: one string addresses through the nesting.
