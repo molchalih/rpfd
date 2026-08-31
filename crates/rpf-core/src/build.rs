@@ -961,6 +961,18 @@ struct Layout<'a> {
 /// So it is the high-water mark of the writes themselves, and only a write with
 /// bytes in it moves it.
 ///
+/// **Payloads go out in entry-table order, at a cursor that only advances, and
+/// a saturated resource's row is only correct because of it.** A resource
+/// longer than the 24-bit compressed-size field writes `MAX_SIZE_24` and states
+/// its extent nowhere; the reader recovers it as the room from this payload's
+/// start to the next payload's, so the entry that follows this one in the table
+/// must be the payload that follows it on disk, with nothing between them but
+/// alignment padding. Reordering payloads for locality, batching them by size,
+/// or interleaving them would leave those rows describing another entry's data.
+/// DR-056, DR-051 clause 1;
+/// `a_resource_longer_than_its_size_field_writes_the_sentinel_and_reads_back`
+/// in `crates/rpf-core/tests/boundaries.rs` is what fails if it stops holding.
+///
 /// `watch` is stepped once per file written, and can stop the write. DR-008.
 fn write_payloads<W, F>(
     out: &mut W,

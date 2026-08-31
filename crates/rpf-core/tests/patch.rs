@@ -20,7 +20,7 @@
               64-bit hosts against buffers the test itself created"
 )]
 
-use std::io::{Cursor, Write as _};
+use std::io::{Cursor, Read as _, Write as _};
 
 use rpf_core::{Archive, FileKind, FileSpec, Plan, Storage, Unwatched};
 
@@ -474,64 +474,106 @@ fn roomy_resource_archive() -> Vec<u8> {
     bytes
 }
 
+/// The field a saturated resource's row carries, and what it means: the
+/// payload's extent is the room to the next payload, not this value. DR-056,
+/// DR-051 clause 1.
+fn saturated_field(archive: &Archive, path: &str) -> Option<u64> {
+    let index = archive.find(path).ok()?;
+    match archive.entry(index).ok()?.kind {
+        rpf_core::EntryKind::Resource { compressed_len, .. } => Some(u64::from(compressed_len)),
+        _ => None,
+    }
+}
+
 #[test]
-fn a_resource_too_large_for_its_size_field_is_refused_rather_than_truncated() {
+fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_truncating() {
     // The entry table stores a compressed size in three bytes. A payload over
     // that limit used to be written whole while its row recorded the low 24
     // bits of the length, which is an archive that parses, verifies, and hands
-    // the runtime a fraction of a resource.
+    // the runtime a fraction of a resource. It is now written whole with the
+    // row carrying `MAX_SIZE_24` — the saturation sentinel a resource's row
+    // has for exactly this, and which the low 24 bits of this length are not:
+    // they are zero, which would read back as a stored entry. DR-056.
     let payload = oversized_resource();
     let before = roomy_resource_archive();
     let mut file = Cursor::new(before.clone());
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
+    let allocation = archive
+        .allocation(archive.find("art.yft").expect("resolves"))
+        .expect("allocation");
     assert!(
-        archive
-            .allocation(archive.find("art.yft").expect("resolves"))
-            .expect("allocation")
-            > payload.len() as u64,
-        "the entry needs room for the payload, or this tests the wrong refusal"
+        allocation > payload.len() as u64,
+        "the entry needs room for the payload, or this tests the wrong write"
     );
 
-    let refused = rpf_core::plan(&mut file, &archive, &edits(&[("art.yft", payload.clone())]));
-    match refused {
-        Err(rpf_core::Error::FieldOverflow { len, limit, .. }) => {
-            assert_eq!(limit, MAX_SIZE_24, "the limit reported");
-            assert_eq!(len, payload.len() as u64, "the length reported");
-        }
-        other => panic!("expected the size field to refuse it, got {other:?}"),
-    }
+    let plan = rpf_core::plan(&mut file, &archive, &edits(&[("art.yft", payload.clone())]))
+        .expect("a resource past the field is written, not refused");
+    let Plan::Fits(patches) = plan else {
+        panic!("expected the patch to fit, got {plan:?}")
+    };
+    patches.apply(&mut file).expect("applies");
+
+    let mut after = Cursor::new(file.into_inner());
+    let archive = Archive::open(&mut after, &rpf_core::Unlock::unkeyed()).expect("re-parses");
     assert_eq!(
-        file.into_inner(),
-        before,
-        "a refused plan still wrote something"
+        saturated_field(&archive, "art.yft").expect("a resource row"),
+        MAX_SIZE_24,
+        "the row carries the sentinel, not a truncation of the real length"
+    );
+    // The extent is the room the entry had, which is where a saturated row
+    // stops meaning anything of its own, and the payload still inflates.
+    assert_eq!(
+        archive
+            .payload_at(archive.find("art.yft").expect("resolves"))
+            .expect("span")
+            .1,
+        allocation
+    );
+    // And the payload itself is there, whole. The extent runs past it into the
+    // room the entry keeps, which is what a saturated row costs and what
+    // DR-051 already records `extract` handing back; the payload is its prefix.
+    let index = archive.find("art.yft").expect("resolves");
+    let mut back = Vec::new();
+    archive
+        .extracted(&mut after, index)
+        .expect("opens")
+        .read_to_end(&mut back)
+        .expect("reads");
+    assert_eq!(back.len(), allocation as usize);
+    assert!(
+        back[..payload.len()] == payload[..],
+        "the payload did not survive the patch"
     );
 }
 
 #[test]
-fn a_build_and_a_patch_refuse_the_same_oversized_resource() {
+fn a_build_and_a_patch_write_the_same_sentinel_for_an_oversized_resource() {
     // The two write paths apply one rule — the entry's storage rule — to new
     // contents, and they used to be two implementations of it that disagreed.
+    // They now agree on the sentinel exactly as they agreed on the refusal,
+    // which is the property this test is for and not the verdict itself.
     let payload = oversized_resource();
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
         kind: FileKind::Resource { declared: None },
     }];
     let mut out = Cursor::new(Vec::new());
-    let refused = rpf_core::build(
+    rpf_core::build(
         &mut out,
         rpf_core::Version::Rpf7,
         &files,
         &[],
         |_: &str| Ok(Cursor::new(payload.clone())),
         &mut Unwatched,
+    )
+    .expect("a resource past the field is written, not refused");
+
+    let mut built = Cursor::new(out.into_inner());
+    let archive = Archive::open(&mut built, &rpf_core::Unlock::unkeyed()).expect("parses");
+    assert_eq!(
+        saturated_field(&archive, "art.yft").expect("a resource row"),
+        MAX_SIZE_24
     );
-    match refused {
-        Err(rpf_core::Error::FieldOverflow { len, limit, .. }) => {
-            assert_eq!(limit, MAX_SIZE_24, "the limit reported");
-            assert_eq!(len, payload.len() as u64, "the length reported");
-        }
-        other => panic!("expected the size field to refuse it, got {other:?}"),
-    }
 }
 
 /// Largest a resource's `RSC7` header is, and the least a resource payload can

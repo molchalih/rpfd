@@ -35,7 +35,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::{Cursor, Write as _},
+    io::{Cursor, Read as _, Write as _},
 };
 
 use rpf_core::{
@@ -871,14 +871,14 @@ const SATURATED: u32 = 0x00FF_FFFF;
 const RESOURCE_SYSTEM_FLAGS: u32 = 0xA800_0000;
 const RESOURCE_GRAPHICS_FLAGS: u32 = 0x2000_0000;
 
-/// An archive of two resources, the first declaring `compressed_len` and the
-/// second bounding it two blocks later.
+/// An archive of two resources, the first at block 1 declaring
+/// `compressed_len` and the second bounding it at `second_block`.
 ///
 /// Both payloads are the same: a 16-byte opaque header and one deflated
 /// 512-byte page, which is far shorter than either declaration. So the only
-/// thing the two tests below differ in is whether the reader believes the
-/// field, and the room the first payload has is exactly two blocks.
-fn saturating_archive(compressed_len: u32) -> Vec<u8> {
+/// thing the sentinel tests below differ in is whether the reader believes the
+/// field, and the room the first payload has is `second_block - 1` blocks.
+fn saturating_archive(compressed_len: u32, second_block: u32) -> Vec<u8> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&vec![0_u8; 512]).expect("deflates");
@@ -887,7 +887,7 @@ fn saturating_archive(compressed_len: u32) -> Vec<u8> {
 
     let mut names = vec![0_u8];
     let mut rows = vec![directory_row(0, 1, 2)];
-    for (which, block) in [(0_u32, 1_u32), (1, 3)] {
+    for (which, block) in [(0_u32, 1_u32), (1, second_block)] {
         let name_offset = names.len() as u16;
         names.extend_from_slice(format!("r{which}.ydr").as_bytes());
         names.push(0);
@@ -905,8 +905,12 @@ fn saturating_archive(compressed_len: u32) -> Vec<u8> {
         ));
     }
 
-    let mut out = archive_bytes(&rows, &names, 4 * BLOCK_LEN as usize);
-    for block in [1_usize, 3] {
+    let mut out = archive_bytes(
+        &rows,
+        &names,
+        (second_block as usize + 1) * BLOCK_LEN as usize,
+    );
+    for block in [1_usize, second_block as usize] {
         let at = block * BLOCK_LEN as usize;
         out[at..at + payload.len()].copy_from_slice(&payload);
     }
@@ -922,7 +926,7 @@ fn saturating_archive(compressed_len: u32) -> Vec<u8> {
 /// inflater a truncated stream and gets about 91% of the output. DR-051.
 #[test]
 fn a_resource_size_field_at_exactly_its_largest_value_is_a_sentinel() {
-    let mut src = Cursor::new(saturating_archive(SATURATED));
+    let mut src = Cursor::new(saturating_archive(SATURATED, 3));
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("r0.ydr").expect("resolves");
 
@@ -951,7 +955,7 @@ fn a_resource_size_field_at_exactly_its_largest_value_is_a_sentinel() {
 /// least this large" would recover a span for this row too and read it back.
 #[test]
 fn a_resource_size_field_one_below_its_largest_value_is_a_length() {
-    let mut src = Cursor::new(saturating_archive(SATURATED - 1));
+    let mut src = Cursor::new(saturating_archive(SATURATED - 1, 3));
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("r0.ydr").expect("resolves");
 
@@ -966,5 +970,239 @@ fn a_resource_size_field_one_below_its_largest_value_is_a_length() {
             }) if len == u64::from(SATURATED - 1)
         ),
         "the field is a length one below the sentinel; got {refused:?}"
+    );
+}
+
+/// The first payload length past the field, and it is exactly one byte past:
+/// 16,777,216 is [`SATURATED`] + 1, and a whole number of blocks, so the
+/// payload after it begins where it ends with no alignment slack between them.
+/// A saturated entry's recovered extent is then the payload and nothing else,
+/// which is what lets the test below compare bytes rather than a prefix.
+const OVER_THE_FIELD: usize = SATURATED as usize + 1;
+
+/// The block a roomy [`saturating_archive`]'s second payload sits at, chosen so
+/// the room the first one has — 16,777,728 bytes — is past the field rather
+/// than the two blocks the sentinel tests above use. A rebuild re-derives every
+/// row from what it wrote, so the room is what arrives at the size field.
+const ROOMY_SECOND_BLOCK: u32 = 32_770;
+
+/// `rpf7.rs`: a resource longer than the 24-bit compressed-size field writes
+/// the sentinel, and the payload comes back byte for byte.
+///
+/// The near side of the same limit from the write direction. `0xFFFFFF` is a
+/// saturation marker on a resource and not a length — 166 corpus resources
+/// carry it, the largest of them 41 MB — so a writer that refused to emit it
+/// could not write an archive its own reader reads. What makes the row correct
+/// is **adjacency**: `write_payloads` lays payloads out in entry-table order,
+/// so the room to the next payload is this payload's own extent. This test is
+/// what fails if that stops being true. DR-056, DR-051 clause 1.
+#[test]
+fn a_resource_longer_than_its_size_field_writes_the_sentinel_and_reads_back() {
+    // A 16-byte opaque head, as every Rockstar resource payload has (Q7), then
+    // a pattern that is not a run, so a payload assembled out of the wrong
+    // bytes does not compare equal by accident.
+    let mut payload = vec![0xFF_u8; 16];
+    payload.extend((16..OVER_THE_FIELD).map(|at| (at % 251) as u8));
+    assert_eq!(payload.len(), OVER_THE_FIELD);
+
+    let files = [
+        FileSpec {
+            path: "big.ydr".to_owned(),
+            kind: FileKind::Resource {
+                declared: Some(rpf_core::ResourceFlags {
+                    system: RESOURCE_SYSTEM_FLAGS,
+                    graphics: RESOURCE_GRAPHICS_FLAGS,
+                }),
+            },
+        },
+        spec("z.bin", Storage::Stored),
+    ];
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::build(
+        &mut out,
+        V,
+        &files,
+        &[],
+        |path: &str| {
+            Ok(Cursor::new(if path == "big.ydr" {
+                payload.clone()
+            } else {
+                b"after".to_vec()
+            }))
+        },
+        &mut Unwatched,
+    )
+    .expect("a resource past the field is written, not refused");
+
+    let mut src = Cursor::new(out.into_inner());
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
+
+    let index = archive.find("big.ydr").expect("resolves");
+    let EntryKind::Resource { compressed_len, .. } = archive.entry(index).expect("an entry").kind
+    else {
+        panic!("big.ydr is not a resource");
+    };
+    assert_eq!(
+        compressed_len, SATURATED,
+        "the field carries the sentinel, not a truncation of the real length"
+    );
+    assert_eq!(
+        archive.payload_at(index).expect("span").1,
+        OVER_THE_FIELD as u64,
+        "the extent recovered from the next payload's start is the payload"
+    );
+
+    let mut back = Vec::new();
+    archive
+        .extracted(&mut src, index)
+        .expect("opens")
+        .read_to_end(&mut back)
+        .expect("reads");
+    assert!(
+        back == payload,
+        "the payload did not survive the round trip"
+    );
+
+    // And the entry the extent was measured against is itself intact, which is
+    // what a recovered extent reaching into it would have cost.
+    let after = archive.find("z.bin").expect("resolves");
+    assert_eq!(archive.read(&mut src, after).expect("reads"), b"after");
+}
+
+/// `build.rs`: a saturated resource whose length is **not** a whole number of
+/// blocks reads back with the alignment padding after it, and that is measured
+/// here rather than assumed.
+///
+/// The reader recovers a saturated entry's extent as the room to the next
+/// payload (DR-051 clause 1), and the writer aligns every payload to a block
+/// (`docs/rpf-format.md`, Layout), so for a payload past the field that is not
+/// block-aligned the two differ by up to 511 bytes. It is the same fact DR-051
+/// already records for `extract` of the 166 corpus resources, arriving from the
+/// write direction: nothing in the archive declares a saturated resource's true
+/// length, so the room is the only number there is. `read` and `verify` are
+/// unaffected — a saturated entry's declared length is its used length, and the
+/// deflate stream ends on its own before the padding.
+#[test]
+fn a_saturated_resource_that_is_not_block_aligned_reads_back_with_its_padding() {
+    // One byte past the aligned case above, so exactly one block of alignment
+    // padding less one byte separates it from the payload after it.
+    let len = OVER_THE_FIELD + 1;
+    let mut payload = vec![0xFF_u8; 16];
+    payload.extend((16..len).map(|at| (at % 251) as u8));
+    assert_eq!(payload.len(), len);
+
+    let files = [
+        FileSpec {
+            path: "big.ydr".to_owned(),
+            kind: FileKind::Resource {
+                declared: Some(rpf_core::ResourceFlags {
+                    system: RESOURCE_SYSTEM_FLAGS,
+                    graphics: RESOURCE_GRAPHICS_FLAGS,
+                }),
+            },
+        },
+        spec("z.bin", Storage::Stored),
+    ];
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::build(
+        &mut out,
+        V,
+        &files,
+        &[],
+        |path: &str| {
+            Ok(Cursor::new(if path == "big.ydr" {
+                payload.clone()
+            } else {
+                b"after".to_vec()
+            }))
+        },
+        &mut Unwatched,
+    )
+    .expect("a resource past the field is written, not refused");
+
+    let mut src = Cursor::new(out.into_inner());
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
+    let index = archive.find("big.ydr").expect("resolves");
+
+    // The room to the next payload, which is this payload rounded up to a
+    // block: 511 bytes more than was written.
+    let slack = usize::try_from(BLOCK_LEN).expect("fits") - 1;
+    assert_eq!(
+        archive.payload_at(index).expect("span").1,
+        u64::try_from(len + slack).expect("fits"),
+    );
+
+    let mut back = Vec::new();
+    archive
+        .extracted(&mut src, index)
+        .expect("opens")
+        .read_to_end(&mut back)
+        .expect("reads");
+    assert_eq!(
+        back.len(),
+        len + slack,
+        "the extent is the room, not the len"
+    );
+    assert!(
+        back.get(..len) == Some(payload.as_slice()),
+        "the payload did not survive the round trip"
+    );
+    assert!(
+        back.get(len..)
+            .is_some_and(|tail| tail.iter().all(|b| *b == 0)),
+        "the slack this writer leaves is its own alignment padding"
+    );
+
+    // What the padding costs nothing: the entry the extent is measured against
+    // is intact, and the walk reports no problem against the saturated row.
+    let after = archive.find("z.bin").expect("resolves");
+    assert_eq!(archive.read(&mut src, after).expect("reads"), b"after");
+}
+
+/// `build.rs`: an archive holding a saturated resource rebuilds, for an edit
+/// that has nothing to do with it.
+///
+/// Measured 2026-08-31, before the change: an empty change set over this
+/// archive answered `FieldOverflow { path: "r0.ydr", what: "compressed size",
+/// len: 16777728, limit: 16777215 }`. `rebuild` re-derives **every** row
+/// through `file_row`, so one saturated resource made the whole archive
+/// permanently unrebuildable rather than merely that entry. DR-056.
+#[test]
+fn an_archive_holding_a_saturated_resource_rebuilds_for_an_unrelated_edit() {
+    let mut src = Cursor::new(saturating_archive(SATURATED, ROOMY_SECOND_BLOCK));
+    let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
+    let room = archive
+        .payload_at(archive.find("r0.ydr").expect("resolves"))
+        .expect("span")
+        .1;
+    assert!(
+        room > u64::from(SATURATED),
+        "the room {room} does not exceed the field, so nothing is exercised"
+    );
+
+    let mut out = Cursor::new(Vec::new());
+    rpf_core::rebuild(
+        &mut src,
+        &archive,
+        &rpf_core::Changes::new(),
+        &mut out,
+        BTreeMap::new(),
+        &mut Unwatched,
+    )
+    .expect("an archive holding a saturated resource rebuilds");
+
+    let mut after = Cursor::new(out.into_inner());
+    let rebuilt = Archive::open(&mut after, &rpf_core::Unlock::unkeyed()).expect("re-parses");
+    let index = rebuilt.find("r0.ydr").expect("resolves");
+    let EntryKind::Resource { compressed_len, .. } = rebuilt.entry(index).expect("an entry").kind
+    else {
+        panic!("r0.ydr is not a resource");
+    };
+    assert_eq!(compressed_len, SATURATED);
+    assert_eq!(rebuilt.payload_at(index).expect("span").1, room);
+    assert_eq!(
+        rebuilt.read(&mut after, index).expect("reads").len(),
+        512,
+        "the deflate stream in the rebuilt payload no longer inflates"
     );
 }

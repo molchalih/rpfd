@@ -276,6 +276,14 @@ pub(super) fn directory_row(name_offset: u32, first_child: u32, child_count: u32
 /// callers used to check different subsets of these, so one of them wrote that
 /// row. A value that will not fit the format cannot now become a row at all.
 ///
+/// One field is the exception, and it is the format's rather than this
+/// function's: a **resource** whose compressed length exceeds [`MAX_SIZE_24`]
+/// writes that value as a saturation sentinel, because the extent of such a
+/// payload was never in the field to begin with — it is the room to the next
+/// payload, which is how the reader recovers it. A **binary** entry at the same
+/// value is refused: its compressed length is the one statement of where its
+/// payload ends, and the format has no other spelling for it. DR-056, DR-051.
+///
 /// # Errors
 ///
 /// [`Error::FieldOverflow`] for a value the row cannot represent, and
@@ -288,7 +296,25 @@ pub(super) fn file_row(path: &str, fields: &FileFields) -> Result<[u8; ROW_LEN]>
         u64::from(fields.name_offset),
         MAX_FILE_NAME_OFFSET,
     )?;
-    check(path, "compressed size", fields.compressed_len, MAX_SIZE_24)?;
+    let (word_at_8, word_at_12, resource) = match fields.content {
+        Content::Binary {
+            uncompressed_len,
+            encryption,
+        } => (uncompressed_len, encryption, false),
+        Content::Resource {
+            system_flags,
+            graphics_flags,
+        } => (system_flags, graphics_flags, true),
+    };
+    // A resource longer than the field holds writes [`MAX_SIZE_24`] and lets
+    // the reader recover its extent from the room to the next payload; a binary
+    // entry has no such spelling and is refused. DR-056, DR-051 clause 1.
+    let compressed_field = if resource && fields.compressed_len > MAX_SIZE_24 {
+        MAX_SIZE_24
+    } else {
+        check(path, "compressed size", fields.compressed_len, MAX_SIZE_24)?;
+        fields.compressed_len
+    };
     // Not `check`: a block offset past the end is the archive's size and not
     // this entry's, and reporting it as this entry's names whichever payload
     // the layout happened to place first past the ceiling.
@@ -300,16 +326,6 @@ pub(super) fn file_row(path: &str, fields: &FileFields) -> Result<[u8; ROW_LEN]>
         });
     }
 
-    let (word_at_8, word_at_12, resource) = match fields.content {
-        Content::Binary {
-            uncompressed_len,
-            encryption,
-        } => (uncompressed_len, encryption, false),
-        Content::Resource {
-            system_flags,
-            graphics_flags,
-        } => (system_flags, graphics_flags, true),
-    };
     let offset_field = if resource {
         fields.block | u64::from(RESOURCE_FLAG)
     } else {
@@ -318,7 +334,7 @@ pub(super) fn file_row(path: &str, fields: &FileFields) -> Result<[u8; ROW_LEN]>
 
     let mut row = [0_u8; ROW_LEN];
     write_at(&mut row, 0, &fields.name_offset.to_le_bytes(), 2);
-    write_at(&mut row, 2, &fields.compressed_len.to_le_bytes(), 3);
+    write_at(&mut row, 2, &compressed_field.to_le_bytes(), 3);
     write_at(&mut row, 5, &offset_field.to_le_bytes(), 3);
     write_at(&mut row, 8, &word_at_8.to_le_bytes(), 4);
     write_at(&mut row, 12, &word_at_12.to_le_bytes(), 4);
@@ -577,6 +593,54 @@ mod tests {
         }
         // And the largest value each field *does* hold is still written.
         assert!(file_row("a.txt", &fields(0xFFFF, MAX_BLOCK, MAX_SIZE_24)).is_ok());
+    }
+
+    #[test]
+    fn a_resource_past_the_size_field_writes_the_sentinel_where_a_binary_entry_is_refused() {
+        // The same length in both variants, so the only thing that differs is
+        // the kind. DR-056: the resource's extent was never in this field —
+        // the reader takes it from the room to the next payload — and the
+        // binary entry's is the only statement of it there is.
+        let over = MAX_SIZE_24.saturating_add(1);
+        let row = file_row(
+            "big.ydr",
+            &FileFields {
+                name_offset: 0,
+                block: 1,
+                compressed_len: over,
+                content: Content::Resource {
+                    system_flags: 0x0002_0000,
+                    graphics_flags: 0xD102_0008,
+                },
+            },
+        )
+        .expect("a resource past the field writes the sentinel");
+        // Written whole rather than truncated to the field's low three bytes,
+        // which for this value would have read back as zero — a stored entry.
+        assert_eq!(u24_at(&row, 2).map(u64::from), Some(MAX_SIZE_24));
+        assert!(matches!(
+            decode_row(&row).expect("a whole row").kind,
+            EntryKind::Resource { compressed_len, .. } if u64::from(compressed_len) == MAX_SIZE_24
+        ));
+
+        let refused = file_row(
+            "big.bin",
+            &FileFields {
+                name_offset: 0,
+                block: 1,
+                compressed_len: over,
+                content: Content::Binary {
+                    uncompressed_len: 0,
+                    encryption: 0,
+                },
+            },
+        )
+        .expect_err("a binary entry past the field has no other spelling");
+        assert!(
+            matches!(refused, Error::FieldOverflow { what, len, .. }
+                if what == "compressed size" && len == over),
+            "{refused:?}"
+        );
     }
 
     #[test]
