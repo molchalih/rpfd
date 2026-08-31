@@ -1206,3 +1206,693 @@ fn an_archive_holding_a_saturated_resource_rebuilds_for_an_unrelated_edit() {
         "the deflate stream in the rebuilt payload no longer inflates"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Resource-embedded `Meta` — the ceilings and the two shape refusals, each at
+// the value it is a limit on. R5.8b, DR-049 and DR-052.
+// ---------------------------------------------------------------------------
+
+/// The name hash of the one structure the `Meta` payloads below define.
+const META_ROOT: u32 = 0xD98B_B561;
+
+/// The name hash of its one member.
+const META_MEMBER: u32 = 0x1234_5678;
+
+/// How deeply a `Meta` walk nests before it refuses.
+///
+/// `meta::kind::MAX_DEPTH`, which is `pub(super)`: the ceiling is the metadata
+/// layer's and is not part of the crate's public contract, so it is pinned here
+/// at the value rather than imported, exactly as `PSO_MAX_DEPTH` is. DR-011.
+const META_MAX_DEPTH: usize = 128;
+
+/// The smallest document any `Meta` payload may be edited by.
+///
+/// `meta::kind::MIN_OUTPUT`, pinned here for the same reason.
+const META_MIN_OUTPUT: usize = 16 * 1024 * 1024;
+
+/// A little-endian `u64` at `at` of `bytes`.
+fn meta_put(bytes: &mut [u8], at: usize, value: u64, width: usize) {
+    bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+}
+
+/// A system-space resource pointer at `offset`.
+fn meta_system(offset: u32) -> u64 {
+    (5u64 << 28) | u64::from(offset)
+}
+
+/// The fixed part every `Meta` payload here opens with: the header, one
+/// structure of one member, and a block table of `blocks` rows.
+///
+/// ```text
+/// 0x050 the structure   0x070 its member   0x100 the block table
+/// ```
+fn meta_frame(len: usize, blocks: u16, length: u32, code: u8) -> Vec<u8> {
+    let mut payload = vec![0u8; len];
+    meta_put(&mut payload, 0x00, 0xDEAD_BEEF, 4);
+    meta_put(&mut payload, 0x04, 1, 4);
+    meta_put(
+        &mut payload,
+        0x10,
+        u64::from(rpf_core::metadata::meta::MAGIC),
+        4,
+    );
+    meta_put(
+        &mut payload,
+        0x14,
+        u64::from(rpf_core::metadata::meta::VERSION_TWO),
+        4,
+    );
+    meta_put(&mut payload, 0x1C, 1, 4);
+    meta_put(&mut payload, 0x20, meta_system(0x50), 8);
+    meta_put(&mut payload, 0x30, meta_system(0x100), 8);
+    meta_put(&mut payload, 0x48, 1, 2);
+    meta_put(&mut payload, 0x4C, u64::from(blocks), 2);
+    // The structure: name, name2, kind, membersPtr, length, one member.
+    meta_put(&mut payload, 0x50, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x54, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x58, 0x300, 4);
+    meta_put(&mut payload, 0x60, meta_system(0x70), 8);
+    meta_put(&mut payload, 0x68, u64::from(length), 4);
+    meta_put(&mut payload, 0x6E, 1, 2);
+    // Its member, at offset 0 of the structure.
+    meta_put(&mut payload, 0x70, u64::from(META_MEMBER), 4);
+    meta_put(&mut payload, 0x78, u64::from(code), 1);
+    payload
+}
+
+/// A `Meta` of `levels` structures, each pointing at the next and the last one
+/// null.
+///
+/// Every block carries the same structure — one structure-pointer member at
+/// offset 0 — so `levels` blocks are a chain `levels` long, and the walk writes
+/// elements at depths 0 through `levels`: one per structure, plus the
+/// `meta:null` leaf the last one's pointer becomes.
+fn chained_meta(levels: usize) -> Vec<u8> {
+    let data = 0x100 + 16 * levels;
+    let mut payload = meta_frame(
+        data + 8 * levels,
+        u16::try_from(levels).expect("a test level count fits"),
+        8,
+        0x06,
+    );
+    for level in 0..levels {
+        let at = data + 8 * level;
+        meta_put(&mut payload, 0x100 + 16 * level, u64::from(META_ROOT), 4);
+        meta_put(&mut payload, 0x100 + 16 * level + 4, 8, 4);
+        meta_put(
+            &mut payload,
+            0x100 + 16 * level + 8,
+            meta_system(u32::try_from(at).expect("fits")),
+            8,
+        );
+        // A `Meta` pointer is the block id in the low twelve bits and the item
+        // offset above them; the last block's is null.
+        let next = if level + 1 < levels { level + 2 } else { 0 };
+        meta_put(&mut payload, at, next as u64, 8);
+    }
+    payload
+}
+
+/// `meta`: a walk exactly as deep as a walk may be is written **and read back**.
+///
+/// The pairing `PSO` needed a repair for: the two directions have to refuse at
+/// the same level, or a payload at exactly the limit renders and is then
+/// refused with the document blamed for it.
+#[test]
+fn a_meta_walk_of_exactly_the_deepest_a_walk_may_be_converts_and_applies_back() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let names = Dictionary::default();
+    let payload = chained_meta(META_MAX_DEPTH);
+    let xml = meta::to_xml(&payload, payload.len(), &names)
+        .expect("a walk of exactly the limit converts");
+    assert_eq!(
+        String::from_utf8_lossy(&xml).matches("<hash_").count(),
+        META_MAX_DEPTH + 1,
+        "one element per structure, and the null leaf the last pointer becomes"
+    );
+    assert_eq!(
+        meta::from_xml(&payload, payload.len(), &xml, &names).expect("and applies back"),
+        payload,
+        "unedited in, unedited out, at the boundary"
+    );
+}
+
+/// `meta`: one level past it is refused, and refused as a fact about the
+/// payload.
+#[test]
+fn a_meta_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let names = Dictionary::default();
+    let payload = chained_meta(META_MAX_DEPTH + 1);
+    match meta::to_xml(&payload, payload.len(), &names) {
+        Err(rpf_core::Error::BadMeta { cause, .. }) => {
+            assert_eq!(cause, meta::Malformed::TooDeep);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // And the document for a payload one level shallower, given one more level
+    // of nesting by hand, is too deep for the document reader as well.
+    let shallower = chained_meta(META_MAX_DEPTH);
+    let xml =
+        String::from_utf8(meta::to_xml(&shallower, shallower.len(), &names).expect("converts"))
+            .expect("UTF-8");
+    let deeper = xml.replace(
+        "<hash_12345678 meta:null=\"struct\"/>",
+        "<hash_12345678 meta:struct=\"hash_D98BB561\">\
+         <hash_12345678 meta:null=\"struct\"/></hash_12345678>",
+    );
+    match meta::from_xml(&shallower, shallower.len(), deeper.as_bytes(), &names) {
+        Err(rpf_core::Error::NotMetaXml { cause, .. }) => {
+            assert_eq!(cause, meta::NotMetaXml::TooDeep);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// `meta`: a document of exactly the bytes a payload allows is applied, and one
+/// byte more is refused before it is parsed.
+#[test]
+fn a_meta_document_of_exactly_its_payloads_budget_is_applied_and_one_byte_more_is_not() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let names = Dictionary::default();
+    let payload = chained_meta(1);
+    let xml = meta::to_xml(&payload, payload.len(), &names).expect("converts");
+    assert!(
+        payload.len() * 256 < META_MIN_OUTPUT,
+        "this payload is small enough that the floor is what bounds it"
+    );
+
+    let mut exact = xml.clone();
+    exact.resize(META_MIN_OUTPUT, b' ');
+    assert_eq!(
+        meta::from_xml(&payload, payload.len(), &exact, &names)
+            .expect("a document of exactly the budget applies"),
+        payload
+    );
+
+    let mut over = exact.clone();
+    over.push(b' ');
+    match meta::from_xml(&payload, payload.len(), &over, &names) {
+        Err(rpf_core::Error::NotMetaXml { cause, .. }) => assert_eq!(
+            cause,
+            meta::NotMetaXml::TooLarge {
+                budget: META_MIN_OUTPUT,
+                len: META_MIN_OUTPUT + 1,
+            }
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A `Meta` whose root holds one counted string, with both counts the caller's
+/// to choose.
+///
+/// ```text
+/// 0x100 block table   0x140 the root's data   0x160 the string
+/// ```
+fn string_meta(count1: u16, count2: u16) -> Vec<u8> {
+    let mut payload = meta_frame(0x200, 2, 16, 0x40);
+    meta_put(&mut payload, 0x100, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x104, 16, 4);
+    meta_put(&mut payload, 0x108, meta_system(0x140), 8);
+    meta_put(&mut payload, 0x110, 0x11, 4);
+    meta_put(&mut payload, 0x114, 8, 4);
+    meta_put(&mut payload, 0x118, meta_system(0x160), 8);
+    // The counted form: the pointer, `count1`, `count2` and a dead word.
+    meta_put(&mut payload, 0x140, 2, 8);
+    meta_put(&mut payload, 0x148, u64::from(count1), 2);
+    meta_put(&mut payload, 0x14A, u64::from(count2), 2);
+    meta_put(&mut payload, 0x14C, 0xDEAD_BEEF, 4);
+    payload[0x160..0x168].copy_from_slice(b"GTA V\0\xA7\xA7");
+    payload
+}
+
+/// `meta`: a counted string of exactly its room is written, and one byte more
+/// is refused — with the room the **smaller** of the two counts.
+///
+/// The bound `PSO` arrived at after measuring 39,469 counted strings, applied
+/// to the form this build reads a `Meta` string through. Nothing here moves a
+/// block or re-allocates a page, so a string may be shortened and never
+/// lengthened past its own store, and the terminator is one of the bytes that
+/// store holds. DR-052.
+#[test]
+fn a_meta_counted_string_of_exactly_its_room_is_written_and_one_byte_more_is_not() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let names = Dictionary::default();
+    for (count1, count2) in [(6u16, 6u16), (6, 5)] {
+        let payload = string_meta(count1, count2);
+        let xml =
+            String::from_utf8(meta::to_xml(&payload, payload.len(), &names).expect("converts"))
+                .expect("UTF-8");
+        assert!(xml.contains("meta:string=\"GTA V\""), "{xml}");
+        assert_eq!(
+            meta::from_xml(&payload, payload.len(), xml.as_bytes(), &names)
+                .expect("unedited applies"),
+            payload,
+            "count1 {count1}, count2 {count2}: unedited in, unedited out"
+        );
+
+        // The store is the smaller of the two counts and the terminator is one
+        // of the bytes it holds, so the room is `min - 1` — floored, DR-052, at
+        // the five bytes already there. `(6, 5)` is exactly that floor: a store
+        // of five holding a five-byte string and no terminator, which the read
+        // direction accepts and which must therefore be writable back.
+        let room = 5;
+        let exact = xml.replace("\"GTA V\"", &format!("\"{}\"", "1".repeat(room)));
+        let edited = meta::from_xml(&payload, payload.len(), exact.as_bytes(), &names)
+            .expect("a string of exactly its room fits");
+        assert_eq!(
+            &edited[0x160..=(0x160 + room)],
+            format!("{}\0", "1".repeat(room)).as_bytes(),
+            "count1 {count1}, count2 {count2}: the terminator survives the edit"
+        );
+
+        let over = xml.replace("\"GTA V\"", &format!("\"{}\"", "1".repeat(room + 1)));
+        match meta::from_xml(&payload, payload.len(), over.as_bytes(), &names) {
+            Err(rpf_core::Error::NotMetaXml { cause, .. }) => assert_eq!(
+                cause,
+                meta::NotMetaXml::TooLong {
+                    name: "hash_12345678".to_owned(),
+                    room: u32::try_from(room).expect("fits"),
+                    len: u32::try_from(room + 1).expect("fits"),
+                },
+                "count1 {count1}, count2 {count2}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+}
+
+/// A `Meta` whose root holds one counted array of `count` `UINT`s.
+fn array_meta(count: u16) -> Vec<u8> {
+    let items = usize::from(count) * 4;
+    let mut payload = meta_frame(0x180 + items, 2, 16, 0x07);
+    // The array's element type is the second member, an `ARRAYINFO` `UINT`.
+    meta_put(&mut payload, 0x6E, 2, 2);
+    meta_put(&mut payload, 0x7A, 1, 2);
+    meta_put(&mut payload, 0x80, 0x0000_0100, 4);
+    meta_put(&mut payload, 0x88, 0x15, 1);
+    meta_put(&mut payload, 0x100, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x104, 16, 4);
+    meta_put(&mut payload, 0x108, meta_system(0x140), 8);
+    meta_put(&mut payload, 0x110, 0x15, 4);
+    meta_put(&mut payload, 0x114, u64::try_from(items).expect("fits"), 4);
+    meta_put(&mut payload, 0x118, meta_system(0x180), 8);
+    meta_put(&mut payload, 0x140, 2, 8);
+    meta_put(&mut payload, 0x148, u64::from(count), 2);
+    meta_put(&mut payload, 0x14A, u64::from(count), 2);
+    for item in 0..usize::from(count) {
+        meta_put(&mut payload, 0x180 + 4 * item, item as u64, 4);
+    }
+    payload
+}
+
+/// `meta`: an array of exactly the items the file declares is applied, and one
+/// item more or fewer is refused.
+///
+/// An array's length is an allocation, and an edit in place moves no
+/// allocation: DR-052. The pin is at the count itself, on both sides, because
+/// a bound compared with `!=` is the one a mutation moves invisibly.
+#[test]
+fn a_meta_array_of_exactly_its_own_length_is_applied_and_one_item_more_is_not() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let names = Dictionary::default();
+    let payload = array_meta(3);
+    let xml = String::from_utf8(meta::to_xml(&payload, payload.len(), &names).expect("converts"))
+        .expect("UTF-8");
+    assert_eq!(xml.matches("<meta:item").count(), 3);
+    assert_eq!(
+        meta::from_xml(&payload, payload.len(), xml.as_bytes(), &names)
+            .expect("exactly its own length applies"),
+        payload
+    );
+
+    for (what, document) in [
+        (
+            "one item more",
+            xml.replace(
+                "    <meta:item meta:uint=\"2\"/>\n",
+                "    <meta:item meta:uint=\"2\"/>\n    <meta:item meta:uint=\"3\"/>\n",
+            ),
+        ),
+        (
+            "one item fewer",
+            xml.replace("    <meta:item meta:uint=\"2\"/>\n", ""),
+        ),
+    ] {
+        match meta::from_xml(&payload, payload.len(), document.as_bytes(), &names) {
+            Err(rpf_core::Error::NotMetaXml { cause, .. }) => assert!(
+                matches!(cause, meta::NotMetaXml::Children { wanted: 3, .. }),
+                "{what}: {cause:?}"
+            ),
+            other => panic!("expected a refusal for {what}, got {other:?}"),
+        }
+    }
+}
+
+/// How many elements one `Meta` payload's walk may write.
+///
+/// `meta::kind::MAX_NODES`, pinned here at its value for the reason
+/// [`META_MAX_DEPTH`] is.
+const META_MAX_NODES: usize = 1 << 20;
+
+/// The name hash of the structure the array below holds.
+const META_ITEM: u32 = 0x0BAD_F00D;
+
+/// The `ARRAYINFO` sentinel a member carries when it describes another member's
+/// elements rather than a field of its own.
+const META_ARRAYINFO: u32 = 0x0000_0100;
+
+/// One structure member, written at `at`.
+fn meta_member(payload: &mut [u8], at: usize, name: u32, offset: u32, code: u8) {
+    meta_put(payload, at, u64::from(name), 4);
+    meta_put(payload, at + 4, u64::from(offset), 4);
+    meta_put(payload, at + 8, u64::from(code), 1);
+}
+
+/// A `Meta` whose root holds one array of `count` structures of `fields`
+/// members each, and `extras` scalar fields of its own.
+///
+/// The walk writes `2 + extras + count * (1 + fields)` elements: the root, its
+/// array, its own scalars, and one structure plus one leaf per item. That is
+/// the arithmetic the node ceiling is pinned with, and it is exact.
+///
+/// ```text
+/// 0x050 structures   0x100 the root's members   0x300 the item's members
+/// 0x400 block table  0x440 the root's data      0x500 the items
+/// ```
+fn wide_meta(count: u16, fields: u16, extras: u16) -> Vec<u8> {
+    let stride = 4 * u32::from(fields);
+    let items = usize::from(count) * (stride as usize);
+    let root_len = 16 + 4 * u32::from(extras);
+    let mut payload = vec![0u8; 0x500 + items];
+    meta_put(&mut payload, 0x00, 0xDEAD_BEEF, 4);
+    meta_put(&mut payload, 0x04, 1, 4);
+    meta_put(
+        &mut payload,
+        0x10,
+        u64::from(rpf_core::metadata::meta::MAGIC),
+        4,
+    );
+    meta_put(
+        &mut payload,
+        0x14,
+        u64::from(rpf_core::metadata::meta::VERSION_TWO),
+        4,
+    );
+    meta_put(&mut payload, 0x1C, 1, 4);
+    meta_put(&mut payload, 0x20, meta_system(0x50), 8);
+    meta_put(&mut payload, 0x30, meta_system(0x400), 8);
+    meta_put(&mut payload, 0x48, 2, 2);
+    meta_put(&mut payload, 0x4C, 2, 2);
+    // The root structure: the array, `extras` scalars, and the `ARRAYINFO`
+    // member the array's element type is read from.
+    meta_put(&mut payload, 0x50, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x54, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x58, 0x300, 4);
+    meta_put(&mut payload, 0x60, meta_system(0x100), 8);
+    meta_put(&mut payload, 0x68, u64::from(root_len), 4);
+    meta_put(&mut payload, 0x6E, u64::from(extras) + 2, 2);
+    // The item structure: `fields` `UINT`s.
+    meta_put(&mut payload, 0x70, u64::from(META_ITEM), 4);
+    meta_put(&mut payload, 0x74, u64::from(META_ITEM), 4);
+    meta_put(&mut payload, 0x78, 0x300, 4);
+    meta_put(&mut payload, 0x80, meta_system(0x300), 8);
+    meta_put(&mut payload, 0x88, u64::from(stride), 4);
+    meta_put(&mut payload, 0x8E, u64::from(fields), 2);
+
+    meta_member(&mut payload, 0x100, META_MEMBER, 0, 0x07);
+    meta_put(&mut payload, 0x10A, u64::from(extras) + 1, 2);
+    for extra in 0..usize::from(extras) {
+        let at = 0x110 + 16 * extra;
+        meta_member(
+            &mut payload,
+            at,
+            META_MEMBER,
+            16 + 4 * u32::try_from(extra).expect("a test field count fits"),
+            0x15,
+        );
+    }
+    let arrayinfo = 0x100 + 16 * (usize::from(extras) + 1);
+    meta_member(&mut payload, arrayinfo, META_ARRAYINFO, 0, 0x05);
+    meta_put(&mut payload, arrayinfo + 12, u64::from(META_ITEM), 4);
+    for field in 0..usize::from(fields) {
+        let at = 0x300 + 16 * field;
+        meta_member(
+            &mut payload,
+            at,
+            META_MEMBER,
+            4 * u32::try_from(field).expect("a test field count fits"),
+            0x15,
+        );
+    }
+
+    meta_put(&mut payload, 0x400, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x404, u64::from(root_len), 4);
+    meta_put(&mut payload, 0x408, meta_system(0x440), 8);
+    meta_put(&mut payload, 0x410, u64::from(META_ITEM), 4);
+    meta_put(&mut payload, 0x414, u64::try_from(items).expect("fits"), 4);
+    meta_put(&mut payload, 0x418, meta_system(0x500), 8);
+    // The counted form: a pointer to block 2, and the two counts.
+    meta_put(&mut payload, 0x440, 2, 8);
+    meta_put(&mut payload, 0x448, u64::from(count), 2);
+    meta_put(&mut payload, 0x44A, u64::from(count), 2);
+    payload
+}
+
+/// How many elements a document holds: every one opens with a `<`, and the
+/// declaration and the closing tags are the rest of them.
+fn meta_elements(document: &str) -> usize {
+    document.matches('<').count() - document.matches("</").count() - 1
+}
+
+/// `meta`: a walk of exactly as many elements as a walk may write converts.
+///
+/// The node ceiling and the byte ceiling are different bounds in different
+/// units, so this payload is deliberately large enough that the byte budget —
+/// 256 bytes of document per byte of payload — is not what answers first.
+#[test]
+fn a_meta_walk_of_exactly_the_most_elements_a_walk_may_write_converts() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let payload = wide_meta(u16::MAX, 15, 14);
+    let xml = String::from_utf8(
+        meta::to_xml(&payload, payload.len(), &Dictionary::default())
+            .expect("a walk of exactly the ceiling converts"),
+    )
+    .expect("UTF-8");
+    assert_eq!(meta_elements(&xml), META_MAX_NODES);
+    assert!(
+        xml.len() < payload.len() * 256,
+        "the byte budget is not what this payload is bounded by"
+    );
+}
+
+/// `meta`: one element more is refused, and refused as a fact about the payload.
+#[test]
+fn a_meta_walk_one_element_past_the_node_ceiling_is_refused() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    // One more scalar field on the root, and nothing else: the same array, the
+    // same items, one element more.
+    let payload = wide_meta(u16::MAX, 15, 15);
+    match meta::to_xml(&payload, payload.len(), &Dictionary::default()) {
+        Err(rpf_core::Error::BadMeta { cause, .. }) => {
+            assert_eq!(cause, meta::Malformed::TooManyNodes);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// How many bytes of document one byte of `Meta` payload may write.
+///
+/// `meta::kind::MAX_OUTPUT_RATIO`, pinned here for the reason
+/// [`META_MIN_OUTPUT`] is.
+const META_MAX_OUTPUT_RATIO: usize = 256;
+
+/// The name hash of the structure every pointer below lands on.
+const META_LEAF: u32 = 0x0FEE_1DAD;
+
+/// How many bytes of document a `Meta` payload of `payload` bytes may write.
+fn meta_budget(payload: usize) -> usize {
+    (payload * META_MAX_OUTPUT_RATIO).max(META_MIN_OUTPUT)
+}
+
+/// A `Meta` whose root holds a counted string of `text` characters and
+/// `pointers` pointers, every one of them at the same structure of `fields`
+/// `UINT`s.
+///
+/// **One block read many times is the only way to the byte ceiling.** That
+/// ceiling is 256 bytes of document per byte of payload, and a walk that reads
+/// each byte once cannot approach it: a `UINT` costs four bytes of payload and
+/// writes some thirty of document. A file may name one block from many
+/// pointers, and then it does — which is the shape here, and the string is the
+/// knob that tunes the document to the byte, because one character of it is one
+/// byte of each.
+///
+/// The payload's *length* does not depend on `text`: the string's block is
+/// always `store` bytes and only the counts and the terminator move. So the
+/// budget is one number across the whole family and the document is what
+/// varies.
+fn amplified_meta(pointers: u16, fields: u16, store: u32, text: u32) -> Vec<u8> {
+    let leaf_members = 0x200;
+    let leaf_data = leaf_members + 16 * usize::from(fields);
+    let string_at = leaf_data + 4 * usize::from(fields);
+    let root_members = string_at + usize::try_from(store).expect("a test store fits");
+    let root_data = root_members + 16 * (usize::from(pointers) + 1);
+    let root_len = 16 + 8 * u32::from(pointers);
+    let mut payload = vec![0u8; root_data + usize::try_from(root_len).expect("fits")];
+    let system = |at: usize| meta_system(u32::try_from(at).expect("a test offset fits"));
+    meta_put(&mut payload, 0x00, 0xDEAD_BEEF, 4);
+    meta_put(&mut payload, 0x04, 1, 4);
+    meta_put(
+        &mut payload,
+        0x10,
+        u64::from(rpf_core::metadata::meta::MAGIC),
+        4,
+    );
+    meta_put(
+        &mut payload,
+        0x14,
+        u64::from(rpf_core::metadata::meta::VERSION_TWO),
+        4,
+    );
+    meta_put(&mut payload, 0x1C, 1, 4);
+    meta_put(&mut payload, 0x20, meta_system(0x50), 8);
+    meta_put(&mut payload, 0x30, meta_system(0x100), 8);
+    meta_put(&mut payload, 0x48, 2, 2);
+    meta_put(&mut payload, 0x4C, 3, 2);
+    // The root structure: the string, then one pointer member per subtree.
+    meta_put(&mut payload, 0x50, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x54, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x58, 0x300, 4);
+    meta_put(&mut payload, 0x60, system(root_members), 8);
+    meta_put(&mut payload, 0x68, u64::from(root_len), 4);
+    meta_put(&mut payload, 0x6E, u64::from(pointers) + 1, 2);
+    // The leaf structure: `fields` `UINT`s.
+    meta_put(&mut payload, 0x70, u64::from(META_LEAF), 4);
+    meta_put(&mut payload, 0x74, u64::from(META_LEAF), 4);
+    meta_put(&mut payload, 0x78, 0x300, 4);
+    meta_put(&mut payload, 0x80, system(leaf_members), 8);
+    meta_put(&mut payload, 0x88, u64::from(fields) * 4, 4);
+    meta_put(&mut payload, 0x8E, u64::from(fields), 2);
+
+    meta_member(&mut payload, root_members, META_MEMBER, 0, 0x40);
+    for pointer in 0..usize::from(pointers) {
+        let at = root_members + 16 * (pointer + 1);
+        meta_member(
+            &mut payload,
+            at,
+            META_MEMBER,
+            16 + 8 * u32::try_from(pointer).expect("a test pointer count fits"),
+            0x06,
+        );
+    }
+    for field in 0..usize::from(fields) {
+        let at = leaf_members + 16 * field;
+        meta_member(
+            &mut payload,
+            at,
+            META_MEMBER,
+            4 * u32::try_from(field).expect("a test field count fits"),
+            0x15,
+        );
+    }
+
+    meta_put(&mut payload, 0x100, u64::from(META_ROOT), 4);
+    meta_put(&mut payload, 0x104, u64::from(root_len), 4);
+    meta_put(&mut payload, 0x108, system(root_data), 8);
+    meta_put(&mut payload, 0x110, u64::from(META_LEAF), 4);
+    meta_put(&mut payload, 0x114, u64::from(fields) * 4, 4);
+    meta_put(&mut payload, 0x118, system(leaf_data), 8);
+    meta_put(&mut payload, 0x120, 0x11, 4);
+    meta_put(&mut payload, 0x124, u64::from(store), 4);
+    meta_put(&mut payload, 0x128, system(string_at), 8);
+
+    // The counted string: a pointer to the third block, and the two counts.
+    meta_put(&mut payload, root_data, 3, 8);
+    meta_put(&mut payload, root_data + 8, u64::from(text) + 1, 2);
+    meta_put(&mut payload, root_data + 10, u64::from(text) + 1, 2);
+    for pointer in 0..usize::from(pointers) {
+        meta_put(&mut payload, root_data + 16 + 8 * pointer, 2, 8);
+    }
+    for character in 0..usize::try_from(text).expect("fits") {
+        payload[string_at + character] = b'a';
+    }
+    payload
+}
+
+/// `meta`: a document of exactly the bytes its payload may write is written,
+/// and one byte more is refused.
+///
+/// The ceiling `apply` reads as [`rpf_core::metadata::meta::NotMetaXml::TooLarge`]
+/// before it parses a document, from the side that writes one. The two are one
+/// number — `meta::kind::document_budget` — so a document this refuses to write
+/// is one the other direction refuses to read, and neither answer depends on
+/// the walk stopping in the same place.
+#[test]
+fn a_meta_document_of_exactly_the_bytes_its_payload_may_write_is_the_largest_written() {
+    use rpf_core::metadata::{hash::Dictionary, meta};
+
+    let names = Dictionary::default();
+    let (pointers, fields, store) = (1192u16, 400u16, 16 * 1024u32);
+    let empty = amplified_meta(pointers, fields, store, 0);
+    let budget = meta_budget(empty.len());
+    let shortest = meta::to_xml(&empty, empty.len(), &names)
+        .expect("a document under the budget converts")
+        .len();
+    let room = budget - shortest;
+    assert!(
+        room < usize::try_from(store).expect("fits"),
+        "the string has to be able to tune the document to the byte: {room} of {store}"
+    );
+
+    let exact = amplified_meta(
+        pointers,
+        fields,
+        store,
+        u32::try_from(room).expect("the room fits"),
+    );
+    assert_eq!(
+        meta_budget(exact.len()),
+        budget,
+        "the same family, the same budget"
+    );
+    assert_eq!(
+        meta::to_xml(&exact, exact.len(), &names)
+            .expect("a document of exactly the budget is written")
+            .len(),
+        budget
+    );
+
+    let over = amplified_meta(
+        pointers,
+        fields,
+        store,
+        u32::try_from(room + 1).expect("the room fits"),
+    );
+    match meta::to_xml(&over, over.len(), &names) {
+        Err(rpf_core::Error::BadMeta { cause, .. }) => {
+            assert_eq!(cause, meta::Malformed::TooLarge);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // And a payload whose document is far past the budget is refused by the
+    // check every element is charged against rather than by the one after the
+    // walk: the walk stops at the ceiling instead of writing twice it and
+    // measuring afterwards.
+    let far = amplified_meta(pointers * 2, fields, store, 0);
+    assert!(meta_budget(far.len()) >= budget);
+    match meta::to_xml(&far, far.len(), &names) {
+        Err(rpf_core::Error::BadMeta { cause, .. }) => {
+            assert_eq!(cause, meta::Malformed::TooLarge);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}

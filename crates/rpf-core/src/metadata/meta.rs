@@ -33,33 +33,123 @@
 //! this layer still takes bytes, never seeks, never opens a file and never
 //! learns that archives exist (`docs/conventions.md` §2).
 //!
-//! # What this module does not decode
+//! # The seam
 //!
-//! Values inside a data block. `docs/metadata-encodings.md` records that
-//! **23** distinct type codes occur over 3,891,369 members and does not
-//! enumerate them, and nothing here guesses: a member's type reaches the
-//! caller as the [`TypeCode`] byte the file carries, with no meaning attached
-//! and no refusal on an unknown one. The same gap is why a block tag that
-//! names no structure is [`BlockTag::Type`] carrying its raw word rather than
-//! a checked code. R5.8b is where a walk over those values goes, and it needs
-//! the census first.
+//! [`to_xml`] and [`from_xml`], bytes in and bytes out, exactly as `rbf`'s pair
+//! and `pso`'s are. Two arguments neither of those two needs, and each is a
+//! fact about this encoding rather than a widening of the seam:
+//!
+//! - **`system_len`**, because a `Meta` payload is a *paged* resource and a
+//!   resource pointer's offset is flat within the space its nibble names. The
+//!   boundary is a fact about the entry (`crate::format::resource::size_from_flags`
+//!   of its system flags) and appears nowhere in the payload, so a caller that
+//!   has the bytes has it too and nothing here can derive it.
+//! - **the payload, in the write direction**, because a document cannot carry
+//!   the file: page slack, inter-table padding, the 7.26% of a payload after
+//!   the last data block, and **2.48% that no walk reaches and that is not
+//!   zero**. DR-049, whose argument for `PSO`'s 2.86% is this one exactly. So
+//!   [`from_xml`] **edits** the payload the document came from, writing each
+//!   value at the address [`to_xml`] read it from and moving nothing
+//!   structural.
+//!
+//! A [`Dictionary`] decides how the hashes render, and is cosmetic by
+//! construction: 412 distinct member names and 73 structure hashes across the
+//! whole corpus, and an empty dictionary spells every one `hash_XXXXXXXX`.
+//!
+//! # What is measured here and what is not
+//!
+//! [`parse`] — the header, the three tables and both pointer kinds — is
+//! `verified` against all 49,614 files. **The value walk is not.** The type
+//! table `kind` carries is `secondary`: `docs/metadata-encodings.md` counted
+//! 23 distinct type codes and does not enumerate them, so the codes are the
+//! reference implementation's, read as specification under `AGENTS.md`'s
+//! authority order. `kind` says what bounds a wrong row, and
+//! `every_shipped_meta_file_round_trips_byte_for_byte` in
+//! `crates/rpf-core/tests/metadata.rs` is the measurement that would settle it
+//! — **it has never been run against the corpus**, because no dump of the
+//! 49,614 payloads has been within reach of this code.
 //!
 //! # What bounds it
 //!
-//! There is no walk here, so there is no depth ceiling and no node budget yet
-//! — [`super::pso`]'s `MAX_DEPTH` and `MAX_NODES` belong with the walk that
-//! needs them. What [`parse`] does allocate is the three tables, and each of
-//! them is bounded by the payload itself: a table of `n` records is refused
-//! unless its whole extent lies inside the space its pointer names, so `n` can
-//! never exceed the payload's own length divided by the record's. Members and
-//! enum entries are not collected at all — they are read from the payload on
-//! demand, through a slice whose extent [`parse`] has already checked — so a
-//! file declaring 65,535 structures of 65,535 members costs one refusal rather
-//! than 4 × 10⁹ records.
+//! What [`parse`] allocates is the three tables, and each of them is bounded by
+//! the payload itself: a table of `n` records is refused unless its whole
+//! extent lies inside the space its pointer names, so `n` can never exceed the
+//! payload's own length divided by the record's. Members and enum entries are
+//! not collected at all — they are read from the payload on demand, through a
+//! slice whose extent [`parse`] has already checked — so a file declaring
+//! 65,535 structures of 65,535 members costs one refusal rather than 4 × 10⁹
+//! records. The walk carries its own three ceilings, which `kind` owns: a
+//! depth, a node budget and an output budget proportional to the payload.
+
+mod apply;
+mod data;
+mod kind;
+mod render;
 
 use std::collections::BTreeMap;
 
-use crate::error::{Error, Result};
+pub use kind::{NotMetaXml, Unsupported};
+
+use crate::{
+    error::{Error, Result},
+    metadata::hash::Dictionary,
+};
+
+/// The reserved XML name prefix this mapping's vocabulary lives under.
+///
+/// A prefix and deliberately **not** an XML namespace, for the reason DR-043
+/// gives for `RBF` and DR-047 carries into `PSO`: an element's name comes from
+/// a dictionary the user supplied, so namespace well-formedness is not this
+/// layer's to promise. Each encoding owns its own, because the prefixes differ;
+/// `data::spell` is the guard that keeps a dictionary name out of it.
+pub const RESERVED_PREFIX: &str = "meta:";
+
+/// Reads a resource `Meta` payload and writes the XML that describes it.
+///
+/// `payload` is the **inflated** payload of a resource entry and `system_len`
+/// how many of its bytes are system pages — see [`parse`], which this is the
+/// walk over.
+///
+/// # Errors
+///
+/// [`Error::BadMeta`] if the file contradicts itself — a pointer outside its
+/// block, a member outside its structure, a walk deeper or larger than the
+/// ceilings allow — and [`Error::UnsupportedMeta`] if it is well formed and
+/// carries a member type code outside the 23 this build names.
+pub fn to_xml(payload: &[u8], system_len: usize, names: &Dictionary) -> Result<Vec<u8>> {
+    render::write(payload, system_len, names)
+}
+
+/// Reads the XML [`to_xml`] wrote and applies it to the payload it came from.
+///
+/// **Four arguments, and none of them will go away.** `payload` is the file
+/// being edited, because 2.48% of it is unreached and nonzero and no document
+/// can carry it (DR-049); `system_len` is the page boundary, which is a fact
+/// about the entry and not about these bytes; `document` is the edit; `names`
+/// spells the hashes, exactly as it does in the read direction.
+///
+/// The walk is [`to_xml`]'s, run backwards: every value the document carries is
+/// written at the address [`to_xml`] read it from, under the same bound — the
+/// block that holds it — and nothing structural moves. An edit that changes the
+/// **shape** — an array's length, a structure's member list, a value past the
+/// store its form gave it — is refused rather than guessed at. DR-052: editing
+/// is value-level and stays that way. So is an edit that two elements of the
+/// document disagree over, which a file pointing at one value twice makes
+/// possible: DR-059.
+///
+/// # Errors
+///
+/// [`Error::BadMeta`] and [`Error::UnsupportedMeta`] for the payload, exactly
+/// as [`to_xml`] answers them, and [`Error::NotMetaXml`] when the document is
+/// not XML or does not describe this payload.
+pub fn from_xml(
+    payload: &[u8],
+    system_len: usize,
+    document: &[u8],
+    names: &Dictionary,
+) -> Result<Vec<u8>> {
+    apply::write(payload, system_len, document, names)
+}
 
 /// The word at [`MAGIC_AT`] of an inflated resource `Meta` payload.
 ///
@@ -466,6 +556,15 @@ impl Header {
 pub struct TypeCode(u8);
 
 impl TypeCode {
+    /// This code, as the file carries it.
+    ///
+    /// The one way to make one, so that a code always comes from a byte
+    /// somewhere rather than from a number a caller invented.
+    #[must_use]
+    pub const fn new(code: u8) -> Self {
+        Self(code)
+    }
+
     /// The byte the file carries.
     #[must_use]
     pub const fn get(self) -> u8 {
@@ -966,6 +1065,11 @@ fn bad(offset: u64, cause: Malformed) -> Error {
     Error::BadMeta { offset, cause }
 }
 
+/// A refusal about this build rather than about the bytes.
+fn unsupported(cause: Unsupported) -> Error {
+    Error::UnsupportedMeta { cause }
+}
+
 /// `at` as an address a refusal can report.
 fn address(at: usize) -> u64 {
     u64::try_from(at).unwrap_or(u64::MAX)
@@ -1025,6 +1129,31 @@ pub enum Malformed {
     /// A `Meta` pointer names a block the table does not hold, or an offset at
     /// or past that block's length.
     Pointer,
+    /// A read fell outside the data block it was made in.
+    DataRange,
+    /// A member's value does not lie inside the structure that declares it.
+    ///
+    /// The one check that measures this build's `secondary` type widths against
+    /// something the file itself states — `kind` says why it is load-bearing.
+    MemberExtent,
+    /// A structure a pointer or a member reaches is not one the file defines.
+    ///
+    /// `docs/metadata-encodings.md`: 0 of 462,942 block tags resolve to neither
+    /// a structure the file defines nor a bare type code, and 0 of 167,988
+    /// structure references on real members are unresolvable — so a file where
+    /// one is, is not one Rockstar's packer wrote.
+    UndefinedStructure,
+    /// An array member's `arrayInfoIndex` names no member of its structure.
+    ///
+    /// `docs/metadata-encodings.md`: 925,473 indices resolved and **0**
+    /// unresolvable.
+    ArrayInfo,
+    /// Structures nested deeper than this walk goes.
+    TooDeep,
+    /// The walk wrote more elements than its budget allows.
+    TooManyNodes,
+    /// The document grew past what a payload of this size is allowed to write.
+    TooLarge,
 }
 
 #[cfg(test)]
@@ -1423,8 +1552,14 @@ mod tests {
 
     #[test]
     fn every_refusal_is_reachable() {
-        // §6, and `docs/conventions.md` §12's rule that the malformed cases are
-        // tested deliberately: one payload per variant of `Malformed`.
+        // §6, and `docs/conventions.md` §12's rule that the malformed cases
+        // are tested deliberately: one payload per variant of `Malformed` that
+        // [`parse`] itself raises. The walk's own — `DataRange`,
+        // `MemberExtent`, `UndefinedStructure`, `ArrayInfo`, `TooDeep`,
+        // `TooManyNodes` and `TooLarge` — belong to `render` and `apply`, and
+        // are pinned in `crates/rpf-core/tests/metadata.rs` and, for the three
+        // that are ceilings, at their boundary in
+        // `crates/rpf-core/tests/boundaries.rs`.
         let short = vec![0_u8; HEADER_LEN - 1];
         assert_eq!(
             refusal(&parse(&short, 0).expect_err("shorter than a header")),

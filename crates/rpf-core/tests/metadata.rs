@@ -2652,3 +2652,630 @@ fn every_shipped_meta_file_parses_from_the_system_length_its_name_carries() {
     );
     eprintln!("{count} Meta payloads parsed, {structures} structures and {blocks} data blocks");
 }
+
+// ---------------------------------------------------------------------------
+// Resource-embedded `Meta` — R5.8b, the value walk and the edit that writes it
+// back. Corpus-free: every payload below is assembled byte by byte here, and
+// the one test that needs the dump says so by refusing without it.
+// ---------------------------------------------------------------------------
+
+/// A `Meta` payload under construction, so that a test states the bytes it
+/// means and nothing else.
+struct MetaBytes(Vec<u8>);
+
+impl MetaBytes {
+    fn of(len: usize) -> Self {
+        Self(vec![0; len])
+    }
+
+    fn put(&mut self, at: usize, bytes: &[u8]) -> &mut Self {
+        self.0[at..at + bytes.len()].copy_from_slice(bytes);
+        self
+    }
+
+    fn u16(&mut self, at: usize, value: u16) -> &mut Self {
+        self.put(at, &value.to_le_bytes())
+    }
+
+    fn u32(&mut self, at: usize, value: u32) -> &mut Self {
+        self.put(at, &value.to_le_bytes())
+    }
+
+    fn u64(&mut self, at: usize, value: u64) -> &mut Self {
+        self.put(at, &value.to_le_bytes())
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// A system-space resource pointer at `offset`.
+fn meta_system(offset: u32) -> u64 {
+    (5u64 << 28) | u64::from(offset)
+}
+
+/// A `Meta` pointer to `offset` of block `id`.
+fn meta_pointer(id: u64, offset: u64) -> u64 {
+    (offset << 12) | id
+}
+
+/// The root structure's name hash.
+const META_ROOT: u32 = 0xD98B_B561;
+/// The name hash of the structure a pointer member reaches.
+const META_CHILD: u32 = 0x1111_0000;
+/// The name hashes of the root's members, one per form.
+const META_UINT: u32 = 0x1234_5678;
+const META_FLOAT: u32 = 0x2222_0000;
+const META_HASH: u32 = 0x3333_0000;
+const META_STRING: u32 = 0x4444_0000;
+const META_ARRAY: u32 = 0x5555_0000;
+const META_POINTER: u32 = 0x6666_0000;
+const META_BYTES: u32 = 0x7777_0000;
+/// The `ARRAYINFO` sentinel a member carries when it describes another
+/// member's elements rather than a field of its own.
+const META_ARRAYINFO: u32 = 0x0000_0100;
+
+/// The header of a well-formed file with no table in it.
+fn meta_header(len: usize) -> MetaBytes {
+    let mut payload = MetaBytes::of(len);
+    payload
+        .u32(0x00, 0xDEAD_BEEF)
+        .u32(0x04, 1)
+        .u32(0x10, meta::MAGIC)
+        .u32(0x14, meta::VERSION_TWO)
+        .u32(0x1C, 1);
+    payload
+}
+
+/// The smallest file that reaches a value: one structure of one `UINT`, one
+/// data block holding it.
+fn minimal_meta() -> Vec<u8> {
+    let mut payload = meta_header(0x100);
+    payload
+        .u64(0x20, meta_system(0x50))
+        .u64(0x30, meta_system(0xA0))
+        .u16(0x48, 1)
+        .u16(0x4C, 1)
+        // The structure: name, name2, kind, membersPtr, length, count.
+        .u32(0x50, META_ROOT)
+        .u32(0x54, META_ROOT)
+        .u32(0x58, 0x300)
+        .u64(0x60, meta_system(0x70))
+        .u32(0x68, 4)
+        .u16(0x6E, 1)
+        // Its one member: a `UINT` at offset 0.
+        .u32(0x70, META_UINT)
+        .u32(0x74, 0)
+        .put(0x78, &[0x15, 0x00])
+        // The block table, and the block.
+        .u32(0xA0, META_ROOT)
+        .u32(0xA4, 4)
+        .u64(0xA8, meta_system(0xB0))
+        .u32(0xB0, 7);
+    payload.bytes().to_vec()
+}
+
+/// A file carrying one of every form this build decodes, with `count1` and
+/// `count2` of its counted string chosen by the caller.
+///
+/// ```text
+/// 0x050 structures   0x100 root's members   0x180 the child's member
+/// 0x200 block table  0x300 the root's data  0x380 string  0x390 array
+/// 0x3A0 child        0x370 bytes
+/// ```
+fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
+    let mut payload = meta_header(0x400);
+    payload
+        .u64(0x20, meta_system(0x50))
+        .u64(0x30, meta_system(0x200))
+        .u16(0x48, 2)
+        .u16(0x4C, 5)
+        // The root structure: eight members, 0x60 bytes long.
+        .u32(0x50, META_ROOT)
+        .u32(0x54, META_ROOT)
+        .u32(0x58, 0x300)
+        .u64(0x60, meta_system(0x100))
+        .u32(0x68, 0x60)
+        .u16(0x6E, 8)
+        // The child structure: one `UINT`.
+        .u32(0x70, META_CHILD)
+        .u32(0x74, META_CHILD)
+        .u32(0x78, 0x300)
+        .u64(0x80, meta_system(0x180))
+        .u32(0x88, 4)
+        .u16(0x8E, 1);
+
+    let member = |payload: &mut MetaBytes, at: usize, name: u32, offset: u32, code: u8| {
+        payload
+            .u32(at, name)
+            .u32(at + 4, offset)
+            .put(at + 8, &[code, 0]);
+    };
+    member(&mut payload, 0x100, META_UINT, 0x00, 0x15);
+    member(&mut payload, 0x110, META_FLOAT, 0x04, 0x21);
+    member(&mut payload, 0x120, META_HASH, 0x08, 0x4A);
+    member(&mut payload, 0x130, META_STRING, 0x10, 0x40);
+    member(&mut payload, 0x140, META_ARRAY, 0x20, 0x07);
+    payload.u16(0x14A, 7); // its `ARRAYINFO` member is the eighth
+    member(&mut payload, 0x150, META_POINTER, 0x30, 0x06);
+    member(&mut payload, 0x160, META_BYTES, 0x38, 0x50);
+    member(&mut payload, 0x170, META_ARRAYINFO, 0x00, 0x15);
+    member(&mut payload, 0x180, META_UINT, 0x00, 0x15);
+
+    let block = |payload: &mut MetaBytes, at: usize, tag: u32, len: u32, to: u32| {
+        payload
+            .u32(at, tag)
+            .u32(at + 4, len)
+            .u64(at + 8, meta_system(to));
+    };
+    block(&mut payload, 0x200, META_ROOT, 0x60, 0x300);
+    block(&mut payload, 0x210, 0x11, 8, 0x380);
+    block(&mut payload, 0x220, 0x15, 8, 0x390);
+    block(&mut payload, 0x230, META_CHILD, 4, 0x3A0);
+    block(&mut payload, 0x240, 0x11, 4, 0x370);
+
+    payload
+        .u32(0x300, 7)
+        .u32(0x304, 0x3FC0_0000)
+        .u32(0x308, 0xAABB_CCDD)
+        .u64(0x310, meta_pointer(2, 0))
+        .u16(0x318, count1)
+        .u16(0x31A, count2)
+        .u64(0x320, meta_pointer(3, 0))
+        .u16(0x328, 2)
+        .u16(0x32A, 2)
+        .u64(0x330, meta_pointer(4, 0))
+        .u64(0x338, meta_pointer(5, 0))
+        .u16(0x340, 3)
+        .u16(0x342, 3)
+        // The bytes no walk reaches, which have to survive untouched.
+        .put(0x348, &[0xA7; 0x18])
+        .put(0x380, b"GTA V\0\xA7\xA7")
+        .u32(0x390, 11)
+        .u32(0x394, 22)
+        .u32(0x3A0, 99)
+        .put(0x370, &[0xDE, 0xAD, 0xBE, 0xA7]);
+    payload.bytes().to_vec()
+}
+
+/// The document a payload renders, with no dictionary.
+fn meta_xml(payload: &[u8]) -> String {
+    let bytes = meta::to_xml(payload, payload.len(), &Dictionary::default()).expect("converts");
+    String::from_utf8(bytes).expect("UTF-8")
+}
+
+/// What a document the payload does not describe is refused with.
+fn meta_not_xml(payload: &[u8], document: &str) -> meta::NotMetaXml {
+    match meta::from_xml(
+        payload,
+        payload.len(),
+        document.as_bytes(),
+        &Dictionary::default(),
+    ) {
+        Err(Error::NotMetaXml { cause, .. }) => cause,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_minimal_meta_is_the_baseline_the_refusals_are_mutations_of() {
+    assert_eq!(
+        meta_xml(&minimal_meta()),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <hash_D98BB561 meta:struct=\"hash_D98BB561\">\n  \
+         <hash_12345678 meta:uint=\"7\"/>\n\
+         </hash_D98BB561>\n"
+    );
+}
+
+#[test]
+fn every_form_this_build_decodes_is_named_in_the_document() {
+    assert_eq!(
+        meta_xml(&rich_meta(6, 6)),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <hash_D98BB561 meta:struct=\"hash_D98BB561\">\n  \
+         <hash_12345678 meta:uint=\"7\"/>\n  \
+         <hash_22220000 meta:float=\"1.5\"/>\n  \
+         <hash_33330000 meta:hash=\"hash_AABBCCDD\"/>\n  \
+         <hash_44440000 meta:string=\"GTA V\"/>\n  \
+         <hash_55550000 meta:array=\"counted\">\n    \
+         <meta:item meta:uint=\"11\"/>\n    \
+         <meta:item meta:uint=\"22\"/>\n  \
+         </hash_55550000>\n  \
+         <hash_66660000 meta:struct=\"hash_11110000\">\n    \
+         <hash_12345678 meta:uint=\"99\"/>\n  \
+         </hash_66660000>\n  \
+         <hash_77770000 meta:bytes=\"deadbe\"/>\n\
+         </hash_D98BB561>\n"
+    );
+}
+
+#[test]
+fn a_hand_built_meta_round_trips_byte_for_byte() {
+    // DR-049 for `Meta`: the write direction edits the payload the document
+    // came from, so the 2.48% of a payload no walk reaches — the `0xA7` filler
+    // here — survives because nothing looks at it.
+    for payload in [minimal_meta(), rich_meta(6, 6), rich_meta(6, 5)] {
+        let xml = meta_xml(&payload);
+        assert_eq!(
+            meta::from_xml(
+                &payload,
+                payload.len(),
+                xml.as_bytes(),
+                &Dictionary::default()
+            )
+            .expect("applies back"),
+            payload,
+            "unedited in, unedited out"
+        );
+    }
+}
+
+#[test]
+fn an_edited_value_changes_the_bytes_it_names_and_no_others() {
+    let payload = rich_meta(6, 6);
+    let edited = meta_xml(&payload).replace("meta:uint=\"7\"", "meta:uint=\"8\"");
+    let written = meta::from_xml(
+        &payload,
+        payload.len(),
+        edited.as_bytes(),
+        &Dictionary::default(),
+    )
+    .expect("applies");
+    assert_eq!(&written[0x300..0x304], &8u32.to_le_bytes());
+    assert_eq!(&written[..0x300], &payload[..0x300]);
+    assert_eq!(&written[0x304..], &payload[0x304..]);
+}
+
+/// What a payload the document does not fit is refused with, in the write
+/// direction.
+fn meta_bad(payload: &[u8], document: &str) -> (u64, meta::Malformed) {
+    match meta::from_xml(
+        payload,
+        payload.len(),
+        document.as_bytes(),
+        &Dictionary::default(),
+    ) {
+        Err(Error::BadMeta { offset, cause }) => (offset, cause),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// What the read direction refuses a payload with.
+fn meta_bad_read(payload: &[u8]) -> (u64, meta::Malformed) {
+    match meta::to_xml(payload, payload.len(), &Dictionary::default()) {
+        Err(Error::BadMeta { offset, cause }) => (offset, cause),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_value_outside_the_block_that_holds_it_is_refused_by_both_directions() {
+    // A structure instance is checked against the length its *block* declares
+    // and not only against the length its structure declares: `fits` is a fact
+    // about the structure, and a block may be shorter than the structure a
+    // pointer says lives in it. The read direction has always bounded every
+    // read by the block; the write direction has to refuse the same payload,
+    // or a document `to_xml` cannot write is one `from_xml` accepts — and the
+    // write runs past the block, over the 7.26% after the last block and the
+    // 2.48% that is unreached and nonzero. DR-049.
+    let document = meta_xml(&minimal_meta());
+    let mut payload = minimal_meta();
+    payload[0xA4] = 3; // the block's declared length, against a four-byte `UINT`
+
+    assert_eq!(meta_bad_read(&payload), (0xB0, meta::Malformed::DataRange));
+    assert_eq!(
+        meta_bad(&payload, &document),
+        (0xB0, meta::Malformed::DataRange),
+        "the two directions refuse the same payload at the same address"
+    );
+}
+
+#[test]
+fn an_array_item_outside_the_block_that_holds_it_is_refused_by_both_directions() {
+    // The same rule down the array path, where the overrun is a stride at a
+    // time: the file declares two items and a block of one, so the second item
+    // is past the block's end in both directions.
+    let document = meta_xml(&rich_meta(6, 6));
+    let mut payload = rich_meta(6, 6);
+    payload[0x224] = 4; // the array block's declared length, against two items
+
+    assert_eq!(meta_bad_read(&payload), (0x394, meta::Malformed::DataRange));
+    assert_eq!(
+        meta_bad(&payload, &document),
+        (0x394, meta::Malformed::DataRange),
+        "the two directions refuse the same payload at the same address"
+    );
+}
+
+/// A `Meta` whose root holds two pointers to one value.
+///
+/// ```text
+/// 0x050 the structure   0x070 its members   0x100 block table
+/// 0x140 the root's data 0x160 the value both pointers name
+/// ```
+fn aliased_meta() -> Vec<u8> {
+    let mut payload = meta_header(0x200);
+    payload
+        .u64(0x20, meta_system(0x50))
+        .u64(0x30, meta_system(0x100))
+        .u16(0x48, 1)
+        .u16(0x4C, 2)
+        // The root structure: two pointer members, 16 bytes long.
+        .u32(0x50, META_ROOT)
+        .u32(0x54, META_ROOT)
+        .u32(0x58, 0x300)
+        .u64(0x60, meta_system(0x70))
+        .u32(0x68, 0x10)
+        .u16(0x6E, 2)
+        .u32(0x70, META_POINTER)
+        .u32(0x74, 0)
+        .put(0x78, &[0x06, 0])
+        .u32(0x80, META_HASH)
+        .u32(0x84, 8)
+        .put(0x88, &[0x06, 0])
+        // The root's block, and the typed block both its pointers name.
+        .u32(0x100, META_ROOT)
+        .u32(0x104, 0x10)
+        .u64(0x108, meta_system(0x140))
+        .u32(0x110, 0x15)
+        .u32(0x114, 4)
+        .u64(0x118, meta_system(0x160))
+        .u64(0x140, meta_pointer(2, 0))
+        .u64(0x148, meta_pointer(2, 0))
+        .u32(0x160, 7);
+    payload.bytes().to_vec()
+}
+
+#[test]
+fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() {
+    // DR-059. Two pointers at one value render two elements over one address,
+    // and the last element applied would decide what the file holds — so an
+    // edit of the first is dropped without a word, which is the one outcome
+    // worse than a refusal: the caller is told the write succeeded.
+    let payload = aliased_meta();
+    let document = meta_xml(&payload);
+    assert_eq!(
+        document,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <hash_D98BB561 meta:struct=\"hash_D98BB561\">\n  \
+         <hash_66660000 meta:uint=\"7\"/>\n  \
+         <hash_33330000 meta:uint=\"7\"/>\n\
+         </hash_D98BB561>\n",
+        "both pointers render, and both render the same value"
+    );
+
+    // Unedited, the two writes agree, so the file is written back byte for
+    // byte: an aliasing payload is still round-tripped.
+    assert_eq!(
+        meta::from_xml(
+            &payload,
+            payload.len(),
+            document.as_bytes(),
+            &Dictionary::default()
+        )
+        .expect("unedited applies"),
+        payload
+    );
+
+    // Edited on one side alone, the two disagree, and that is the refusal.
+    let half = document.replace(
+        "<hash_66660000 meta:uint=\"7\"/>",
+        "<hash_66660000 meta:uint=\"99\"/>",
+    );
+    assert_eq!(
+        meta_not_xml(&payload, &half),
+        meta::NotMetaXml::Aliased {
+            name: "hash_33330000".to_owned(),
+            address: 0x160,
+        }
+    );
+
+    // Edited on both, they agree again and the edit lands once.
+    let whole = document.replace("meta:uint=\"7\"", "meta:uint=\"99\"");
+    let written = meta::from_xml(
+        &payload,
+        payload.len(),
+        whole.as_bytes(),
+        &Dictionary::default(),
+    )
+    .expect("an edit both elements agree on applies");
+    assert_eq!(&written[0x160..0x164], &99u32.to_le_bytes());
+    assert_eq!(&written[..0x160], &payload[..0x160]);
+    assert_eq!(&written[0x164..], &payload[0x164..]);
+}
+
+#[test]
+fn a_document_that_changes_an_arrays_length_is_refused() {
+    // DR-052: an array's length is a fact about the payload, not about the
+    // document. Nothing here moves a block or re-allocates a page.
+    let payload = rich_meta(6, 6);
+    let shorter = meta_xml(&payload).replace("    <meta:item meta:uint=\"22\"/>\n", "");
+    assert_eq!(
+        meta_not_xml(&payload, &shorter),
+        meta::NotMetaXml::Children {
+            name: "hash_55550000".to_owned(),
+            wanted: 2,
+            found: 1,
+        }
+    );
+}
+
+#[test]
+fn a_document_that_changes_a_structures_member_list_is_refused() {
+    let payload = minimal_meta();
+    let extra = meta_xml(&payload).replace(
+        "  <hash_12345678 meta:uint=\"7\"/>\n",
+        "  <hash_12345678 meta:uint=\"7\"/>\n  <hash_12345678 meta:uint=\"7\"/>\n",
+    );
+    assert_eq!(
+        meta_not_xml(&payload, &extra),
+        meta::NotMetaXml::Children {
+            name: "hash_D98BB561".to_owned(),
+            wanted: 1,
+            found: 2,
+        }
+    );
+}
+
+#[test]
+fn a_document_naming_a_member_the_file_does_not_have_is_refused() {
+    let payload = minimal_meta();
+    let renamed = meta_xml(&payload).replace("hash_12345678", "hash_00000001");
+    assert_eq!(
+        meta_not_xml(&payload, &renamed),
+        meta::NotMetaXml::Tag {
+            wanted: "hash_12345678".to_owned(),
+            found: "hash_00000001".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn a_type_word_that_is_not_the_one_the_file_declares_is_refused() {
+    let payload = minimal_meta();
+    let retyped = meta_xml(&payload).replace("meta:uint", "meta:int");
+    assert_eq!(
+        meta_not_xml(&payload, &retyped),
+        meta::NotMetaXml::Word {
+            wanted: "uint".to_owned(),
+            found: "int".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn a_value_that_does_not_read_back_as_its_own_type_is_refused() {
+    let payload = minimal_meta();
+    let nonsense = meta_xml(&payload).replace("meta:uint=\"7\"", "meta:uint=\"seven\"");
+    assert_eq!(
+        meta_not_xml(&payload, &nonsense),
+        meta::NotMetaXml::Value {
+            name: "hash_12345678".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn a_type_code_outside_the_table_is_refused_rather_than_guessed_at() {
+    // The 23 codes are what `docs/metadata-encodings.md` counted over 3,891,369
+    // members; it does not enumerate them, so a code this build does not name
+    // is answered rather than rendered as whatever width happened to fit.
+    let mut payload = minimal_meta();
+    payload[0x78] = 0x7F;
+    let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
+        .expect_err("an unnamed type code is not decoded");
+    assert!(
+        matches!(
+            error,
+            Error::UnsupportedMeta {
+                cause: meta::Unsupported::DataType { code: 0x7F }
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.category(), Category::Unsupported);
+}
+
+#[test]
+fn a_member_that_does_not_fit_its_own_structure_is_refused() {
+    // The one check that would catch this build's `secondary` widths being
+    // wrong on a real file: a member's value has to lie inside the structure
+    // whose length the file itself declares.
+    let mut payload = minimal_meta();
+    payload[0x68] = 3; // structLength, against a four-byte `UINT` at offset 0
+    let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
+        .expect_err("a member past its structure is refused");
+    assert!(
+        matches!(
+            error,
+            Error::BadMeta {
+                cause: meta::Malformed::MemberExtent,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn an_array_whose_element_member_its_structure_does_not_have_is_refused() {
+    // `docs/metadata-encodings.md`: 925,473 `ARRAYINFO` indices resolved and
+    // **0** unresolvable, so an index that names no member of the owning
+    // structure is a file no packer of Rockstar's wrote.
+    let mut payload = rich_meta(6, 6);
+    payload[0x14A] = 9; // the array's element index, past the eight members
+    let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
+        .expect_err("an element index that names no member is refused");
+    assert!(
+        matches!(
+            error,
+            Error::BadMeta {
+                cause: meta::Malformed::ArrayInfo,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn an_inline_structure_the_file_does_not_define_is_refused() {
+    // The read is driven by the file's own tables and by nothing else — no
+    // builtin table is consulted, because the census found none is needed — so
+    // a member naming a structure the file does not define is answered rather
+    // than looked up somewhere.
+    let mut payload = minimal_meta();
+    payload[0x78] = 0x05; // an inline structure, whose `referenceKey` is 0
+    let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
+        .expect_err("a structure the file does not define is refused");
+    assert!(
+        matches!(
+            error,
+            Error::BadMeta {
+                cause: meta::Malformed::UndefinedStructure,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+#[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
+fn every_shipped_meta_file_round_trips_byte_for_byte() {
+    // R5.8b's exit criterion, and it has **not** been measured: no `RPF_METADATA`
+    // dump of the 49,614 resource `Meta` payloads has been within reach of this
+    // code. The test is here so that the first machine that holds one runs it,
+    // and so that setting the gate over a dump that is not there fails loudly
+    // rather than passing over nothing — `each_meta_payload` refuses on a count
+    // that is not the corpus's.
+    let mut failed = Vec::new();
+    let names = Dictionary::default();
+    let mut trip = |name: &str, dumped: &Dumped| {
+        let xml = match meta::to_xml(&dumped.payload, dumped.system_len, &names) {
+            Ok(xml) => xml,
+            Err(error) => {
+                failed.push(format!("{name}: to_xml: {error}"));
+                return;
+            }
+        };
+        match meta::from_xml(&dumped.payload, dumped.system_len, &xml, &names) {
+            Ok(written) if written == dumped.payload => {}
+            Ok(_) => failed.push(format!("{name}: applied back to different bytes")),
+            Err(error) => failed.push(format!("{name}: from_xml: {error}")),
+        }
+    };
+    let count = each_meta_payload(
+        "every_shipped_meta_file_round_trips_byte_for_byte",
+        &mut trip,
+    );
+    assert!(
+        failed.is_empty(),
+        "{} of {count} payloads did not round-trip:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+    eprintln!("{count} Meta payloads round-tripped byte for byte");
+}

@@ -750,6 +750,35 @@ pub enum Error {
         cause: crate::metadata::pso::Unsupported,
     },
 
+    /// A resource `Meta` payload is well formed and carries something this
+    /// build does not decode.
+    ///
+    /// The same shape as [`Error::UnsupportedPso`] and for the same reason, with
+    /// one difference worth stating: `docs/metadata-encodings.md` counted 23
+    /// distinct `Meta` type codes and does **not** enumerate them, so the table
+    /// this refusal is the complement of is `secondary` rather than measured.
+    /// `crate::metadata::meta`'s own documentation says what bounds that.
+    #[error("the Meta payload carries something this build does not decode")]
+    UnsupportedMeta {
+        /// Which thing.
+        cause: crate::metadata::meta::Unsupported,
+    },
+
+    /// The XML handed to the metadata layer does not describe the resource
+    /// `Meta` payload it was given beside.
+    ///
+    /// The `Meta` write direction is an edit of the file the document came from
+    /// — DR-049 — so this says the two disagree rather than that either is
+    /// malformed on its own.
+    #[error("the XML at position {position} does not describe this Meta payload")]
+    NotMetaXml {
+        /// Where in the XML the reader was, so an editor can put the cursor on
+        /// the line that has to change.
+        position: u64,
+        /// What was wrong with it.
+        cause: crate::metadata::meta::NotMetaXml,
+    },
+
     /// The XML handed to the metadata layer does not describe an `RBF`
     /// document.
     #[error("the XML at position {position} does not describe an RBF document")]
@@ -832,7 +861,8 @@ impl Error {
             | Self::UnrecognisedExecutable { .. }
             | Self::CannotWriteEncrypted { .. }
             | Self::UnrepresentableRbf { .. }
-            | Self::UnsupportedPso { .. } => Category::Unsupported,
+            | Self::UnsupportedPso { .. }
+            | Self::UnsupportedMeta { .. } => Category::Unsupported,
             Self::NotFound { .. } | Self::NoSuchEntry { .. } => Category::NotFound,
             Self::Overlapping { .. }
             | Self::FieldOverflow { .. }
@@ -846,7 +876,8 @@ impl Error {
             | Self::NameCollision { .. }
             | Self::WrongKind { .. }
             | Self::NotRbfXml { .. }
-            | Self::NotPsoXml { .. } => Category::Refused,
+            | Self::NotPsoXml { .. }
+            | Self::NotMetaXml { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
             // DR-019: the bytes decide. A payload that never claimed to be an
             // archive was named one by the caller's own path.
@@ -933,9 +964,11 @@ impl Error {
             Self::BadPso { .. } => "BadPso",
             Self::BadMeta { .. } => "BadMeta",
             Self::UnsupportedPso { .. } => "UnsupportedPso",
+            Self::UnsupportedMeta { .. } => "UnsupportedMeta",
             Self::UnrepresentableRbf { .. } => "UnrepresentableRbf",
             Self::NotRbfXml { .. } => "NotRbfXml",
             Self::NotPsoXml { .. } => "NotPsoXml",
+            Self::NotMetaXml { .. } => "NotMetaXml",
             Self::WrongKind { .. } => "WrongKind",
         }
     }
@@ -982,7 +1015,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 42;
+    const VARIANTS: usize = 44;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -1170,6 +1203,12 @@ mod tests {
                 position: 12,
                 cause: crate::metadata::pso::NotPsoXml::Empty,
             },
+            // And a `Meta` document says the same thing about the resource
+            // payload it was written from. DR-049.
+            Error::NotMetaXml {
+                position: 12,
+                cause: crate::metadata::meta::NotMetaXml::Empty,
+            },
         ]
     }
 
@@ -1256,6 +1295,15 @@ mod tests {
                         code: 0xFF,
                         subtype: 0xFF,
                     },
+                },
+                Category::Unsupported,
+            ),
+            // A `Meta` type code outside the 23 this build names: the same
+            // shape again, and the table it is the complement of is
+            // `secondary` rather than measured.
+            (
+                Error::UnsupportedMeta {
+                    cause: crate::metadata::meta::Unsupported::DataType { code: 0xFF },
                 },
                 Category::Unsupported,
             ),
