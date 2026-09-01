@@ -31,9 +31,9 @@ use quick_xml::{
 
 use super::{
     BlockTag, Malformed, Member, RESERVED_PREFIX, TypeCode, bad,
-    data::{Spot, Values, spell, unhex, until_nul},
+    data::{Spot, Values, spell, until_nul},
     kind::{COUNT_AT, Field, Kind, MAX_DEPTH, NotMetaXml, Scalar, document_budget, fits, is_field},
-    render::{ARRAY, BYTES, COUNTED, ITEM, NULL, STRUCT, TEXT, reserved},
+    render::{ARRAY, COUNTED, INLINE, ITEM, Items, NULL, STRUCT, TEXT, reserved},
 };
 use crate::{
     error::{Error, Result},
@@ -289,7 +289,7 @@ impl<'a> Applier<'a, '_> {
                 owner: Some(structure),
             };
             let tag = spell(self.names, member.name);
-            let width = field.kind()?.width(self.values.meta, spot.address())?;
+            let width = field.width(self.values.meta, spot.address())?;
             fits(&structure, member.data_offset, width, spot.address())?;
             let at = spot.step(member.data_offset)?;
             self.value(field, &tag, at, child, depth.saturating_add(1))?;
@@ -306,6 +306,13 @@ impl<'a> Applier<'a, '_> {
         node: &Node,
         depth: usize,
     ) -> Result<()> {
+        // The ceiling `structure` states, asked again here for the values that
+        // reach no structure: a pointer into a block tagged with a bare type
+        // code applies nothing of its own and recurses, which is the cycle
+        // `render` refuses at the same place.
+        if depth > MAX_DEPTH {
+            return Err(bad(spot.address(), Malformed::TooDeep));
+        }
         match field.kind()? {
             Kind::Scalar(scalar) => {
                 expect(node, tag, scalar.word())?;
@@ -316,44 +323,54 @@ impl<'a> Applier<'a, '_> {
                 None => expect_null(node, tag, STRUCT),
                 Some(landing) => self.target(landing, tag, node, depth),
             },
-            Kind::Array => self.array(field, tag, spot, node, depth),
+            Kind::Array => {
+                let (base, count) = self.values.items(spot)?;
+                self.items(
+                    field,
+                    tag,
+                    Items {
+                        layout: COUNTED,
+                        base,
+                        count,
+                    },
+                    node,
+                    depth,
+                )
+            }
+            Kind::InlineArray(count) => self.items(
+                field,
+                tag,
+                Items {
+                    layout: INLINE,
+                    base: Some(spot),
+                    count,
+                },
+                node,
+                depth,
+            ),
             Kind::Text => match self.values.counted(spot)? {
                 (None, _) => expect_null(node, tag, TEXT),
                 (Some(landing), store) => {
-                    expect(node, tag, TEXT)?;
-                    let bytes = text::decode(&node.value).ok_or(Error::NotMetaXml {
-                        position: node.position,
-                        cause: NotMetaXml::BadEscape,
-                    })?;
                     // The terminator is one of the bytes the store holds, so a
                     // value may fill the store less one — never less, though,
                     // than the value already there, because an edit moves
                     // nothing it did not change. DR-052.
                     let was = until_nul(landing.bytes(store)?).len();
-                    let room = room(store.saturating_sub(1), was);
-                    let len = self.put_value(landing, &bytes, room, node)?;
-                    if usize::try_from(len).is_ok_and(|written| written == was) {
-                        return Ok(());
+                    let len = self.put_text(landing, store.saturating_sub(1), was, tag, node)?;
+                    match len {
+                        None => Ok(()),
+                        Some(len) => self.put_count(spot, len, node),
                     }
-                    if len < room {
-                        self.put(landing.step(len)?, &[0], node)?;
-                    }
-                    self.put_count(spot, len, node)
                 }
             },
-            Kind::Bytes => match self.values.counted(spot)? {
-                (None, _) => expect_null(node, tag, BYTES),
-                (Some(landing), store) => {
-                    expect(node, tag, BYTES)?;
-                    let bytes = unhex(&node.value).ok_or_else(|| unreadable(node))?;
-                    let was = landing.bytes(store)?.len();
-                    let len = self.put_value(landing, &bytes, room(store, was), node)?;
-                    if usize::try_from(len).is_ok_and(|written| written == was) {
-                        return Ok(());
-                    }
-                    self.put_count(spot, len, node)
-                }
-            },
+            Kind::InlineText(store) => {
+                // No count to rewrite: the buffer is the member's own bytes and
+                // its length is a fact about the structure, so a shortened
+                // string is a terminator and nothing else.
+                let was = until_nul(spot.bytes(store)?).len();
+                self.put_text(spot, store.saturating_sub(1), was, tag, node)
+                    .map(|_| ())
+            }
         }
     }
 
@@ -364,6 +381,10 @@ impl<'a> Applier<'a, '_> {
             BlockTag::Type(word) => {
                 let code = u8::try_from(word)
                     .map_err(|_| bad(landing.address(), Malformed::UndefinedStructure))?;
+                // Deepened here and nowhere else on this path, for the reason
+                // `render::Writer::target` gives — and by the same level, or a
+                // payload one direction writes a document for is one the other
+                // refuses.
                 self.value(
                     Field {
                         member: typed(code),
@@ -372,38 +393,30 @@ impl<'a> Applier<'a, '_> {
                     tag,
                     landing,
                     node,
-                    depth,
+                    depth.saturating_add(1),
                 )
             }
         }
     }
 
-    /// Applies an array and its items.
-    fn array(
+    /// Applies an array of either layout: `items.count` items from
+    /// `items.base`.
+    fn items(
         &mut self,
         field: Field<'a>,
         tag: &str,
-        spot: Spot<'a>,
+        items: Items<'a>,
         node: &Node,
         depth: usize,
     ) -> Result<()> {
         expect(node, tag, ARRAY)?;
-        expect_value(node, COUNTED)?;
-        let (base, count) = self.values.items(spot)?;
-        let children = expect_children(node, usize::try_from(count).unwrap_or(usize::MAX))?;
-        let (Some(base), true) = (base, count != 0) else {
+        expect_value(node, items.layout)?;
+        let children = expect_children(node, usize::try_from(items.count).unwrap_or(usize::MAX))?;
+        let (Some(base), true) = (items.base, items.count != 0) else {
             return Ok(());
         };
-        let owner = field
-            .owner
-            .ok_or_else(|| bad(spot.address(), Malformed::ArrayInfo))?;
-        let described = Field {
-            member: owner
-                .member(field.member.array_info_index)
-                .ok_or_else(|| bad(spot.address(), Malformed::ArrayInfo))?,
-            owner: Some(owner),
-        };
-        let stride = described.kind()?.width(self.values.meta, spot.address())?;
+        let described = field.element(base.address())?;
+        let stride = described.stride(self.values.meta, base.address())?;
         let item = reserved(ITEM);
         for (index, child) in children.iter().enumerate() {
             let index =
@@ -501,6 +514,38 @@ impl<'a> Applier<'a, '_> {
         }
         self.put(landing, bytes, node)?;
         Ok(len)
+    }
+
+    /// Writes a NUL-terminated string into the `room` bytes it has, and
+    /// answers the new length when it is one the caller has to record.
+    ///
+    /// `was` is how long the string already there is. `None` says the value is
+    /// unchanged, which is every unedited trip and is what keeps one
+    /// byte-perfect: nothing at all is written past the value, because what
+    /// follows is whatever the packer left and the packer's leavings are 2.48%
+    /// of a `Meta` payload.
+    fn put_text(
+        &mut self,
+        landing: Spot<'a>,
+        store: u32,
+        was: usize,
+        tag: &str,
+        node: &Node,
+    ) -> Result<Option<u32>> {
+        expect(node, tag, TEXT)?;
+        let bytes = text::decode(&node.value).ok_or(Error::NotMetaXml {
+            position: node.position,
+            cause: NotMetaXml::BadEscape,
+        })?;
+        let room = room(store, was);
+        let len = self.put_value(landing, &bytes, room, node)?;
+        if usize::try_from(len).is_ok_and(|written| written == was) {
+            return Ok(None);
+        }
+        if len < room {
+            self.put(landing.step(len)?, &[0], node)?;
+        }
+        Ok(Some(len))
     }
 
     /// Rewrites the count a shortened value leaves behind.
@@ -673,22 +718,37 @@ fn expect_children(node: &Node, wanted: usize) -> Result<&[Node]> {
     Ok(&node.children)
 }
 
-/// Keeps the hex spelling and its inverse in one another's sight.
 #[cfg(test)]
 mod tests {
-    use super::super::data::{hex, unhex};
+    use super::{Error, NotMetaXml, read_tree};
 
+    // -------------------------------------------------------------------
+    // `is_space` — a mutant that always answers `true` would trim a stray
+    // word down to nothing and never see it. The same pair `PSO` carries,
+    // for the copy of the predicate this module holds.
+    // -------------------------------------------------------------------
+
+    /// Text between elements that is not whitespace is a document this
+    /// mapping does not write, and is answered rather than dropped.
     #[test]
-    fn every_byte_string_up_to_two_bytes_round_trips_through_hex() {
-        for first in 0u16..=255 {
-            let one = [u8::try_from(first).expect("a byte")];
-            assert_eq!(unhex(&hex(&one)).as_deref(), Some(&one[..]), "{one:?}");
-        }
-        assert_eq!(hex(b"\xde\xad\xbe"), "deadbe");
-        assert_eq!(unhex("deadbe").as_deref(), Some(&b"\xde\xad\xbe"[..]));
-        // A spelling this never writes is refused rather than half-read.
-        assert_eq!(unhex("d"), None);
-        assert_eq!(unhex("zz"), None);
-        assert_eq!(unhex("de ad"), None);
+    fn text_between_elements_that_is_not_whitespace_is_refused() {
+        let error = read_tree(b"<a meta:x=\"y\">not-blank</a>").expect_err("stray text is refused");
+        assert!(
+            matches!(
+                error,
+                Error::NotMetaXml {
+                    cause: NotMetaXml::UnexpectedText,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Text that is only whitespace is the indentation the render writes, and
+    /// is not content.
+    #[test]
+    fn text_between_elements_that_is_only_whitespace_is_accepted() {
+        read_tree(b"<a meta:x=\"y\">  \n\t\r  </a>").expect("pure whitespace is not content");
     }
 }

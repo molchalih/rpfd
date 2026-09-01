@@ -177,6 +177,26 @@ impl Scheme {
         }
     }
 
+    /// Whether an archive under this transform is keyed by **the name it is
+    /// found under**.
+    ///
+    /// AES takes its key from the tag alone, so an AES archive renamed, moved
+    /// or written at another size is still under the key it was read under. An
+    /// NG archive's every region is keyed by `(hash(name) + length + 61) % 101`
+    /// — `docs/rpf-format.md`, Encryption — so what it is *called* is part of
+    /// what it is, and a nested one whose holder renames it is left keyed by a
+    /// name it no longer has.
+    ///
+    /// The one place that asymmetry is decided for a rename, as
+    /// [`Scheme::seals`] is for a write (`docs/conventions.md` §3). DR-064.
+    #[must_use]
+    pub const fn keyed_by_name(self) -> bool {
+        match self {
+            Self::Aes(_) => false,
+            Self::Ng => true,
+        }
+    }
+
     /// Whether `material` carries what this transform needs.
     ///
     /// Every source carries the RAGE key; only a memory image carries the NG
@@ -328,12 +348,21 @@ impl Cipher {
 /// nothing on disk (DR-062) — and one [`Seal`] is minted per table of contents,
 /// per names blob and per payload.
 ///
-/// **That split is what makes the wrong key unrepresentable.** A single seal
-/// carried through a rebuild would be keyed by the length the archive had
-/// before it was rebuilt, and an NG archive sealed under it parses and does not
-/// load. A `Sealer` cannot seal anything without being handed a name and a
-/// length, so a write path that forgot to re-derive would not compile
-/// (`docs/conventions.md` §5).
+/// **That split is what keeps the wrong key out of a write path's shape.** A
+/// single seal carried through a rebuild would be keyed by the length the
+/// archive had before it was rebuilt, and an NG archive sealed under it parses
+/// and does not load. A `Sealer` cannot seal anything without being handed a
+/// name and a length, so a value that travels — held in a struct, cloned across
+/// a session, returned from the call that derived the transform — is this one
+/// and never a [`Seal`].
+///
+/// It is not a proof, and DR-063 is what taught the difference. A `Seal` is
+/// still a value some caller holds for the length of one call, and one minted
+/// from the length of the bytes it was *read* from and applied to the bytes
+/// being *written* is the wrong key with nothing to say so. What the type can
+/// do it does: a `Seal` is not [`Clone`], so it cannot outlive the write that
+/// minted it, and every seam that seals bytes it produced itself mints the
+/// seal from those bytes.
 ///
 /// Nothing here holds a key of its own and nothing here prints one: `Debug`
 /// says which transform, never a byte of it (DR-020).
@@ -472,13 +501,16 @@ impl fmt::Debug for Sealer {
 /// Nothing here holds a key of its own and nothing here prints one: `Debug`
 /// says which transform and which of the 101 expanded keys, never a byte of
 /// either (DR-020).
-#[derive(Clone)]
+///
+/// **Not [`Clone`]**, since DR-063. A seal that could be copied out of the
+/// write that minted it could be applied to bytes of another length, which for
+/// NG is the wrong key — and that is exactly what a converted resource write
+/// did with one.
 pub struct Seal {
     inner: SealInner,
 }
 
 /// The forward transform, keyed for one region.
-#[derive(Clone)]
 enum SealInner {
     /// The expanded AES key schedule, and which key the tag chose.
     Aes {
@@ -1397,6 +1429,15 @@ pub(crate) mod synthetic {
         }
     }
 
+    /// How many singular draws one column tolerates before [`table_set`] gives
+    /// up and says why.
+    ///
+    /// A random 32 x 32 matrix over GF(2) is invertible about 29% of the time,
+    /// so two hundred consecutive failures land near 10^-30 and mean the
+    /// derivation has stopped inverting rather than that the draws were
+    /// unlucky.
+    const MOST_DRAWS: u32 = 200;
+
     /// A whole table set whose every round derives.
     ///
     /// Built one output word at a time, and **retried per word**: a random
@@ -1408,12 +1449,27 @@ pub(crate) mod synthetic {
     /// `substituted` says whether each column's byte substitution is a shuffle
     /// or the identity. The identity gives affine tables — what rounds 0, 1
     /// and 16 are — and a shuffle gives what rounds 2 through 15 are.
+    ///
+    /// The retry is **bounded**, and that is a fix rather than a decoration: a
+    /// helper that cannot fail can only spin. Unbounded, three mutations of
+    /// `inverse_of` — which make it answer `None` for every map — turned this
+    /// loop into a program that never stops, and a mutation sweep spent its
+    /// full per-mutant timeout on each of them instead of recording a kill. A
+    /// reader with a genuinely broken `inverse_of` would have spent an
+    /// afternoon on the same silence.
     pub(crate) fn table_set(seed: u32, substituted: bool) -> Vec<u8> {
         let mut stream = Stream(seed);
         let mut tables = no_tables();
         for round in 0..NG_ROUNDS {
             for columns in ng_order(round) {
+                let mut drawn = 0_u32;
                 loop {
+                    drawn = drawn.saturating_add(1);
+                    assert!(
+                        drawn <= MOST_DRAWS,
+                        "round {round}: {MOST_DRAWS} draws in a row were singular, which is not \
+                         luck — `inverse_of` has stopped inverting"
+                    );
                     let bases: [u32; 4] = std::array::from_fn(|_| stream.next());
                     let images: [[u32; NG_COLUMN_BITS]; 4] =
                         std::array::from_fn(|_| std::array::from_fn(|_| stream.next()));
@@ -1763,6 +1819,47 @@ mod tests {
     }
 
     #[test]
+    fn nothing_a_sealer_prints_is_a_key() {
+        // DR-020, on the type a write path holds for the whole of a rebuild.
+        // Both directions, because the second is satisfied by an
+        // implementation that prints nothing at all — and so, therefore, would
+        // it be by a derived one that prints everything, since neither is what
+        // the suite reads. It has to **name the transform**, so that a log
+        // line or a panic says which one was running, and it has to name
+        // nothing else, because what it is over is 305 KB of material.
+        let material = ng_material(0x0BAD_C0DE);
+        let sealer = Sealer::new(Scheme::Ng, &material).expect("the tables derive");
+        let rendered = format!("{sealer:?}");
+        assert!(rendered.contains("Sealer"), "{rendered}");
+        assert!(rendered.contains("Ng"), "{rendered}");
+        let ng = material.ng().expect("carries the NG material");
+        for index in 0..NG_EXPANDED_KEY_COUNT {
+            let key = ng.expanded_key(index).expect("is there");
+            assert!(
+                !rendered.contains(&format!("{key:?}")),
+                "expanded key {index} is in the Debug rendering"
+            );
+        }
+        assert!(
+            !rendered.contains(&format!("{:?}", material.keys().hash_lut())),
+            "the hash lookup table is in the Debug rendering"
+        );
+
+        // And the AES arm, which names its key by a discriminant and holds a
+        // whole expanded schedule behind it.
+        let plain = Material::over_zeros();
+        let sealer = Sealer::new(Scheme::Aes(AesKey::Rage), &plain).expect("carries the RAGE key");
+        let rendered = format!("{sealer:?}");
+        assert!(rendered.contains("Sealer"), "{rendered}");
+        assert!(rendered.contains("Aes"), "{rendered}");
+        assert!(rendered.contains("Rage"), "{rendered}");
+        assert!(
+            !rendered.contains(&format!("{:?}", plain.keys().aes_key())),
+            "the AES key is in the Debug rendering"
+        );
+    }
+
+    #[test]
     fn nothing_a_seal_prints_is_a_key() {
         // DR-020, on the type the write path holds.
         let rendered = format!("{:?}", Seal::over_zeros());
@@ -2023,6 +2120,62 @@ mod tests {
     }
 
     #[test]
+    fn a_vector_that_reduces_to_zero_early_still_has_its_coordinates_read_off() {
+        // `basis_of` and `coordinates_of` are reached only through a whole
+        // table's factorisation, so a basis written down here is the only way
+        // to say what one of them answers for one vector. The case worth
+        // writing down is a basis holding the vector `1`: `leading_bit` is zero
+        // both for `1` and for the zero a vector reduces to, so a pass that did
+        // not stop at zero would reduce a spanned vector a second time, come
+        // out at `1` rather than at zero, and answer `None` for a vector the
+        // basis plainly spans.
+        //
+        // The identity basis, in the echelon form and the order `basis_of`
+        // hands back: leading bits descending, so bit `n` of the coordinates is
+        // the `n`th vector here.
+        let basis: [u32; NG_COLUMN_BITS] = [0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01];
+        // Reduced to zero by the first vector, with seven slots still to go.
+        assert_eq!(coordinates_of(&basis, 0x80), Some(0b0000_0001));
+        // Zero itself, which is at the origin of every space there is.
+        assert_eq!(coordinates_of(&basis, 0x00), Some(0));
+        // The last vector, which is the one that reduces nothing early.
+        assert_eq!(coordinates_of(&basis, 0x01), Some(0b1000_0000));
+        // And a vector that takes four of the eight.
+        assert_eq!(coordinates_of(&basis, 0xC3), Some(0b1100_0011));
+        // A vector outside the space the basis spans has no coordinates, which
+        // is the answer `distinct_of` and the rank both hang off.
+        assert_eq!(coordinates_of(&basis, 0x100), None);
+    }
+
+    #[test]
+    fn a_columns_rank_is_the_dimension_its_entries_differ_from_the_first_over() {
+        // The rank is the whole of what a `NotASubstitution` says about the
+        // *shape* of a table that does not factor, and it is a number nothing
+        // else in this build reads back — so a table perturbed inside a whole
+        // round measures that the refusal fires and cannot measure what number
+        // it carries out, since a rank arrived at wrongly is unequal to eight
+        // just as the right one is. Written down here instead: three columns
+        // whose differences are counted by hand.
+        let base = 0x2C_u32;
+        // Eight independent differences from the first entry, and nothing
+        // else — which is what every one of the 272 real tables is.
+        let mut table = [base; NG_TABLE_ENTRIES];
+        for bit in 0..NG_COLUMN_BITS {
+            table[bit.saturating_add(1)] = base ^ (1_u32 << bit);
+        }
+        assert_eq!(rank_of(&table, base), NG_COLUMN_BITS);
+
+        // A ninth takes it to nine, which is the number a table one bit away
+        // from factoring reports.
+        table[NG_COLUMN_BITS.saturating_add(1)] = base ^ 0x100;
+        assert_eq!(rank_of(&table, base), NG_COLUMN_BITS + 1);
+
+        // And a column whose every entry is the first differs from it over
+        // nothing at all, which is the all-zero fixture's answer.
+        assert_eq!(rank_of(&[base; NG_TABLE_ENTRIES], base), 0);
+    }
+
+    #[test]
     fn the_solver_inverts_an_invertible_map_and_refuses_a_singular_one() {
         // The Gaussian elimination on its own, over a matrix that is no part of
         // any cipher — the one half of this work that needs no game material of
@@ -2212,7 +2365,11 @@ mod tests {
                 distinct,
             }) => {
                 assert_eq!((round, column), (3, 9));
-                assert_ne!(rank, NG_COLUMN_BITS, "the rank is what is wrong");
+                // Nine, and not merely "not eight". The rank is the whole of
+                // what this refusal reports about the shape, so a number that
+                // was garbled on the way out would still satisfy "not the
+                // invertible one" and say nothing.
+                assert_eq!(rank, NG_COLUMN_BITS + 1, "the rank is what is wrong");
                 assert_eq!(distinct, NG_TABLE_ENTRIES);
             }
             other => panic!("{other:?}"),

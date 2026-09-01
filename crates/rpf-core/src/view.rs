@@ -76,6 +76,7 @@
 use std::{
     borrow::Cow,
     io::{Read, Seek, Write as _},
+    sync::Arc,
 };
 
 use flate2::{Compression, write::DeflateEncoder};
@@ -86,7 +87,8 @@ use crate::{
     entry::EntryKind,
     error::{Error, NoWrite, Result},
     format::{
-        crypto::{Cipher, Seal},
+        Version,
+        crypto::{Cipher, Sealer},
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LENS, resource_len, size_from_flags},
         rpf7, u32_at,
     },
@@ -202,14 +204,37 @@ pub struct Resource {
     ///
     /// The decrypting direction, which is what takes a payload in hand apart.
     cipher: Option<Cipher>,
-    /// Its inverse, where this build can run the transform forwards.
+    /// What mints its inverse, where this build can run the transform
+    /// forwards.
     ///
-    /// `None` for an archive under a transform with no inverse — NG — which is
-    /// a refusal at the write and not at the read: what is readable stays
-    /// readable, and only putting it back is impossible.
-    seal: Option<Seal>,
+    /// **A [`Sealer`] and not a [`crate::format::crypto::Seal`]**, and that is the whole of DR-063: an
+    /// NG key is chosen by the name *and the length* of what is being written,
+    /// and what a converted write writes is a payload it has just produced. A
+    /// seal minted when this value was made would be keyed by the length the
+    /// entry had **before** the edit, and an archive sealed under it parses and
+    /// does not load. So the key is chosen in [`Resource::seal_from`], from the
+    /// bytes actually being sealed, and there is no seal here to be reused.
+    ///
+    /// `None` for an archive under a transform this build cannot run forwards,
+    /// which is a refusal at the write and not at the read: what is readable
+    /// stays readable, and only putting it back is impossible.
+    ///
+    /// Shared rather than owned because a [`Held`] is cloned across the
+    /// daemon's session and deriving the NG forward transform is seventeen
+    /// rounds.
+    sealer: Option<Arc<Sealer>>,
+    /// The entry's own name, which is the other half of what a key is chosen
+    /// by.
+    ///
+    /// Empty where there is no transform to key, which is every caller holding
+    /// only flag words.
+    name: String,
     /// The archive's encryption tag, which that refusal names.
     tag: u32,
+    /// The archive's version, which is what says how a payload's keying length
+    /// is derived from its own — [`crate::format::Version::resource_key_len`],
+    /// the rule this seals under and the reader reads under.
+    version: Version,
 }
 
 impl Resource {
@@ -219,8 +244,13 @@ impl Resource {
         Self {
             flags,
             cipher: None,
-            seal: None,
+            sealer: None,
+            name: String::new(),
             tag: rpf7::ENCRYPTION_OPEN,
+            // Nothing is keyed under it: this is the answer for a caller with
+            // no archive to ask, and `seal_from` returns before it looks at a
+            // length for a payload that was not sealed.
+            version: Version::Rpf7,
         }
     }
 
@@ -244,22 +274,47 @@ impl Resource {
     /// reader's own `archive::Decrypting` counts its blocks from: a resource is
     /// decrypted from its stream's start and not from the payload's, and the
     /// two differ for the 24-byte headers of [`RESOURCE_HEADER_LENS`]. The tail
-    /// shorter than a block goes through as it stands, which is [`Seal::apply`]'s
+    /// shorter than a block goes through as it stands, which is
+    /// [`crate::format::crypto::Seal::apply`]'s
     /// rule and the reader's alike.
+    ///
+    /// **The key is chosen here, from the payload in hand**, because an NG key
+    /// index is `(hash(name) + length + 61) % 101` (Q2) and `payload` is a
+    /// payload this build has just produced: deflated again from edited
+    /// contents, and its own length. The length is the whole payload's — the
+    /// opaque prefix included — because that is what the row will declare and
+    /// what `Archive::resource_cipher` hands the reader off that row.
+    ///
+    /// **The length is put through
+    /// [`crate::format::Version::resource_key_len`] rather than used as it
+    /// stands**, and that is DR-063's correction. Once the payload has outgrown
+    /// the row's 24-bit compressed-size field the row states no extent at all,
+    /// and the reader recovers one as the block-aligned room to the next
+    /// payload — so for every payload past that field whose length is not a
+    /// whole number of blocks, the length in hand here is not the length the
+    /// reader will key by, and the two pick different keys of the 101. The
+    /// rebuilt archive then parses, verifies, and does not load. The one
+    /// number both sides can compute is the room, and both sides derive it
+    /// through that one function.
     ///
     /// # Errors
     ///
     /// [`Error::CannotWriteEncrypted`] for an archive under a transform this
-    /// build cannot run forwards, which is how a converted write into an NG
-    /// archive refuses rather than lands in the clear.
+    /// build cannot run forwards, which is how a converted write into an
+    /// archive this build cannot seal refuses rather than lands in the clear.
     fn seal_from(&self, payload: &mut [u8], from: usize, sealed: bool) -> Result<()> {
         if !sealed {
             return Ok(());
         }
-        let seal = self.seal.as_ref().ok_or(Error::CannotWriteEncrypted {
+        let no_inverse = || Error::CannotWriteEncrypted {
             tag: self.tag,
             reason: NoWrite::NoInverse,
-        })?;
+        };
+        let forward = self.sealer.as_ref().ok_or_else(no_inverse)?;
+        let len = self
+            .version
+            .resource_key_len(u64::try_from(payload.len()).unwrap_or(u64::MAX));
+        let seal = forward.seal(&self.name, len).ok_or_else(no_inverse)?;
         seal.apply(payload.get_mut(from..).unwrap_or_default());
         Ok(())
     }
@@ -467,8 +522,18 @@ fn held_by<R: Read + Seek>(src: &mut R, archive: &Archive, index: u32, path: &st
 /// The length matters because the NG key index is a function of the payload's
 /// length on disk (DR-051), and a payload a caller holds is not always the one
 /// the entry carries: what a converted write buffers is deflated again and is
-/// its own length. The AES key is the tag's and takes neither, so for the one
-/// transform this build writes forwards the two agree by construction.
+/// its own length. It keys the **read** direction, which is the direction a
+/// length can be known in advance for: the bytes to be taken apart are the ones
+/// the caller is holding.
+///
+/// The write direction takes no length here at all, and that is DR-063. What
+/// goes back is a payload this build has not produced yet — `exported` deflates
+/// edited contents and the result is neither the entry's length nor the
+/// buffer's — so the key for it is chosen when the bytes exist, in
+/// [`Resource::seal_from`], and what is carried here is the [`Sealer`] that
+/// mints it. Carrying a [`crate::format::crypto::Seal`] instead sealed every
+/// converted write into an
+/// NG archive under the *old* payload's key.
 fn resource_at(archive: &Archive, index: u32, in_hand: Option<u64>) -> Result<Held> {
     let EntryKind::Resource {
         system_flags,
@@ -481,15 +546,17 @@ fn resource_at(archive: &Archive, index: u32, in_hand: Option<u64>) -> Result<He
         // has no resource view.
         return Ok(Held::Nothing);
     };
-    let (cipher, seal) = archive.resource_transform(index, in_hand)?;
+    let (cipher, sealer) = archive.resource_transform(index, in_hand)?;
     Ok(Held::Resource(Resource {
         flags: ResourceFlags {
             system: system_flags,
             graphics: graphics_flags,
         },
         cipher,
-        seal,
+        sealer,
+        name: archive.name(index)?.to_owned(),
         tag: archive.encryption_tag(),
+        version: archive.version(),
     }))
 }
 
@@ -1273,11 +1340,11 @@ mod tests {
         use super::*;
         use crate::{
             archive::Archive,
-            build::{FileKind, FileSpec, Under, build_under},
+            build::{FileKind, FileSpec, Under, build_under, entry_name},
             edit::{Bytes, Change, Changes},
             format::{
                 Version,
-                crypto::{Cipher, Seal, Sealer},
+                crypto::{Cipher, Seal, Sealer, synthetic},
                 rpf7,
             },
             keys::{Material, Unlock},
@@ -1411,6 +1478,341 @@ mod tests {
             )
             .expect("the sealed archive builds");
             (out.into_inner(), unlock, payload)
+        }
+
+        /// The synthetic NG forward transform, and the [`Unlock`] that opens
+        /// what it wrote.
+        ///
+        /// `synthetic::ng_material` is arithmetic over a seed and no key
+        /// material at all (DR-006), which is what makes the NG write path
+        /// testable on a machine that has never seen a game — and the NG arm is
+        /// the one where a seal's *name and length* decide which of the 101
+        /// keys it is.
+        fn ng_zeroed(named: &str) -> (Sealer, Unlock) {
+            let material = Arc::new(synthetic::ng_material(0x0DE1_2A55));
+            let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_NG).expect("NG");
+            let sealer = Sealer::new(scheme, &material).expect("synthetic tables derive");
+            (sealer, Unlock::held(material, named))
+        }
+
+        /// An NG-sealed archive holding one resource whose payload is under the
+        /// archive's own transform, the material that opens it, and that
+        /// payload as it sits on disk.
+        ///
+        /// The NG twin of [`sealed_archive`]: the payload is sealed under the
+        /// key its **entry name and its own length on disk** choose, which is
+        /// the key `Archive::resource_cipher` will pick to read it back.
+        fn ng_sealed_archive() -> (Vec<u8>, Unlock, Vec<u8>) {
+            let (sealer, unlock) = ng_zeroed("meta.rpf");
+            let mut payload = PREFIX.to_vec();
+            payload.extend_from_slice(&deflated(&meta_page()));
+            let len = u64::try_from(payload.len()).expect("a payload this size");
+            sealer
+                .seal(entry_name(AT), len)
+                .expect("the synthetic material holds every key")
+                .apply(&mut payload);
+            let held = payload.clone();
+            let mut out = Cursor::new(Vec::new());
+            build_under(
+                &mut out,
+                Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_NG, &sealer, "meta.rpf"),
+                &[FileSpec {
+                    path: AT.to_owned(),
+                    kind: FileKind::Resource {
+                        declared: Some(FLAGS),
+                    },
+                }],
+                &[],
+                |_: &str| Ok(Cursor::new(held.clone())),
+                &mut Unwatched,
+            )
+            .expect("the NG archive builds");
+            (out.into_inner(), unlock, payload)
+        }
+
+        /// The same document with a value that **deflates to a different
+        /// length**, which is what moves the payload's own length on disk and
+        /// so the key an NG archive seals it under.
+        const WIDENED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                               <hash_D98BB561 meta:struct=\"hash_D98BB561\">\n  \
+                               <hash_12345678 meta:uint=\"123456789\"/>\n\
+                               </hash_D98BB561>\n";
+
+        /// [`meta_page`] with its one value edited, which is what [`WIDENED`]
+        /// applies.
+        fn widened_page() -> Vec<u8> {
+            let mut page = meta_page();
+            page[0xB0..0xB4].copy_from_slice(&123_456_789_u32.to_le_bytes());
+            page
+        }
+
+        #[test]
+        fn a_converted_write_into_an_ng_archive_is_keyed_for_the_bytes_it_seals() {
+            // **The severe one, on the NG arm.** An NG key index is
+            // `(hash(name) + length + 61) % 101`, so it is a function of the
+            // payload being written — and a converted write produces a payload
+            // of its own length, deflated again from edited contents. A seal
+            // minted from the length the entry had *before* the edit picks the
+            // key the old payload had: the archive parses, `verify` finds a
+            // resource, and the entry does not load.
+            //
+            // The assertion is what LANDS: the rebuilt archive is opened again
+            // and the entry read back through it.
+            let (bytes, unlock, on_disk) = ng_sealed_archive();
+            let mut src = Cursor::new(bytes);
+            let archive = Archive::open(&mut src, &unlock).expect("the NG archive opens");
+            let index = archive.find(AT).expect("the entry is there");
+            // The fixture is the case it claims to be: keyed, and read back
+            // only through the key.
+            assert_eq!(
+                archive.read(&mut src, index).expect("reads"),
+                meta_page(),
+                "the fixture does not read back at all"
+            );
+            for header in [16_usize, 24] {
+                assert_ne!(
+                    inflated(on_disk.get(header..).unwrap_or_default()).len(),
+                    512,
+                    "the fixture's payload inflates in the clear, so it is not keyed"
+                );
+            }
+
+            let names = Dictionary::default();
+            let converted = apply(
+                &mut src,
+                &archive,
+                index,
+                AT,
+                Wanted {
+                    view: View::Xml,
+                    names: &names,
+                },
+                WIDENED.as_bytes().to_vec(),
+            )
+            .expect("the document applies");
+
+            // The edit moves the payload's length, and the two lengths choose
+            // different keys — asserted rather than assumed, because a fixture
+            // where both chose the same key would pass against a write that
+            // never re-keyed at all.
+            let (sealer, _) = ng_zeroed("meta.rpf");
+            let key_for = |len: usize| {
+                sealer
+                    .seal(entry_name(AT), u64::try_from(len).expect("a length"))
+                    .and_then(|seal| seal.key_index())
+            };
+            assert_ne!(
+                converted.len(),
+                on_disk.len(),
+                "the edited payload is the same length, so this test proves nothing"
+            );
+            assert_ne!(
+                key_for(converted.len()),
+                key_for(on_disk.len()),
+                "the two lengths chose the same key, so this test proves nothing"
+            );
+
+            let changes = Changes::one(
+                AT,
+                Change::Write {
+                    contents: Arc::new(Bytes::new(converted)),
+                    create: false,
+                    allow_encoding_change: false,
+                },
+            );
+            let mut out = Cursor::new(Vec::new());
+            crate::rewrite(
+                &mut src,
+                &archive,
+                &changes,
+                &mut out,
+                &mut InMemory,
+                &mut Unwatched,
+            )
+            .expect("the archive rebuilds");
+
+            let mut back = Cursor::new(out.into_inner());
+            let archive = Archive::open(&mut back, &unlock).expect("the rebuilt archive opens");
+            let index = archive.find(AT).expect("the entry is still there");
+            assert_eq!(
+                archive.read(&mut back, index).expect("the entry loads"),
+                widened_page(),
+                "the entry does not read back under the key its new length chose"
+            );
+        }
+
+        /// The largest value a resource's 24-bit compressed-size field holds,
+        /// and — on a resource — the sentinel it writes when the payload has
+        /// outgrown it.
+        ///
+        /// Spelled out rather than imported, for the reason
+        /// `crates/rpf-core/tests/boundaries.rs` spells it out: a test that
+        /// took the limit from the code it checks would agree with whatever
+        /// that code came to believe.
+        const SATURATED: usize = 0x00FF_FFFF;
+
+        /// A payload past the field that is **not** a whole number of blocks.
+        ///
+        /// The ordinary case rather than a corner: `build::write_payloads`
+        /// aligns every payload to 512, so the room the reader recovers for a
+        /// saturated row is longer than the payload for every length but the
+        /// aligned ones — 246 bytes longer here.
+        const PAST_THE_FIELD: usize = 17_828_618;
+
+        /// Where the saturated fixture's resource sits: the root, so that the
+        /// entry after it in the table is the payload after it on disk, which
+        /// is what a saturated extent is measured by (DR-051 clause 1).
+        const BIG: &str = "big.ymt";
+
+        /// An NG archive holding one resource payload of `len` bytes sealed
+        /// exactly as a converted write seals one — [`Resource::seal_from`],
+        /// the one place this build seals a resource payload — with a second
+        /// entry after it bounding its room.
+        ///
+        /// The payload is a stream and then slack, which is what a saturated
+        /// resource is on disk: the reader finds the stream at the payload's
+        /// own start and the bytes past it are the alignment the row cannot
+        /// describe.
+        fn ng_saturated_archive(len: usize) -> (Vec<u8>, Unlock) {
+            let (sealer, unlock) = ng_zeroed("meta.rpf");
+            let mut payload = PREFIX.to_vec();
+            payload.extend_from_slice(&deflated(&meta_page()));
+            assert!(payload.len() <= len, "the fixture's stream fits in {len}");
+            payload.resize(len, 0);
+            let resource = Resource {
+                flags: FLAGS,
+                cipher: None,
+                sealer: Some(Arc::new(sealer)),
+                name: entry_name(BIG).to_owned(),
+                tag: rpf7::ENCRYPTION_NG,
+                version: Version::Rpf7,
+            };
+            resource
+                .seal_from(&mut payload, PREFIX.len(), true)
+                .expect("the synthetic material seals");
+
+            let (sealer, _) = ng_zeroed("meta.rpf");
+            let mut out = Cursor::new(Vec::new());
+            build_under(
+                &mut out,
+                Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_NG, &sealer, "meta.rpf"),
+                &[
+                    FileSpec {
+                        path: BIG.to_owned(),
+                        kind: FileKind::Resource {
+                            declared: Some(FLAGS),
+                        },
+                    },
+                    FileSpec {
+                        path: "z.bin".to_owned(),
+                        kind: FileKind::Binary {
+                            storage: crate::build::Storage::Stored,
+                            encryption: rpf7::ENTRY_OPEN,
+                        },
+                    },
+                ],
+                &[],
+                |path: &str| {
+                    Ok(Cursor::new(if path == BIG {
+                        payload.clone()
+                    } else {
+                        b"after".to_vec()
+                    }))
+                },
+                &mut Unwatched,
+            )
+            .expect("the NG archive builds");
+            (out.into_inner(), unlock)
+        }
+
+        /// The fixture opened again and its saturated entry read back, with
+        /// the row's sentinel and the recovered room asserted on the way.
+        fn saturated_reads_back(len: usize, room: u64) {
+            let (bytes, unlock) = ng_saturated_archive(len);
+            let mut src = Cursor::new(bytes);
+            let archive = Archive::open(&mut src, &unlock).expect("the NG archive opens");
+            let index = archive.find(BIG).expect("the entry is there");
+
+            let crate::entry::EntryKind::Resource { compressed_len, .. } =
+                archive.entry(index).expect("an entry").kind
+            else {
+                panic!("the fixture's entry is not a resource");
+            };
+            assert_eq!(
+                u64::from(compressed_len),
+                SATURATED as u64,
+                "the fixture's row does not carry the sentinel, so it is not the case this test is about"
+            );
+            assert_eq!(
+                archive.payload_at(index).expect("a span").1,
+                room,
+                "the reader recovered another extent than this test reasons about"
+            );
+            assert_eq!(
+                archive.read(&mut src, index).expect("the entry loads"),
+                meta_page(),
+                "the entry does not read back under the key the reader chooses"
+            );
+        }
+
+        #[test]
+        fn a_saturated_resource_is_sealed_under_the_key_the_reader_will_choose() {
+            // **The severe one.** A resource whose payload has outgrown the
+            // 24-bit compressed-size field writes a sentinel there and states
+            // its extent nowhere, so the reader recovers the extent as the
+            // room to the next payload — block-aligned, because the writer
+            // aligns every payload. An NG key is chosen by name and length, so
+            // a seal minted from the payload's own length picks one of the 101
+            // keys and the reader picks another: the archive parses, `verify`
+            // passes, and the entry does not load.
+            //
+            // Asserted on the archive re-opened and the entry read back, not
+            // on any return value.
+            let room = (PAST_THE_FIELD as u64).next_multiple_of(512);
+            assert_ne!(
+                room, PAST_THE_FIELD as u64,
+                "an aligned payload would prove nothing"
+            );
+
+            // The two lengths choose different keys, so a fixture where they
+            // agreed cannot be what makes this pass.
+            let (sealer, _) = ng_zeroed("meta.rpf");
+            let key_for = |len: u64| {
+                sealer
+                    .seal(entry_name(BIG), len)
+                    .and_then(|seal| seal.key_index())
+            };
+            assert_ne!(
+                key_for(PAST_THE_FIELD as u64),
+                key_for(room),
+                "the payload's length and its room chose the same key, so this test proves nothing"
+            );
+
+            saturated_reads_back(PAST_THE_FIELD, room);
+        }
+
+        #[test]
+        fn a_resource_payload_of_exactly_the_field_is_keyed_as_the_sentinel_it_reads_back_as() {
+            // The off-by-one at the boundary: a payload of exactly the field's
+            // largest value writes that value as its **length**, and no reader
+            // can tell it from the sentinel — the same 24 bits either way. So
+            // the field saturates at `>=` and not at `>`, and the key follows
+            // the reader's reading of the row rather than the writer's private
+            // knowledge of the payload.
+            let room = (SATURATED as u64).next_multiple_of(512);
+            assert_ne!(room, SATURATED as u64, "the field's value is not aligned");
+            saturated_reads_back(SATURATED, room);
+        }
+
+        #[test]
+        fn a_resource_payload_one_past_the_field_is_keyed_by_the_room_it_exactly_fills() {
+            // The far side of the same boundary, and the one that must not
+            // move: 16,777,216 is a whole number of blocks, so the room and
+            // the payload are the same length and the same key. A rule that
+            // over-aligned would break this one.
+            let room = (SATURATED as u64).saturating_add(1);
+            assert_eq!(room % 512, 0, "one past the field is a whole block");
+            saturated_reads_back(SATURATED + 1, room);
         }
 
         /// What `stream` inflates to, or nothing at all.
@@ -1806,6 +2208,168 @@ mod tests {
             .expect("auto falls back");
             assert!(!viewed.xml);
             assert_eq!(viewed.bytes, payload);
+        }
+
+        /// A resource payload whose `RSC7` header declares `header` as its two
+        /// flag words, in front of [`meta_page`]'s deflated stream.
+        ///
+        /// The header is sixteen bytes, which is one of
+        /// [`RESOURCE_HEADER_LENS`], so the stream begins exactly where an
+        /// unheaded payload's does and the words at offsets 8 and 12 are the
+        /// only thing that tells one of these payloads from another.
+        fn headed_payload(header: ResourceFlags) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&MAGIC_RSC7);
+            payload.extend_from_slice(
+                &crate::format::resource::resource_version(header.system, header.graphics)
+                    .to_le_bytes(),
+            );
+            payload.extend_from_slice(&header.system.to_le_bytes());
+            payload.extend_from_slice(&header.graphics.to_le_bytes());
+            payload.extend_from_slice(&deflated(&meta_page()));
+            payload
+        }
+
+        #[test]
+        fn a_header_that_agrees_with_the_row_is_unframed_and_one_word_apart_is_not() {
+            // DR-059 word by word. The refusal is over two facts and not one:
+            // a header that disagrees on the **system** word alone describes
+            // another entry exactly as one that disagrees on the graphics word
+            // alone does, and a header that agrees on both is the ordinary read
+            // every `RSC7`-headed payload takes. A suite that only ever built a
+            // header wrong in both words cannot tell this refusal from one that
+            // fires on agreement, nor from one that waits for both words to be
+            // wrong before it fires — and a refusal that fired on agreement
+            // would leave every headed payload with no view at all.
+            let names = Dictionary::default();
+            let viewed = of(
+                headed_payload(FLAGS),
+                Held::from(FLAGS),
+                AT,
+                Wanted {
+                    view: View::Xml,
+                    names: &names,
+                },
+            )
+            .expect("a header that agrees with the row is this entry's own");
+            assert!(viewed.xml);
+            assert_eq!(String::from_utf8_lossy(&viewed.bytes), DOCUMENT);
+
+            for header in [
+                ResourceFlags {
+                    system: ELSEWHERE.system,
+                    graphics: FLAGS.graphics,
+                },
+                ResourceFlags {
+                    system: FLAGS.system,
+                    graphics: ELSEWHERE.graphics,
+                },
+            ] {
+                let refused = of(
+                    headed_payload(header),
+                    Held::from(FLAGS),
+                    AT,
+                    Wanted {
+                        view: View::Xml,
+                        names: &names,
+                    },
+                )
+                .expect_err("one word apart is another entry all the same");
+                assert_eq!(refused.name(), "NoXmlView");
+            }
+        }
+
+        #[test]
+        fn a_resource_entry_read_through_the_archive_tells_the_three_views_apart() {
+            // R5.8's conversion path is a resource's, and which views take it
+            // is the whole of it. `raw` is the entry's own framed payload, byte
+            // for byte, because `rpf cat > f` followed by `rpf put … f` is a
+            // round trip through the filesystem; `xml` and `auto` are both the
+            // document, because a resource carrying `Meta` has a view and
+            // `auto` is asked to find one rather than to hand back the bytes
+            // (DR-061, DR-063). One entry, three reads, three answers.
+            let (bytes, unlock, on_disk) = sealed_archive();
+            let mut src = Cursor::new(bytes);
+            let archive = Archive::open(&mut src, &unlock).expect("opens");
+            let index = archive.find(AT).expect("the entry is there");
+            let names = Dictionary::default();
+            let read_as = |src: &mut Cursor<Vec<u8>>, view| {
+                read(
+                    src,
+                    &archive,
+                    index,
+                    AT,
+                    Wanted {
+                        view,
+                        names: &names,
+                    },
+                )
+                .expect("the entry reads")
+            };
+
+            let raw = read_as(&mut src, View::Raw);
+            assert!(!raw.xml, "raw converted");
+            assert_eq!(
+                raw.bytes, on_disk,
+                "raw is not the entry's own payload as it sits on disk"
+            );
+            assert_ne!(
+                raw.bytes,
+                DOCUMENT.as_bytes(),
+                "the fixture's payload is the document, so this test proves nothing"
+            );
+
+            for view in [View::Xml, View::Auto] {
+                let viewed = read_as(&mut src, view);
+                assert!(viewed.xml, "{} did not convert", view.name());
+                assert_eq!(String::from_utf8_lossy(&viewed.bytes), DOCUMENT);
+            }
+        }
+
+        #[test]
+        fn the_tag_a_refusal_to_seal_a_resource_names_is_the_archives_own() {
+            // `Archive::encryption_tag` exists so that a refusal to write an
+            // encrypted archive names the tag it could not write, and a number
+            // nothing ever reads back is a number that can be anything. The tag
+            // travels from the header into the `Resource` a read classifies and
+            // out again in `CannotWriteEncrypted`, so both ends of that journey
+            // are asserted here over one archive.
+            let (bytes, unlock, _) = sealed_archive();
+            let mut src = Cursor::new(bytes);
+            let archive = Archive::open(&mut src, &unlock).expect("opens");
+            let index = archive.find(AT).expect("the entry is there");
+            assert_eq!(archive.encryption_tag(), rpf7::ENCRYPTION_AES);
+            let Held::Resource(resource) =
+                held_by(&mut src, &archive, index, AT).expect("the entry classifies")
+            else {
+                panic!("the fixture's entry is not a resource");
+            };
+            assert_eq!(
+                resource.tag,
+                rpf7::ENCRYPTION_AES,
+                "the entry carries another archive's tag"
+            );
+            // The fixture seals, so the refusal is reached by taking the
+            // forward transform away and leaving the tag: what a converted
+            // write into an archive this build cannot seal answers.
+            let stranded = Resource {
+                sealer: None,
+                ..resource
+            };
+            let mut payload = vec![0_u8; 32];
+            let refused = stranded
+                .seal_from(&mut payload, 0, true)
+                .expect_err("nothing is left to seal it with");
+            assert!(
+                matches!(
+                    refused,
+                    Error::CannotWriteEncrypted {
+                        tag,
+                        reason: NoWrite::NoInverse
+                    } if tag == rpf7::ENCRYPTION_AES
+                ),
+                "the refusal answered {refused:?}"
+            );
         }
 
         /// The same 512 bytes with the boundary declared in the wrong place:

@@ -158,6 +158,32 @@ impl Version {
         }
     }
 
+    /// Whether a **resource** payload of this length — or a compressed-size
+    /// field carrying this value — leaves the row saying nothing about the
+    /// payload's extent.
+    ///
+    /// The version's spelling of [`rpf7::size_field_saturates`], and the only
+    /// one: the writer asks it of a payload it holds and the reader asks it of
+    /// a field it read, so neither can decide the boundary for itself.
+    pub(crate) const fn size_field_saturates(self, len: u64) -> bool {
+        match self {
+            Self::Rpf7 => rpf7::size_field_saturates(len),
+        }
+    }
+
+    /// The length a resource payload's transform is keyed by, given the
+    /// payload's length on disk.
+    ///
+    /// [`rpf7::resource_key_len`] carries the rule and the reasoning. The two
+    /// sites that key a resource payload — `Archive::resource_cipher` on the
+    /// way in and `view::Resource::seal_from` on the way out — derive it here
+    /// and nowhere else. DR-063.
+    pub(crate) const fn resource_key_len(self, len: u64) -> u64 {
+        match self {
+            Self::Rpf7 => rpf7::resource_key_len(len),
+        }
+    }
+
     /// The compressor this version's payloads are written with.
     #[must_use]
     pub const fn codec(self) -> Codec {

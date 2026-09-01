@@ -23,6 +23,7 @@ use std::{
 
 use rpf_core::{
     Archive, Change, Changes, EntryKind, Error, FileKind, FileSpec, Plan, Storage, Unwatched,
+    format::rpf7,
 };
 
 /// A stored binary file at `path`.
@@ -293,6 +294,52 @@ fn renaming_a_directory_moves_its_children() {
         paths(&rebuilt),
         vec!["moved", "moved/a.txt", "moved/deep", "moved/deep/b.txt"]
     );
+}
+
+/// An `RPF7` archive whose header claims the encryption tag `tag`, holding one
+/// stored entry.
+///
+/// The tag is the header's fourth word, at bytes 12 through 16, and claiming
+/// one costs no key material to state (DR-006): a rename asks
+/// `Archive::nested_transform` what a payload is under, and that reads the
+/// nested header and nothing else. So the four bytes are the whole of the
+/// fixture, and the archive underneath them stays plain and readable.
+fn tagged(tag: u32) -> Vec<u8> {
+    let mut bytes = built(&[stored("note.txt")], &[], b"held inside");
+    bytes
+        .get_mut(12..16)
+        .expect("a whole header")
+        .copy_from_slice(&tag.to_le_bytes());
+    bytes
+}
+
+/// An AES-encrypted nested archive is renamed, and an NG one beside it is not.
+///
+/// **The over-refusal direction, which is the half that regresses quietly.**
+/// DR-064 refuses a rename that would leave a nested archive keyed by a name it
+/// no longer has, and that is a fact about the NG transform alone: an NG
+/// archive's every region is keyed by `(hash(name) + length + 61) % 101`, so
+/// what it is called is part of what it is, while an AES archive takes its key
+/// from the tag alone and is the same archive under any name. A refusal that
+/// covered both would be indistinguishable from the rule for as long as nothing
+/// renamed an AES one — so the two halves are asserted together, on the same
+/// fixture under two tags.
+#[test]
+fn a_nested_aes_archive_is_renamed_and_a_nested_ng_one_is_not() {
+    let renaming = Changes::one("inner.rpf", Change::RenameTo("other.rpf".to_owned()));
+
+    // The AES half: the rename lands, and what lands under the new name is the
+    // payload byte for byte, since nothing inside it was re-keyed or touched.
+    let aes = tagged(rpf7::ENCRYPTION_AES);
+    let rebuilt = rewritten(&built(&[stored("inner.rpf")], &[], &aes), &renaming);
+    assert_eq!(paths(&rebuilt), vec!["other.rpf"]);
+    assert_eq!(contents(&rebuilt, "other.rpf"), aes);
+
+    // The NG half, on a fixture differing only in those four bytes.
+    let ng = tagged(rpf7::ENCRYPTION_NG);
+    let refused = rewriting(&built(&[stored("inner.rpf")], &[], &ng), &renaming)
+        .expect_err("renaming a nested NG archive is refused");
+    assert_eq!(refused.name(), "CannotRenameKeyed", "{refused:?}");
 }
 
 /// A rename onto a path the archive already holds is refused rather than

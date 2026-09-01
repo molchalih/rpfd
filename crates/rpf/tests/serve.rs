@@ -26,6 +26,82 @@ mod common;
 
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
+/// How long anything here waits on the daemon before the wait is a failure.
+///
+/// Generous, because a loaded machine is not a defect; finite, because a wait
+/// that cannot fail can only spin. Every loop below reads an answer off a pipe,
+/// and unbounded each one turns "the answer is wrong" into "the suite never
+/// comes back" — the same failure for a reader, and a much more expensive one
+/// for a mutation sweep, where at the harness level it is indistinguishable
+/// from a mutant that loops. Two mutations of `View::name` cost one sweep the
+/// full per-mutant timeout here for exactly that reason.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A bound on one wait, naming what the wait is for.
+///
+/// [`Deadline::check`] fails a loop that comes back around of its own accord.
+/// A loop blocked inside a read of the daemon's output never reaches its own
+/// check, so a deadline also arms a watchdog that ends the process once the
+/// patience is spent: a diagnostic and a non-zero exit, rather than a test
+/// binary that hangs until something outside it runs out of patience instead.
+/// The watchdog is disarmed when the deadline is dropped, so a wait that
+/// finishes leaves nothing behind.
+struct Deadline {
+    what: &'static str,
+    started: std::time::Instant,
+    met: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Deadline {
+    /// A deadline of [`PATIENCE`] on waiting for `what`.
+    fn on(what: &'static str) -> Self {
+        let met = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watching = std::sync::Arc::clone(&met);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < PATIENCE {
+                if watching.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if watching.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            // Straight at the descriptor: the test harness captures what the
+            // print macros write and drops it when the process ends this way,
+            // and a watchdog whose diagnostic is lost is a watchdog that only
+            // reports a signal number.
+            let said = format!("waited {PATIENCE:?} for {what}, and it never arrived\n");
+            let mut stderr = std::io::stderr();
+            let _ = stderr.write_all(said.as_bytes());
+            let _ = stderr.flush();
+            std::process::abort();
+        });
+        Self {
+            what,
+            started: std::time::Instant::now(),
+            met,
+        }
+    }
+
+    /// Fails, naming what was being waited for, once the patience is spent.
+    #[track_caller]
+    fn check(&self) {
+        assert!(
+            self.started.elapsed() < PATIENCE,
+            "waited {PATIENCE:?} for {}, and it never arrived",
+            self.what
+        );
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        self.met.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// An archive with one deflated file and one resource.
 fn make_archive(at: &Path) -> Vec<u8> {
     // A minimal but real resource: an RSC7 header whose flags describe one
@@ -866,15 +942,14 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
 
     // Keep asking until the commit answers. The interval is short enough that
     // the flag is set within one entry of the rebuild starting.
+    let deadline = Deadline::on("the cancelled commit to answer");
     let mut commit = None;
-    let mut cancels = 0;
     while commit.is_none() {
+        deadline.check();
         let cancel = json!({"jsonrpc":"2.0","id":900,"method":"cancel","params":{}});
         if writeln!(stdin, "{cancel}").is_err() {
             break;
         }
-        cancels += 1;
-        assert!(cancels < 2000, "the commit never answered");
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         while let Ok(line) = received.try_recv() {
@@ -1482,10 +1557,11 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
         writeln!(stdin, "{request}").expect("writable");
     }
 
+    let deadline = Deadline::on("the commit to answer past the cancels aimed elsewhere");
     let mut commit = None;
     let mut answers = Vec::new();
-    let mut sent = 0;
     while commit.is_none() {
+        deadline.check();
         // Request 2 finished long ago, and handle 2 was never opened. Neither
         // names the rebuild that is running.
         let aimed_elsewhere = [
@@ -1498,8 +1574,6 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
         {
             break;
         }
-        sent += 1;
-        assert!(sent < 2000, "the commit never answered");
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         while let Ok(line) = received.try_recv() {
@@ -1568,8 +1642,10 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
 
     // The cancel goes out only once the commit has answered, so it cannot race
     // the rebuild it would otherwise be naming.
+    let deadline = Deadline::on("the rebuilding commit to answer");
     let mut committed = None;
     while committed.is_none() {
+        deadline.check();
         let line = lines.next().expect("the daemon answered").expect("a line");
         let object: Value = serde_json::from_str(&line).expect("a JSON object per line");
         if object["id"] == json!(3) {
@@ -1943,10 +2019,11 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
         writeln!(stdin, "{request}").expect("writable");
     }
 
+    let deadline = Deadline::on("the commit to answer past the ill-typed cancels");
     let mut commit = None;
     let mut answers = Vec::new();
-    let mut sent = 0;
     while commit.is_none() {
+        deadline.check();
         // Each of these names handle 2, in a way the daemon did not read.
         let ill_typed = [
             json!({"jsonrpc":"2.0","id":900,"method":"cancel","params":{"handle":"2"}}),
@@ -1962,8 +2039,6 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
         {
             break;
         }
-        sent += 1;
-        assert!(sent < 2000, "the commit never answered");
         std::thread::sleep(std::time::Duration::from_millis(5));
 
         while let Ok(line) = received.try_recv() {
@@ -2005,9 +2080,11 @@ fn read_slowly(
     pause: std::time::Duration,
 ) -> Vec<u8> {
     use std::io::Read as _;
+    let deadline = Deadline::on("the daemon to finish writing its answer");
     let mut all = Vec::new();
     let mut buffer = vec![0_u8; piece];
     loop {
+        deadline.check();
         match stdout.read(&mut buffer) {
             Ok(0) | Err(_) => return all,
             Ok(taken) => all.extend_from_slice(buffer.get(..taken).unwrap_or_default()),
@@ -2319,7 +2396,9 @@ fn a_session_still_holds_its_archive_after_its_own_rebuild() {
     // The commit is read before the second name is made, so the link is made
     // against the inode the rebuild left rather than the one it replaced.
     let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let deadline = Deadline::on("the commit that precedes the second name to answer");
     let committed = loop {
+        deadline.check();
         let mut line = String::new();
         assert!(
             lines.read_line(&mut line).expect("readable") > 0,
@@ -2548,7 +2627,9 @@ fn read_with_one_pause(
     let mut all = Vec::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut paused = false;
+    let deadline = Deadline::on("the daemon to finish writing its answer past the pause");
     loop {
+        deadline.check();
         match stdout.read(&mut buffer) {
             Ok(0) | Err(_) => return all,
             Ok(taken) => all.extend_from_slice(buffer.get(..taken).unwrap_or_default()),

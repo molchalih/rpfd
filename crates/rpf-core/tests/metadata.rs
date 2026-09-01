@@ -2566,22 +2566,27 @@ fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
     // Five `verified` rows of `docs/metadata-encodings.md`'s resource `Meta`
     // section, as a test that fails if any of them stops being true: the magic
     // word at 0x10 in 49,614 of 49,614, the two version words and no third, the
-    // zero at 0x18, the root block in range with a value in 1..8, and the three
+    // zero at 0x18, the root block a block the table holds, and the three
     // info-table pointers in the system space.
+    //
+    // The root's *value* is not pinned to 1..8. The probe reported that range
+    // and it is wrong: 237 of the 49,614 carry a root between 9 and 40, every
+    // one of them an interior `.ytyp` with that many data blocks, and every one
+    // of them in range. What is checked is what `parse` checks — that the block
+    // table holds it — and the census of the values is printed rather than
+    // asserted, because nothing about the format bounds it.
     //
     // The header alone, deliberately: this is the one claim that holds without
     // the page boundary, so it fails on a header rather than on a pointer that
     // could not be resolved. Parsing the whole file is the test below.
     let mut failed = Vec::new();
     let mut versions: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut roots: BTreeMap<u16, usize> = BTreeMap::new();
     let read = |name: &str, dumped: &Dumped| {
         match meta::Header::read(&dumped.payload) {
             Ok(header) => {
                 *versions.entry(header.version).or_default() += 1;
-                let roots = 1..=8;
-                if !roots.contains(&header.root.get()) {
-                    failed.push(format!("{name}: root block {}", header.root.get()));
-                }
+                *roots.entry(header.root.get()).or_default() += 1;
                 for (table, pointer, count) in [
                     ("structures", header.structures, header.structure_count),
                     ("enums", header.enums, header.enum_count),
@@ -2616,7 +2621,7 @@ fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
         failed.len(),
         failed.join("\n")
     );
-    eprintln!("{count} Meta headers read, versions {versions:?}");
+    eprintln!("{count} Meta headers read, versions {versions:?}, roots {roots:?}");
 }
 
 #[test]
@@ -2711,7 +2716,8 @@ const META_HASH: u32 = 0x3333_0000;
 const META_STRING: u32 = 0x4444_0000;
 const META_ARRAY: u32 = 0x5555_0000;
 const META_POINTER: u32 = 0x6666_0000;
-const META_BYTES: u32 = 0x7777_0000;
+const META_INLINE_TEXT: u32 = 0x7777_0000;
+const META_INLINE_ARRAY: u32 = 0x8888_0000;
 /// The `ARRAYINFO` sentinel a member carries when it describes another
 /// member's elements rather than a field of its own.
 const META_ARRAYINFO: u32 = 0x0000_0100;
@@ -2756,13 +2762,68 @@ fn minimal_meta() -> Vec<u8> {
     payload.bytes().to_vec()
 }
 
+/// A file whose one member is an inline array of elements **of no width at
+/// all**: a `0x50` whose `arrayInfoIndex` names a `0x05` describing a structure
+/// the file declares zero bytes long.
+///
+/// `referenceKey × 0` is `0` for any count, so the array fits any structure and
+/// every element sits at one address. Nothing in the payload grows with the
+/// count, and the count is a 32-bit field.
+///
+/// ```text
+/// 0x050 the root structure  0x070 the empty one  0x090 the block table
+/// 0x0B0 the root's members  0x0F0 its data
+/// ```
+fn zero_stride_meta(count: u32) -> Vec<u8> {
+    let mut payload = meta_header(0x100);
+    payload
+        .u64(0x20, meta_system(0x50))
+        .u64(0x30, meta_system(0x90))
+        .u16(0x48, 2)
+        .u16(0x4C, 1)
+        // The root: two members, four bytes long.
+        .u32(0x50, META_ROOT)
+        .u32(0x54, META_ROOT)
+        .u32(0x58, 0x300)
+        .u64(0x60, meta_system(0xB0))
+        .u32(0x68, 4)
+        .u16(0x6E, 2)
+        // The structure its elements are, declared **zero bytes long**.
+        .u32(0x70, META_CHILD)
+        .u32(0x74, META_CHILD)
+        .u32(0x78, 0x300)
+        .u64(0x80, meta_system(0xE0))
+        .u32(0x88, 0)
+        .u16(0x8E, 0)
+        // The block table, and the root's block.
+        .u32(0x90, META_ROOT)
+        .u32(0x94, 4)
+        .u64(0x98, meta_system(0xF0))
+        // The inline array, and the `ARRAYINFO` member describing its elements.
+        .u32(0xB0, META_INLINE_ARRAY)
+        .u32(0xB4, 0)
+        .put(0xB8, &[0x50, 0x00])
+        .u16(0xBA, 1)
+        .u32(0xBC, count)
+        .u32(0xC0, META_ARRAYINFO)
+        .u32(0xC4, 0)
+        .put(0xC8, &[0x05, 0x00])
+        .u32(0xCC, META_CHILD)
+        .u32(0xF0, 7);
+    payload.bytes().to_vec()
+}
+
 /// A file carrying one of every form this build decodes, with `count1` and
 /// `count2` of its counted string chosen by the caller.
 ///
+/// The codes are the census's: `0x44` for the counted string and `0x40` for
+/// the inline one, `0x52` for the counted array and `0x50` for the inline one,
+/// `0x59` for a pointer.
+///
 /// ```text
-/// 0x050 structures   0x100 root's members   0x180 the child's member
+/// 0x050 structures   0x100 root's members   0x190 the child's member
 /// 0x200 block table  0x300 the root's data  0x380 string  0x390 array
-/// 0x3A0 child        0x370 bytes
+/// 0x3A0 child
 /// ```
 fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
     let mut payload = meta_header(0x400);
@@ -2770,19 +2831,19 @@ fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
         .u64(0x20, meta_system(0x50))
         .u64(0x30, meta_system(0x200))
         .u16(0x48, 2)
-        .u16(0x4C, 5)
-        // The root structure: eight members, 0x60 bytes long.
+        .u16(0x4C, 4)
+        // The root structure: nine members, 0x60 bytes long.
         .u32(0x50, META_ROOT)
         .u32(0x54, META_ROOT)
         .u32(0x58, 0x300)
         .u64(0x60, meta_system(0x100))
         .u32(0x68, 0x60)
-        .u16(0x6E, 8)
+        .u16(0x6E, 9)
         // The child structure: one `UINT`.
         .u32(0x70, META_CHILD)
         .u32(0x74, META_CHILD)
         .u32(0x78, 0x300)
-        .u64(0x80, meta_system(0x180))
+        .u64(0x80, meta_system(0x190))
         .u32(0x88, 4)
         .u16(0x8E, 1);
 
@@ -2795,13 +2856,19 @@ fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
     member(&mut payload, 0x100, META_UINT, 0x00, 0x15);
     member(&mut payload, 0x110, META_FLOAT, 0x04, 0x21);
     member(&mut payload, 0x120, META_HASH, 0x08, 0x4A);
-    member(&mut payload, 0x130, META_STRING, 0x10, 0x40);
-    member(&mut payload, 0x140, META_ARRAY, 0x20, 0x07);
-    payload.u16(0x14A, 7); // its `ARRAYINFO` member is the eighth
-    member(&mut payload, 0x150, META_POINTER, 0x30, 0x06);
-    member(&mut payload, 0x160, META_BYTES, 0x38, 0x50);
-    member(&mut payload, 0x170, META_ARRAYINFO, 0x00, 0x15);
-    member(&mut payload, 0x180, META_UINT, 0x00, 0x15);
+    member(&mut payload, 0x130, META_STRING, 0x10, 0x44);
+    member(&mut payload, 0x140, META_ARRAY, 0x20, 0x52);
+    payload.u16(0x14A, 8); // its `ARRAYINFO` member is the ninth
+    member(&mut payload, 0x150, META_POINTER, 0x30, 0x59);
+    // An inline string of eight bytes, whose length is its `referenceKey`.
+    member(&mut payload, 0x160, META_INLINE_TEXT, 0x38, 0x40);
+    payload.u32(0x16C, 8);
+    // An inline array of two `UINT`, whose count is its `referenceKey` and
+    // whose elements the same `ARRAYINFO` member describes.
+    member(&mut payload, 0x170, META_INLINE_ARRAY, 0x40, 0x50);
+    payload.u16(0x17A, 8).u32(0x17C, 2);
+    member(&mut payload, 0x180, META_ARRAYINFO, 0x00, 0x15);
+    member(&mut payload, 0x190, META_UINT, 0x00, 0x15);
 
     let block = |payload: &mut MetaBytes, at: usize, tag: u32, len: u32, to: u32| {
         payload
@@ -2813,7 +2880,6 @@ fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
     block(&mut payload, 0x210, 0x11, 8, 0x380);
     block(&mut payload, 0x220, 0x15, 8, 0x390);
     block(&mut payload, 0x230, META_CHILD, 4, 0x3A0);
-    block(&mut payload, 0x240, 0x11, 4, 0x370);
 
     payload
         .u32(0x300, 7)
@@ -2826,16 +2892,15 @@ fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
         .u16(0x328, 2)
         .u16(0x32A, 2)
         .u64(0x330, meta_pointer(4, 0))
-        .u64(0x338, meta_pointer(5, 0))
-        .u16(0x340, 3)
-        .u16(0x342, 3)
+        .put(0x338, b"RAGE\0\xA7\xA7\xA7")
+        .u32(0x340, 33)
+        .u32(0x344, 44)
         // The bytes no walk reaches, which have to survive untouched.
         .put(0x348, &[0xA7; 0x18])
         .put(0x380, b"GTA V\0\xA7\xA7")
         .u32(0x390, 11)
         .u32(0x394, 22)
-        .u32(0x3A0, 99)
-        .put(0x370, &[0xDE, 0xAD, 0xBE, 0xA7]);
+        .u32(0x3A0, 99);
     payload.bytes().to_vec()
 }
 
@@ -2886,7 +2951,11 @@ fn every_form_this_build_decodes_is_named_in_the_document() {
          <hash_66660000 meta:struct=\"hash_11110000\">\n    \
          <hash_12345678 meta:uint=\"99\"/>\n  \
          </hash_66660000>\n  \
-         <hash_77770000 meta:bytes=\"deadbe\"/>\n\
+         <hash_77770000 meta:string=\"RAGE\"/>\n  \
+         <hash_88880000 meta:array=\"inline\">\n    \
+         <meta:item meta:uint=\"33\"/>\n    \
+         <meta:item meta:uint=\"44\"/>\n  \
+         </hash_88880000>\n\
          </hash_D98BB561>\n"
     );
 }
@@ -3011,10 +3080,10 @@ fn aliased_meta() -> Vec<u8> {
         .u16(0x6E, 2)
         .u32(0x70, META_POINTER)
         .u32(0x74, 0)
-        .put(0x78, &[0x06, 0])
+        .put(0x78, &[0x59, 0])
         .u32(0x80, META_HASH)
         .u32(0x84, 8)
-        .put(0x88, &[0x06, 0])
+        .put(0x88, &[0x59, 0])
         // The root's block, and the typed block both its pointers name.
         .u32(0x100, META_ROOT)
         .u32(0x104, 0x10)
@@ -3158,10 +3227,224 @@ fn a_value_that_does_not_read_back_as_its_own_type_is_refused() {
 }
 
 #[test]
+fn a_reserved_words_value_is_checked_and_not_only_the_word_itself() {
+    // DR-047: the word says what kind of record an element is and its value
+    // says which one — a structure's own type, an array's layout — so a
+    // document naming another type the file declares, or another layout,
+    // describes some other payload and is refused rather than applied to this
+    // one. The value is the half of the attribute a round trip never
+    // disagrees with, and so the half nothing else here asks about.
+    let payload = rich_meta(6, 6);
+    let xml = meta_xml(&payload);
+
+    let retyped = xml.replace(
+        "meta:struct=\"hash_D98BB561\"",
+        "meta:struct=\"hash_11110000\"",
+    );
+    assert_eq!(
+        meta_not_xml(&payload, &retyped),
+        meta::NotMetaXml::Word {
+            wanted: "hash_D98BB561".to_owned(),
+            found: "hash_11110000".to_owned(),
+        },
+        "the structure the file declares, and not another one it also declares"
+    );
+
+    let relaid = xml.replace("meta:array=\"counted\"", "meta:array=\"inline\"");
+    assert_eq!(
+        meta_not_xml(&payload, &relaid),
+        meta::NotMetaXml::Word {
+            wanted: "counted".to_owned(),
+            found: "inline".to_owned(),
+        },
+        "an array's layout is the file's and not the document's"
+    );
+}
+
+/// [`rich_meta`] with its pointer member null, so that one element of the
+/// document it renders stands for an absent value.
+fn null_pointer_meta() -> Vec<u8> {
+    let mut payload = rich_meta(6, 6);
+    payload[0x330..0x338].fill(0);
+    payload
+}
+
+#[test]
+fn a_null_pointer_written_down_as_an_empty_value_of_its_type_is_refused() {
+    // DR-047 from the other side: an absent value and an empty one are
+    // different things, so a null pointer is written down as one — the
+    // reserved word carrying the type the value would have had — and a
+    // document that turns it into an empty structure of that type is not this
+    // file's and is answered rather than applied.
+    let payload = null_pointer_meta();
+    let xml = meta_xml(&payload);
+    assert!(
+        xml.contains("<hash_66660000 meta:null=\"struct\"/>"),
+        "the null pointer is written down as one: {xml}"
+    );
+    assert_eq!(
+        meta::from_xml(
+            &payload,
+            payload.len(),
+            xml.as_bytes(),
+            &Dictionary::default()
+        )
+        .expect("unedited applies"),
+        payload
+    );
+
+    let emptied = xml.replace(
+        "<hash_66660000 meta:null=\"struct\"/>",
+        "<hash_66660000 meta:struct=\"hash_11110000\"/>",
+    );
+    assert_eq!(
+        meta_not_xml(&payload, &emptied),
+        meta::NotMetaXml::Word {
+            wanted: "null".to_owned(),
+            found: "struct".to_owned(),
+        }
+    );
+}
+
+/// A little-endian `u16` at `at` of `bytes`.
+///
+/// Deliberately not through [`meta_xml`], for the reason [`half_at`] is not:
+/// the read direction answers a counted string as `until_nul` of the bytes the
+/// store covers, so it cannot see a count that disagrees with what was
+/// written — which is the class of error the counts below pin.
+fn meta_half_at(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes(bytes[at..at + 2].try_into().expect("two bytes"))
+}
+
+#[test]
+fn a_shortened_counted_string_is_terminated_where_it_now_ends() {
+    // The store is eight bytes holding a five-byte string, so a three-byte one
+    // has room for a terminator and gets one. A round trip cannot see this:
+    // the value reads back as `GTA` whether the byte after it is a NUL or the
+    // space that was there, and the difference is only found by whatever reads
+    // past the value — which is every reader that is not this one.
+    let payload = rich_meta(8, 8);
+    let xml = meta_xml(&payload);
+    assert!(xml.contains("meta:string=\"GTA V\""), "{xml}");
+
+    let shorter = xml.replace("meta:string=\"GTA V\"", "meta:string=\"GTA\"");
+    let edited = meta::from_xml(
+        &payload,
+        payload.len(),
+        shorter.as_bytes(),
+        &Dictionary::default(),
+    )
+    .expect("shortening fits");
+    assert_eq!(
+        &edited[0x380..0x384],
+        b"GTA\0",
+        "the bytes and their terminator"
+    );
+    assert_eq!(
+        &edited[0x384..0x388],
+        &payload[0x384..0x388],
+        "and nothing past the terminator moved"
+    );
+}
+
+#[test]
+fn a_counted_string_that_fills_its_room_is_not_terminated_past_that_room() {
+    // The other side of the same guard, and the one that says why it is a
+    // guard rather than an unconditional write: the room is the store less its
+    // terminator, so a value filling it exactly ends at the store's last byte
+    // and there is nowhere left to put a NUL. What terminates it is the count,
+    // which shrinks with it — and the byte past the value belongs to whatever
+    // the packer left there. DR-049.
+    let payload = rich_meta(8, 8);
+    let filled = meta_xml(&payload).replace("meta:string=\"GTA V\"", "meta:string=\"1111111\"");
+    let edited = meta::from_xml(
+        &payload,
+        payload.len(),
+        filled.as_bytes(),
+        &Dictionary::default(),
+    )
+    .expect("a value of exactly its room fits");
+    assert_eq!(&edited[0x380..0x387], b"1111111");
+    assert_eq!(
+        edited[0x387], payload[0x387],
+        "the store's last byte is not written over with a terminator it has no room for"
+    );
+    assert_eq!(
+        meta_half_at(&edited, 0x318),
+        7,
+        "the count is what says where the value ends"
+    );
+}
+
+#[test]
+fn a_shortened_meta_counted_string_leaves_no_stale_length_behind() {
+    // DR-049's amendment, which a shortened `ATSTRING` was found contradicting
+    // in `PSO`: `count1` describes the bytes the edit changed and changes with
+    // them, and `count2` is the capacity of the allocation, which an edit in
+    // place does not touch.
+    let payload = rich_meta(8, 8);
+    assert_eq!(meta_half_at(&payload, 0x318), 8);
+    assert_eq!(meta_half_at(&payload, 0x31A), 8);
+
+    let shorter = meta_xml(&payload).replace("meta:string=\"GTA V\"", "meta:string=\"GTA\"");
+    let edited = meta::from_xml(
+        &payload,
+        payload.len(),
+        shorter.as_bytes(),
+        &Dictionary::default(),
+    )
+    .expect("shortening fits");
+    assert_eq!(
+        meta_half_at(&edited, 0x318),
+        3,
+        "count1 is the length, and the length is now three"
+    );
+    assert_eq!(
+        meta_half_at(&edited, 0x31A),
+        8,
+        "count2 is the capacity, and the allocation did not change"
+    );
+    assert_eq!(edited.len(), payload.len(), "an edit changes no length");
+}
+
+#[test]
+fn an_inline_array_of_elements_with_no_width_is_refused_rather_than_walked() {
+    // The amplifier a ratio cannot see. An element of width 0 makes an array of
+    // any count occupy no bytes at all, so `fits` passes for every
+    // `referenceKey` there is and the walk writes one element per count — up to
+    // 4,294,967,295 of them — out of a payload that never grows. The node
+    // budget still bounds it, but bounding is not the answer: a stride of zero
+    // describes nothing, and the file is refused where the stride is derived.
+    let error = meta::to_xml(
+        &zero_stride_meta(4_000_000_000),
+        zero_stride_meta(0).len(),
+        &Dictionary::default(),
+    )
+    .expect_err("an array of elements with no width is refused");
+    assert!(
+        matches!(
+            error,
+            Error::BadMeta {
+                cause: meta::Malformed::ZeroStride,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.category(), Category::Corrupt);
+    // An array of **no elements** is a different thing and is not refused: a
+    // file may describe an element it never instantiates, which is one of the
+    // ways a structure goes unreached.
+    let empty = zero_stride_meta(0);
+    meta::to_xml(&empty, empty.len(), &Dictionary::default())
+        .expect("an empty array asks nothing of its element type");
+}
+
+#[test]
 fn a_type_code_outside_the_table_is_refused_rather_than_guessed_at() {
-    // The 23 codes are what `docs/metadata-encodings.md` counted over 3,891,369
-    // members; it does not enumerate them, so a code this build does not name
-    // is answered rather than rendered as whatever width happened to fit.
+    // The 23 codes are the census of every member of all 49,614 files, so a
+    // code outside them is one neither shipped build carries and is answered
+    // rather than rendered as whatever width happened to fit.
     let mut payload = minimal_meta();
     payload[0x78] = 0x7F;
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3180,9 +3463,9 @@ fn a_type_code_outside_the_table_is_refused_rather_than_guessed_at() {
 
 #[test]
 fn a_member_that_does_not_fit_its_own_structure_is_refused() {
-    // The one check that would catch this build's `secondary` widths being
-    // wrong on a real file: a member's value has to lie inside the structure
-    // whose length the file itself declares.
+    // The check that catches a width being wrong on a real file: a member's
+    // value has to lie inside the structure whose length the file itself
+    // declares.
     let mut payload = minimal_meta();
     payload[0x68] = 3; // structLength, against a four-byte `UINT` at offset 0
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3205,7 +3488,7 @@ fn an_array_whose_element_member_its_structure_does_not_have_is_refused() {
     // **0** unresolvable, so an index that names no member of the owning
     // structure is a file no packer of Rockstar's wrote.
     let mut payload = rich_meta(6, 6);
-    payload[0x14A] = 9; // the array's element index, past the eight members
+    payload[0x14A] = 10; // the array's element index, past the nine members
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
         .expect_err("an element index that names no member is refused");
     assert!(
@@ -3243,14 +3526,235 @@ fn an_inline_structure_the_file_does_not_define_is_refused() {
 }
 
 #[test]
+fn a_null_pointer_that_still_declares_a_count_is_a_file_contradicting_itself() {
+    // Both counted forms end in the same refusal, and it is about the same
+    // file: a pointer of zero says the value is not there and a count above
+    // zero says how much of it there is. Nothing in the corpus says both, so
+    // the pair is answered rather than resolved in favour of one half — a null
+    // read as an empty run would render a value the file does not hold, and the
+    // count read as a length would read from offset zero of a block the pointer
+    // never named.
+    let mut string = rich_meta(1, 1);
+    string[0x310..0x318].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        meta_bad_read(&string),
+        (0x310, meta::Malformed::Pointer),
+        "a counted string of one byte and no pointer"
+    );
+
+    // The array shape of it, whose count is `count1` alone: the same
+    // contradiction one member further on.
+    let mut array = rich_meta(6, 6);
+    array[0x320..0x328].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        meta_bad_read(&array),
+        (0x320, meta::Malformed::Pointer),
+        "an array of two items and no pointer"
+    );
+}
+
+#[test]
+fn a_null_pointer_that_declares_nothing_is_read_rather_than_refused() {
+    // The other half of the same arm, and what says the refusal above is about
+    // the contradiction rather than about the null: a field that is null and
+    // counts nothing is what an absent value looks like, and both forms write
+    // it. A guard that refused every null pointer would refuse this file.
+    let mut empty = rich_meta(0, 0);
+    empty[0x310..0x318].copy_from_slice(&0u64.to_le_bytes());
+    empty[0x320..0x328].copy_from_slice(&0u64.to_le_bytes());
+    empty[0x328..0x32C].copy_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        meta_xml(&empty),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <hash_D98BB561 meta:struct=\"hash_D98BB561\">\n  \
+         <hash_12345678 meta:uint=\"7\"/>\n  \
+         <hash_22220000 meta:float=\"1.5\"/>\n  \
+         <hash_33330000 meta:hash=\"hash_AABBCCDD\"/>\n  \
+         <hash_44440000 meta:null=\"string\"/>\n  \
+         <hash_55550000 meta:array=\"counted\"/>\n  \
+         <hash_66660000 meta:struct=\"hash_11110000\">\n    \
+         <hash_12345678 meta:uint=\"99\"/>\n  \
+         </hash_66660000>\n  \
+         <hash_77770000 meta:string=\"RAGE\"/>\n  \
+         <hash_88880000 meta:array=\"inline\">\n    \
+         <meta:item meta:uint=\"33\"/>\n    \
+         <meta:item meta:uint=\"44\"/>\n  \
+         </hash_88880000>\n\
+         </hash_D98BB561>\n"
+    );
+}
+
+/// How many bytes of text every item of [`counted_strings_meta`] reads from.
+const META_TEXT_LEN: usize = 56_000;
+
+/// A file whose one array is `stores.len()` counted strings, each reading the
+/// number of bytes its own row names out of one shared block of text, followed
+/// by a `UINT` at offset 16 of the root's block.
+///
+/// The array is what lets a payload of 60 KB write a document of 16 MB — one
+/// block of text, read once per item — and the stores are what make that
+/// document's length something a test can state to the byte. `root_len` is what
+/// decides whether the `UINT` after the array can be read at all: a block of 16
+/// bytes ends where the array's own field does, so the value at offset 16 is
+/// past it and is refused by a read that charges nothing against the budget.
+///
+/// ```text
+/// 0x050 the root structure  0x0A0 the block table  0x100 its members
+/// 0x200 the root's data     0x300 the array's items, then the text
+/// ```
+fn counted_strings_meta(stores: &[u16], root_len: u32) -> Vec<u8> {
+    const ITEMS_AT: usize = 0x300;
+    let items_len = stores.len() * 16;
+    let text_at = ITEMS_AT + items_len;
+    let offset = |at: usize| u32::try_from(at).expect("a payload this size");
+    let count = u16::try_from(stores.len()).expect("a count that fits");
+    let mut payload = meta_header(text_at + META_TEXT_LEN);
+    payload
+        .u64(0x20, meta_system(0x50))
+        .u64(0x30, meta_system(0xA0))
+        .u16(0x48, 1)
+        .u16(0x4C, 3)
+        // The root structure: three members, twenty bytes long.
+        .u32(0x50, META_ROOT)
+        .u32(0x54, META_ROOT)
+        .u32(0x58, 0x300)
+        .u64(0x60, meta_system(0x100))
+        .u32(0x68, 20)
+        .u16(0x6E, 3)
+        // The counted array at offset 0, the `ARRAYINFO` member naming its
+        // elements as counted strings, and the `UINT` at offset 16.
+        .u32(0x100, META_ARRAY)
+        .u32(0x104, 0)
+        .put(0x108, &[0x52, 0x00])
+        .u16(0x10A, 1)
+        .u32(0x110, META_ARRAYINFO)
+        .u32(0x114, 0)
+        .put(0x118, &[0x44, 0x00])
+        .u32(0x120, META_UINT)
+        .u32(0x124, 16)
+        .put(0x128, &[0x15, 0x00])
+        // The root's block, the items' block and the text's.
+        .u32(0xA0, META_ROOT)
+        .u32(0xA4, root_len)
+        .u64(0xA8, meta_system(0x200))
+        .u32(0xB0, 0x15)
+        .u32(0xB4, offset(items_len))
+        .u64(0xB8, meta_system(offset(ITEMS_AT)))
+        .u32(0xC0, 0x11)
+        .u32(0xC4, offset(META_TEXT_LEN))
+        .u64(0xC8, meta_system(offset(text_at)))
+        // The array itself.
+        .u64(0x200, meta_pointer(2, 0))
+        .u16(0x208, count)
+        .u16(0x20A, count);
+    for (index, store) in stores.iter().enumerate() {
+        let at = ITEMS_AT + index * 16;
+        payload
+            .u64(at, meta_pointer(3, 0))
+            .u16(at + 8, *store)
+            .u16(at + 10, *store);
+    }
+    payload.put(text_at, &vec![b'A'; META_TEXT_LEN]);
+    payload.bytes().to_vec()
+}
+
+#[test]
+fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
+    // The read direction's own half of `document_budget`, ungated and on a
+    // payload built here rather than found: the argument for the bound is
+    // `a_document_is_bounded_in_bytes_and_not_only_in_elements`, and this is
+    // where the `Meta` walk puts it. An element is not a fixed number of bytes,
+    // so no element budget can be the memory bound; this file writes 16 MB of
+    // document out of 60 KB of payload with three hundred elements, which is
+    // three orders of magnitude under the element ceiling and exactly on the
+    // byte one.
+    //
+    // **The boundary is stated as a pair either side of one byte**, which is
+    // what makes it a boundary rather than a direction. The document is charged
+    // before each element is written, so what the last item's charge sees is
+    // everything written before it: at exactly the budget the walk goes on, and
+    // one byte over it stops. What the walk goes on *to* is the `UINT` past the
+    // end of the root's block — a read, refused before it charges anything — so
+    // the two cases answer with different refusals rather than with the same
+    // one at different moments.
+    const BUDGET: usize = 16 * 1024 * 1024;
+
+    // What the document costs before its first item, and what an item costs
+    // around its text: measured off the walk's own output rather than counted
+    // out by hand here.
+    let one = meta_xml(&counted_strings_meta(&[8], 20));
+    let two = meta_xml(&counted_strings_meta(&[8, 8], 20));
+    let item_at = one.find("<meta:item").expect("an item is written");
+    let prefix = one[..item_at].rfind('\n').expect("a line before it") + 1;
+    let overhead = two.len() - one.len() - 8;
+
+    // The stores that put the last item's charge exactly on the budget: as many
+    // whole runs of the text block as fit, one shorter run for the remainder,
+    // and a last item whose own text is written after the charge and so is no
+    // part of the sum.
+    let whole = (BUDGET - prefix + META_TEXT_LEN) / (overhead + META_TEXT_LEN);
+    let remainder = BUDGET - prefix - whole * overhead - (whole - 1) * META_TEXT_LEN;
+    assert!(
+        remainder < META_TEXT_LEN,
+        "the remainder is a run of the text block: {remainder}"
+    );
+    let stores = |over: usize| {
+        let mut stores = vec![u16::try_from(remainder + over).expect("a store that fits")];
+        stores.resize(
+            whole,
+            u16::try_from(META_TEXT_LEN).expect("a store that fits"),
+        );
+        stores.push(8);
+        stores
+    };
+
+    // The budget is the payload's, so the payload has to be inside the floor
+    // for `BUDGET` to be the number this states.
+    let payload = counted_strings_meta(&stores(0), 16);
+    assert!(
+        payload.len() * 256 <= BUDGET,
+        "the floor is what a payload this size is entitled to: {} bytes",
+        payload.len()
+    );
+
+    // Exactly on the budget the walk goes on, and the read after it is what
+    // stops the file.
+    assert_eq!(
+        meta_bad_read(&payload),
+        (0x210, meta::Malformed::DataRange),
+        "a document of exactly the budget is written, and the `UINT` after it is not"
+    );
+
+    // One byte over, the last item is never written at all.
+    assert_eq!(
+        meta_bad_read(&counted_strings_meta(&stores(1), 16)),
+        (0, meta::Malformed::TooLarge),
+        "one byte past the budget is one byte too many"
+    );
+}
+
+#[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_meta_file_round_trips_byte_for_byte() {
-    // R5.8b's exit criterion, and it has **not** been measured: no `RPF_METADATA`
-    // dump of the 49,614 resource `Meta` payloads has been within reach of this
-    // code. The test is here so that the first machine that holds one runs it,
-    // and so that setting the gate over a dump that is not there fails loudly
-    // rather than passing over nothing — `each_meta_payload` refuses on a count
-    // that is not the corpus's.
+    // R5.8b's exit criterion, and it has been run: all 49,614 of 49,614
+    // payloads render and are applied back byte for byte, 2026-09-01, over the
+    // `RPF_METADATA` dump (`docs/metadata-encodings.md`). Setting the gate over
+    // a dump that is not there still fails loudly rather than passing over
+    // nothing — `each_meta_payload` refuses on a count that is not the
+    // corpus's.
+    //
+    // **What it proves is narrower than it looks**, and the difference matters
+    // most for the member widths `kind` derives. `from_xml` applies the
+    // document `to_xml` has just written: every value matches what is already
+    // in the payload, so nothing is written at all, and byte-for-byte equality
+    // is the payload being handed back. What this establishes is that the walk
+    // reached every value without refusing and that the re-parse agreed with
+    // the render, over 1,487,349,189 elements — **not** that a member's width
+    // is right. A wrong stride that lands on nulls, on zeroes or on pointers
+    // that still resolve round-trips byte for byte and renders nonsense. The
+    // widths that are actually pinned are pinned elsewhere: `0x50` by its
+    // product equalling the gap to the next member in 51,168 of 51,168, and the
+    // rest by the extent check and by the census. `kind` says which is which.
     let mut failed = Vec::new();
     let names = Dictionary::default();
     let mut trip = |name: &str, dumped: &Dumped| {

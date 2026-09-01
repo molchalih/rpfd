@@ -22,8 +22,8 @@ use quick_xml::escape::escape;
 
 use super::{
     BlockTag, Malformed, Member, RESERVED_PREFIX, Structure, TypeCode, bad,
-    data::{Spot, Values, hex, spell, until_nul},
-    kind::{Field, Kind, MAX_DEPTH, MAX_NODES, Scalar, document_budget, fits, is_field},
+    data::{Spot, Values, spell, until_nul},
+    kind::{Field, Kind, MAX_DEPTH, Scalar, document_budget, fits, is_field, node_budget},
 };
 use crate::{
     error::Result,
@@ -45,17 +45,33 @@ pub(super) const STRUCT: &str = "struct";
 /// The word an array is written under.
 pub(super) const ARRAY: &str = "array";
 
-/// The one array layout this encoding has: a pointer and two counts.
+/// The layout of an array that lives behind a pointer: the pointer, a length
+/// and a capacity.
 pub(super) const COUNTED: &str = "counted";
+
+/// The layout of an array that lives in the member's own bytes.
+pub(super) const INLINE: &str = "inline";
 
 /// The word a string is written under.
 pub(super) const TEXT: &str = "string";
 
-/// The word a counted run of bytes is written under.
-pub(super) const BYTES: &str = "bytes";
-
 /// How far each level of nesting is indented.
 const INDENT: &str = "  ";
+
+/// An array as both directions see it: which of the two layouts it is, where
+/// its items are, and how many there are.
+///
+/// The two layouts differ in where the items live and in nothing else, so the
+/// walk that writes one writes the other and this is what it is handed.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Items<'a> {
+    /// The word the layout is written under: [`COUNTED`] or [`INLINE`].
+    pub(super) layout: &'static str,
+    /// Where the first item is, or `None` when there is none.
+    pub(super) base: Option<Spot<'a>>,
+    /// How many items there are.
+    pub(super) count: u32,
+}
 
 /// Reads a resource `Meta` payload and writes the XML that describes it.
 ///
@@ -75,6 +91,7 @@ pub(super) fn write(payload: &[u8], system_len: usize, names: &Dictionary) -> Re
         names,
         out: String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"),
         nodes: 0,
+        nodes_allowed: node_budget(payload.len()),
         budget: document_budget(payload.len()),
     };
     let tag = spell(names, name);
@@ -106,6 +123,8 @@ struct Writer<'a, 'b> {
     names: &'b Dictionary,
     out: String,
     nodes: usize,
+    /// The most elements this payload is allowed to write.
+    nodes_allowed: usize,
     /// The most bytes of document this payload is allowed to write.
     budget: usize,
 }
@@ -131,6 +150,21 @@ impl Place {
         Self {
             depth: self.depth.saturating_add(1),
             indent: self.indent.saturating_add(1),
+        }
+    }
+
+    /// One level deeper, at the same indent.
+    ///
+    /// A pointer hop is a level of the walk and not a level of the document:
+    /// the element a pointer's target writes **is** the pointer's own element,
+    /// so the indentation is the same one and only the ceiling moves. The two
+    /// are separate fields for exactly this, and a hop that moved neither is
+    /// what let a block tagged with a bare pointer code name itself and recurse
+    /// without bound.
+    const fn deeper(self) -> Self {
+        Self {
+            depth: self.depth.saturating_add(1),
+            indent: self.indent,
         }
     }
 }
@@ -168,14 +202,24 @@ impl<'a> Writer<'a, '_> {
     /// Where a member's value is, once it has been checked to lie inside the
     /// structure that declares it.
     fn field(&self, structure: Structure<'a>, member: Member, spot: Spot<'a>) -> Result<Spot<'a>> {
-        let kind = Kind::of(member.type_code, member.reference_key)?;
-        let width = kind.width(self.values.meta, spot.address())?;
+        let field = Field {
+            member,
+            owner: Some(structure),
+        };
+        let width = field.width(self.values.meta, spot.address())?;
         fits(&structure, member.data_offset, width, spot.address())?;
         spot.step(member.data_offset)
     }
 
     /// Writes one value — a member of a structure, or one item of an array.
     fn value(&mut self, field: Field<'a>, tag: &str, spot: Spot<'a>, place: Place) -> Result<()> {
+        // Here as well as in `spend`, because not every value writes an
+        // element: a pointer into a block tagged with a bare type code writes
+        // nothing of its own and recurses, so the ceiling has to be asked on
+        // the way in rather than only where the output is charged.
+        if place.depth > MAX_DEPTH {
+            return Err(bad(spot.address(), Malformed::TooDeep));
+        }
         match field.kind()? {
             Kind::Scalar(scalar) => {
                 let value = self.scalar(scalar, spot)?;
@@ -186,7 +230,29 @@ impl<'a> Writer<'a, '_> {
                 None => self.leaf(tag, &reserved(NULL), STRUCT, place),
                 Some(landing) => self.target(landing, tag, place),
             },
-            Kind::Array => self.array(field, tag, spot, place),
+            Kind::Array => {
+                let (base, count) = self.values.items(spot)?;
+                self.items(
+                    field,
+                    tag,
+                    Items {
+                        layout: COUNTED,
+                        base,
+                        count,
+                    },
+                    place,
+                )
+            }
+            Kind::InlineArray(count) => self.items(
+                field,
+                tag,
+                Items {
+                    layout: INLINE,
+                    base: Some(spot),
+                    count,
+                },
+                place,
+            ),
             Kind::Text => match self.values.counted(spot)? {
                 (None, _) => self.leaf(tag, &reserved(NULL), TEXT, place),
                 (Some(landing), store) => {
@@ -194,13 +260,10 @@ impl<'a> Writer<'a, '_> {
                     self.leaf(tag, &reserved(TEXT), &value, place)
                 }
             },
-            Kind::Bytes => match self.values.counted(spot)? {
-                (None, _) => self.leaf(tag, &reserved(NULL), BYTES, place),
-                (Some(landing), store) => {
-                    let value = hex(landing.bytes(store)?);
-                    self.leaf(tag, &reserved(BYTES), &value, place)
-                }
-            },
+            Kind::InlineText(len) => {
+                let value = text::encode(until_nul(spot.bytes(len)?));
+                self.leaf(tag, &reserved(TEXT), &value, place)
+            }
         }
     }
 
@@ -220,6 +283,12 @@ impl<'a> Writer<'a, '_> {
                 // is no structure an `ARRAYINFO` index could resolve against —
                 // which is why the owner is an option rather than a borrow of
                 // whatever structure happened to be nearby.
+                //
+                // `deeper` and not `inside`: this hop writes no element of its
+                // own — the element is the pointer's — so nothing else charges
+                // it, and a block tagged `0x07` holding a pointer at itself
+                // recurses forever if this does not. The indent stays put
+                // because the document does.
                 self.value(
                     Field {
                         member: typed(code),
@@ -227,35 +296,27 @@ impl<'a> Writer<'a, '_> {
                     },
                     tag,
                     landing,
-                    place,
+                    place.deeper(),
                 )
             }
         }
     }
 
-    /// Writes an array and its items.
-    fn array(&mut self, field: Field<'a>, tag: &str, spot: Spot<'a>, place: Place) -> Result<()> {
-        let attributes = attribute(&reserved(ARRAY), COUNTED);
-        let (base, count) = self.values.items(spot)?;
-        let (Some(base), true) = (base, count != 0) else {
+    /// Writes an array of either layout: `items.count` items from
+    /// `items.base`.
+    fn items(&mut self, field: Field<'a>, tag: &str, items: Items<'a>, place: Place) -> Result<()> {
+        let attributes = attribute(&reserved(ARRAY), items.layout);
+        let (Some(base), true) = (items.base, items.count != 0) else {
             // An empty array's element type is never asked for: a file may
             // describe an element it never instantiates, which is one of the
             // ways a structure goes unreached.
             return self.empty(tag, &attributes, place);
         };
-        let owner = field
-            .owner
-            .ok_or_else(|| bad(spot.address(), Malformed::ArrayInfo))?;
-        let described = Field {
-            member: owner
-                .member(field.member.array_info_index)
-                .ok_or_else(|| bad(spot.address(), Malformed::ArrayInfo))?,
-            owner: Some(owner),
-        };
-        let stride = described.kind()?.width(self.values.meta, spot.address())?;
+        let described = field.element(base.address())?;
+        let stride = described.stride(self.values.meta, base.address())?;
         self.open(tag, &attributes, place)?;
         let item = reserved(ITEM);
-        for index in 0..count {
+        for index in 0..items.count {
             let at = base.step(
                 index
                     .checked_mul(stride)
@@ -345,7 +406,7 @@ impl Writer<'_, '_> {
             return Err(bad(0, Malformed::TooDeep));
         }
         self.nodes = self.nodes.saturating_add(1);
-        if self.nodes > MAX_NODES {
+        if self.nodes > self.nodes_allowed {
             return Err(bad(0, Malformed::TooManyNodes));
         }
         // In bytes as well as in elements, because an element is not a fixed

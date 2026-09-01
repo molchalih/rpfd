@@ -20,10 +20,9 @@ use crate::{
     error::{Category, Error, NoWrite, Result},
     format::{
         Header, MAX_HEADER_LEN, Names, Version,
-        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme, Seal, Sealer},
+        crypto::{CIPHER_BLOCK_LEN, Cipher, Scheme, Sealer},
         folded,
         resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, RESOURCE_HEADER_LENS, resource_len},
-        rpf7::MAX_SIZE_24,
         same_name,
     },
     keys::{Material, Unlock},
@@ -519,6 +518,15 @@ pub struct Extracted<S> {
     len: u64,
     /// How many it has yielded.
     pos: u64,
+    /// How many have actually come out of the decompressor.
+    ///
+    /// Behind [`Extracted::pos`] by whatever a **forward seek** passed over and
+    /// has not needed yet: a deflated stream has no position but the one it has
+    /// inflated to, and inflating to reach one the caller may never read from
+    /// is work the caller did not ask for. The gap is closed by the next read,
+    /// which is the only thing that needs it closed. Zero for a stored stream,
+    /// whose source seeks.
+    inflated: u64,
     /// How many bytes on disk the entry gives the stream.
     declared: u64,
     stream: Stream<S>,
@@ -533,6 +541,7 @@ impl<S: Read + Seek> Extracted<S> {
             at,
             len,
             pos: 0,
+            inflated: 0,
             declared: len,
             stream: Stream::Stored(Plain::new(src, at, len, cipher)),
         }
@@ -552,6 +561,7 @@ impl<S: Read + Seek> Extracted<S> {
             at,
             len: expected,
             pos: 0,
+            inflated: 0,
             declared: on_disk,
             stream: Stream::Deflated(flate2::bufread::DeflateDecoder::new(BufReader::new(
                 Plain::new(src, at, on_disk, cipher),
@@ -637,6 +647,67 @@ impl<S: Read + Seek> Extracted<S> {
             decoder.get_mut().seek(SeekFrom::Start(0))?;
         }
         self.pos = 0;
+        self.inflated = 0;
+        Ok(())
+    }
+
+    /// Inflates into `buf`, one byte past what the entry promises at most.
+    ///
+    /// The one place bytes come out of the decompressor, so what a read hands
+    /// out and what a seek discards are inflated by the same rule — and the
+    /// bound is over [`Extracted::inflated`] rather than over the position,
+    /// because a forward seek moves the position and not the stream.
+    ///
+    /// A payload that inflates to more than the entry promises is caught by the
+    /// extra byte rather than truncated to fit.
+    fn inflate(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let (entry, expected) = (self.entry, self.len);
+        let limit = expected.checked_add(1).ok_or_else(|| {
+            Error::LengthMismatch {
+                entry,
+                expected,
+                actual: u64::MAX,
+            }
+            .into_io()
+        })?;
+        let room = limit.saturating_sub(self.inflated);
+        let want = usize::try_from(room).unwrap_or(usize::MAX).min(buf.len());
+        let window = buf.get_mut(..want).unwrap_or_default();
+        if window.is_empty() {
+            return Ok(0);
+        }
+        let Stream::Deflated(ref mut decoder) = self.stream else {
+            return Ok(0);
+        };
+        let read = decoder
+            .read(window)
+            .map_err(|source| inflating(entry, source))?;
+        self.inflated = self
+            .inflated
+            .saturating_add(u64::try_from(read).unwrap_or(0));
+        Ok(read)
+    }
+
+    /// Inflates and discards whatever a forward seek passed over.
+    ///
+    /// Bounded by the entry's own length: past that there is nothing to inflate
+    /// and a read answers empty, exactly as it does past the end of a file. A
+    /// stream that ends before the position it was seeked to leaves the
+    /// position where the bytes actually stopped, so the failure the next read
+    /// reports names where it really is.
+    fn catch_up(&mut self) -> io::Result<()> {
+        let target = self.pos.min(self.len);
+        let mut discarded = [0_u8; 8 * 1024];
+        while self.inflated < target {
+            let want = usize::try_from(target.saturating_sub(self.inflated))
+                .unwrap_or(usize::MAX)
+                .min(discarded.len());
+            let read = self.inflate(discarded.get_mut(..want).unwrap_or_default())?;
+            if read == 0 {
+                self.pos = self.inflated;
+                break;
+            }
+        }
         Ok(())
     }
 }
@@ -658,27 +729,11 @@ impl<S: Read + Seek> Read for Extracted<S> {
         let (entry, expected) = (self.entry, self.len);
         let read = match self.stream {
             Stream::Stored(ref mut plain) => plain.read(buf)?,
-            Stream::Deflated(ref mut decoder) => {
-                // One byte past what the entry promises, so a payload that
-                // inflates to more than that is caught rather than truncated
-                // to it.
-                let limit = expected.checked_add(1).ok_or_else(|| {
-                    Error::LengthMismatch {
-                        entry,
-                        expected,
-                        actual: u64::MAX,
-                    }
-                    .into_io()
-                })?;
-                let room = limit.saturating_sub(self.pos);
-                let want = usize::try_from(room).unwrap_or(usize::MAX).min(buf.len());
-                let window = buf.get_mut(..want).unwrap_or_default();
-                if window.is_empty() {
-                    return Ok(0);
-                }
-                decoder
-                    .read(window)
-                    .map_err(|source| inflating(entry, source))?
+            Stream::Deflated(_) => {
+                // Whatever a forward seek passed over is inflated here, at the
+                // read that needs it, rather than at the seek that named it.
+                self.catch_up()?;
+                self.inflate(buf)?
             }
         };
 
@@ -713,10 +768,17 @@ impl<S: Read + Seek> Seek for Extracted<S> {
     ///
     /// A stored payload seeks its source and costs nothing. **A deflated one
     /// has no position but the one it has inflated to**: seeking backwards
-    /// starts the stream again and seeking forwards inflates what it passes
-    /// over and throws it away. [`crate::Payload`] asks for [`Seek`] because
-    /// [`crate::build()`] reads a payload twice in one case, and that case is a
-    /// rewind.
+    /// starts the stream again, and seeking forwards moves the position and
+    /// leaves the decompressor where it is — what was passed over is inflated
+    /// and discarded by the next read that needs it, and never at all if none
+    /// does. [`crate::Payload`] asks for [`Seek`] because [`crate::build()`]
+    /// reads a payload twice in one case, and that case is a rewind.
+    ///
+    /// The laziness is not an optimisation of a rare path: `build::store`
+    /// measures every payload with `SeekFrom::End(0)` and rewinds, so an eager
+    /// forward seek inflated **every deflated entry of every rebuild twice**.
+    /// The length it is measuring for is [`Extracted::len`], which the entry
+    /// declared and this has held since it was made. R3.9.
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let target = match to {
             SeekFrom::Start(at) => at,
@@ -732,21 +794,12 @@ impl<S: Read + Seek> Seek for Extracted<S> {
         if target < self.pos {
             self.restart()?;
         }
-        // Forward by inflating and discarding, bounded by the entry's own
-        // length: past that there is nothing to inflate, and a read answers
-        // empty exactly as it does past the end of a file.
-        let mut left = self.len.min(target).saturating_sub(self.pos);
-        let mut discarded = [0_u8; 8 * 1024];
-        while left > 0 {
-            let want = usize::try_from(left)
-                .unwrap_or(usize::MAX)
-                .min(discarded.len());
-            let read = self.read(discarded.get_mut(..want).unwrap_or_default())?;
-            if read == 0 {
-                break;
-            }
-            left = left.saturating_sub(u64::try_from(read).unwrap_or(0));
-        }
+        // Forward costs nothing here: the position moves and the decompressor
+        // stays where it is, and [`Extracted::catch_up`] inflates the gap at
+        // the read that needs it. Nothing needs it for the one seek the write
+        // path makes — `build::store` seeks to the end to measure the payload
+        // and rewinds, which used to inflate the whole entry and throw it away
+        // before inflating it again to write it.
         self.pos = target;
         Ok(target)
     }
@@ -1327,9 +1380,15 @@ impl Archive {
     /// describe its own payload.
     ///
     /// `docs/rpf-format.md`, Compression, `verified`: the field is 24 bits, and
-    /// a resource whose payload is longer writes [`MAX_SIZE_24`] into it — 166
-    /// of the corpus's 696,578 resources do. It is a sentinel and not a length,
-    /// so a reader that believes it hands the inflater a truncated stream.
+    /// a resource whose payload is that long or longer writes [`crate::format::rpf7::MAX_SIZE_24`]
+    /// into it — 166 of the corpus's 696,578 resources do. It is a sentinel and
+    /// not a length, so a reader that believes it hands the inflater a
+    /// truncated stream.
+    ///
+    /// The boundary is [`Version::size_field_saturates`] and is not decided
+    /// here: a payload of exactly [`crate::format::rpf7::MAX_SIZE_24`] bytes and one of more write
+    /// the same twenty-four bits, so a reader has no way to tell them apart and
+    /// a writer that thought it had keyed one differently from the other.
     ///
     /// Only a **resource** is asked. A binary entry at the same value is a
     /// payload of exactly that many bytes, because a binary entry that could
@@ -1338,7 +1397,8 @@ impl Archive {
     fn size_field_saturated(&self, index: u32) -> Result<bool> {
         Ok(matches!(
             self.entry(index)?.kind,
-            EntryKind::Resource { compressed_len, .. } if u64::from(compressed_len) == MAX_SIZE_24
+            EntryKind::Resource { compressed_len, .. }
+                if self.version.size_field_saturates(u64::from(compressed_len))
         ))
     }
 
@@ -1596,12 +1656,22 @@ impl Archive {
     /// and `view::Resource::seal_from` is the write side (DR-060 §2, DR-061).
     ///
     /// `in_hand` is the length of a payload the caller holds rather than the
-    /// one this entry carries, and `None` is the entry's own. It is a parameter
-    /// because the NG key index is a function of the payload's length **on
-    /// disk** (DR-051, [`Archive::resource_cipher`]), and what a converted
-    /// write buffers is deflated again and is its own length.
+    /// one this entry carries, and `None` is the entry's own. It keys the
+    /// **cipher**, because the NG key index is a function of the payload's
+    /// length **on disk** (DR-051, [`Archive::resource_cipher`]) and what a
+    /// converted write buffers is deflated again and is its own length.
     ///
-    /// The seal is `None` rather than an error for a transform this build
+    /// **The forward direction is a [`Sealer`] and not a [`Seal`]**, and that
+    /// is DR-063. A length can be known in advance for the bytes being taken
+    /// apart — the caller is holding them — and cannot for the bytes going
+    /// back: what a converted write seals is a payload framed and deflated
+    /// after this call, of neither the entry's length nor the buffer's. So the
+    /// key for it is chosen where those bytes exist, in
+    /// `view::Resource::seal_from`, and what travels is what mints it. A
+    /// `Seal` handed over here was minted from the *old* payload's length, and
+    /// an NG archive written under it parses and does not load.
+    ///
+    /// The sealer is `None` rather than an error for a transform this build
     /// cannot run forwards, because that is a refusal at the write and not at
     /// the read: an NG archive's resources still take apart, and only putting
     /// one back is impossible. `view::Resource::seal_from` is where that `None`
@@ -1623,7 +1693,7 @@ impl Archive {
         &self,
         index: u32,
         in_hand: Option<u64>,
-    ) -> Result<(Option<Cipher>, Option<Seal>)> {
+    ) -> Result<(Option<Cipher>, Option<Arc<Sealer>>)> {
         let len = match in_hand {
             Some(len) => len,
             None => self.payload_span(index)?.1,
@@ -1633,17 +1703,7 @@ impl Archive {
             Err(Error::CannotWriteEncrypted { .. }) => None,
             Err(other) => return Err(other),
         };
-        // Keyed by the same two values the cipher beside it is keyed by — this
-        // entry's own name and the payload's length **on disk** — so a
-        // converted resource goes back under the key it came out from. For a
-        // payload the caller holds rather than the one the entry carries, that
-        // length is `in_hand`, and re-deriving the key from it is what makes a
-        // resource written at a new size read back (Q2, DR-051, DR-062).
-        let seal = match sealer {
-            None => None,
-            Some(sealer) => sealer.seal(self.name(index)?, len),
-        };
-        Ok((self.resource_cipher(index, len)?, seal))
+        Ok((self.resource_cipher(index, len)?, sealer.map(Arc::new)))
     }
 
     /// The archive's own encryption tag, which a refusal to write one names.
@@ -1800,6 +1860,13 @@ impl Archive {
     /// `script_rel.rpf/abigail1.ysc` is 90,775 bytes on disk and inflates to
     /// the 229,376 its flags declare, and only 90,775 chooses the key that
     /// decrypts it.
+    ///
+    /// It is [`Version::resource_key_len`] that says which number that is, and
+    /// this is one of the two sites that ask — `view::Resource::seal_from` is
+    /// the other, and the write side. Past the 24-bit field the payload's own
+    /// length is a number the reader cannot recover, so the keying length is
+    /// the block-aligned room both sides can compute; below it the two are the
+    /// same number and the call changes nothing. DR-063.
     fn resource_cipher(&self, index: u32, on_disk: u64) -> Result<Option<Cipher>> {
         let Some(scheme) = self.scheme else {
             return Ok(None);
@@ -1807,7 +1874,8 @@ impl Archive {
         let Some(material) = self.unlock.held_material() else {
             return Ok(None);
         };
-        Ok(Cipher::new(scheme, material, self.name(index)?, on_disk))
+        let len = self.version.resource_key_len(on_disk);
+        Ok(Cipher::new(scheme, material, self.name(index)?, len))
     }
 
     /// One entry as a stream of the file it is **outside the archive**.
@@ -2178,6 +2246,46 @@ impl Archive {
         Self::parse_nested(src, offset, on_disk, depth, &unlock)
     }
 
+    /// The transform of an archive nested in this entry's payload, where the
+    /// payload is one this build recognises.
+    ///
+    /// The **header alone**, and deliberately: it needs no key, so an entry
+    /// holding an archive nobody here can open is still answered — which is the
+    /// case a rename most needs to be told about. A nested archive is parsed
+    /// straight out of the source at its payload's offset
+    /// ([`Archive::open_nested`]), so the same bytes are what is read here.
+    ///
+    /// `None` for a payload that is not an archive and for one of a version
+    /// this build does not read — the ordinary answer for every entry in an
+    /// archive, and never a failure: a walk that stopped at the first `.txt`
+    /// would be useless.
+    ///
+    /// **An archive that is not encrypted and one under a tag this build does
+    /// not recognise are told apart**, and that is [`NestedTransform`]'s whole
+    /// reason. `Version::scheme` answers `None` for both, and a caller reading
+    /// that as "nothing to protect" would rename a nested archive keyed by its
+    /// name out from under its key as soon as some tag this build does not
+    /// define turned up — silently, which is the failure
+    /// [`Error::CannotRenameKeyed`] exists to prevent. Unreachable with any tag
+    /// this build defines, and unreachable by construction rather than by that
+    /// coincidence.
+    ///
+    /// The tag rides with the scheme because a refusal names both.
+    pub(crate) fn nested_transform<R: Read + Seek>(
+        &self,
+        src: &mut R,
+        index: u32,
+    ) -> Option<NestedTransform> {
+        let (offset, _) = self.payload_span(index).ok()?;
+        let header = read_header(src, offset).ok()?;
+        let tag = header.encryption;
+        Some(match header.version.scheme(tag) {
+            Some(scheme) => NestedTransform::Known { tag, scheme },
+            None if header.version.is_open(tag) => NestedTransform::Open,
+            None => NestedTransform::Unknown { tag },
+        })
+    }
+
     /// The archive nested in an entry's payload, or `None` when the payload is
     /// not one.
     ///
@@ -2215,6 +2323,37 @@ impl Archive {
             Err(_) => Ok(Nested::None),
         }
     }
+}
+
+/// What the archive nested in an entry's payload is under, as a caller that
+/// must not move it needs it.
+///
+/// Three answers rather than `Option<Scheme>`, because that type cannot say the
+/// third: `Version::scheme` answers `None` both for an archive that is not
+/// encrypted and for one under a tag this build does not recognise, and those
+/// are opposite facts — "there is nothing here to protect" against "this is
+/// under something nobody here has identified". A rename asks this, and reading
+/// the second as the first renames an archive out from under a key nobody can
+/// name. DR-064.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NestedTransform {
+    /// The nested archive is not encrypted, so nothing in it is keyed by
+    /// anything.
+    Open,
+    /// It is under a transform this build names, which says whether its key is
+    /// a function of the name it is filed under.
+    Known {
+        /// Its own encryption tag.
+        tag: u32,
+        /// What that tag names.
+        scheme: Scheme,
+    },
+    /// It carries an encryption tag this build does not define. What keys it is
+    /// unknown, so it is treated as though its name were part of it.
+    Unknown {
+        /// The tag as it stands, which a refusal names.
+        tag: u32,
+    },
 }
 
 /// What one entry is: R3.7's six classes, and the two sources they come from.
@@ -2914,6 +3053,81 @@ mod tests {
         let mut tail = Vec::new();
         stream.read_to_end(&mut tail).expect("reads");
         assert!(tail.is_empty());
+    }
+
+    /// A source that counts the bytes handed out of it.
+    struct Counted<S> {
+        inner: S,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<S: Read> Read for Counted<S> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let read = self.inner.read(buf)?;
+            self.read.set(
+                self.read
+                    .get()
+                    .saturating_add(u64::try_from(read).unwrap_or(0)),
+            );
+            Ok(read)
+        }
+    }
+
+    impl<S: Seek> Seek for Counted<S> {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(to)
+        }
+    }
+
+    #[test]
+    fn a_deflated_entry_answers_its_length_without_inflating_it() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        // **The 2x on the main write path.** `build::store` measures the
+        // payload it is about to write with `seek(SeekFrom::End(0))` and then
+        // rewinds — and a deflated entry answered that by inflating the whole
+        // of itself and throwing it away, so every rebuild read and inflated
+        // every deflated payload **twice**. The length was never in the bytes:
+        // it is what the entry declares, and this type has carried it since it
+        // was made ([`Extracted::len`]).
+        //
+        // So a forward seek moves the position and inflates nothing; what it
+        // passed over is inflated and discarded by the next read that needs it,
+        // which is what keeps `a_deflated_streams_seek_sequence_lands_on_the_bytes_it_names`
+        // true. R3.9.
+        let plain = bytes(64 * 1024);
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain).expect("deflates");
+        let compressed = encoder.finish().expect("finishes");
+        let read = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+        let source = Counted {
+            inner: Cursor::new(compressed.clone()),
+            read: std::rc::Rc::clone(&read),
+        };
+        let len = u64::try_from(plain.len()).unwrap_or(0);
+        let on_disk = u64::try_from(compressed.len()).unwrap_or(0);
+        let mut stream = Extracted::deflated(0, source, 0, on_disk, len, None);
+
+        assert_eq!(stream.seek(SeekFrom::End(0)).expect("seeks"), len);
+        assert_eq!(
+            read.get(),
+            0,
+            "measuring the entry read {} bytes of it",
+            read.get()
+        );
+
+        // And what `store` does next still answers every byte, from one pass
+        // over the compressed stream rather than two.
+        stream.rewind().expect("rewinds");
+        let mut whole = Vec::new();
+        stream.read_to_end(&mut whole).expect("reads");
+        assert_eq!(whole, plain);
+        assert!(
+            read.get() <= on_disk,
+            "the payload was read {} times over its {on_disk} bytes",
+            read.get()
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use std::{
 };
 
 use crate::{
-    archive::Archive,
+    archive::{Archive, NestedTransform},
     build::{FileKind, FileSpec, Payload, Storage, directories_of, kind_of, specs_of},
     error::{Error, Result},
     format::{folded, resource::MAGIC_RSC7, same_name},
@@ -719,7 +719,7 @@ pub(crate) fn tree_of<R: Read + Seek>(
         let Change::RenameTo(ref to) = *change else {
             continue;
         };
-        rename(archive, &mut tree, path, to)?;
+        rename(&mut *src, archive, &mut tree, path, to)?;
     }
     for (path, change) in changes {
         let Change::Write {
@@ -841,10 +841,17 @@ fn remove(
 }
 
 /// Moves the entry at `path`, and everything under it, to `to`.
-fn rename(archive: &Archive, tree: &mut Tree, path: &str, to: &str) -> Result<()> {
+fn rename<R: Read + Seek>(
+    src: &mut R,
+    archive: &Archive,
+    tree: &mut Tree,
+    path: &str,
+    to: &str,
+) -> Result<()> {
     let index = entry_at(archive, path)?;
     let held = archive.path(index)?;
     name::check_tree(to)?;
+    renamable(src, archive, index, &held, to)?;
 
     if !tree.holds(&held) {
         return Err(Error::NotFound {
@@ -875,6 +882,77 @@ fn rename(archive: &Archive, tree: &mut Tree, path: &str, to: &str) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Refuses a rename that would leave a **nested archive** keyed by a name it no
+/// longer has.
+///
+/// A nested archive travels through a rebuild as opaque payload bytes: the
+/// holder streams them across and re-keys nothing inside them. An NG archive's
+/// own table of contents and names blob are keyed by
+/// `(hash(name) + length + 61) % 101` over the name its holder files it under
+/// (`Archive::open_nested`, `docs/rpf-format.md`), so renaming the entry
+/// produces an archive that parses, verifies and answers
+/// [`Error::WrongKey`] to whoever opens it — with nothing refused and nothing
+/// reported. DR-064 decides that it is refused here rather than re-keyed:
+/// re-keying means holding and rewriting a payload that may be gigabytes, which
+/// is the streaming cost R3.9 exists to avoid.
+///
+/// **A move is not a rename**, and that is the only exemption there is: the key
+/// takes the entry's own name and not its path, so an entry carried into
+/// another directory under the byte-for-byte same name is untouched.
+///
+/// **A case-respelling is not exempt**, and used to be. The NG name hash does
+/// fold case, but it folds it through the **material's own 256-byte lookup
+/// table** (`format::crypto`), which this build reads out of a game rather than
+/// defines — so "the same name in another case hashes the same" is a claim
+/// about key material that nothing here checks, and it held only for a table
+/// that lowercases ASCII and folds nothing else. Deriving the fold from the
+/// table would mean holding the material at every rename, and the exemption
+/// bought nothing: a pure respelling is refused a few lines further on anyway,
+/// as one entry addressed twice (`at_or_under` and `Tree::holds` are
+/// case-folded). So the claim is gone rather than left unchecked.
+///
+/// The holder's own tag decides nothing: an NG archive nested inside an AES one
+/// breaks the same way, and one nested inside an unencrypted archive does too.
+///
+/// # Errors
+///
+/// [`Error::CannotRenameKeyed`], naming the nested archive's tag and transform.
+fn renamable<R: Read + Seek>(
+    src: &mut R,
+    archive: &Archive,
+    index: u32,
+    held: &str,
+    to: &str,
+) -> Result<()> {
+    let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned();
+    if name(held) == name(to) {
+        return Ok(());
+    }
+    let Some(nested) = archive.nested_transform(src, index) else {
+        return Ok(());
+    };
+    let (tag, scheme) = match nested {
+        // Nothing in it is keyed, so its name is not part of what it is.
+        NestedTransform::Open => return Ok(()),
+        NestedTransform::Known { tag, scheme } => {
+            if !scheme.keyed_by_name() {
+                return Ok(());
+            }
+            (tag, scheme.named())
+        }
+        // What keys it is unknown, so it is refused rather than guessed at:
+        // the one answer that cannot silently corrupt an archive nobody here
+        // can open to check. Unreachable with any tag this build defines.
+        NestedTransform::Unknown { tag } => (tag, "unrecognised"),
+    };
+    Err(Error::CannotRenameKeyed {
+        path: held.to_owned(),
+        to: to.to_owned(),
+        tag,
+        scheme,
+    })
 }
 
 /// What a [`Change::Write`] was told, beside the bytes.

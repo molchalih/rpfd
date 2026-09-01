@@ -1,39 +1,82 @@
 //! What a member's type code means, what a document calls it, and the ceilings
 //! a walk of one obeys.
 //!
-//! # The type table is `secondary`, and this is the only place it is written
+//! # The type table is measured, and this is the only place it is written
 //!
 //! `docs/metadata-encodings.md` counted **23 distinct type codes over
-//! 3,891,369 members** and **does not say which**. So the codes below are not
-//! measured here: they are the reference implementation's
-//! `MetaStructureEntryDataType`, read as specification under `AGENTS.md`'s
-//! authority order, row 3. What corroborates them is arithmetic rather than a
-//! probe — the enumeration has exactly 23 members, which is the number the
-//! corpus census reached — and that is weaker than a measurement and is
-//! recorded as weaker.
+//! 3,891,369 members** and, until the corpus was walked, did not say which.
+//! The census below now does: every member of all 49,614 files was read out of
+//! its structure table and the 23 codes are exactly
 //!
-//! Two rules keep a wrong row from becoming a wrong file rather than a
-//! refusal:
+//! ```text
+//! 0x01 0x05 0x07 0x10 0x11 0x12 0x13 0x14 0x15 0x21 0x33 0x34
+//! 0x40 0x44 0x4A 0x50 0x52 0x59 0x60 0x62 0x63 0x64 0x65
+//! ```
 //!
-//! - **A code outside the table is [`Unsupported::DataType`]**, never a width
-//!   that happened to fit. The 23 are what this build claims and nothing else.
-//! - **A member's value has to lie inside its own structure.** The structure's
-//!   length is a number the *file* states, so a width that is wrong for a real
-//!   member is answered [`super::Malformed::MemberExtent`] instead of reading
-//!   its neighbour. That check is the whole reason the table can be carried at
-//!   `secondary` at all.
+//! Three of them are aggregates whose width is not a constant, and each was
+//! derived from the corpus rather than named from outside it. A member's width
+//! is bounded above by the offset of the next member of its structure, so the
+//! measurement is what that bound admits:
 //!
-//! The layouts of the two aggregate forms are `secondary` for the same reason
-//! and rest on one measured fact: a `Meta` pointer is **`PSO`'s pointer widened
-//! to 64 bits** (`docs/metadata-encodings.md`, Two pointer kinds). The counted
-//! form here is therefore `PSO`'s counted form with its pointer widened — the
-//! pointer, `count1:u16`, `count2:u16` and a dead word — and every read through
-//! it is bounds-checked against the block the pointer lands in, so a file this
-//! reading is wrong about is refused rather than mis-edited.
+//! - **`0x50`, a fixed-length array stored inline.** Its `referenceKey` is the
+//!   element count and its `arrayInfoIndex` names the `ARRAYINFO` member that
+//!   describes the elements, so its width is `referenceKey × element width`.
+//!   That product equals the gap to the next member in **51,168 of 51,168**
+//!   members — three floats in twelve bytes, twelve bytes in twelve, five
+//!   floats in twenty — and the index resolves to a real `ARRAYINFO` member
+//!   every time.
+//! - **`0x40`, a NUL-terminated string in a fixed inline buffer.** Its
+//!   `referenceKey` is the buffer's length, 64 in all 566 members, and the gap
+//!   is 64 or 67. Its `arrayInfoIndex` is not an element description and is
+//!   not read.
+//! - **`0x52`, the counted array**, and **`0x44`, the counted string**: the
+//!   sixteen-byte form of a pointer, `count1`, `count2` and a dead word, whose
+//!   gap is 16 in 946,644 of the 953,492 members that carry one. `0x52` is the
+//!   only code that carries a subtype — 0 on 793,391 members, `0x04` on 78,648
+//!   and `0x24` on 1,030, which with `0x59`'s 670 is the whole subtype census
+//!   the document records.
+//!
+//! Two codes the reference implementation names — `0x03` and `0x06` — occur
+//! **0** times, and are therefore not named here: a code outside the table is
+//! [`Unsupported::DataType`] rather than a width that happened to fit.
+//!
+//! One rule keeps a wrong row from becoming a wrong file rather than a
+//! refusal: **a member's value has to lie inside its own structure.** The
+//! structure's length is a number the *file* states, so a width that is wrong
+//! for a real member is answered [`super::Malformed::MemberExtent`] instead of
+//! reading its neighbour.
+//!
+//! # Which of these widths are proved, and which are only consistent
+//!
+//! The corpus round trip — 49,614 of 49,614 rendered and applied back byte for
+//! byte — is quoted more strongly than it deserves, and this table is the
+//! honest version. An unedited trip writes **nothing**: `apply` compares each
+//! value with what is already there and finds it equal, so the payload comes
+//! back because it went in untouched. What the trip establishes is that the
+//! walk reached every value without refusing and the re-parse agreed with the
+//! render; a wrong stride that lands on a null, a zero or a pointer that still
+//! resolves passes it while rendering nonsense.
+//!
+//! | Width | Standing |
+//! |---|---|
+//! | `0x50` = `referenceKey` × element | **proved** — the product equals the gap to the next member in 51,168 of 51,168, so nothing else fits |
+//! | `0x44` and `0x52` = 16 | **consistent, not tight.** The gap is 16 on 946,644 members and larger on the rest, so 16 is an upper bound that fits everywhere and 12 would fit the padded ones too. It is `PSO`'s counted form with its pointer widened, which is where the 16 comes from |
+//! | `0x40` = `referenceKey` = 64 | **consistent, not tight** — one value across all 566 members, against a gap of 64 or 67 |
+//! | `0x07` = 8 | **not disambiguated by the corpus at all.** All 95,705 occurrences are `ARRAYINFO` element descriptors, which have no next member and so no gap to bound them. The 8 is the pointer width the two counted forms already rest on, and nothing in the corpus would notice another value |
+//!
+//! What does bound a wrong width in the file rather than in this table is the
+//! extent rule above, and — for an array — [`Field::stride`], which refuses an
+//! element of no width at all.
+//!
+//! The layouts of the two counted forms rest on one measured fact: a `Meta`
+//! pointer is **`PSO`'s pointer widened to 64 bits**
+//! (`docs/metadata-encodings.md`, Two pointer kinds), so the counted form here
+//! is `PSO`'s counted form with its pointer widened. Every read through it is
+//! bounds-checked against the block the pointer lands in.
 
 use crate::error::Result;
 
-use super::{Malformed, Member, Meta, Structure, TypeCode, bad, unsupported};
+use super::{Malformed, Member, Meta, Structure, bad, unsupported};
 
 /// The `ARRAYINFO` sentinel: the name hash a member carries when it describes
 /// another member's elements rather than a field of its own.
@@ -52,21 +95,52 @@ pub(super) const ARRAYINFO: u32 = 0x0000_0100;
 /// same value [`crate::metadata::pso`] uses, and for the same reason.
 pub(super) const MAX_DEPTH: usize = 128;
 
-/// How many elements one payload's walk may write.
+/// How many elements one byte of payload may write.
 ///
 /// A depth limit alone does not bound the work: a block graph shaped as a
 /// diamond repeated `MAX_DEPTH` times is acyclic, within the depth, and
 /// exponential. Charged by every element written rather than by the structures
 /// among them, which is the repair `PSO`'s own budget needed.
-pub(super) const MAX_NODES: usize = 1 << 20;
+///
+/// A ratio and not a flat count, for the reason [`MAX_OUTPUT_RATIO`] is one:
+/// the work a payload may make is proportional to the payload. Calibrated
+/// against the corpus rather than guessed at — the 49,614 files write
+/// 1,487,349,189 elements between them, and the worst *ratio* any single one
+/// reaches is **1.0472** elements per payload byte, on `hei_ch1_08_grass_1.ymap`.
+/// This is a little under eight times that. The flat `1 << 20` it replaced was
+/// under the largest shipped file by a factor of four and refused 530 of them.
+pub(super) const MAX_NODES_RATIO: usize = 8;
+
+/// How many elements any payload may write, whatever its size.
+///
+/// **The ceiling over the ratio**, and the half a ratio cannot do: a ratio
+/// bounds the work *relative to* the input, so a 100 MB payload is entitled to
+/// 800 million elements and the several gigabytes of `String` they write. The
+/// flat `1 << 20` this pair replaced bounded the memory absolutely and was the
+/// wrong size — under the largest shipped file by a factor of four — which is
+/// an argument about the value and not about having one.
+///
+/// Sized off the corpus in the unit the corpus was measured in: the largest
+/// single `Meta` file writes **3,833,493** elements (`ch3_06_grass_0.ymap`),
+/// and this is a little over seventeen times that. It binds only above 8 MB of
+/// payload, and the largest `Meta` payload of either shipped build is 3.8 MB,
+/// so no shipped file comes near either half.
+pub(super) const MAX_NODES: usize = 64 << 20;
+
+/// How many elements a payload of `payload` bytes may write.
+///
+/// One owner for the ceiling (`docs/conventions.md` §3), as
+/// [`document_budget`] is for the other.
+pub(super) fn node_budget(payload: usize) -> usize {
+    payload.saturating_mul(MAX_NODES_RATIO).min(MAX_NODES)
+}
 
 /// How many bytes of document one byte of payload may write.
 ///
-/// The bound the memory actually needs, in the unit the memory is in. Unlike
-/// `PSO`'s, this ratio has **not** been calibrated against a corpus — no
-/// `RPF_METADATA` dump of the 49,614 `Meta` payloads has been within reach of
-/// this code — so it is `PSO`'s own value, which that encoding measured at ten
-/// times the worst real ratio.
+/// The bound the memory actually needs, in the unit the memory is in. `PSO`'s
+/// own value, and the `Meta` corpus clears it: the worst real ratio over the
+/// 49,614 files is **54.51**, on `hei_ch1_08_grass_1.ymap`, so this is a
+/// little under five times the largest document any shipped file writes.
 pub(super) const MAX_OUTPUT_RATIO: usize = 256;
 
 /// The smallest document any payload may write, whatever its size.
@@ -76,13 +150,39 @@ pub(super) const MAX_OUTPUT_RATIO: usize = 256;
 /// legitimately name a great deal of it.
 pub(super) const MIN_OUTPUT: usize = 16 * 1024 * 1024;
 
+/// The largest document any payload may write, whatever its size.
+///
+/// The ceiling over [`MAX_OUTPUT_RATIO`], for the reason [`MAX_NODES`] is one
+/// over the element ratio: this is the bound the memory actually obeys, and a
+/// ratio alone leaves it proportional to an attacker-chosen input rather than
+/// absolute. The largest document any shipped file writes is **199 MB**, on
+/// the same `ch3_06_grass_0.ymap`, and this is a little over five times that.
+/// It binds only above 4 MB of payload, which no shipped `Meta` payload
+/// reaches.
+pub(super) const MAX_OUTPUT: usize = 1 << 30;
+
 /// How many bytes of document a payload of `payload` bytes may have.
 ///
 /// One owner for the ceiling both directions obey (`docs/conventions.md` §3):
 /// [`super::render`] refuses to write past it, and [`super::apply`] refuses a
 /// longer document **before parsing one**.
+///
+/// A floor and a ceiling around the ratio: [`MIN_OUTPUT`] because a small file
+/// can legitimately name a great deal of a payload, [`MAX_OUTPUT`] because a
+/// large one must not be entitled to gigabytes.
+#[expect(
+    clippy::manual_clamp,
+    reason = "two bounds that cannot panic, where clamp would"
+)]
 pub(super) fn document_budget(payload: usize) -> usize {
-    payload.saturating_mul(MAX_OUTPUT_RATIO).max(MIN_OUTPUT)
+    // `clamp` would be the same two comparisons and panics when its bounds
+    // cross; these two are constants and do not, but the ceiling is the one
+    // value here most likely to be tuned, so it is written as two bounds that
+    // cannot panic however either is set.
+    payload
+        .saturating_mul(MAX_OUTPUT_RATIO)
+        .max(MIN_OUTPUT)
+        .min(MAX_OUTPUT)
 }
 
 /// How long a pointer field is: a `Meta` pointer is a 64-bit word.
@@ -184,33 +284,45 @@ pub(super) enum Kind {
     Structure(u32),
     /// A pointer to a data block, whose type is that block's tag.
     ///
-    /// `StructurePointer` and `DataBlockPointer` both. Neither carries its
-    /// target's type in the member — the block table does, which is
-    /// `docs/metadata-encodings.md`'s measurement that 0 of 462,942 block tags
-    /// resolve to neither a structure nor a type code.
+    /// `0x07` and `0x59` both. Neither carries its target's type in the member
+    /// — the block table does, which is `docs/metadata-encodings.md`'s
+    /// measurement that 0 of 462,942 block tags resolve to neither a structure
+    /// nor a type code.
     Pointer,
-    /// A counted array, whose element type is the `ARRAYINFO` member the
-    /// `arrayInfoIndex` names.
+    /// A counted array, `0x52`: a pointer, a length and a capacity, whose
+    /// element type is the `ARRAYINFO` member the `arrayInfoIndex` names.
     Array,
-    /// A counted string.
+    /// A fixed-length array of that many elements, stored inline, `0x50`.
+    ///
+    /// The count is the member's `referenceKey` and the element type is the
+    /// `ARRAYINFO` member its `arrayInfoIndex` names, exactly as [`Kind::Array`]
+    /// resolves one. The difference is where the elements are: here, in the
+    /// member's own bytes rather than through a pointer.
+    InlineArray(u32),
+    /// A counted string, `0x44`.
     Text,
-    /// A counted run of bytes.
-    Bytes,
+    /// A NUL-terminated string in an inline buffer of that many bytes, `0x40`.
+    ///
+    /// The buffer's length is the member's `referenceKey`. Its
+    /// `arrayInfoIndex` describes no elements and is not read.
+    InlineText(u32),
 }
 
 impl Kind {
     /// What this type code means.
     ///
-    /// `reference` is the member's `referenceKey`, which is the structure's
-    /// name for the one inline form that needs it.
+    /// The whole member, because three of the aggregate forms take a number out
+    /// of it: `0x05` its `referenceKey` as the structure's name, `0x50` its
+    /// `referenceKey` as an element count and `0x40` its `referenceKey` as a
+    /// buffer length.
     ///
     /// # Errors
     ///
     /// [`crate::Error::UnsupportedMeta`] for a code outside the 23. The bytes
     /// are not wrong; this build has no name for them, which is a different
     /// thing to tell a caller (`docs/conventions.md` §10).
-    pub(super) fn of(code: TypeCode, reference: u32) -> Result<Self> {
-        Ok(match code.get() {
+    pub(super) fn of(member: Member) -> Result<Self> {
+        Ok(match member.type_code.get() {
             0x01 => Self::Scalar(Scalar::Bool),
             0x10 => Self::Scalar(Scalar::Byte),
             0x11 => Self::Scalar(Scalar::UByte),
@@ -227,35 +339,13 @@ impl Kind {
             0x63 => Self::Scalar(Scalar::ShortFlags),
             0x64 => Self::Scalar(Scalar::IntFlags1),
             0x65 => Self::Scalar(Scalar::IntFlags2),
-            0x05 => Self::Structure(reference),
-            0x06 | 0x59 => Self::Pointer,
-            0x07 => Self::Array,
-            0x03 | 0x40 => Self::Text,
-            0x50 => Self::Bytes,
+            0x05 => Self::Structure(member.reference_key),
+            0x07 | 0x59 => Self::Pointer,
+            0x52 => Self::Array,
+            0x50 => Self::InlineArray(member.reference_key),
+            0x44 => Self::Text,
+            0x40 => Self::InlineText(member.reference_key),
             other => return Err(unsupported(Unsupported::DataType { code: other })),
-        })
-    }
-
-    /// How many bytes of its container one of these occupies.
-    ///
-    /// The stride of an array of them, and what a member's own extent is
-    /// checked against.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::UndefinedStructure`] when an inline structure's type is
-    /// one the file does not define, which is the one width that is not a
-    /// constant.
-    pub(super) fn width(self, meta: &Meta<'_>, at: u64) -> Result<u32> {
-        Ok(match self {
-            Self::Scalar(scalar) => scalar.bytes(),
-            Self::Structure(name) => {
-                meta.structure(name)
-                    .ok_or_else(|| bad(at, Malformed::UndefinedStructure))?
-                    .length
-            }
-            Self::Pointer => POINTER_LEN,
-            Self::Array | Self::Text | Self::Bytes => COUNTED_LEN,
         })
     }
 }
@@ -283,7 +373,98 @@ impl Field<'_> {
     ///
     /// [`crate::Error::UnsupportedMeta`] for a type code outside the 23.
     pub(super) fn kind(self) -> Result<Kind> {
-        Kind::of(self.member.type_code, self.member.reference_key)
+        Kind::of(self.member)
+    }
+
+    /// The field describing this one's elements, for the two array forms.
+    ///
+    /// The `ARRAYINFO` indirection: `arrayInfoIndex` is an index into the
+    /// *owning* structure's member array, and the member it names describes
+    /// the elements rather than a field of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`Malformed::ArrayInfo`] when there is no owner to resolve the index
+    /// against, or the owner has no such member. `docs/metadata-encodings.md`:
+    /// 925,473 indices resolved and 0 unresolvable.
+    pub(super) fn element(self, at: u64) -> Result<Self> {
+        let owner = self.owner.ok_or_else(|| bad(at, Malformed::ArrayInfo))?;
+        let member = owner
+            .member(self.member.array_info_index)
+            .ok_or_else(|| bad(at, Malformed::ArrayInfo))?;
+        Ok(Self {
+            member,
+            owner: Some(owner),
+        })
+    }
+
+    /// How many bytes of its container one of these occupies.
+    ///
+    /// The stride of an array of them, and what a member's own extent is
+    /// checked against.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::UnsupportedMeta`] for a type code outside the 23,
+    /// [`Malformed::UndefinedStructure`] when an inline structure's type is one
+    /// the file does not define, [`Malformed::ArrayInfo`] when an inline
+    /// array's element description does not resolve, and
+    /// [`Malformed::TooDeep`] when the element descriptions nest deeper than
+    /// [`MAX_DEPTH`] — an `arrayInfoIndex` that names its own member is a
+    /// cycle, and the corpus contains no nesting at all.
+    pub(super) fn width(self, meta: &Meta<'_>, at: u64) -> Result<u32> {
+        self.width_within(meta, at, MAX_DEPTH)
+    }
+
+    /// The width of one element of an array of these — the array's **stride**
+    /// — which is [`Field::width`] with a width of zero refused.
+    ///
+    /// The one place a zero stride is answered, so that both directions and
+    /// both array layouts refuse the same file (`docs/conventions.md` §3).
+    /// [`Malformed::ZeroStride`] says why it is an answer rather than a
+    /// ceiling's problem: an element of no width makes an array of any count
+    /// occupy no bytes, so the extent check passes for every count and the walk
+    /// writes one element per count out of a payload that never grows.
+    ///
+    /// # Errors
+    ///
+    /// As [`Field::width`], plus [`Malformed::ZeroStride`].
+    pub(super) fn stride(self, meta: &Meta<'_>, at: u64) -> Result<u32> {
+        match self.width(meta, at)? {
+            0 => Err(bad(at, Malformed::ZeroStride)),
+            width => Ok(width),
+        }
+    }
+
+    /// [`Field::width`], with the fuel that bounds the `ARRAYINFO` chain.
+    fn width_within(self, meta: &Meta<'_>, at: u64, fuel: usize) -> Result<u32> {
+        let left = fuel
+            .checked_sub(1)
+            .ok_or_else(|| bad(at, Malformed::TooDeep))?;
+        Ok(match self.kind()? {
+            Kind::Scalar(scalar) => scalar.bytes(),
+            Kind::Structure(name) => {
+                meta.structure(name)
+                    .ok_or_else(|| bad(at, Malformed::UndefinedStructure))?
+                    .length
+            }
+            Kind::Pointer => POINTER_LEN,
+            Kind::Array | Kind::Text => COUNTED_LEN,
+            Kind::InlineText(len) => len,
+            Kind::InlineArray(count) => {
+                let stride = self.element(at)?.width_within(meta, at, left)?;
+                // The same refusal [`Field::stride`] makes, made here because
+                // this is where an inline array's own element width is
+                // derived: an array that instantiates elements of no width is
+                // refused, and one that instantiates none asks nothing of them.
+                if stride == 0 && count != 0 {
+                    return Err(bad(at, Malformed::ZeroStride));
+                }
+                count
+                    .checked_mul(stride)
+                    .ok_or_else(|| bad(at, Malformed::MemberExtent))?
+            }
+        })
     }
 }
 
@@ -295,8 +476,8 @@ pub(super) fn is_field(name: u32) -> bool {
 
 /// Checks that a member's value lies inside the structure that declares it.
 ///
-/// The one place a `secondary` width is measured against something the file
-/// itself states. `docs/conventions.md` §6: every read is bounds-checked
+/// The one place a width this module derives is measured against something the
+/// file itself states. `docs/conventions.md` §6: every read is bounds-checked
 /// against the containing declaration, not against what happens to be there.
 ///
 /// # Errors
@@ -322,9 +503,9 @@ pub(super) fn fits(structure: &Structure<'_>, offset: u32, width: u32, at: u64) 
 pub enum Unsupported {
     /// A member type code outside the 23 this build names.
     ///
-    /// `docs/metadata-encodings.md` counted 23 distinct codes and does not
-    /// enumerate them, so the table this refusal is the complement of is
-    /// `secondary` — `Kind::of` says what that costs and what bounds it.
+    /// The 23 are the census of all 49,614 files, so a code that reaches this
+    /// is one neither shipped build contains — `Kind::of` says what the table
+    /// is and how it was measured.
     DataType {
         /// The code the file carries.
         code: u8,
@@ -435,4 +616,47 @@ pub enum NotMetaXml {
         /// The payload address the two write at.
         address: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The largest resource `Meta` payload either shipped build carries, in
+    /// bytes. `docs/metadata-encodings.md`, and the dump `RPF_METADATA` names.
+    const LARGEST_SHIPPED_PAYLOAD: usize = 3_833_856;
+
+    /// The most elements any single shipped file writes, and the largest
+    /// document one writes: `ch3_06_grass_0.ymap`, a field of instanced grass.
+    const MOST_SHIPPED_NODES: usize = 3_833_493;
+    const LARGEST_SHIPPED_DOCUMENT: usize = 199 * 1_000_000;
+
+    #[test]
+    fn the_ceilings_bound_the_memory_absolutely_and_still_clear_the_corpus() {
+        // Both halves of the pair, and the pair is the point. A ratio alone
+        // bounds the work relative to an attacker-chosen input — a 100 MB
+        // payload was entitled to 800 million elements and the gigabytes of
+        // `String` they write — and a flat count alone was the wrong size for
+        // the corpus, which is what retired the old `1 << 20`.
+        assert_eq!(node_budget(usize::MAX), MAX_NODES);
+        assert_eq!(document_budget(usize::MAX), MAX_OUTPUT);
+        assert_eq!(document_budget(0), MIN_OUTPUT);
+
+        // And neither ceiling reaches down to anything shipped: at the largest
+        // payload in the corpus both budgets are still the ratio's, so what the
+        // corpus run measures is the ratio and nothing else.
+        assert_eq!(
+            node_budget(LARGEST_SHIPPED_PAYLOAD),
+            LARGEST_SHIPPED_PAYLOAD * MAX_NODES_RATIO
+        );
+        assert_eq!(
+            document_budget(LARGEST_SHIPPED_PAYLOAD),
+            LARGEST_SHIPPED_PAYLOAD * MAX_OUTPUT_RATIO
+        );
+        // Which is room for the worst file there is, several times over.
+        assert!(node_budget(LARGEST_SHIPPED_PAYLOAD) > MOST_SHIPPED_NODES);
+        assert!(document_budget(LARGEST_SHIPPED_PAYLOAD) > LARGEST_SHIPPED_DOCUMENT);
+        const { assert!(MAX_NODES > MOST_SHIPPED_NODES) };
+        const { assert!(MAX_OUTPUT > LARGEST_SHIPPED_DOCUMENT) };
+    }
 }

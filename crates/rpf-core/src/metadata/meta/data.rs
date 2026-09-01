@@ -183,38 +183,3 @@ pub(super) fn spell(names: &Dictionary, hash: u32) -> String {
     }
     name
 }
-
-/// A run of bytes, as the lower-case hex a document carries it in.
-///
-/// Hex rather than [`crate::metadata::text::encode`] because these bytes are
-/// not text: nothing says a `0x50` member holds characters, and rendering them
-/// as an escaped string would invite an editor to type words into a field the
-/// file counts in bytes.
-pub(super) fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        out.push(nibble(byte >> 4));
-        out.push(nibble(byte & 0x0F));
-    }
-    out
-}
-
-/// The bytes a [`hex`] string spells, or `None` when it is not one.
-pub(super) fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let digits: Vec<char> = text.chars().collect();
-    let mut out = Vec::with_capacity(digits.len().saturating_div(2));
-    for pair in digits.chunks(2) {
-        let high = pair.first()?.to_digit(16)?;
-        let low = pair.get(1)?.to_digit(16)?;
-        out.push(u8::try_from(high.checked_mul(16)?.checked_add(low)?).ok()?);
-    }
-    Some(out)
-}
-
-/// The hex digit for the low four bits of `value`.
-fn nibble(value: u8) -> char {
-    char::from_digit(u32::from(value & 0x0F), 16).unwrap_or('0')
-}

@@ -162,6 +162,48 @@ pub(super) const fn holds_compressed_len(len: u64) -> bool {
     len <= MAX_SIZE_24
 }
 
+/// Whether a **resource** payload of this length leaves its row's
+/// compressed-size field saying nothing about its extent.
+///
+/// **The one place the boundary is decided**, asked by the writer of a payload
+/// in hand ([`file_row`]) and by the reader of a field ([`crate::Archive`])
+/// alike, so that the two cannot come to read the same row differently.
+///
+/// `>=` rather than `>`, and that is the whole of it: a payload of exactly
+/// [`MAX_SIZE_24`] bytes writes its real length, a longer one writes the
+/// sentinel, and the twenty-four bits are the same either way. No reader can
+/// tell the two apart, so a writer that treated the equal case as a length
+/// keyed its payload by one number while the reader keyed it by another.
+pub(super) const fn size_field_saturates(len: u64) -> bool {
+    len >= MAX_SIZE_24
+}
+
+/// The length a resource payload's transform is keyed by.
+///
+/// **The one place that length is derived**, on both sides of the seam: the
+/// writer minting a seal for a payload it holds and the reader choosing a
+/// cipher for a payload on disk call this and nothing else, so a future change
+/// cannot leave them keying the same bytes differently. DR-063.
+///
+/// An NG key index is `(hash(name) + length + 61) % 101`, so the length is
+/// part of the key and the two sides have to name the same one. While the row
+/// can state the payload's length it is the payload's own — that is the
+/// measured rule, `script_rel.rpf/abigail1.ysc` at 90,775 bytes on disk. Once
+/// the field saturates the row states nothing, and the reader recovers the
+/// extent as the room to the next payload: block-aligned, because every
+/// payload is written at an aligned offset. The real length is then knowledge
+/// the reader does not have and cannot get, so the keying length is the room
+/// — the one number both sides can compute — and the writer rounds up to it.
+pub(super) const fn resource_key_len(len: u64) -> u64 {
+    if !size_field_saturates(len) {
+        return len;
+    }
+    match len.checked_rem(BLOCK_LEN) {
+        None | Some(0) => len,
+        Some(over) => len.saturating_add(BLOCK_LEN.saturating_sub(over)),
+    }
+}
+
 /// The header these bytes hold, or `None` if there are not [`HEADER_LEN`] of
 /// them.
 ///
@@ -277,9 +319,10 @@ pub(super) fn directory_row(name_offset: u32, first_child: u32, child_count: u32
 /// row. A value that will not fit the format cannot now become a row at all.
 ///
 /// One field is the exception, and it is the format's rather than this
-/// function's: a **resource** whose compressed length exceeds [`MAX_SIZE_24`]
-/// writes that value as a saturation sentinel, because the extent of such a
-/// payload was never in the field to begin with — it is the room to the next
+/// function's: a **resource** whose compressed length reaches [`MAX_SIZE_24`]
+/// writes that value as a saturation sentinel ([`size_field_saturates`], which
+/// is where the boundary lives), because the extent of such a payload was
+/// never in the field to begin with — it is the room to the next
 /// payload, which is how the reader recovers it. A **binary** entry at the same
 /// value is refused: its compressed length is the one statement of where its
 /// payload ends, and the format has no other spelling for it. DR-056, DR-051.
@@ -309,7 +352,7 @@ pub(super) fn file_row(path: &str, fields: &FileFields) -> Result<[u8; ROW_LEN]>
     // A resource longer than the field holds writes [`MAX_SIZE_24`] and lets
     // the reader recover its extent from the room to the next payload; a binary
     // entry has no such spelling and is refused. DR-056, DR-051 clause 1.
-    let compressed_field = if resource && fields.compressed_len > MAX_SIZE_24 {
+    let compressed_field = if resource && size_field_saturates(fields.compressed_len) {
         MAX_SIZE_24
     } else {
         check(path, "compressed size", fields.compressed_len, MAX_SIZE_24)?;

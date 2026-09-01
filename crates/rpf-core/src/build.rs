@@ -691,7 +691,7 @@ impl<W: Write + Seek> Seek for Sink<'_, W> {
 /// name the reader finds in the blob are one derivation and not two (§3). A
 /// backslash is a name byte and not a separator, so it is not one of these
 /// (DR-016).
-fn entry_name(path: &str) -> &str {
+pub(crate) fn entry_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
@@ -1774,8 +1774,9 @@ mod tests {
     use super::{FileKind, FileSpec, Sink, Storage, Under, build_under};
     use crate::{
         archive::Archive,
+        edit::{Change, Changes},
         entry::EntryKind,
-        error::Error,
+        error::{Error, Result},
         format::{
             Version,
             crypto::{CIPHER_BLOCK_LEN, Scheme, Seal, Sealer, synthetic},
@@ -1783,6 +1784,7 @@ mod tests {
             rpf7, widen,
         },
         keys::{Material, Unlock},
+        scratch::InMemory,
         watch::Unwatched,
     };
 
@@ -2035,6 +2037,284 @@ mod tests {
             matches!(error, Error::NeedsKey { tag } if tag == rpf7::ENCRYPTION_NG),
             "{error:?}"
         );
+    }
+
+    /// An NG archive of one file, written under the name it will be found at.
+    ///
+    /// A **nested** archive's own table of contents is keyed by the name its
+    /// holder gives it (`Archive::open_nested`), so what it is called is part
+    /// of what it is.
+    fn ng_inner(named: &str, holding: &str, contents: &[u8]) -> Vec<u8> {
+        let (sealer, _) = ng_zeroed(named);
+        let held = contents.to_vec();
+        let mut out = Cursor::new(Vec::new());
+        build_under(
+            &mut out,
+            Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_NG, &sealer, named),
+            &[FileSpec {
+                path: holding.to_owned(),
+                kind: FileKind::Binary {
+                    storage: Storage::Stored,
+                    encryption: 1,
+                },
+            }],
+            &[],
+            |_: &str| Ok(Cursor::new(held.clone())),
+            &mut Unwatched,
+        )
+        .expect("the nested archive builds");
+        out.into_inner()
+    }
+
+    /// An NG archive holding that one as an entry of its own, in the clear and
+    /// stored — which is the only form a nested archive is read in, since
+    /// `Archive::open_nested` parses it straight out of the source at its
+    /// payload's offset.
+    fn ng_outer(named: &str, at: &str, inner: &[u8]) -> (Vec<u8>, Unlock) {
+        let (sealer, unlock) = ng_zeroed(named);
+        let mut out = Cursor::new(Vec::new());
+        build_under(
+            &mut out,
+            Under::sealed(Version::Rpf7, rpf7::ENCRYPTION_NG, &sealer, named),
+            &[FileSpec {
+                path: at.to_owned(),
+                kind: FileKind::Binary {
+                    storage: Storage::Stored,
+                    encryption: rpf7::ENTRY_OPEN,
+                },
+            }],
+            &[],
+            |_: &str| Ok(Cursor::new(inner.to_vec())),
+            &mut Unwatched,
+        )
+        .expect("the holding archive builds");
+        (out.into_inner(), unlock)
+    }
+
+    /// What the nested archive at `at` holds at `holding`, read through both
+    /// tables of contents.
+    fn through_nested(bytes: Vec<u8>, unlock: &Unlock, at: &str, holding: &str) -> Result<Vec<u8>> {
+        let mut src = Cursor::new(bytes);
+        let archive = Archive::open(&mut src, unlock)?;
+        let index = archive.find(at)?;
+        let nested = archive.open_nested(&mut src, index)?;
+        let inside = nested.find(holding)?;
+        nested.read(&mut src, inside)
+    }
+
+    #[test]
+    fn a_nested_ng_archive_is_not_renamed_out_from_under_its_own_key() {
+        // **The silent one.** A nested archive travels through a rebuild as
+        // opaque payload bytes, and an NG archive's own table of contents is
+        // keyed by `(hash(name) + length + 61) % 101` — the name being the one
+        // its holder files it under. Renaming the entry re-keys nothing inside
+        // it, so the archive that comes out parses, verifies and cannot be
+        // opened: `open_nested` answers `WrongKey`. Nothing in the rebuild
+        // touched it and nothing reported anything.
+        //
+        // Re-keying it is possible in principle and is not what this does: a
+        // nested archive is written through as a stream and re-keying its
+        // tables means holding and rewriting the whole payload, which is R3.9's
+        // cost on an entry that may be gigabytes. So the rename is refused,
+        // named, and typed. DR-064.
+        let inner = ng_inner("inner.rpf", "note.txt", b"held inside");
+        let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
+        // The fixture is the case it claims to be: the nested archive opens
+        // under the name it is filed at.
+        assert_eq!(
+            through_nested(bytes.clone(), &unlock, "inner.rpf", "note.txt")
+                .expect("the nested archive opens as it stands"),
+            b"held inside"
+        );
+
+        let mut src = Cursor::new(bytes.clone());
+        let archive = Archive::open(&mut src, &unlock).expect("the holder opens");
+        let changes = Changes::one("inner.rpf", Change::RenameTo("other.rpf".to_owned()));
+        let mut out = Cursor::new(Vec::new());
+        let refused = crate::rewrite(
+            &mut src,
+            &archive,
+            &changes,
+            &mut out,
+            &mut InMemory,
+            &mut Unwatched,
+        )
+        .expect_err("renaming a nested NG archive is refused");
+        assert_eq!(refused.name(), "CannotRenameKeyed", "{refused:?}");
+        assert!(
+            matches!(
+                refused,
+                Error::CannotRenameKeyed { tag, scheme, .. }
+                    if tag == rpf7::ENCRYPTION_NG && scheme == "NG"
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_ng_archive_moves_between_directories_and_still_opens() {
+        // The other half, and what keeps the refusal from being a ban on
+        // rebuilds: an NG key is a function of the entry's **name** and not of
+        // its path, so a move that keeps the name changes nothing inside the
+        // payload and is allowed. Asserted on what lands — the rebuilt archive
+        // is opened, the nested one opened through it, and the file inside read
+        // back.
+        let inner = ng_inner("inner.rpf", "note.txt", b"held inside");
+        let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
+        let mut src = Cursor::new(bytes);
+        let archive = Archive::open(&mut src, &unlock).expect("the holder opens");
+        let changes = Changes::one("inner.rpf", Change::RenameTo("deep/inner.rpf".to_owned()));
+        let mut out = Cursor::new(Vec::new());
+        crate::rewrite(
+            &mut src,
+            &archive,
+            &changes,
+            &mut out,
+            &mut InMemory,
+            &mut Unwatched,
+        )
+        .expect("a move that keeps the name is allowed");
+        assert_eq!(
+            through_nested(out.into_inner(), &unlock, "deep/inner.rpf", "note.txt")
+                .expect("the nested archive still opens"),
+            b"held inside"
+        );
+    }
+
+    /// An encryption tag no build here defines, in an otherwise well-formed
+    /// `RPF7` header.
+    ///
+    /// `Version::scheme` answers `None` for it, exactly as it does for
+    /// [`rpf7::ENCRYPTION_OPEN`] — and the two mean opposite things: one is
+    /// "there is nothing here to protect" and the other is "this is under
+    /// something nobody here has identified".
+    const UNKNOWN_TAG: u32 = 0x0BAD_5EA1;
+
+    #[test]
+    fn a_nested_archive_under_an_unrecognised_tag_is_not_renamed_either() {
+        // The latent half of the same defect. A rename is refused by asking
+        // the nested archive's header what transform it is under, and a tag
+        // this build does not recognise used to answer the same `None` as an
+        // unencrypted archive — so an archive keyed by a name nobody here can
+        // name would have been renamed out from under its key with nothing
+        // refused and nothing reported. Unreachable with any tag this build
+        // defines, and now unreachable by construction: the two answers are
+        // told apart, and the unknown one refuses.
+        let mut inner = ng_inner("inner.rpf", "note.txt", b"held inside");
+        inner[12..16].copy_from_slice(&UNKNOWN_TAG.to_le_bytes());
+        let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
+
+        let mut src = Cursor::new(bytes);
+        let archive = Archive::open(&mut src, &unlock).expect("the holder opens");
+        let changes = Changes::one("inner.rpf", Change::RenameTo("other.rpf".to_owned()));
+        let mut out = Cursor::new(Vec::new());
+        let refused = crate::rewrite(
+            &mut src,
+            &archive,
+            &changes,
+            &mut out,
+            &mut InMemory,
+            &mut Unwatched,
+        )
+        .expect_err("a nested archive under an unknown tag is not renamed");
+        assert!(
+            matches!(
+                refused,
+                Error::CannotRenameKeyed { tag, .. } if tag == UNKNOWN_TAG
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_unencrypted_archive_is_renamed_freely() {
+        // The other side of that telling-apart, and what keeps it from being a
+        // ban on renaming anything that looks like an archive: an unencrypted
+        // nested archive is keyed by nothing, so its name is not part of what
+        // it is. Asserted on what lands.
+        let mut out = Cursor::new(Vec::new());
+        crate::build(
+            &mut out,
+            Version::Rpf7,
+            &[FileSpec {
+                path: "note.txt".to_owned(),
+                kind: FileKind::Binary {
+                    storage: Storage::Stored,
+                    encryption: rpf7::ENTRY_OPEN,
+                },
+            }],
+            &[],
+            |_: &str| Ok(Cursor::new(b"held inside".to_vec())),
+            &mut Unwatched,
+        )
+        .expect("the plain nested archive builds");
+        let inner = out.into_inner();
+
+        let mut out = Cursor::new(Vec::new());
+        crate::build(
+            &mut out,
+            Version::Rpf7,
+            &[FileSpec {
+                path: "inner.rpf".to_owned(),
+                kind: FileKind::Binary {
+                    storage: Storage::Stored,
+                    encryption: rpf7::ENTRY_OPEN,
+                },
+            }],
+            &[],
+            |_: &str| Ok(Cursor::new(inner.clone())),
+            &mut Unwatched,
+        )
+        .expect("the holding archive builds");
+
+        let mut src = Cursor::new(out.into_inner());
+        let unlock = Unlock::unkeyed();
+        let archive = Archive::open(&mut src, &unlock).expect("the holder opens");
+        let changes = Changes::one("inner.rpf", Change::RenameTo("other.rpf".to_owned()));
+        let mut out = Cursor::new(Vec::new());
+        crate::rewrite(
+            &mut src,
+            &archive,
+            &changes,
+            &mut out,
+            &mut InMemory,
+            &mut Unwatched,
+        )
+        .expect("an unencrypted nested archive is renamed");
+
+        assert_eq!(
+            through_nested(out.into_inner(), &unlock, "other.rpf", "note.txt")
+                .expect("the nested archive still opens"),
+            b"held inside"
+        );
+    }
+
+    #[test]
+    fn a_nested_ng_archive_is_not_respelled_out_from_under_its_own_key_either() {
+        // The exemption that used to sit in front of this refusal read a
+        // case-respelling as no rename at all, on the strength of the NG name
+        // hash folding case. It folds case through the **material's own
+        // 256-byte lookup table**, which this build reads rather than defines,
+        // so "the hash folds ASCII case and nothing else" was a claim about
+        // the key material that nothing here checked. The rename is refused
+        // instead: only a name that is byte for byte the one the archive is
+        // already keyed under is not a rename.
+        let inner = ng_inner("inner.rpf", "note.txt", b"held inside");
+        let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
+        let mut src = Cursor::new(bytes);
+        let archive = Archive::open(&mut src, &unlock).expect("the holder opens");
+        let changes = Changes::one("inner.rpf", Change::RenameTo("INNER.RPF".to_owned()));
+        let mut out = Cursor::new(Vec::new());
+        let refused = crate::rewrite(
+            &mut src,
+            &archive,
+            &changes,
+            &mut out,
+            &mut InMemory,
+            &mut Unwatched,
+        )
+        .expect_err("a respelling of a keyed nested archive is not let through");
+        assert_eq!(refused.name(), "CannotRenameKeyed", "{refused:?}");
     }
 
     #[test]

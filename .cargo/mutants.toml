@@ -85,3 +85,21 @@ additional_cargo_args = ["--workspace"]
 # hang costs five minutes of one job; a false timeout costs a wrong line in the
 # report.
 minimum_test_timeout = 300
+
+# Two mutants are excluded by name, because no test in this repository could
+# kill either: `cargo-mutants` parses source and does not evaluate `cfg`, so it
+# proposes mutations of bodies `cargo test` never compiles.
+#
+#   `keys/mod.rs`'s `Material::over_bytes` sits inside an `impl Material` block
+#   that is `#[cfg(fuzzing)]` in its entirety — the fuzz seam DR-048 confines.
+#
+#   `keys/cache.rs`'s `create_private` is the `#[cfg(not(unix))]` arm, and every
+#   sweep so far has run on Linux.
+#
+# Three reports in a row rediscovered them and spent an afternoon each time
+# deciding they were not gaps. Excluding them by name is the decision, written
+# down. A pass run with `--cfg fuzzing`, or on Windows, would want them back.
+exclude_re = [
+    "src/keys/mod\\.rs.*over_bytes",
+    "src/keys/cache\\.rs.*create_private",
+]

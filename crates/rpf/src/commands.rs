@@ -1213,8 +1213,11 @@ pub fn pack(
 /// [`unlock_for`], over `--cache-dir` or the platform's own cache, read only
 /// where the tag names a transform this build can write forwards. `pack` opens
 /// no archive, so the name that unlock carries is the **output** archive's —
-/// which no AES key is a function of, and no tag this route accepts is
-/// (DR-054 §2, DR-057).
+/// and since DR-062 that route accepts NG, whose every region *is* keyed by
+/// that name. Which is why the output's name is the right one and not merely a
+/// harmless one: an archive is read back under the name it is written at, so
+/// the name the table of contents is keyed by here is the name the reader will
+/// key it by. An AES key is a function of neither (DR-054 §2, DR-057).
 ///
 /// # Errors
 ///

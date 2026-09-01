@@ -174,6 +174,41 @@ pub enum Error {
         reason: NoWrite,
     },
 
+    /// An entry holding an archive whose own key is a function of its name
+    /// cannot be renamed.
+    ///
+    /// A nested archive travels through a rebuild as **opaque payload bytes**:
+    /// its holder copies it across and re-keys nothing inside it. An NG
+    /// archive's own table of contents and names blob are keyed by the name it
+    /// is filed under — `(hash(name) + length + 61) % 101` — so an entry
+    /// renamed from `dlc.rpf` to anything else holds an archive that parses,
+    /// verifies and no longer opens, with nothing refused and nothing reported.
+    /// That is the failure this variant exists to make loud. DR-064.
+    ///
+    /// The holder's own tag is irrelevant: an NG archive nested inside an AES
+    /// one breaks the same way. And a **move** is not a rename here — the key
+    /// takes the entry's name and not its path, so an entry that keeps its name
+    /// is carried anywhere without this.
+    ///
+    /// [`Category::Unsupported`]: no material closes the gap, because the
+    /// missing part is here — re-keying the payload means holding and rewriting
+    /// the whole of a nested archive, which is the streaming cost R3.9 exists
+    /// to avoid.
+    #[error(
+        "{path}: renaming to {to} would leave the {scheme} archive nested there \
+         (tag {tag:#010x}) keyed by the name it no longer has"
+    )]
+    CannotRenameKeyed {
+        /// The entry as it stands.
+        path: String,
+        /// What the rename would call it.
+        to: String,
+        /// The nested archive's encryption tag.
+        tag: u32,
+        /// What that tag's transform is called. Never a key: DR-020.
+        scheme: &'static str,
+    },
+
     /// A game executable does not carry the key material this build knows how
     /// to find.
     ///
@@ -872,6 +907,7 @@ impl Error {
             Self::UnsupportedVersion { .. }
             | Self::UnrecognisedExecutable { .. }
             | Self::CannotWriteEncrypted { .. }
+            | Self::CannotRenameKeyed { .. }
             | Self::UnrepresentableRbf { .. }
             | Self::UnsupportedPso { .. }
             | Self::UnsupportedMeta { .. } => Category::Unsupported,
@@ -946,6 +982,7 @@ impl Error {
             Self::NeedsKey { .. } => "NeedsKey",
             Self::WrongKey { .. } => "WrongKey",
             Self::CannotWriteEncrypted { .. } => "CannotWriteEncrypted",
+            Self::CannotRenameKeyed { .. } => "CannotRenameKeyed",
             Self::OutOfBounds { .. } => "OutOfBounds",
             Self::BadName { .. } => "BadName",
             Self::BadChildRange { .. } => "BadChildRange",
@@ -1027,7 +1064,7 @@ mod tests {
     /// That match is exhaustive, so a variant added later stops the crate
     /// compiling until it is named there — and then this number and the tables
     /// below have to be brought up to date, which is the point.
-    const VARIANTS: usize = 44;
+    const VARIANTS: usize = 45;
 
     /// The variant's own name, for a test that has to say which one it means.
     ///
@@ -1254,6 +1291,15 @@ mod tests {
                 Error::CannotWriteEncrypted {
                     tag: 0x0FEF_FFFF,
                     reason: NoWrite::NoInverse,
+                },
+                Category::Unsupported,
+            ),
+            (
+                Error::CannotRenameKeyed {
+                    path: "dlc.rpf".to_owned(),
+                    to: "other.rpf".to_owned(),
+                    tag: 0x0FEF_FFFF,
+                    scheme: "NG",
                 },
                 Category::Unsupported,
             ),

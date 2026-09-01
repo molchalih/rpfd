@@ -6,8 +6,8 @@
 //! no checksum, no encrypted section, no `PSIG`. One measurement shapes the
 //! module exactly as it shapes [`super::pso`]: every file was walked from its
 //! root using **only its own tables** and reached **0** references it did not
-//! define, over 88,171,116 nodes. So nothing here consults a builtin table and
-//! there is none to consult.
+//! define, over 88,171,116 structures. So nothing here consults a builtin
+//! table and there is none to consult.
 //!
 //! # Two pointer kinds, and the type system keeps them apart
 //!
@@ -56,18 +56,29 @@
 //! construction: 412 distinct member names and 73 structure hashes across the
 //! whole corpus, and an empty dictionary spells every one `hash_XXXXXXXX`.
 //!
-//! # What is measured here and what is not
+//! # What is measured here
 //!
 //! [`parse`] — the header, the three tables and both pointer kinds — is
-//! `verified` against all 49,614 files. **The value walk is not.** The type
-//! table `kind` carries is `secondary`: `docs/metadata-encodings.md` counted
-//! 23 distinct type codes and does not enumerate them, so the codes are the
-//! reference implementation's, read as specification under `AGENTS.md`'s
-//! authority order. `kind` says what bounds a wrong row, and
-//! `every_shipped_meta_file_round_trips_byte_for_byte` in
-//! `crates/rpf-core/tests/metadata.rs` is the measurement that would settle it
-//! — **it has never been run against the corpus**, because no dump of the
-//! 49,614 payloads has been within reach of this code.
+//! `verified` against all 49,614 files, and so is the value walk: every one of
+//! them renders and is written back **byte for byte**
+//! (`every_shipped_meta_file_round_trips_byte_for_byte` in
+//! `crates/rpf-core/tests/metadata.rs`), over 1,487,349,189 elements. The type
+//! table `kind` carries is that measurement's: 23 codes, which is the number
+//! `docs/metadata-encodings.md` counted, and `kind` says which and how each
+//! aggregate's width was derived.
+//!
+//! **What that round trip proves is narrower than it sounds, and the narrower
+//! claim is the one to quote.** [`from_xml`] applies the document [`to_xml`]
+//! has just written, so every value matches what is already there and nothing
+//! is written back at all: the payload comes out because it went in untouched.
+//! So 49,614 of 49,614 says *the walk reached every value without refusing and
+//! the re-parse agreed with the render* — it does not say a member's width is
+//! right. A stride that is wrong by eight and lands on a null, a zero or a
+//! pointer that still resolves round-trips byte for byte and renders nonsense.
+//! Which widths are pinned, and by what, is written down in `kind`: `0x50`'s
+//! is proved by its product equalling the gap to the next member in 51,168 of
+//! 51,168; `0x44`, `0x52` and `0x40` are consistent with every gap and not
+//! pinned by one; and `0x07`'s 8 is not disambiguated by the corpus at all.
 //!
 //! # What bounds it
 //!
@@ -79,7 +90,9 @@
 //! slice whose extent [`parse`] has already checked — so a file declaring
 //! 65,535 structures of 65,535 members costs one refusal rather than 4 × 10⁹
 //! records. The walk carries its own three ceilings, which `kind` owns: a
-//! depth, a node budget and an output budget proportional to the payload.
+//! depth, and an element budget and an output budget both proportional to the
+//! payload, both floored or capped in absolute terms, and all three calibrated
+//! against the corpus.
 
 mod apply;
 mod data;
@@ -1143,6 +1156,23 @@ pub enum Malformed {
     /// structure references on real members are unresolvable — so a file where
     /// one is, is not one Rockstar's packer wrote.
     UndefinedStructure,
+    /// An array's elements are declared **no bytes wide**.
+    ///
+    /// A stride of zero puts every element of an array at one address and makes
+    /// an array of any count occupy nothing, so [`Malformed::MemberExtent`]'s
+    /// check — the one that measures a derived width against a length the file
+    /// states — passes for every count there is. It is reachable two ways: a
+    /// `0x05` naming a structure the file declares zero bytes long, and a
+    /// `0x50` whose own `referenceKey` is zero. Neither describes anything, and
+    /// a `0x52` carrying a count of four billion over it writes four billion
+    /// elements out of a payload that never grows.
+    ///
+    /// Refused where the stride is derived rather than left to a ceiling: a
+    /// budget bounds the work, and what is wanted here is the answer that the
+    /// file is wrong. No shipped file has one — the 51,168 inline arrays of the
+    /// corpus all have a product equal to the gap to the next member, and a gap
+    /// of zero is not a member.
+    ZeroStride,
     /// An array member's `arrayInfoIndex` names no member of its structure.
     ///
     /// `docs/metadata-encodings.md`: 925,473 indices resolved and **0**
@@ -1150,7 +1180,7 @@ pub enum Malformed {
     ArrayInfo,
     /// Structures nested deeper than this walk goes.
     TooDeep,
-    /// The walk wrote more elements than its budget allows.
+    /// The walk wrote more elements than a payload of this size may write.
     TooManyNodes,
     /// The document grew past what a payload of this size is allowed to write.
     TooLarge,
@@ -1159,6 +1189,8 @@ pub enum Malformed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::metadata::hash::placeholder;
 
     /// A payload under construction, so that a test states the bytes it means
     /// and nothing else.
@@ -1275,6 +1307,16 @@ mod tests {
         }
     }
 
+    /// Where a refusal points, for a test that asserts the offset that reached
+    /// it rather than only the cause.
+    #[track_caller]
+    fn refused_at(error: &Error) -> u64 {
+        match *error {
+            Error::BadMeta { offset, .. } => offset,
+            ref other => panic!("not a Meta refusal: {other}"),
+        }
+    }
+
     #[test]
     fn the_magic_is_the_word_the_format_document_records_at_0x10() {
         assert_eq!(MAGIC, 0x5052_4430);
@@ -1298,6 +1340,9 @@ mod tests {
         let pointer = ResourcePointer::wide(system(0x1234)).expect("a 32-bit pointer");
         assert_eq!(pointer.space(), Some(Space::System));
         assert_eq!(pointer.offset(), 0x1234);
+        // The word it was read from is the space and the offset back together,
+        // and neither half of it alone.
+        assert_eq!(pointer.word(), 0x5000_1234);
         let pointer = ResourcePointer::wide(graphics(0x0FFF_FFFF)).expect("a 32-bit pointer");
         assert_eq!(pointer.space(), Some(Space::Graphics));
         assert_eq!(pointer.offset(), 0x0FFF_FFFF);
@@ -1340,6 +1385,9 @@ mod tests {
         assert_ne!(MetaPointer::wide(0x10_0003).item_offset(), 16);
         // A block id of 0 is null, and the id is bounded by its 12 bits.
         assert!(MetaPointer::wide(data_pointer(0, 4096)).is_null());
+        // And one that names a block is not null, which is the half a
+        // one-sided assertion leaves free.
+        assert!(!MetaPointer::wide(data_pointer(3, 128)).is_null());
         assert_eq!(BlockId::new(0), None);
         assert_eq!(BlockId::new(BLOCK_MASK).map(BlockId::get), Some(4095));
         assert_eq!(BlockId::new(BLOCK_MASK + 1), None);
@@ -1473,6 +1521,8 @@ mod tests {
         assert_eq!(structure.member(0), Some(member));
         assert_eq!(structure.member(1), None);
 
+        assert_eq!(meta.enums().len(), 1);
+        assert_eq!(meta.enums()[0].name, 0x5555_5555);
         let enumeration = meta.enumeration(0x5555_5555).expect("the enum");
         assert_eq!(enumeration.unknown, 0x6666_6666);
         assert_eq!(enumeration.entry_count, 1);
@@ -1493,6 +1543,14 @@ mod tests {
         assert!(meta.structure(0).is_none());
         assert!(meta.enumeration(0).is_none());
         assert!(meta.block(BlockId::new(2).expect("a second id")).is_none());
+
+        // And the other side of the emptiness question: a row declaring no
+        // bytes gives a block that holds none.
+        let mut hollow = whole();
+        hollow.u32(0xA4, 0);
+        let meta = parse(hollow.bytes(), hollow.bytes().len()).expect("a whole file");
+        assert_eq!(meta.root().len(), 0);
+        assert!(meta.root().is_empty());
     }
 
     #[test]
@@ -1750,5 +1808,137 @@ mod tests {
         // And a header whose every field is set.
         let ones = vec![0xFF_u8; 0x200];
         let _ = parse(&ones, 0x100);
+    }
+
+    #[test]
+    fn the_headers_two_unnamed_pointers_have_to_land_in_the_space_they_name() {
+        // `docs/metadata-encodings.md` measured 0 of 1,014,378 pointers out of
+        // range, and nothing says how many bytes either of these two owns — so
+        // all `parse` can ask of them is that they land, and it asks it of
+        // both. A file whose `pages_info` at `0x08` or whose pointer at `0x40`
+        // points past the space its nibble names is refused there.
+        for at in [0x08_usize, 0x40] {
+            let mut payload = bare(HEADER_LEN);
+            payload.u64(at, system(0x100));
+            let error = parse(payload.bytes(), HEADER_LEN).expect_err("past the system pages");
+            assert_eq!(refusal(&error), Malformed::OutOfRange, "at {at:#x}");
+            assert_eq!(refused_at(&error), address(at), "at {at:#x}");
+        }
+        // A null one names nothing, so there is nothing to check and it is
+        // accepted: `0x40` is 0 on most shipped files.
+        let mut payload = whole();
+        payload.u64(0x08, 0).u64(0x40, 0);
+        parse(payload.bytes(), payload.bytes().len()).expect("null pointers name nothing");
+        // As is one that does land.
+        payload.u64(0x08, system(0x50)).u64(0x40, system(0xFF));
+        parse(payload.bytes(), payload.bytes().len()).expect("both pointers land");
+    }
+
+    #[test]
+    fn a_malformed_table_record_is_refused_at_its_own_address() {
+        // "each at the payload offset that reached it": a record's address is
+        // its table's base plus its index times its stride, so the second
+        // record of a table at `0x100` is reported at `0x120` and at `0x110`
+        // for the two strides below — never at the table's own address and
+        // never at the payload's.
+        let mut structures = bare(0x200);
+        structures
+            .u64(0x20, system(0x100))
+            .u16(0x48, 2)
+            // The first record declares no members, so only the second is bad:
+            // its `membersPtr` has its high half set.
+            .u64(0x130, 1_u64 << 32);
+        let error = parse(structures.bytes(), structures.bytes().len())
+            .expect_err("the second structure's pointer is not one");
+        assert_eq!(refusal(&error), Malformed::PointerWidth);
+        assert_eq!(refused_at(&error), 0x120);
+
+        let mut blocks = bare(0x200);
+        blocks
+            .u64(0x30, system(0x100))
+            .u16(0x4C, 2)
+            // The first row is an empty block at a pointer that lands; the
+            // second's pointer has its high half set.
+            .u64(0x108, system(0x180))
+            .u64(0x118, 1_u64 << 32);
+        let error = parse(blocks.bytes(), blocks.bytes().len())
+            .expect_err("the second block's pointer is not one");
+        assert_eq!(refusal(&error), Malformed::PointerWidth);
+        assert_eq!(refused_at(&error), 0x110);
+    }
+
+    /// A file whose root structure holds a pointer into a block **tagged with
+    /// the bare pointer type code**, whose own first word points back at that
+    /// block.
+    ///
+    /// The cycle this makes runs through `target` and never through an element:
+    /// a typed block names its one value's type and nothing else, so following
+    /// a pointer into a block tagged `0x07` writes no element, charges no node,
+    /// and — until the walk was made to count the hop — deepened nothing.
+    fn pointer_cycle() -> Payload {
+        let mut payload = bare(0x100);
+        payload
+            .u64(0x20, system(0x50))
+            .u64(0x30, system(0xA0))
+            .u16(0x48, 1)
+            .u16(0x4C, 2)
+            // One structure, whose one member is a pointer.
+            .u32(0x50, 0x1111_1111)
+            .u32(0x54, 0x2222_2222)
+            .u32(0x58, 0x300)
+            .u64(0x60, system(0x70))
+            .u32(0x68, 8)
+            .u16(0x6E, 1)
+            .u32(0x70, 0x3333_3333)
+            .u32(0x74, 0)
+            .put(0x78, &[0x07, 0x00])
+            // Block 1, the root, holding that pointer.
+            .u32(0xA0, 0x1111_1111)
+            .u32(0xA4, 8)
+            .u64(0xA8, system(0xC0))
+            // Block 2, tagged `0x07`, holding a pointer at itself.
+            .u32(0xB0, 0x07)
+            .u32(0xB4, 8)
+            .u64(0xB8, system(0xC8))
+            .u64(0xC0, data_pointer(2, 0))
+            .u64(0xC8, data_pointer(2, 0));
+        payload
+    }
+
+    /// The document [`pointer_cycle`]'s root would be written as, down to the
+    /// one child the applier reaches before it follows the pointer.
+    fn pointer_cycle_document() -> Vec<u8> {
+        let root = placeholder(0x1111_1111);
+        let field = placeholder(0x3333_3333);
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <{root} meta:struct=\"{root}\">\n  <{field} meta:struct=\"{root}\"/>\n</{root}>\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_pointer_hop_is_a_level_of_depth_so_a_block_naming_itself_is_refused() {
+        let payload = pointer_cycle();
+        let error = to_xml(
+            payload.bytes(),
+            payload.bytes().len(),
+            &Dictionary::default(),
+        )
+        .expect_err("a block of pointers that names itself has no depth");
+        assert_eq!(refusal(&error), Malformed::TooDeep);
+    }
+
+    #[test]
+    fn applying_a_document_through_a_block_that_names_itself_is_refused_as_well() {
+        let payload = pointer_cycle();
+        let error = from_xml(
+            payload.bytes(),
+            payload.bytes().len(),
+            &pointer_cycle_document(),
+            &Dictionary::default(),
+        )
+        .expect_err("the write direction follows the same cycle the read direction does");
+        assert_eq!(refusal(&error), Malformed::TooDeep);
     }
 }
