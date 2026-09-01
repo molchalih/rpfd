@@ -108,6 +108,11 @@ jobs:
             [ -f "$m" ] || continue
             perl -0pi -e "s/^version = \"0\\.0\\.0\"/version = \"$v\"/m" "$m"
           done
+          # The lock records each workspace member's version, so rewriting the
+          # manifests without it makes `--locked` refuse the build.
+          for name in rpf rpf-core metadata-dump; do
+            perl -0pi -e "s/(name = \"$name\"\nversion = )\"0\\.0\\.0\"/\${1}\"$v\"/" Cargo.lock
+          done
           cargo metadata --format-version 1 --no-deps >/dev/null
 
       # --locked, because a release is the one build where resolving a
