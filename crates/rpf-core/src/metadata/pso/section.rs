@@ -1,10 +1,8 @@
 //! The section chain, and reading big-endian words out of one.
 //!
-//! `docs/metadata-encodings.md`, `PSO` Sections: a file is a concatenation of
-//! sections, each a four-character tag and a `u32` length that **includes the
-//! eight-byte header**, and Σ(section lengths) is the file's length in 9,753 of
-//! 9,753. Everything is big-endian, including in a file shipped on a
-//! little-endian PC build.
+//! A file is a concatenation of sections, each a four-character tag and a `u32`
+//! length that includes the eight-byte header, summing to the file's length.
+//! Everything is big-endian, even on a little-endian build.
 
 use super::model::Malformed;
 
@@ -20,13 +18,9 @@ pub(super) const PSCH: [u8; 4] = *b"PSCH";
 /// The checksum's tag.
 pub(super) const CHKS: [u8; 4] = *b"CHKS";
 
-/// How long a `CHKS` section is.
-///
-/// `docs/metadata-encodings.md`, `CHKS`: twenty bytes — `ident`, `length`,
-/// `fileSize`, `checksum`, `unk0` — in 8,978 of 8,978 files that carry one. The
-/// writes into it are bounded by this rather than by the file, so a chain that
-/// declares a shorter `CHKS` is refused instead of having the next section's
-/// header overwritten.
+/// How long a `CHKS` section is: `ident`, `length`, `fileSize`, `checksum`,
+/// `unk0`. Writes are bounded by this, so a chain declaring a shorter `CHKS` is
+/// refused instead of overwriting the next section's header.
 pub(super) const CHKS_LEN: usize = 20;
 
 /// One section of a `PSO` file: its tag, and its bytes, header included.
@@ -42,9 +36,8 @@ pub(super) struct Section<'a> {
 
 /// Every section of `payload`, in order.
 ///
-/// The chain is walked to the end and must land exactly there: no slack, no
-/// trailer and no padding between sections, which is what the corpus shows and
-/// what makes `PSIN` a stronger check than a four-byte magic.
+/// The chain must land exactly on the end: no slack, no trailer and no padding
+/// between sections.
 ///
 /// # Errors
 ///
@@ -124,9 +117,8 @@ pub(super) fn f32(bytes: &[u8], at: usize) -> Option<f32> {
 
 /// The big-endian IEEE 754 half at `at`, widened to an `f32`.
 ///
-/// `docs/metadata-encodings.md`, the census: `FLOAT16` is 60 of 580,044
-/// members. Rust has no `f16` on the pinned toolchain, so the widening is done
-/// here, and it is exact — every half has an `f32` that is equal to it.
+/// Done by hand because the pinned toolchain has no `f16`; the widening is
+/// exact.
 pub(super) fn f16(bytes: &[u8], at: usize) -> Option<f32> {
     let bits = u16(bytes, at)?;
     let sign = u32::from(bits & 0x8000) << 16;
@@ -196,8 +188,6 @@ mod tests {
 
     #[test]
     fn the_half_float_widens_exactly() {
-        // Bits chosen for each arm: zero, a subnormal, one, the largest finite
-        // half, an infinity and a NaN.
         for (half, want) in [
             (0x0000u16, 0.0f32),
             (0x8000, -0.0),

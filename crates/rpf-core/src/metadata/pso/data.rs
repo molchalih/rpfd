@@ -1,10 +1,6 @@
 //! Reading a value out of the `PSIN` section, bounds-checked against it.
 //!
-//! One owner for the reads both directions of the conversion make
-//! (`docs/conventions.md` §3): [`super::render`] reads a value to write it as
-//! XML, [`super::apply`] reads one to compare a document against it, and the
-//! pointer decode below is a `verified` row of `docs/metadata-encodings.md`
-//! that must be encoded exactly once.
+//! One owner for the reads both directions of the conversion make.
 
 use super::{
     bad,
@@ -14,10 +10,7 @@ use super::{
 };
 use crate::error::Result;
 
-/// The low bits of a pointer's first dword: its 1-based block id.
-///
-/// `docs/metadata-encodings.md`, Pointers. Twelve bits is at most 4,095 blocks,
-/// a limit the corpus never approaches.
+/// The low bits of a pointer's first dword: its 1-based block id, twelve bits.
 const POINTER_BLOCK: u32 = 0xFFF;
 
 /// How far the item offset sits above the block id.
@@ -70,15 +63,10 @@ impl<'a> Data<'a> {
 
     /// A pointer, as the block it names and the address it lands at.
     ///
-    /// `docs/metadata-encodings.md`, Pointers: a pointer is **32 bits, in the
-    /// first dword** — block id in the low 12, item offset in the next 20 — and
-    /// the second word carries nothing. Read as one big-endian `u64` with the
-    /// block id in the low bits, every pointer in the corpus reads null.
-    ///
-    /// A block id of 0 is null; anything else must resolve, and an offset at or
-    /// past the block's length is refused rather than guessed at. 0 of
-    /// 1,362,769 pointers in the corpus do either, which is what says
-    /// `CodeWalker`'s `offset = offset >> 8` recovery is never needed.
+    /// A pointer is 32 bits in the first dword — block id in the low 12, item
+    /// offset in the next 20 — and the second word carries nothing. Block id 0
+    /// is null; anything else must resolve, and an offset at or past the
+    /// block's length is refused.
     pub(super) fn block_pointer(&self, address: u32) -> Result<Landing<'a>> {
         let word = self.word(address)?;
         let id = word & POINTER_BLOCK;
@@ -120,10 +108,6 @@ mod tests {
     use super::*;
 
     /// A block table naming one block, id 1, covering the whole section.
-    ///
-    /// `terminated` never reads it, but `Data` carries a reference to one, so
-    /// a test that only exercises `terminated` still needs a table that
-    /// resolves.
     fn one_block(section_len: u32) -> Blocks {
         let mut table = Vec::from(*b"PMAP");
         table.extend_from_slice(&0u32.to_be_bytes()); // section length, unread here

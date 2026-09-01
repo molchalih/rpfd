@@ -1,39 +1,21 @@
 //! Seeing a long write happen, and stopping one.
 //!
-//! A rebuild is unbounded work — the sample is 145 MB and the format document
-//! names archives of 2.7 GB — so a caller needs to know it is progressing and
-//! needs to be able to give up on it. DR-008.
-//!
-//! Both are one seam because they are one question, asked at the same moment:
-//! how far are we, and should we carry on. A caller that wants neither says so
-//! with [`Unwatched`] rather than by leaving an argument out — §4 allows one
-//! spelling per operation, and a progress-free second spelling of every write
-//! path would be four more.
+//! Progress and cancellation are one seam because they are one question, asked
+//! at the same moment: how far are we, and should we carry on.
 
 /// How far a long write has got.
 ///
-/// Reported once per entry written, after that entry is on the sink. A
-/// cascading rebuild produces one sequence of these per archive it rebuilds,
-/// innermost first, so `done` and `total` count the archive being written now
-/// rather than the whole cascade — there is no honest total for the cascade
-/// until it is finished.
+/// Reported once per entry written. A cascading rebuild counts the archive
+/// being written now rather than the whole cascade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step<'a> {
-    /// What this step is about: the entry just written, by path within the
-    /// archive being written.
-    ///
-    /// A scan over a source that has no entries — `keys` — names the material
-    /// it is looking for instead. There is no path to give: §7 keeps one from
-    /// reaching the library at all, and the unit of work is a block of the
-    /// source rather than an entry. DR-024.
+    /// The entry just written, by path within the archive being written; a
+    /// scan over a source that has no entries names the material it seeks.
     pub path: &'a str,
     /// How many units of work are done, this one included: entries written, or
     /// blocks of a source scanned.
     pub done: u32,
-    /// How many there are in total.
-    ///
-    /// A scan that finds everything it was looking for stops where it is, so
-    /// its last step can name fewer than this.
+    /// How many there are in total; a scan that stops early names fewer.
     pub total: u32,
     /// How many bytes have been written so far, the header and entry table
     /// included — or, for a scan, how many have been read.
@@ -45,26 +27,21 @@ pub struct Step<'a> {
 pub enum Flow {
     /// Keep going.
     Continue,
-    /// Stop. The write fails with [`crate::Error::Cancelled`] and the sink is
-    /// left however far it got, which is why every caller writes to a
-    /// temporary file and renames only on success (§8).
+    /// Stop; the write fails with [`crate::Error::Cancelled`] and the sink is
+    /// left however far it got.
     Stop,
 }
 
 /// Something watching a long write.
 ///
-/// Implement it to report progress, to cancel, or both. The method is called
-/// between entries, so a cancellation lands within one entry's work rather than
-/// instantly — and an entry can be a 20 MB payload.
+/// The method is called between entries, so a cancellation lands only at the
+/// end of the entry in flight.
 pub trait Watch {
     /// One entry has been written. Returns whether to write the next.
     fn step(&mut self, step: Step<'_>) -> Flow;
 }
 
 /// Watches nothing and never stops.
-///
-/// The spelling of "I do not want progress" at a call site, so that not wanting
-/// it is visible rather than being the absence of something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unwatched;
 
@@ -75,7 +52,7 @@ impl Watch for Unwatched {
 }
 
 /// So that a caller holding a `&mut W` can pass it on to a nested rebuild
-/// without giving it away. `replace_many` needs exactly this.
+/// without giving it away.
 impl<W: Watch + ?Sized> Watch for &mut W {
     fn step(&mut self, step: Step<'_>) -> Flow {
         (**self).step(step)

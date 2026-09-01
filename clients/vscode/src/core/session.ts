@@ -1,32 +1,14 @@
 /**
- * One open archive, and the changes held against it. R7.3.
+ * One open archive, and the changes held against it.
  *
- * **A write is not free.** Saving one entry may patch its payload in place or
- * may rebuild the whole archive, and the daemon decides which for the *set* of
- * buffered changes before it writes any of them — R4.14. So a change here is
- * buffered rather than saved, and the set is committed by one explicit act.
- * That is what makes a 145 MB archive editable in a loop: the alternative is
- * deciding the question once per keystroke-sized change.
- *
- * **The set is structural as well.** DR-026 gives the daemon `write { create }`,
- * `delete`, `rename` and `mkdir`, all buffered the same way. What it does not
- * give is a listing that reflects them: DR-028 says a listing is the archive on
- * disk, and `read` is the one method that prefers what was buffered. So this
- * class keeps the set itself, in {@link Pending}, and every question about the
- * archive's shape is answered from the listing **with the set applied** —
- * otherwise a created entry would be invisible until the save. DR-030.
- *
- * **A gesture is a plan, and the daemon is asked for all of it or none.** A set
- * holds one change per path and the daemon refuses a second — `Error::Claimed`
- * — so a gesture that supersedes or re-keys a buffered change takes it back
- * with `forget` before it offers what it means. Both sides then hold the same
- * set, which is the whole argument for keeping one here at all. DR-032.
- *
- * **One writer per archive.** DR-009: an archive is open in one session at a
- * time and the second `open` is refused, so this class is the unit a client
- * counts. Nothing here opens an archive twice, and `close` is what releases the
- * claim — a leaked handle locks the daemon out of its own archive for the rest
- * of its life.
+ * A change is buffered rather than saved, and the set — writes, deletes,
+ * renames and directories alike — is committed by one explicit act, because the
+ * daemon decides patch-or-rebuild for the whole set. A listing is the archive
+ * on disk, so every question about its shape is answered from the listing with
+ * the buffered set applied. A set holds one change per path and the daemon
+ * refuses a second, so a gesture that supersedes one takes it back with
+ * `forget` first. An archive is open in one session at a time, so a leaked
+ * handle locks the daemon out of its own archive.
  */
 
 import type { Daemon } from './daemon.js';
@@ -64,7 +46,7 @@ export interface Saved {
     len: number;
 }
 
-/** What a save would do, without doing any of it. R6.7. */
+/** What a save would do, without doing any of it. */
 export interface Preview {
     method: 'patch' | 'rebuild';
     /** Where each edit would land, when it would be patched in place. */
@@ -109,11 +91,9 @@ export interface RenameOptions {
     /**
      * Whether an entry the destination already holds is removed to make room.
      *
-     * DR-026's own answer to "I mean to replace that": the target is removed
-     * **in the same change set**, and removals are applied before renames for
-     * exactly that reason. It is not a second flag on the rename and it is not
-     * a delete and a create — the entry keeps its storage class and its kind,
-     * because it is still a rename. DR-032 §3 is what made the set assemblable.
+     * The target is removed **in the same change set**, where removals are
+     * applied before renames for exactly that reason. It is not a delete and a
+     * create: the entry keeps its storage class and its kind.
      */
     overwrite?: boolean;
 }
@@ -147,8 +127,8 @@ export class ArchiveSession {
     /**
      * Opens an archive and reads its shape once.
      *
-     * The path is on the daemon's own filesystem — the one thing a path on this
-     * wire has ever meant. DR-014.
+     * The path is on the daemon's own filesystem, which is the only thing a
+     * path on this wire has ever meant.
      */
     static async open(daemon: Daemon, archive: string): Promise<ArchiveSession> {
         const opened = await daemon.request<Opened>('open', { path: archive });
@@ -168,7 +148,7 @@ export class ArchiveSession {
      * The archive's path as the daemon resolved it.
      *
      * The resolved one rather than the one asked for: it is what the session
-     * claimed, and what a refusal of a second `open` will name. DR-009.
+     * claimed, and what a refusal of a second `open` will name.
      */
     get path(): string {
         return this.opened.path;
@@ -194,7 +174,7 @@ export class ArchiveSession {
      * buffered change applied.
      *
      * Not the listing itself, which is the archive on disk and says nothing
-     * about a creation or a removal until the commit. DR-028, DR-030.
+     * about a creation or a removal until the commit.
      */
     get tree(): Tree {
         return this.listing;
@@ -231,13 +211,10 @@ export class ArchiveSession {
      * disk otherwise.
      *
      * **Asked for as `auto`, which is the XML view where the entry has one.**
-     * `RBF` and `PSO` are tokenised binary that no editor can show and nobody
-     * can type, so what is presented is the document the daemon converts them
-     * to — and {@link write} hands that same document back, where it is
-     * converted the other way. The client neither converts anything nor decides
-     * what to ask for from a path: the daemon says what an entry holds, and an
-     * entry that gains a view later is presented without a change here. R7.4,
-     * DR-053.
+     * `RBF` and `PSO` are tokenised binary nobody can type, so what is
+     * presented is the document the daemon converts them to and {@link write}
+     * hands the same document back. The client converts nothing and decides
+     * nothing from a path.
      */
     async read(inside: string): Promise<Uint8Array> {
         const answer = await this.daemon.request<ReadEntry>('read', {
@@ -254,26 +231,17 @@ export class ArchiveSession {
      * The daemon resolves the path and checks the payload now rather than at
      * commit, so a refusal — a directory, or a payload that is not the `RSC7` a
      * resource entry takes — arrives while the user can still act on it.
-     *
-     * `create` is what DR-026 added: a path the archive does not hold is an
-     * entry added, and therefore a rebuild. Without it such a path is exit 3,
-     * because creating an entry a caller merely misspelled is the failure that
-     * guards against.
+     * Without `create` a path the archive does not hold is exit 3, which is
+     * what guards against creating an entry a caller merely misspelled.
      *
      * A write over a path this set removes is the removal withdrawn and these
      * contents in its place, which is the one change the set holds there.
      *
-     * **Offered as `auto`, which is what {@link read} answered.** A document
-     * going into an entry that holds `RBF` or `PSO` is converted by the daemon
-     * before it is buffered, so what the archive takes is of the entry's own
-     * encoding and DR-050's guardrail is neither weakened nor in the way.
-     * Anything that is not a document is offered exactly as it is, so pasting a
-     * payload into an entry is what it always was. DR-053.
-     *
-     * One consequence, and it is visible: the length this session projects for
-     * an edited metadata entry is the **document's**, because that is what this
-     * client holds. The entry's own length is what a listing says, and a
-     * listing is the archive on disk. DR-028.
+     * **Offered as `auto`, which is what {@link read} answered**, so a document
+     * is converted back to the entry's own encoding before it is buffered and
+     * anything that is not a document is offered exactly as it is. One visible
+     * consequence: the length this session projects for an edited metadata
+     * entry is the document's, because that is what this client holds.
      */
     async write(inside: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
         const visible = normalise(inside);
@@ -281,8 +249,6 @@ export class ArchiveSession {
         const there = this.pending.at(held);
         // A rename and a write are two changes at one path, and a set holds at
         // most one — so buffering this would silently drop the rename.
-        // `edit::Changes` is keyed by path and has no change that does both, so
-        // there is no set that expresses it either. DR-030, DR-032 §3.
         if (there?.kind === 'rename') {
             throw new Refused(
                 'refused',
@@ -300,15 +266,12 @@ export class ArchiveSession {
             );
         }
         // A creation is applied after the renames, so it is addressed by the
-        // path it will have; a replacement is addressed by the one the archive
-        // holds it at, and found there by index. `edit::tree_of`.
+        // path it will have; a replacement, by the one the archive holds it at.
         const known = this.onDisk.at(held) !== undefined;
         const path = known ? held : visible;
         const create = !known && options.create === true;
-        // Writing where a buffered removal is about to take a directory out is
-        // not one change: the set would have to hold the removal and the write
-        // at one path. Only a file can be replaced this way, and that is the
-        // write on its own.
+        // Only a file can be replaced this way: one set cannot hold both the
+        // removal of a directory and a write at that path.
         const gone = this.committed.at(path);
         if (this.pending.at(path)?.kind === 'remove' && gone !== undefined && isDirectory(gone)) {
             throw new Refused(
@@ -323,10 +286,8 @@ export class ArchiveSession {
     /**
      * Buffers a removal. Nothing on disk changes until {@link save}.
      *
-     * A removal of something only a buffered change put there is that change
-     * withdrawn — `forget`, one request, where the buffer used to have to be
-     * discarded and offered again. The same is true of a directory removed over
-     * the changes buffered inside it. DR-032 §4.
+     * A removal of something only a buffered change put there withdraws that
+     * change instead, as does a directory removed over the changes inside it.
      */
     async remove(inside: string, options: RemoveOptions = {}): Promise<void> {
         const visible = normalise(inside);
@@ -335,11 +296,8 @@ export class ArchiveSession {
             throw new Refused('not-found', visible, `${visible} is not in the archive`);
         }
         const recursive = options.recursive === true;
-        // Asked of the view rather than only of the archive, because the daemon
-        // cannot see it: a directory the archive holds empty may hold buffered
-        // creations, and one the archive does not hold at all is entirely
-        // buffered. The daemon asks the same of the archive, and both answers
-        // stand.
+        // Asked of the view as well as the archive: a directory the archive
+        // holds empty may hold buffered creations the daemon cannot see.
         if (!recursive && isDirectory(node) && node.children.size > 0) {
             throw new Refused(
                 'refused',
@@ -355,12 +313,9 @@ export class ArchiveSession {
      * Buffers a rename. Nothing on disk changes until {@link save}.
      *
      * A destination the view already holds is refused unless `overwrite` says
-     * to replace it, and replacing it is DR-026's own answer rather than an
-     * override: the target is **removed in the same change set**, where
-     * removals are applied before renames for exactly that reason. That set
-     * could not be assembled through the wire until DR-032 made `allows` judge
-     * a change against the changes buffered beside it; now it can, and the
-     * entry keeps its storage class and its kind because it is still a rename.
+     * to replace it, and then the target is **removed in the same change set**,
+     * where removals are applied before renames. The entry keeps its storage
+     * class and its kind, because it is still a rename.
      */
     async rename(from: string, to: string, options: RenameOptions = {}): Promise<void> {
         const source = normalise(from);
@@ -386,9 +341,8 @@ export class ArchiveSession {
         }
         const plans: Plan[] = [];
         if (occupied) {
-            // A directory with entries under it is not what "replace this" is
-            // asked about, and taking it recursively is a deletion the user did
-            // not ask for. DR-026 §4 wants that said out loud, as its own act.
+            // Taking a non-empty directory recursively is a deletion the user
+            // did not ask for, so it is refused rather than assumed.
             if (isDirectory(occupied) && occupied.children.size > 0) {
                 throw new Refused(
                     'refused',
@@ -497,11 +451,9 @@ export class ArchiveSession {
     /**
      * Asks the daemon to stop the save this session started.
      *
-     * Named by the request that started it and by this handle: a cancel that
-     * names nothing means "whatever is running", which is somebody else's work
-     * as readily as this one's. A patch answers `cancelling: false` with the
-     * reason, because a patch writes the bytes of one edit and has no part-way
-     * to stop at. DR-008.
+     * Named by the request and this handle: a cancel that names nothing means
+     * "whatever is running", which is somebody else's work as readily. A patch
+     * answers `cancelling: false`, having no part-way to stop at.
      */
     async cancelSave(): Promise<Cancelled> {
         const running = this.saving;
@@ -531,9 +483,8 @@ export class ArchiveSession {
     /**
      * Writes every entry out to a tree on the daemon's filesystem.
      *
-     * A cancelled extraction leaves the files it had already written, and no
-     * manifest: a tree with no `.rpf-manifest.json` in it is the signature of
-     * one that did not finish. DR-014.
+     * A cancelled extraction leaves the files it had already written and no
+     * manifest: a tree with no `.rpf-manifest.json` in it did not finish.
      */
     extract(into: string, onProgress?: (progress: Progress) => void): Promise<Extracted> {
         return this.daemon.send<Extracted>(
@@ -569,12 +520,7 @@ export class ArchiveSession {
      * daemon has taken all of it.
      *
      * Withdrawals go first, because the daemon refuses a second change at a
-     * path its set already holds — `Error::Claimed`, exit 6, which is DR-032
-     * making the one-change-per-path rule a thing the wire says rather than a
-     * thing each client enforces while the daemon silently dropped one. Each is
-     * one `forget`, where the same withdrawal used to cost a `discard` and a
-     * replay of everything that was left. DR-030 §3 recorded that as a
-     * workaround for a missing method; this is the method.
+     * path its set already holds — `Error::Claimed`, exit 6.
      *
      * A plan is all of it or none of it: a refusal part-way puts back what was
      * withdrawn, so a gesture the daemon declines costs the gesture and never

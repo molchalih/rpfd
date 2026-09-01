@@ -1,27 +1,6 @@
-//! The sidecar manifest: what an extracted tree cannot say for itself.
-//!
-//! DR-004. An extracted file carries its own contents, and a resource that
-//! carries an `RSC7` header of its own carries its flags and version in it, so
-//! for those the manifest is the second route rather than the first. What it is
-//! the only route for:
-//!
-//! - whether an entry was **stored or deflated**, which the contents cannot say;
-//! - the per-entry **encryption** word;
-//! - the **resource bit** for an entry whose payload is not `RSC7`, which
-//!   `docs/backlog.md` Q7 measured at 696,578 of 696,578 Rockstar resources;
-//! - that entry's two **page-flag words**, which are its whole statement of its
-//!   own length and version and which a payload with no header of its own
-//!   states nowhere else. DR-058;
-//! - **empty directories**, which a tree of files loses;
-//! - the **container version** and the **codec** the tree came out of, which
-//!   nothing on disk carries and which a tree extracted from one version must
-//!   not be packed as another without. R11.3, DR-012;
-//! - a **checksum of each entry's contents**, which no archive carries and
-//!   which is the only thing that can say a *stored* entry's bytes changed.
-//!   DR-023.
-//!
-//! It is JSON so that it can be read in a diff and edited by hand, and its
-//! field names are stable.
+//! The sidecar manifest: what an extracted tree cannot say for itself —
+//! storage, per-entry encryption, resource page flags, empty directories, the
+//! container version and codec, and a checksum of each entry's contents.
 
 use std::{
     collections::BTreeMap,
@@ -52,41 +31,12 @@ use crate::{
 /// What the manifest is called inside an extracted tree.
 pub const MANIFEST_NAME: &str = ".rpf-manifest.json";
 
-/// The schema version this build writes.
-///
-/// Bumped when a field changes meaning, never for an addition a reader can
-/// ignore — and [`Manifest::version`] is not one a reader may ignore, because a
-/// reader that does packs a tree as a version nobody said it was. R11.3.
-/// [`ManifestEntry::checksum`] took it to 3 for the reason DR-023 gives: a
-/// reader that ignores it verifies less than it says it did.
-///
-/// [`ManifestEntry::flags`] took it to 4 for a fact only the number can carry:
-/// the same tree packs differently depending on which build extracted it, and
-/// its files are byte-identical either way. A tree extracted at schema 3
-/// refuses at its first Rockstar resource and the same tree re-extracted
-/// refuses nothing, so a caller who has to be told to re-extract has to be told
-/// it from the manifest. DR-058 §2.
+/// The schema version this build writes, bumped when a field changes meaning
+/// and never for an addition a reader can ignore.
 pub const SCHEMA_VERSION: u32 = 4;
 
-/// The oldest schema this build reads.
-///
-/// Schema 1 carried no version and no codec. It did not need to: `RPF7` was the
-/// only container this tool had ever read or written, so a schema-1 manifest
-/// describes an `RPF7` tree with deflated payloads and nothing else it could
-/// describe. It is therefore **read as that** rather than refused —
-/// `schema_1_version` and `schema_1_codec` are where that reading is
-/// written down, and DR-018 is why. Refusing it instead would have made a
-/// schema bump break every tree already extracted, for no fact recovered.
-///
-/// Schema 2 carried no checksum, and 1 is still the oldest read: a manifest
-/// without one is a manifest that recorded none, which is a thing a reader can
-/// act on rather than a thing it has to guess. `schema_2_checksum`, DR-023.
-///
-/// Schema 3 carried no page-flag words, and 1 is still the oldest read for the
-/// same reason and one more: refusing such a manifest would refuse whole trees
-/// that pack correctly today — a resource whose payload carries its own `RSC7`
-/// header needs no field here at all — over entries that are fine.
-/// `schema_3_flags`, DR-058 §3.
+/// The oldest schema this build reads; each older schema's missing fields are
+/// read as what they can only have meant rather than refused.
 pub const OLDEST_SCHEMA: u32 = 1;
 
 /// The container version a manifest that does not name one was written from.
@@ -99,28 +49,15 @@ fn schema_1_codec() -> Codec {
     Codec::Deflate
 }
 
-/// The checksum an entry that does not carry one has: **none was recorded**.
-///
-/// Not "the contents matched", and not "the contents are empty" — an entry with
-/// no checksum is one nothing can be checked against, and a walk counts it as
-/// unchecked rather than as passed. Written as a named function rather than as
-/// a bare `#[serde(default)]` for DR-018's reason: what a missing field means is
-/// a stated migration rule with a record attached, never the `Default` impl of
-/// an unrelated type. DR-023.
+/// The checksum an entry that does not carry one has: none was recorded, so a
+/// walk counts it as unchecked rather than as passed.
 fn schema_2_checksum() -> Option<Checksum> {
     None
 }
 
-/// The page flags an entry that does not carry them has: **none were
-/// recorded**.
-///
-/// Not zeros, and not a value derived from the payload. Both of those are a
-/// guess at a resource's length and its version, and the version is what tells
-/// the game's loader which deserialiser to run — so a guess produces an archive
-/// that parses, packs, verifies and does not load. What is not recorded is
-/// refused at the entry that lacks it instead. `schema_2_checksum` is the same
-/// rule for the same reason, DR-018 is why it is a named function, and DR-058
-/// §3 is why the value is `None`.
+/// The page flags an entry that does not carry them has: none were recorded —
+/// not zeros and not derived from the payload, either of which would guess at
+/// the resource's length and version.
 fn schema_3_flags() -> Option<ResourceFlags> {
     None
 }
@@ -128,24 +65,9 @@ fn schema_3_flags() -> Option<ResourceFlags> {
 /// Bytes in a [`Checksum`], which is the digest length of SHA-256.
 pub const CHECKSUM_LEN: usize = 32;
 
-/// The SHA-256 of one entry as the file it is outside the archive.
-///
-/// **Of the contents, never of the payload on disk.** The two differ for a
-/// deflated entry, and a rebuild is expected to change the payload — our
-/// deflate is not the producer's — while leaving the contents byte for byte
-/// the same. A digest over the payload would therefore fail on every archive
-/// this tool writes correctly, which is the opposite of what it is for.
-/// DR-023.
-///
-/// Contents means exactly what [`Archive::extract`] returns: the bytes the
-/// extracted file holds. For a binary entry that is what it inflates to; for a
-/// resource it is the `RSC7` file, header and deflated body, because that is
-/// what a `.yft` on disk is and passthrough keeps it identical across a
-/// rebuild. So `sha256sum` over an extracted tree reproduces these values.
-///
-/// SHA-256 because `docs/conventions.md` §14's checksums row already names
-/// `sha2` for exactly this — "per-entry checksums" — so nothing new is
-/// depended on.
+/// The SHA-256 of one entry as the file it is outside the archive: of the
+/// contents, what [`Archive::extract`] returns, never of the payload on disk,
+/// which a rebuild is expected to change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Checksum([u8; CHECKSUM_LEN]);
 
@@ -156,21 +78,14 @@ impl Checksum {
         Self(Sha256::digest(contents).into())
     }
 
-    /// [`Checksum::of`], over contents that go past rather than contents in
-    /// hand.
-    ///
-    /// The same digest of the same bytes — [`Archive::extracted`] is what a
-    /// caller streams into it — and the difference is only that nothing holds
-    /// the entry. It is the form anything digesting a whole archive uses, since
-    /// the largest entry is exactly what a caller must not have to size for.
+    /// [`Checksum::of`], over contents that stream past.
     ///
     /// # Errors
     ///
     /// Whatever the stream fails with, as the [`Error`] it really was.
     pub fn of_stream<S: Read>(contents: &mut S) -> Result<Self> {
         let mut digest = Sha256::new();
-        // The same width `std::io::copy` uses, and on the stack: this is
-        // reached once per entry from a walk that is already recursive.
+        // The same width `std::io::copy` uses.
         let mut buffer = [0_u8; 8 * 1024];
         loop {
             let read = contents
@@ -185,8 +100,7 @@ impl Checksum {
 }
 
 impl fmt::Display for Checksum {
-    /// Lower-case hexadecimal, which is what the manifest holds and what
-    /// `sha256sum` prints.
+    /// Lower-case hexadecimal, as the manifest holds it.
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
             write!(out, "{byte:02x}")?;
@@ -246,16 +160,9 @@ pub struct ManifestEntry {
     pub path: String,
     /// Binary or resource.
     pub class: EntryClass,
-    /// The two page-flag words the entry's row declared, when they were
-    /// recorded.
-    ///
-    /// A resource's whole statement of its own length and version
-    /// (`docs/rpf-format.md`, Resource page flags), verbatim, because the
-    /// mapping from a word to a page count and a base page size is many-to-one
-    /// and a decomposition could not be put back. `None` means **none were
-    /// recorded**, which is every schema-3 manifest and what a binary entry
-    /// always says; a binary entry that carries them is refused rather than
-    /// read. `schema_3_flags`, DR-058.
+    /// The two page-flag words the entry's row declared, kept verbatim because
+    /// the mapping to a page count and base page size is many-to-one; `None`
+    /// means none were recorded.
     #[serde(default = "schema_3_flags", skip_serializing_if = "Option::is_none")]
     pub flags: Option<ResourceFlags>,
     /// Stored or deflated. A resource is always stored as it is; the field is
@@ -264,12 +171,8 @@ pub struct ManifestEntry {
     /// The per-entry encryption word. Zero on everything measured so far.
     #[serde(default)]
     pub encryption: u32,
-    /// The digest of the entry's contents, when one was recorded.
-    ///
-    /// `None` means **no checksum was recorded**, which is what every schema-1
-    /// and schema-2 manifest says and what [`Manifest::of`] writes: it is not a
-    /// claim that the contents are empty and not a claim that they were
-    /// checked. `schema_2_checksum`, DR-023.
+    /// The digest of the entry's contents; `None` means none was recorded, not
+    /// that the contents are empty or that they were checked.
     #[serde(default = "schema_2_checksum", skip_serializing_if = "Option::is_none")]
     pub checksum: Option<Checksum>,
 }
@@ -281,16 +184,10 @@ pub struct Manifest {
     pub schema: u32,
     /// The container version the tree was extracted from, and the one it packs
     /// back to.
-    ///
-    /// Absent in schema 1, which meant [`Version::Rpf7`] because that was the
-    /// only container there was.
     #[serde(default = "schema_1_version")]
     pub version: Version,
-    /// The compressor its payloads are written with.
-    ///
-    /// Beside the version rather than derived from it: `docs/rpf-format.md`
-    /// reads one version number as two codecs on two platforms, `secondary`.
-    /// Absent in schema 1, which meant [`Codec::Deflate`].
+    /// The compressor its payloads are written with, recorded beside the
+    /// version because one version number can mean two codecs on two platforms.
     #[serde(default = "schema_1_codec")]
     pub codec: Codec,
     /// The archive's encryption tag.
@@ -304,34 +201,20 @@ pub struct Manifest {
 impl Manifest {
     /// Derives everything an archive's entry table says that a tree cannot.
     ///
-    /// This is where an archive becomes a tree on a filesystem, so it is where
-    /// [`name::check_host`] is asked. `extract` derives the manifest before it
-    /// creates the target directory, so a refused extraction leaves nothing
-    /// behind. DR-013's second amendment.
-    ///
-    /// It records **no checksum**, because it is not given the payloads to
-    /// digest — nothing about an entry's contents is in the entry table.
-    /// [`Manifest::of_contents`] is the form that reads them, and a manifest
-    /// from here is exactly the schema-3 manifest DR-023's migration rule
-    /// describes: one that recorded none.
+    /// Where an archive becomes a tree on a filesystem, so where
+    /// [`name::check_host`] is asked. It records no checksum;
+    /// [`Manifest::of_contents`] is the form that reads the payloads.
     ///
     /// # Errors
     ///
-    /// As [`Archive::path`], for an entry whose ancestry does not resolve, and
-    /// [`Error::BadPath`] for a name that could not be one file on a host.
+    /// As [`Archive::path`], and [`Error::BadPath`] for a name that could not
+    /// be one file on a host.
     pub fn of(archive: &Archive) -> Result<Self> {
         Self::derive(archive, &BTreeMap::new())
     }
 
-    /// [`Manifest::of`], with each entry's contents digested into it.
-    ///
-    /// Reading every payload is unbounded work in the same way a rebuild or a
-    /// `verify` is, so it takes the same [`Watch`] seam, reports one step per
-    /// entry and stops when the watcher says to. DR-008.
-    ///
-    /// What is digested is [`Archive::extract`]'s answer — the entry as the
-    /// file it is outside the archive — which is what makes the value survive a
-    /// rebuild and match `sha256sum` over the extracted tree. [`Checksum`].
+    /// [`Manifest::of`], with each entry's contents digested into it, reporting
+    /// one [`Watch`] step per entry and stopping when the watcher says to.
     ///
     /// # Errors
     ///
@@ -348,8 +231,8 @@ impl Manifest {
         let mut done = 0_u32;
         let mut bytes = 0_u64;
         for (spec, index) in &specs {
-            // Streamed, not held: this reads every entry of the archive, and
-            // the largest of them is not a size the caller chose. R3.9.
+            // Streamed, not held: the largest entry is not a size the caller
+            // chose.
             let mut contents = archive.extracted(&mut *src, *index)?;
             let len = contents.len();
             recorded.insert(spec.path.clone(), Checksum::of_stream(&mut contents)?);
@@ -369,12 +252,8 @@ impl Manifest {
         Self::derive(archive, &recorded)
     }
 
-    /// One derivation, with whatever checksums were recorded for its paths.
-    ///
-    /// Joined by path rather than by position, because path is what a manifest
-    /// keys an entry by everywhere else — [`Manifest::checksums`] and
-    /// [`Manifest::specs`] both — and two orders that happen to agree are a
-    /// fact nothing checks.
+    /// One derivation, with whatever checksums were recorded for its paths,
+    /// joined by path rather than by position.
     fn derive(archive: &Archive, recorded: &BTreeMap<String, Checksum>) -> Result<Self> {
         let mut entries = Vec::new();
         for (spec, index) in specs_of(archive)? {
@@ -398,9 +277,7 @@ impl Manifest {
                 FileKind::Resource { .. } => 0,
             };
             // From the specification and not from the entry a second time:
-            // `build::kind_of` is the one place a row's flag words are read off
-            // an entry, and asking twice is two encodings of one fact
-            // (§3, DR-046).
+            // `build::kind_of` is the one place a row's flag words are read.
             let flags = match spec.kind {
                 FileKind::Resource { declared } => declared,
                 FileKind::Binary { .. } => None,
@@ -427,11 +304,8 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// The checksum recorded for each path, for a caller checking many entries.
-    ///
-    /// One place decides what a recorded checksum is keyed by (§3), and an
-    /// entry that records none is simply absent — which is what makes "not
-    /// recorded" and "did not match" two different answers at the other end.
+    /// The checksum recorded for each path; an entry that records none is
+    /// absent, keeping "not recorded" and "did not match" two answers.
     #[must_use]
     pub fn checksums(&self) -> BTreeMap<&str, Checksum> {
         self.entries
@@ -442,10 +316,6 @@ impl Manifest {
 
     /// Refuses any path in the manifest that could not be one file below a
     /// directory on a host filesystem.
-    ///
-    /// One place rather than two, because the manifest is what `extract` writes
-    /// a tree from and what `pack` reads one back through, and the rule is the
-    /// same in both directions.
     fn check_host_names(&self) -> Result<()> {
         for directory in &self.directories {
             name::check_host(directory)?;
@@ -456,11 +326,8 @@ impl Manifest {
         Ok(())
     }
 
-    /// Refuses a binary entry that declares page flags.
-    ///
-    /// Not ignored: no manifest this build has ever written can carry one, so
-    /// there is no migration to weigh against it, and the value would otherwise
-    /// sit in the file reading as though something used it. DR-058 §4.
+    /// Refuses a binary entry that declares page flags, rather than ignoring a
+    /// value that would otherwise read as though something used it.
     fn check_flags(&self) -> Result<()> {
         for entry in &self.entries {
             if entry.class == EntryClass::Binary && entry.flags.is_some() {
@@ -497,27 +364,13 @@ impl Manifest {
     }
 
     /// Which transform this manifest's tree packs back under, or `None` for a
-    /// tree that packs in the clear.
-    ///
-    /// **What a tag alone can decide, decided at parse time.** An encrypted tag
-    /// this build holds no scheme for has no forward direction whatever anyone
-    /// extracts, and a version whose entry-table row is not one aligned cipher
-    /// block cannot have its table sealed row by row (`Archive::seal` asks the
-    /// same of a rebuild). Both are refused here, before a byte of the tree is
-    /// read and before any key material is wanted.
-    ///
-    /// **What it cannot decide is left to [`Manifest::pack_into`].** Since
-    /// DR-062 the NG arm of [`Scheme::seals`] is a question about *material*
-    /// rather than about the tag — the seventeen rounds derive from the decrypt
-    /// tables and there are none in a manifest — so an NG tag is no longer
-    /// refused at parse time. It is refused at the pack, where there is an
-    /// [`Unlock`] to ask (R2.6, DR-041, DR-057).
+    /// tree that packs in the clear; what depends on key material is left to
+    /// [`Manifest::pack_into`].
     ///
     /// # Errors
     ///
-    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for an
-    /// encrypted tag this build holds no scheme for, and for a version whose
-    /// entry-table row is not one aligned cipher block.
+    /// [`Error::CannotWriteEncrypted`] for an encrypted tag this build holds no
+    /// scheme for, or a version whose row is not one aligned cipher block.
     fn sealing(&self) -> Result<Option<Scheme>> {
         if self.version.is_open(self.encryption) {
             return Ok(None);
@@ -537,32 +390,22 @@ impl Manifest {
     /// # Errors
     ///
     /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] where no
-    /// material available carries what the transform derives from — which for
-    /// NG is what that reason now means, and is the refusal a caller with no
-    /// memory image gets (DR-062). [`Error::NeedsKey`] where the transform is
-    /// one every source carries a key for and this `unlock` reached none, which
-    /// is the answer `Archive::open` already gives for the same archive and the
-    /// same empty cache, and [`Error::Io`] if a cache directory exists and
-    /// cannot be read.
+    /// material carries what the transform derives from, [`Error::NeedsKey`]
+    /// where `unlock` reached none, and [`Error::Io`] from a cache directory.
     fn sealer(&self, scheme: Scheme, unlock: &Unlock) -> Result<Sealer> {
         unlock
             .candidates(scheme)?
             .iter()
             .find_map(|material| Sealer::new(scheme, material))
             .ok_or(match scheme {
-                // Nothing here derives the seventeen rounds, which is the whole
-                // of what the refusal means since DR-062. `NeedsKey` would be
-                // wrong: it tells an automation to go and extract a key, and
-                // what is missing is a memory image of a running game (DR-040),
-                // which is not a key and not something a retry finds.
+                // What is missing is a memory image of a running game, not a
+                // key, so `NeedsKey` would send a caller after the wrong thing.
                 Scheme::Ng => Error::CannotWriteEncrypted {
                     tag: self.encryption,
                     reason: NoWrite::NoInverse,
                 },
                 // The AES key is one every source carries, so a caller that
-                // reached none is told to go and extract one — the same answer
-                // `Archive::open` gives for the same archive and the same empty
-                // cache.
+                // reached none is told to go and extract one.
                 Scheme::Aes(_) => Error::NeedsKey {
                     tag: self.encryption,
                 },
@@ -570,23 +413,15 @@ impl Manifest {
     }
 
     /// Writes the archive this manifest describes, taking each file's contents
-    /// from `fetch` at the moment it is written.
-    ///
-    /// `pack`, in one call: the tree's own record decides the version, the
-    /// encryption tag and every entry's kind, so a caller cannot pack a tree as
-    /// something it was not (§4, DR-018). `unlock` is what the archive's own
-    /// transform is run with where it has one, and is not consulted at all
-    /// where the tag is open — the same on-demand rule `Archive::open` follows
-    /// (R2.6, DR-041). Where it has one, the archive is written under
-    /// `Under::sealed`, which is the same machinery a rebuild seals with
-    /// (§3, DR-054, DR-057).
+    /// from `fetch` at the moment it is written; the tree's own record decides
+    /// the version, the tag and every entry's kind, and `unlock` is consulted
+    /// only where the tag names a transform.
     ///
     /// # Errors
     ///
-    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for a tag
-    /// this build cannot write forwards, [`Error::NeedsKey`] when it can and no
-    /// material available runs it — in both cases before anything is written —
-    /// and as [`crate::build::build`] otherwise.
+    /// [`Error::CannotWriteEncrypted`] for a tag this build cannot write
+    /// forwards and [`Error::NeedsKey`] when no material runs it, both before
+    /// anything is written, and as [`crate::build::build`] otherwise.
     pub fn pack_into<W, F>(
         &self,
         out: &mut W,
@@ -603,9 +438,7 @@ impl Manifest {
             Some(scheme) => Some(self.sealer(scheme, unlock)?),
         };
         // The name the packed archive will be read back under, which is half of
-        // what its table of contents is keyed by. It is the `Unlock`'s, because
-        // that is the name every other command already addresses an archive by
-        // (DR-021, DR-057) and the name the reader will find this file at.
+        // what its table of contents is keyed by.
         let under = sealer.as_ref().map_or_else(
             || Under::open(self.version),
             |sealer| Under::sealed(self.version, self.encryption, sealer, unlock.name()),
@@ -617,7 +450,7 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// Never, in practice; the shape is fixed and every field is serialisable.
+    /// Never in practice; the shape is fixed and every field is serialisable.
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|error| Error::BadPath {
             path: MANIFEST_NAME.to_owned(),
@@ -629,30 +462,16 @@ impl Manifest {
         })
     }
 
-    /// Reads a manifest.
-    ///
-    /// A manifest of schema [`OLDEST_SCHEMA`] through [`SCHEMA_VERSION`] is
-    /// read; anything else is refused by its schema rather than by whichever
-    /// field first failed to parse. A schema-1 manifest names no container
-    /// version, and is read as the one it can only have meant — see
-    /// [`OLDEST_SCHEMA`].
-    ///
-    /// A `version` this build has no codec for is refused here too: [`Version`]
-    /// is closed over the versions that have one, so naming another is a
-    /// manifest this build does not understand rather than one it half-reads.
-    ///
-    /// A schema-1 or schema-2 manifest records no checksum for any entry, and a
-    /// schema-3 one may record none for some of them. Both read, and both mean
-    /// the same thing — [`ManifestEntry::checksum`]. A manifest below schema 4
-    /// records no page-flag words either, and reads the same way:
-    /// [`ManifestEntry::flags`].
+    /// Reads a manifest of schema [`OLDEST_SCHEMA`] through [`SCHEMA_VERSION`],
+    /// refusing anything else by its schema rather than by whichever field
+    /// first failed to parse.
     ///
     /// # Errors
     ///
     /// [`Error::BadPath`] when the text is not a manifest, names a schema this
     /// build does not read, names a path that could not be one file on a host,
-    /// or declares page flags on a binary entry, and [`Error::CannotWriteEncrypted`] when it describes an encrypted
-    /// archive, which nothing here can write back yet.
+    /// or declares page flags on a binary entry, and [`Error::CannotWriteEncrypted`] for an encrypted
+    /// archive this build cannot write back.
     pub fn from_json(text: &str) -> Result<Self> {
         let manifest: Self = serde_json::from_str(text).map_err(|_| Error::BadPath {
             path: MANIFEST_NAME.to_owned(),
@@ -664,18 +483,11 @@ impl Manifest {
                 reason: "was written by a schema version this build does not read",
             });
         }
-        // A tree extracted from an encrypted archive packs back under that
-        // archive's own transform or not at all, and whether it can is the
-        // transform's question rather than `pack`'s: [`Manifest::sealing`] is
-        // where it is asked, once. A tag with no forward direction here is
-        // refused now, before a byte of the tree is read and before any key
-        // material is wanted; one that has a forward direction is not refused
-        // here at all, and waits to be handed the material that runs it.
-        // DR-057.
+        // A tag with no forward direction is refused now, before a byte of the
+        // tree is read and before any key material is wanted.
         manifest.sealing()?;
-        // Before `pack` opens anything: `build` plans the tree before it
-        // fetches a payload, and this is earlier still, so a read from a name
-        // no host should hold does not happen at all.
+        // Before `pack` opens anything, so a read from a name no host should
+        // hold does not happen at all.
         manifest.check_host_names()?;
         manifest.check_flags()?;
         Ok(manifest)
@@ -689,10 +501,8 @@ mod tests {
     use super::*;
     use crate::{keys::Material, watch::Unwatched};
 
-    /// The files a packed tree holds, and what each one's contents are.
-    ///
-    /// One stored and one deflated, and one of them shorter than a cipher
-    /// block, so a payload's tail rule is exercised by the sealed pack.
+    /// The files a packed tree holds: one stored, one deflated, one shorter
+    /// than a cipher block.
     fn contents() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("short.bin", vec![b'a'; 7]),
@@ -725,7 +535,6 @@ mod tests {
                     },
                     // 1 is "under the archive's own transform", which is what
                     // an entry of an encrypted archive carries.
-                    // `docs/rpf-format.md`, Entry table.
                     encryption: u32::from(sealed),
                     checksum: None,
                 })
@@ -746,7 +555,7 @@ mod tests {
     }
 
     /// What packs and opens a sealed archive here: thirty-two zero bytes, which
-    /// are not key material and did not come from any. DR-006.
+    /// are not key material and did not come from any.
     fn keyed(named: &str) -> Unlock {
         Unlock::held(Arc::new(Material::over_zeros()), named)
     }
@@ -781,8 +590,6 @@ mod tests {
         let text = manifest.to_json().expect("renders");
         assert!(text.contains("\"version\": \"rpf7\""), "{text}");
         assert!(text.contains("\"codec\": \"deflate\""), "{text}");
-        // Lower-case hexadecimal, which is what `sha256sum` prints, so the
-        // value in a diff is one a reader can reproduce from the file itself.
         assert!(
             text.contains(
                 "\"checksum\": \"12998c017066eb0d2a70b94e6ed31929\
@@ -800,9 +607,6 @@ mod tests {
 
     #[test]
     fn a_manifest_that_records_no_checksum_reads_as_having_recorded_none() {
-        // Schema 2's every entry, and any schema-3 entry written by
-        // `Manifest::of`. The missing field is a stated migration rule, not the
-        // `Default` of an unrelated type: DR-023, following DR-018.
         let text = r#"{"schema":2,"version":"rpf7","codec":"deflate",
                        "encryption":1313165391,"directories":[],
                        "entries":[{"path":"a.txt","class":"binary",
@@ -839,8 +643,6 @@ mod tests {
     #[test]
     fn a_schema_1_manifest_is_read_as_the_only_container_it_could_have_meant() {
         // Schema 1 named no version, because `RPF7` was the only one there was.
-        // Refusing it would break every tree already on disk and recover no
-        // fact. DR-018.
         let text = r#"{"schema":1,"encryption":1313165391,"directories":[],
                        "entries":[{"path":"a.txt","class":"binary",
                                    "storage":"stored","encryption":0}]}"#;
@@ -854,7 +656,7 @@ mod tests {
     #[test]
     fn a_manifest_naming_a_container_this_build_cannot_write_is_refused() {
         // `Version` is closed over the versions that have a codec, so a tree
-        // from another one cannot be packed as this one by accident. DR-012.
+        // from another one cannot be packed as this one by accident.
         let text = r#"{"schema":2,"version":"rpf2","codec":"deflate",
                        "encryption":1313165391,"directories":[],"entries":[]}"#;
         assert!(matches!(
@@ -865,16 +667,8 @@ mod tests {
 
     #[test]
     fn an_ng_manifest_refuses_the_pack_when_nothing_derives_the_transform() {
-        // **The re-aimed refusal.** Until DR-062 this said the refusal was made
-        // "from the tag alone, before a cache is consulted", because NG had no
-        // forward direction whatever anyone held. It has one, derived from the
-        // decrypt tables in milliseconds — so the tag no longer decides, and
-        // `NoWrite::NoInverse` now means *this build has nothing to derive the
-        // transform from*. It fires here because `keyed` reaches thirty-two
-        // zero bytes and no memory image (DR-040).
-        //
-        // Exit 9 and not 5, still: `NeedsKey` tells an automation to go and
-        // extract a key, and what is missing is not a key.
+        // `NoWrite::NoInverse` means this build has nothing to derive the
+        // transform from; `keyed` reaches zero bytes and no memory image.
         let tag = 267_386_879_u32;
         let mut out = Cursor::new(Vec::new());
         let error = packable(tag)
@@ -896,16 +690,8 @@ mod tests {
 
     #[test]
     fn an_ng_manifest_is_read_back_rather_than_refused_at_parse_time() {
-        // **DR-057's parse-time refusal, revisited.** It refused an NG tag in
-        // `from_json` on the ground that no material reaches the transform. A
-        // manifest carries no material at all, so with DR-062 the tag alone can
-        // no longer answer: refusing here would refuse a tree a caller *can*
-        // pack, on a machine that holds what packs it. The refusal moved to the
-        // pack, where there is an `Unlock` to ask — the test above.
-        //
-        // What still refuses at parse time is a tag this build holds no scheme
-        // for at all, which no material changes: `a_manifest_naming_a_container
-        // _this_build_cannot_write_is_refused` and the arm below.
+        // A manifest carries no material, so an NG tag is left to the pack;
+        // a tag this build holds no scheme for still refuses here.
         let tag = 267_386_879_u32;
         let text = format!(r#"{{"schema":1,"encryption":{tag},"directories":[],"entries":[]}}"#);
         let manifest = Manifest::from_json(&text).expect("an NG manifest reads back");
@@ -930,15 +716,8 @@ mod tests {
 
     #[test]
     fn an_ng_manifest_packs_back_under_its_own_transform_and_opens_again() {
-        // **R4.7 through `pack`.** A tree whose manifest names the NG tag packs
-        // back sealed under the derived transform, and what it wrote opens
-        // again under the same material — table of contents, names blob and
-        // every payload, each keyed by its own name and its own new length.
-        //
-        // No key material anywhere and none possible: the tables and the 101
-        // expanded keys are arithmetic over a seed (DR-006), and the gated half
-        // — a Rockstar archive under Rockstar's own material — is
-        // `crates/rpf-core/tests/encrypted.rs`.
+        // A tree whose manifest names the NG tag packs back sealed and opens
+        // again; the tables are arithmetic over a seed, not key material.
         let tag = crate::format::rpf7::ENCRYPTION_NG;
         let manifest = packable(tag);
         let unlock = Unlock::held(
@@ -965,17 +744,8 @@ mod tests {
 
     #[test]
     fn an_aes_manifest_packs_back_under_its_own_transform_and_opens_again() {
-        // The whole of DR-057 in one claim: a tree whose manifest names a tag
-        // this build can write forwards packs back **sealed**, and what it
-        // wrote opens again under the same material. A pack that wrote the
-        // table of contents or a payload in the clear fails at the read back,
-        // and one that wrote a cleartext archive under an encrypted tag fails
-        // at the open.
-        //
-        // No key material anywhere: `Material::over_zeros` is thirty-two zero
-        // bytes and the transform is real. DR-006 is untouched, and the gated
-        // half — a Rockstar archive under a Rockstar key — is
-        // `crates/rpf-core/tests/encrypted.rs`.
+        // A tree whose manifest names a tag this build can write forwards packs
+        // back sealed, and opens again under the same material.
         let manifest = packable(crate::format::rpf7::ENCRYPTION_AES);
         let text = manifest.to_json().expect("renders");
         assert_eq!(
@@ -1000,9 +770,7 @@ mod tests {
         }
 
         // "It opens under the key" and "it is not in the clear" are different
-        // claims, so both are made: an archive written in the clear under an
-        // encrypted tag opens for nobody, and this one refuses only the caller
-        // with no material.
+        // claims, so both are made.
         let error = Archive::open(&mut source, &Unlock::unkeyed())
             .expect_err("a sealed archive opens for no one unkeyed");
         assert!(matches!(error, Error::NeedsKey { .. }), "{error:?}");
@@ -1010,11 +778,8 @@ mod tests {
 
     #[test]
     fn a_pack_with_no_key_material_refuses_rather_than_writing_in_the_clear() {
-        // The failure this exists for is silent and expensive: an AES manifest
-        // packed as a plaintext archive carrying an AES tag, exit 0, opening
-        // for nobody afterwards. `pack` answers what `open` answers for the
-        // same empty cache instead — exit 5, which names material as the thing
-        // that is missing. DR-041, DR-057.
+        // The failure this exists for is silent: an AES manifest packed as a
+        // plaintext archive carrying an AES tag, opening for nobody afterwards.
         let tag = crate::format::rpf7::ENCRYPTION_AES;
         let mut out = Cursor::new(Vec::new());
         let error = packable(tag)
@@ -1030,9 +795,7 @@ mod tests {
 
     #[test]
     fn a_manifest_naming_no_transform_packs_in_the_clear_and_reaches_no_cache() {
-        // The other half of R2.6: an unencrypted tree packs on a machine that
-        // has no material at all, and `Unlock::unkeyed` is what says the pack
-        // path asked for none.
+        // An unencrypted tree packs on a machine that has no material at all.
         let manifest = packable(Version::Rpf7.open());
         let mut out = Cursor::new(Vec::new());
         manifest
@@ -1050,9 +813,8 @@ mod tests {
 
     #[test]
     fn a_resources_flag_words_survive_the_manifests_own_json() {
-        // The fact a tree cannot carry: a Rockstar resource's payload begins
-        // with no `RSC7` header (Q7), so its two flag words exist nowhere but
-        // the row it came out of. DR-058.
+        // A Rockstar resource's payload begins with no `RSC7` header, so its
+        // two flag words exist nowhere but the row it came out of.
         let manifest = Manifest {
             schema: SCHEMA_VERSION,
             version: Version::Rpf7,
@@ -1072,16 +834,14 @@ mod tests {
             }],
         };
         let text = manifest.to_json().expect("renders");
-        // The spelling is pinned and not just the value: `docs/rpf-format.md`,
-        // DR-046 and `rpf ls --json` all write these words this way, so a
-        // reviewer comparing a manifest line against any of them is reading the
-        // same characters.
+        // The spelling is pinned and not just the value, so it matches how
+        // these words are written everywhere else.
         assert!(text.contains("\"system\": \"0x00020000\""), "{text}");
         assert!(text.contains("\"graphics\": \"0xd0000000\""), "{text}");
         assert_eq!(Manifest::from_json(&text).expect("parses"), manifest);
 
-        // And it reaches the build specification, which is the whole point of
-        // recording it: the row is created from the manifest's words.
+        // And it reaches the build specification: the row is created from the
+        // manifest's words.
         assert_eq!(
             manifest.specs().first().map(|spec| spec.kind),
             Some(FileKind::Resource {
@@ -1095,10 +855,8 @@ mod tests {
 
     #[test]
     fn a_flag_word_that_is_not_eight_hex_digits_is_refused_rather_than_padded() {
-        // A dropped digit is what this refusal is for. Every bit of these words
-        // is spoken for — nine fields decoded out of one of them — so a value
-        // read as anything but the eight digits written is a resource of
-        // another length and another version. DR-058 §1.
+        // Every bit of these words is spoken for, so a value read as anything
+        // but the eight digits written is another resource entirely.
         for bad in [
             "",
             "0x2000",
@@ -1123,10 +881,8 @@ mod tests {
 
     #[test]
     fn a_schema_3_manifest_reads_and_records_no_flag_words() {
-        // Every tree extracted before DR-058, and the reason `OLDEST_SCHEMA`
-        // stays 1: a manifest that recorded no flag words is read as having
-        // recorded none, and refuses at the entry that lacks them rather than
-        // at the file. DR-018.
+        // A manifest that recorded no flag words refuses at the entry that
+        // lacks them rather than at the file.
         let text = r#"{"schema":3,"version":"rpf7","codec":"deflate",
                        "encryption":1313165391,"directories":[],
                        "entries":[{"path":"a.ydr","class":"resource",
@@ -1143,10 +899,8 @@ mod tests {
 
     #[test]
     fn a_binary_entry_that_carries_flag_words_is_refused() {
-        // Not ignored: no manifest that has ever been written can carry one, so
-        // the value would sit in the file reading as though it did something.
         // The asymmetry with the schema-3 rule above is the difference between
-        // a fact not recorded and a contradiction. DR-058 §4.
+        // a fact not recorded and a contradiction.
         let text = r#"{"schema":4,"version":"rpf7","codec":"deflate",
                        "encryption":1313165391,"directories":[],
                        "entries":[{"path":"a.txt","class":"binary",

@@ -1,28 +1,7 @@
-//! R4.7: whether the NG transform's forward direction derives from the decrypt
-//! tables this build already holds.
-//!
-//! `docs/ng-scheme.md`, "The inverse is published", records that the reference
-//! implementation derives its encrypt material from nothing but the decrypt
-//! tables — Gaussian elimination over GF(2) for rounds 0, 1 and 16, a 2^32
-//! sweep for rounds 2 through 15 — and that **none of it had been run here**.
-//! This file is the run. It is the decisive part and not the whole of R4.7: no
-//! write path asks for an NG seal, and rounds 2 through 15 are not derived.
-//!
-//! The derivation itself is measured with no key material at all, in
-//! `crates/rpf-core/src/format/crypto.rs`'s own tests: a solver over a
-//! synthetic invertible matrix, and a round trip over synthetic affine tables.
-//! What only real material can answer is whether **these** tables have the
-//! shape the derivation needs, and that is what is gated here.
-//!
-//! `RPF_GAME_IMAGE` names the memory image the NG material is scanned from
-//! (DR-040) and `RPF_CORPUS` names the directory holding `gtav_ng/dlc.rpf`,
-//! whose bytes are the real ciphertext the round trip runs over. That is one
-//! machine, for DR-006's reason: key material is extracted from the user's own
-//! installation and never travels.
-//!
-//! `clippy.toml`'s `allow-*-in-tests` settings reach `#[cfg(test)]` modules and
-//! not this directory: an integration test is its own crate with no
-//! `cfg(test)`. `docs/conventions.md` §15's exception is spelled out here.
+//! Whether the NG transform's forward direction derives from the decrypt tables
+//! this build already holds. Gated: `RPF_GAME_IMAGE` names the memory image the
+//! material is scanned from, `RPF_CORPUS` the directory holding the real
+//! ciphertext.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -39,24 +18,17 @@ use rpf_core::{
 };
 
 /// The NG-encrypted archive in the corpus, by the relative path that addresses
-/// it. `docs/corpus.md`.
+/// it.
 const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 
-/// How long one round key is, which is the block.
 const ROUND_KEY_LEN: usize = crypto::CIPHER_BLOCK_LEN;
 
-/// How many blocks of the archive the round trip runs over.
-///
-/// The whole file would do and would say nothing more: what is being measured
-/// is a property of the tables, and every block exercises the same four maps.
-/// This many is enough that a table wrong in one byte value is hit.
+/// How many blocks of the archive the round trip runs over: enough that a table
+/// wrong in one byte value is hit.
 const BLOCKS: usize = 4096;
 
-/// Reports a skip, naming the test and the gate that was not there.
-///
-/// The same shape `crates/rpf-core/tests/encrypted.rs` uses, and for the same
-/// reason: `RPF_REQUIRE_<GATE>` turns that gate's absence into a failure, so a
-/// green suite cannot be confused with a suite that ran (§12).
+/// Reports a skip, naming the test and the gate that was not there;
+/// `RPF_REQUIRE_<GATE>` turns that gate's absence into a failure.
 fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -67,10 +39,8 @@ fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     None
 }
 
-/// The key material the memory image carries, scanned once for this binary.
-///
-/// Nothing is written anywhere: the material lives in this process and dies
-/// with it, which is what DR-006 is about.
+/// The key material the memory image carries, scanned once for this binary and
+/// never written anywhere.
 fn scanned() -> Result<Arc<Material>, String> {
     static HELD: std::sync::OnceLock<Result<Arc<Material>, String>> = std::sync::OnceLock::new();
     HELD.get_or_init(|| {
@@ -93,7 +63,6 @@ fn scanned() -> Result<Arc<Material>, String> {
     .clone()
 }
 
-/// The same, as a skip that names the test when there is no image.
 fn material(test: &str) -> Option<Arc<Material>> {
     match scanned() {
         Ok(material) => Some(material),
@@ -101,7 +70,6 @@ fn material(test: &str) -> Option<Arc<Material>> {
     }
 }
 
-/// The corpus NG archive's bytes and its own file name.
 fn ng_archive(test: &str) -> Option<(Vec<u8>, String)> {
     let Some(root) = env::var_os("RPF_CORPUS") else {
         return skip(test, "RPF_CORPUS", "RPF_CORPUS is not set");
@@ -121,7 +89,6 @@ fn ng_archive(test: &str) -> Option<(Vec<u8>, String)> {
     Some((fs::read(&path).expect("the archive is readable"), name))
 }
 
-/// One round key out of an expanded key.
 fn round_key(expanded: &[u8], round: usize) -> [u8; ROUND_KEY_LEN] {
     let at = round * ROUND_KEY_LEN;
     expanded
@@ -134,15 +101,8 @@ fn round_key(expanded: &[u8], round: usize) -> [u8; ROUND_KEY_LEN] {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
 fn every_round_of_the_transform_derives_from_the_decrypt_tables_alone() {
-    // **All seventeen, and not the three the reference implementation solves.**
-    // Its `GTAKeys.cs` solves rounds 0, 1 and 16 by elimination and brute-forces
-    // the other fourteen with a 2^32 sweep each; the factorisation
-    // `NgRound::solve` uses finds what those sweeps are searching for, so the
-    // whole transform derives in milliseconds from the same input.
-    //
-    // If a round ever stops deriving, this names it and says what shape its
-    // tables had — which is the difference between "the material changed" and
-    // "the derivation is wrong".
+    // All seventeen: the factorisation `NgRound::solve` uses finds what the
+    // reference implementation sweeps 2^32 values for on rounds 2 through 15.
     let test = "every_round_of_the_transform_derives_from_the_decrypt_tables_alone";
     let Some(material) = material(test) else {
         return;
@@ -162,17 +122,9 @@ fn every_round_of_the_transform_derives_from_the_decrypt_tables_alone() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive() {
-    // **The experiment R4.7 turns on.** Real decrypt tables, out of the user's
-    // own running game; a real expanded key, the one this archive's name and
-    // length choose; and real ciphertext, the bytes of `dlc.rpf` as they sit on
-    // disk. For each of the three linear rounds, what the decrypt round turns a
-    // block into, the forward round derived from that round's own tables turns
-    // back — and the other way about, which is the direction a writer runs.
-    //
-    // Bytes off the disk rather than random ones because that is what the claim
-    // is about: not that the algebra closes, which the ungated tests in
-    // `format::crypto` already say over synthetic tables, but that it closes
-    // over the material and the blocks this tool actually meets.
+    // Real tables, a real expanded key and real ciphertext: the claim is that
+    // the algebra closes over the material this tool actually meets, not merely
+    // over synthetic tables.
     let test = "a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive";
     let Some(material) = material(test) else {
         return;
@@ -182,10 +134,8 @@ fn a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive() {
     };
     let ng = material.ng().expect("the image carries the NG half");
 
-    // The key this archive's own table of contents is read under, chosen by its
-    // name and its length exactly as `Cipher` chooses it — so the round keys
-    // below are the ones the archive was written with and not an arbitrary
-    // index. `docs/rpf-format.md`, Encryption.
+    // Chosen by name and length exactly as `Cipher` chooses it, so the round
+    // keys below are the ones the archive was written with.
     let index = crypto::Cipher::new(
         crypto::Scheme::Ng,
         &material,
@@ -245,7 +195,6 @@ fn a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive() {
 fn a_derived_round_undoes_the_decrypt_round_under_every_key_the_material_holds() {
     // The round key is exclusive-ored in, so a derivation that got the affine
     // part wrong could still round-trip under one key and fail under another.
-    // All 101 of them, over blocks that cover every byte value in every column.
     let test = "a_derived_round_undoes_the_decrypt_round_under_every_key_the_material_holds";
     let Some(material) = material(test) else {
         return;
@@ -295,21 +244,10 @@ fn rank(words: &[u32]) -> usize {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
 fn a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column() {
-    // **What decides whether rounds 2 through 15 need a 2^32 sweep at all.**
-    //
-    // A round's output word is the exclusive-or of four table lookups, and the
-    // map from the four bytes to the word is a bijection. If, for each column,
-    // the 256 differences `T[b] ^ T[0]` are 256 *distinct* words spanning an
-    // eight-dimensional subspace, then that table is a byte permutation
-    // followed by an injection into a subspace — an AES-shaped T-box — the four
-    // subspaces of a group are independent, and the round inverts by the same
-    // Gaussian elimination the linear rounds use plus one 256-byte permutation
-    // per column. If instead a column's differences span more than eight
-    // dimensions, or repeat, no such factorisation exists and the inverse has to
-    // be swept for.
-    //
-    // This test is the measurement, and it is written to report the shape it
-    // found rather than merely to fail.
+    // 256 distinct differences spanning eight dimensions means the table is a
+    // byte permutation into a subspace — an AES-shaped T-box — and the round
+    // inverts by elimination plus one 256-byte permutation per column. Anything
+    // else and the inverse has to be swept for.
     let test = "a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column";
     let Some(material) = material(test) else {
         return;
@@ -340,11 +278,8 @@ fn a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn the_derived_transform_undoes_the_whole_decrypt_transform_on_an_ng_archives_bytes() {
-    // **The whole of R4.7's blocker, measured.** Not one round but all
-    // seventeen, run backwards, over the bytes of `dlc.rpf` as they sit on
-    // disk and under the expanded key that archive's own name and length
-    // choose. What `Cipher` turns a block into, the derived transform turns
-    // back — which is the statement "an NG archive can be written back".
+    // All seventeen rounds run backwards over real bytes: the statement "an NG
+    // archive can be written back".
     let test = "the_derived_transform_undoes_the_whole_decrypt_transform_on_an_ng_archives_bytes";
     let Some(material) = material(test) else {
         return;
@@ -377,8 +312,6 @@ fn the_derived_transform_undoes_the_whole_decrypt_transform_on_an_ng_archives_by
         forward.block(&expanded, &mut back);
         assert_eq!(back, *block, "block {at} of {name} did not come back");
 
-        // And the direction a writer runs: encrypt a plaintext block, then read
-        // it back through the reader this tool already ships.
         let mut sealed = *block;
         forward.block(&expanded, &mut sealed);
         let mut reopened = sealed;

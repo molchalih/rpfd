@@ -1,24 +1,12 @@
 //! An arbitrary set of changes resolved against an arbitrary archive, and the
 //! archive that committing it produces.
 //!
-//! `edit::tree_of` is where every change is resolved and every one that cannot
-//! be made is refused, and it is crate-private. [`allows`] is one public door
-//! onto it and [`rewrite`] is the other, and **`rewrite` is the one that
-//! ships**: both the command line and the daemon commit through it, and it is
-//! the one that matches what `allows` answers, because both group a set by the
-//! archive each change lands in and descend into nested archives to resolve
-//! it. `build::rebuild` resolves the same set flatly against the outer archive
-//! and answers a different question for every path that addresses through
-//! nesting — which is most of what DR-030 is about.
-//!
-//! Three things are asserted past "no panic". That the set is the data
-//! structure it says it is. That [`allows`] and the commit agree, which is the
-//! DR-030 property — a client told its edit is fine and then failed at commit
-//! is the failure that exists to prevent. And that **every path the commit was
-//! asked to create is findable in the archive it wrote**: a name the writer
-//! transforms and the reader then cannot address is silent corruption, and
-//! DR-039 records that a single such path raised nothing at all until a second
-//! one collided with it.
+//! Three things are asserted past "no panic": that the set is the data
+//! structure it says it is; that [`allows`] and the commit through [`rewrite`]
+//! agree, since a client told its edit is fine and then failed at commit is the
+//! failure that pair exists to prevent; and that every path the commit was
+//! asked to create is findable in the archive it wrote, a name the writer
+//! transforms and the reader cannot address being silent corruption.
 
 #![no_main]
 
@@ -78,15 +66,9 @@ const ENTRY_LIMIT: usize = 128;
 /// The most payload one archive may hold before this target stops committing
 /// it.
 ///
-/// **The entry count is the wrong axis on its own.** A commit re-encodes every
-/// payload, and deflate expands: 16 MiB of zeros packs into a 16,896-byte
-/// archive of two entries, which is inside [`MAX_INPUT`] and inside
-/// [`ENTRY_LIMIT`], and re-encoding it was measured at 28 ms — four orders of
-/// magnitude above the 2 µs a typical input costs, spent on `flate2` rather
-/// than on anything this target is about. `extracted.rs` bounds the same
-/// expansion with `DRAIN_LIMIT`; this is that bound for the write path. A
-/// megabyte still admits a sixteenfold expansion of a full-size input, which
-/// is more than real payloads reach.
+/// The entry count is the wrong axis on its own: a commit re-encodes every
+/// payload and deflate expands, so a two-entry archive well inside
+/// [`ENTRY_LIMIT`] can cost the whole input's time in `flate2`.
 const PAYLOAD_LIMIT: u64 = 1024 * 1024;
 
 /// The [`Change`] a [`Wanted`] names.
@@ -111,10 +93,8 @@ fuzz_target!(|input: Input| {
     let Some(data) = bounded(input.data) else {
         return;
     };
-    // The edits are input too, and all of them reach the archive being
-    // written: a path, a rename's destination, a write's contents. Sizing the
-    // allocation bound against the input means against all of it, not against
-    // whichever field the archive happens to be in. `MAX_INPUT`.
+    // The edits are input too, and all of them reach the archive being written,
+    // so the allocation bound is sized against all of it.
     let edits: Vec<(String, Wanted)> = input.edits.into_iter().take(EDIT_LIMIT).collect();
     let carried: usize = edits
         .iter()
@@ -126,9 +106,8 @@ fuzz_target!(|input: Input| {
 
     watched(|| {
         let mut src = Cursor::new(data);
-        // An archive that does not open is still an input that builds a set,
-        // and everything below that is the set's own is asked of it either
-        // way. Only `allows` needs the archive.
+        // An archive that does not open is still an input that builds a set;
+        // only `allows` needs the archive.
         let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).ok();
 
         let mut buffered = Changes::new();
@@ -136,15 +115,14 @@ fuzz_target!(|input: Input| {
         for (path, wanted) in edits {
             let change = change_of(wanted);
 
-            // What a client does with every edit before it buffers it: ask
-            // whether the set it already holds admits this one.
+            // What a client does before it buffers an edit: ask whether the
+            // set it already holds admits this one.
             if let Some(ref archive) = archive {
                 all_allowed &= allows(&mut src, archive, &buffered, &path, &change).is_ok();
             }
 
             // A plain write is the one change `bears_on` does not count: it
-            // replaces an entry that is there, so it moves nothing and the
-            // archive's own answer about the path already covers it.
+            // replaces an entry that is there, so it moves nothing.
             let restructures = !matches!(change, Change::Write { create: false, .. });
 
             let before = buffered.len();
@@ -177,10 +155,8 @@ fuzz_target!(|input: Input| {
             committed(&mut src, archive, &buffered, &created, all_allowed);
         }
 
-        // The set is data, and taking a change back out of it is the one
-        // operation on it that is not a read. What went in comes out, and the
-        // set is what it was before. Nothing here needs an archive, and
-        // nothing here waits on one.
+        // Taking a change back out is the one operation on the set that is not
+        // a read: what went in comes out, and the set is empty after.
         let taken: Vec<String> = buffered.paths().map(str::to_owned).collect();
         for path in &taken {
             assert!(
@@ -227,19 +203,13 @@ fn affordable(archive: &Archive) -> bool {
 /// archive itself**.
 ///
 /// `tree_of` applies removals, then renames, then writes, then new
-/// directories, so a creation is the last word on its own path: nothing else
-/// in the set can move it or take it away. A `Write` onto a path the archive
-/// already holds is left out for the opposite reason — that one attaches to an
-/// existing entry, which a rename earlier in the same set may already have
-/// moved somewhere else.
+/// directories, so a creation is the last word on its own path. A `Write` onto
+/// an existing path is left out: it attaches to an entry an earlier rename may
+/// already have moved.
 ///
-/// **A creation inside a nested archive is left out too**, because what the
-/// commit writes back for it cannot be asserted on from here: a payload the
-/// source declared deflated, whose bytes happened to parse as an archive, is
-/// descended into on the way in and deflated again on the way out, so the
-/// reader cannot descend the archive that was written even though nothing went
-/// wrong. Those paths are covered by the agreement assertion in [`committed`]
-/// instead, which is where DR-030's case about them lives.
+/// A creation inside a nested archive is left out too, since a payload
+/// descended into on the way in is deflated again on the way out and the reader
+/// cannot descend it, though nothing went wrong.
 fn created_here(archive: &Archive, buffered: &Changes) -> Vec<String> {
     buffered
         .iter()
@@ -257,10 +227,9 @@ fn created_here(archive: &Archive, buffered: &Changes) -> Vec<String> {
 /// Whether `path` names something in `archive` itself rather than inside a
 /// nested one.
 ///
-/// The walk `edit::landing_of` makes, in the terms this side of the wall has:
-/// a component that resolves to a file with components still after it is an
-/// archive the commit descends into. Deliberately conservative — anything it
-/// cannot decide counts as nested, so an assertion is skipped rather than made
+/// A component that resolves to a file with components still after it is an
+/// archive the commit descends into. Deliberately conservative: anything it
+/// cannot decide counts as nested, so the assertion is skipped rather than made
 /// about a path the commit routed somewhere this cannot see.
 fn lands_here(archive: &Archive, path: &str) -> bool {
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -298,19 +267,9 @@ fn committed(
         Ok(report) => report,
         Err(failure) => {
             // `allows` promises that a change it accepts is one the commit
-            // will not refuse for the same reason, and DR-030's second
-            // measured bug was exactly this shape: a rename onto a path
-            // another buffered rename had already claimed, accepted here and
-            // refused there as `AlreadyExists`.
-            //
-            // **Only that one kind.** A commit is `split`, then `tree_of`, then
-            // `build` at every level, and `build` raises `BadPath`,
-            // `NotFound`, `Overlapping` and `WrongKind` of its own — a file and
-            // a directory of one name, a name offset that overflows its field —
-            // so a refusal carrying one of those cannot be attributed to the
-            // resolution from out here. `AlreadyExists` is the one kind `edit`
-            // raises that `build` never does, which is what makes it the one
-            // that can be asserted on.
+            // will not refuse for the same reason. Only `AlreadyExists` can be
+            // asserted on: `build` raises the other kinds of its own, so a
+            // refusal carrying one cannot be attributed to the resolution.
             assert!(
                 !all_allowed || !matches!(failure, Error::AlreadyExists { .. }),
                 "every change was allowed, and the commit refused: {failure:?}"
@@ -342,9 +301,8 @@ fn committed(
         "an archive this build committed has names it will not read"
     );
 
-    // The stronger claim, and the one `check_names` is blind to: a commit that
-    // accepted a path wrote that path, and the reader can address it by the
-    // name it was given.
+    // The claim `check_names` is blind to: a commit that accepted a path wrote
+    // it, and the reader can address it by the name it was given.
     for path in created {
         assert!(
             reopened.find(path).is_ok(),

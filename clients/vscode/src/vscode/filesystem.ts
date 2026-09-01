@@ -1,22 +1,16 @@
 /**
- * The `rpf:` filesystem, as the editor asks about one. R7.1.
+ * The `rpf:` filesystem, as the editor asks about one.
  *
  * A thin adapter and nothing else: every question is answered out of
- * `core/session.ts`, `core/pending.ts` and `core/tree.ts`, which are tested
- * against a live daemon, and every failure is rendered by `core/errors.ts`.
- * What is here that is not there is exactly the editor's own vocabulary.
+ * `core/session.ts`, `core/pending.ts` and `core/tree.ts`, and every failure is
+ * rendered by `core/errors.ts`. What is here is the editor's own vocabulary.
  *
  * **A change buffers.** `writeFile`, `delete`, `rename` and `createDirectory`
- * do not write the archive: they buffer, and the archive is written by the
- * explicit `RPF: Save Archive` command. R7.3, DR-026, and DR-008's reason for
- * it — a save decides between patching in place and rebuilding for the whole
- * set of changes, and a rebuild is unbounded work.
+ * do not write the archive; the explicit `RPF: Save Archive` command does.
  *
- * **The explorer is shown the session's view, not the daemon's listing.**
- * DR-028: `list` answers the archive on disk, so a provider that forwarded it
- * would show a created entry as absent and a deleted one as present until the
- * save. The session models the buffered structure itself, and this file fires
- * the events that make the editor ask again. DR-030.
+ * **The explorer is shown the session's view, not the daemon's listing**, which
+ * answers the archive on disk and would show a created entry as absent until
+ * the save. This file fires the events that make the editor ask again.
  */
 
 import * as vscode from 'vscode';
@@ -40,9 +34,8 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
     /**
      * Nothing is watched.
      *
-     * The archive is the daemon's, one session at a time (DR-009), and nothing
-     * else in this window can change it. What does change it — a buffered
-     * change, or a save — fires {@link changed} or its own event for itself.
+     * The archive is the daemon's, one session at a time, and what does change
+     * it — a buffered change, or a save — fires its own event.
      */
     watch(): vscode.Disposable {
         return new vscode.Disposable(() => undefined);
@@ -97,7 +90,7 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
         }
     }
 
-    /** Buffers a write, creating the entry when asked to. R7.3, DR-026. */
+    /** Buffers a write, creating the entry when asked to. */
     async writeFile(
         uri: vscode.Uri,
         content: Uint8Array,
@@ -125,7 +118,7 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
         this.announce(address.archive, address.inside, node ? 'changed' : 'created');
     }
 
-    /** Buffers a removal. The archive is written by an explicit save. DR-026. */
+    /** Buffers a removal. The archive is written by an explicit save. */
     async delete(uri: vscode.Uri, options: { recursive: boolean }): Promise<void> {
         const { mount, address } = this.locate(uri);
         if (!mount.session.tree.at(address.inside)) {
@@ -142,12 +135,8 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
     /**
      * Buffers a rename.
      *
-     * `overwrite` is carried out rather than refused or approximated: the
-     * session removes the target **in the same change set**, which is DR-026's
-     * own answer to "I mean to replace that" and is a set the wire could not
-     * carry until DR-032. It is not a delete and a create — that would change
-     * the entry's storage class and its kind behind the user's back — and it is
-     * not a second flag on `rename`, which DR-026 refused and still refuses.
+     * `overwrite` removes the target **in the same change set**, not as a
+     * delete and a create: the entry keeps its storage class and its kind.
      */
     async rename(from: vscode.Uri, to: vscode.Uri, options: { overwrite: boolean }): Promise<void> {
         const source = this.locate(from);
@@ -176,7 +165,7 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
         this.announce(target.address.archive, target.address.inside, occupied ? 'changed' : 'created');
     }
 
-    /** Buffers a directory. DR-026. */
+    /** Buffers a directory. */
     async createDirectory(uri: vscode.Uri): Promise<void> {
         const { mount, address } = this.locate(uri);
         if (mount.session.tree.at(address.inside)) {
@@ -199,9 +188,8 @@ export class RpfFileSystem implements vscode.FileSystemProvider {
     /**
      * Says a path appeared, went, or changed, and that its parent listing did.
      *
-     * The parent as well as the path itself: an explorer asks a directory for
-     * its children again when the directory changes, and a creation is a change
-     * to the directory that now holds it.
+     * The parent as well: an explorer asks a directory for its children again
+     * only when the directory itself changes.
      */
     private announce(archive: string, inside: string, what: 'created' | 'deleted' | 'changed'): void {
         const type =

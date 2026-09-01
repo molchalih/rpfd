@@ -1,38 +1,23 @@
 //! The `RBF` document, and the invariants that make it one.
 //!
 //! Every constraint the two encodings impose is checked in a constructor here,
-//! so that a value of these types is convertible to `RBF` bytes and to XML
-//! without either conversion being able to fail (`docs/conventions.md` §4, §5).
-//! What the token stream cannot express — more than 253 distinct names, a name
-//! longer than a `u16` — and what XML cannot express — a name that is not a
-//! name, two attributes sharing one, a blob with no bytes — are the same list,
-//! checked once, at construction.
+//! so a value of these types converts to `RBF` bytes and to XML without either
+//! conversion being able to fail.
 
 use std::collections::BTreeSet;
 
 use crate::metadata::text::is_xml_name;
 
-/// The reserved XML name prefix.
-///
-/// Deliberately a prefix and **not** a namespace: `docs/metadata-encodings.md`
-/// records `CriminalCareerDefs::ShoppingCartItemCategoryLimits` as a real
-/// descriptor name, and no namespace-well-formed document can carry it.
+/// The reserved XML name prefix, deliberately a prefix and not a namespace:
+/// real descriptor names carry `::`, which no namespace can.
 pub(super) const RESERVED_PREFIX: &str = "rbf:";
 
-/// The largest descriptor table the one-byte index can address.
-///
-/// `docs/metadata-encodings.md`, The token stream: `0xFD` and `0xFF` are taken
-/// by the blob and close records, so `0x00`–`0xFC` are the indices and there
-/// are 253 of them. The corpus reaches 115.
+/// The largest descriptor table the one-byte index can address: `0xFD` and
+/// `0xFF` are taken by the blob and close records, leaving `0x00`–`0xFC`.
 pub(super) const MAX_NAMES: usize = 253;
 
-/// How deeply elements may nest.
-///
-/// The format states no limit and the corpus reaches 12
-/// (`docs/metadata-encodings.md`, What the probe settled). A limit is here
-/// because every walk over a document — writing it, and dropping it — recurses,
-/// and a stack overflow is an abort that no `Result` can catch, which is worse
-/// than the panic `docs/conventions.md` §6 already forbids.
+/// How deeply elements may nest: the format states no limit, but every walk
+/// recurses, and a stack overflow is an abort no `Result` catches.
 pub(super) const MAX_DEPTH: usize = 256;
 
 /// Why a byte stream is not a well-formed `RBF` token stream.
@@ -46,12 +31,9 @@ pub enum Malformed {
     /// A close or blob record's second byte was not the `0xFF` marker.
     Marker,
     /// A descriptor index named neither an existing descriptor nor the next
-    /// one, so there is no name for the record.
-    ///
-    /// `0xFE` lands here too, and there is no separate case for it: it can only
-    /// ever be the 255th index, and the table holds at most 253.
+    /// one, so there is no name for the record. `0xFE` lands here too.
     DescriptorIndex,
-    /// A data-type byte outside the seven `docs/metadata-encodings.md` records.
+    /// A data-type byte outside the seven records this encoding has.
     DataType,
     /// The first record was not an open element, so there is no root.
     NoRoot,
@@ -65,10 +47,8 @@ pub enum Malformed {
     TooDeep,
 }
 
-/// Why a well-formed document cannot cross to the other encoding.
-///
-/// The same list in both directions: these are the things one representation
-/// can say and the other cannot.
+/// Why a well-formed document cannot cross to the other encoding — the same
+/// list in both directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Unrepresentable {
@@ -79,8 +59,6 @@ pub enum Unrepresentable {
     },
     /// A name is not one this build writes: an XML name of ASCII letters,
     /// digits, `_`, `:`, `.` and `-`, starting with a letter, `_` or `:`.
-    ///
-    /// All 6,112 descriptor names in the corpus are of that shape.
     NameSyntax {
         /// The name.
         name: String,
@@ -115,19 +93,10 @@ pub enum Unrepresentable {
         /// How many bytes long.
         len: usize,
     },
-    /// A blob has no bytes.
-    ///
-    /// An element whose text is empty is indistinguishable from one with no
-    /// text at all, and XML gives no way to tell them apart. 0 of the 48,042
-    /// blobs in the corpus are empty.
+    /// A blob has no bytes, which XML cannot tell from an element with no text.
     EmptyBlob,
-    /// A blob shares its element with child elements, with named values, or
-    /// with a second blob.
-    ///
-    /// All 48,042 blobs in the corpus are the **sole** content of their
-    /// element. Two adjacent blobs are one text node once written as XML, and
-    /// a blob interleaved with elements cannot be told from the indentation
-    /// around them, so this is refused rather than silently merged.
+    /// A blob shares its element with child elements, named values or a second
+    /// blob, which XML text cannot tell apart from indentation.
     BlobNotAlone {
         /// The element's name.
         name: String,
@@ -189,10 +158,8 @@ pub enum NotRbf {
     },
 }
 
-/// A descriptor name: an element's, an attribute's or a value's.
-///
-/// Valid as an XML name and short enough for the token stream's `u16` length,
-/// because it cannot be built otherwise.
+/// A descriptor name: an element's, an attribute's or a value's, valid as an
+/// XML name and short enough for the token stream's `u16` length.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Name(String);
 
@@ -226,11 +193,8 @@ impl Name {
     }
 }
 
-/// A `0x60` string value: raw bytes with a `u16` length.
-///
-/// Bytes, not a `String`. `docs/metadata-encodings.md`: 1,038 records in the
-/// corpus carry a byte at or above `0x80`, and `CodeWalker` maps every one of
-/// them to `?` by routing them through `Encoding.ASCII`.
+/// A `0x60` string value: raw bytes with a `u16` length, not a `String`,
+/// because records carry bytes at or above `0x80`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Str(Vec<u8>);
 
@@ -243,16 +207,13 @@ impl Str {
         Ok(Self(bytes))
     }
 
-    /// The bytes.
     pub(super) fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
 
-/// A `0xFD` raw byte blob: an element's text.
-///
-/// Never empty, so that an element with text is distinguishable from one
-/// without once written as XML.
+/// A `0xFD` raw byte blob: an element's text, never empty so that an element
+/// with text stays distinguishable from one without.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Blob(Vec<u8>);
 
@@ -292,16 +253,13 @@ pub(super) enum Scalar {
 /// One of an element's attribute records.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Attribute {
-    /// Its name.
     pub(super) name: Name,
-    /// Its value.
     pub(super) value: Scalar,
 }
 
 /// Something inside an element that is not one of its attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Node {
-    /// A nested element.
     Element(Element),
     /// A named value.
     Value {
@@ -312,12 +270,8 @@ pub(super) enum Node {
     },
 }
 
-/// What an element carries.
-///
-/// The two are exclusive because `docs/metadata-encodings.md` measured them
-/// exclusive: a blob is the **sole** content of its element in all 48,042 in
-/// the corpus. Modelling it that way is what lets a blob be the element's XML
-/// text without whitespace, indentation or a second blob making it ambiguous.
+/// What an element carries; the two are exclusive, since a blob is the sole
+/// content of its element.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Content {
     /// Nested elements and named values, in order. Empty for a leaf.
@@ -336,13 +290,8 @@ pub(super) struct Element {
 }
 
 impl Element {
-    /// Checks an element and keeps it.
-    ///
-    /// `unknown` is the two `u16`s an open element carries before its attribute
-    /// count. `docs/metadata-encodings.md`: both are 0 in all 106,193 open
-    /// elements in the corpus, so they carry nothing — but they are kept and
-    /// written back rather than assumed, so that the round trip is a property
-    /// of the code rather than of the corpus.
+    /// Checks an element and keeps it. `unknown` is the two `u16`s an open
+    /// element carries before its attribute count, always 0 but never assumed.
     pub(super) fn new(
         name: Name,
         unknown: [u16; 2],
@@ -380,12 +329,10 @@ impl Element {
         self.unknown
     }
 
-    /// Its attribute records, in order.
     pub(super) fn attributes(&self) -> &[Attribute] {
         &self.attributes
     }
 
-    /// What it carries.
     pub(super) fn content(&self) -> &Content {
         &self.content
     }
@@ -400,14 +347,9 @@ pub(super) struct Document {
 impl Document {
     /// Checks that the tree is shallow enough to walk, and keeps it.
     ///
-    /// The walk is iterative rather than recursive on purpose: it is what
-    /// establishes the depth bound, so it cannot be the thing that overflows
-    /// while checking it.
-    ///
-    /// [`MAX_NAMES`] is **not** checked here, and deliberately. It is a limit
-    /// of the token stream's one-byte descriptor index, not of the document —
-    /// XML has no such ceiling — so it belongs to the writer that has to
-    /// address a descriptor, and `token::write` is where it is reported.
+    /// The walk is iterative on purpose: it establishes the depth bound, so it
+    /// cannot be the thing that overflows while checking it. [`MAX_NAMES`] is
+    /// not checked here — it is the token writer's limit, not the document's.
     pub(super) fn new(root: Element) -> Result<Self, Unrepresentable> {
         let mut pending: Vec<(&Element, usize)> = vec![(&root, 1)];
         while let Some((element, depth)) = pending.pop() {
@@ -425,7 +367,6 @@ impl Document {
         Ok(Self { root })
     }
 
-    /// Its root element.
     pub(super) fn root(&self) -> &Element {
         &self.root
     }

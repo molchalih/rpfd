@@ -1,10 +1,8 @@
 // The acceptance loop's server half. It ships the archive and prints what the
-// client found in it; it never parses the archive. docs/acceptance.md.
+// client found in it; it never parses the archive.
 //
-// Every line it prints is prefixed `rpf:` and carries a timestamp, because the
-// interval between a report and a disconnect is what separates a client that
-// answered and left from a client that died mid-answer. acceptance.sh
-// classifies these lines and nothing else interprets anything.
+// Every line is prefixed `rpf:` and timestamped: the interval between a report
+// and a disconnect separates a client that answered from one that died.
 function line(text) {
     console.log("rpf:" + text + " at=" + new Date().toISOString());
 }
@@ -13,8 +11,8 @@ mp.events.add("rpf:joined", (player, model, hash) => {
     line(`joined player=${player.name} ${model} ${hash}`);
 });
 
-// A breadcrumb the client leaves before every native call that has been seen to
-// end its process. The last one printed names what it was about to do.
+// A breadcrumb the client leaves before every native call that may end its
+// process. The last one printed names what it was about to do.
 mp.events.add("rpf:probe", (player, stage, detail) => {
     line(`probe ${stage}${detail === undefined ? "" : " " + detail}`);
 });

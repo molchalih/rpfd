@@ -1,40 +1,11 @@
 //! What a payload announces itself to be, from its leading bytes.
 //!
-//! This is the metadata layer's alphabet and nothing more: the names of the
-//! encodings `docs/metadata-encodings.md` owns, and the signatures that pick
-//! one out. It takes bytes and returns a name. It does not seek, does not open
-//! anything, decodes nothing and knows no archive exists (`docs/conventions.md`
-//! §2).
+//! The names of the metadata encodings and the signatures that pick one out.
+//! Nothing here reads an extension.
 //!
-//! Recognition is repeated in `docs/rpf-format.md`'s Metadata encodings section
-//! because *asking* the question is the container's — R3.7 — and each constant
-//! below cites the row it comes from (§3). Why the answer lives on this side of
-//! the boundary while the question lives on the other is DR-044.
-//!
-//! Nothing here reads an extension. `docs/metadata-encodings.md` measured what
-//! extensions carry what, and the answer refuted three intuitions at once: no
-//! `.meta` anywhere is `PSO`, `.ymf` and `.cut` are 55% of the `PSO` corpus,
-//! and a `.ytyp` is almost always a resource.
-//!
-//! Below this module sits what a payload *means* once recognised, one module per
-//! encoding, and `docs/metadata-encodings.md` owns those facts. Each takes and
-//! returns bytes for the same reason this module does.
-//!
-//! **Resource `Meta` is deliberately not one of [`Encoding`]'s variants, and
-//! has no magic here.** `docs/rpf-format.md`'s Metadata encodings row says what
-//! the container recognises one by, and it is **not the payload's bytes**: the
-//! entry table's resource bit is the only truth, as Q7 found for `RSC7`. What
-//! the row also records — the `0x50524430` word at offset `0x10` of the
-//! *inflated* payload — is a metadata-layer test on bytes the container has by
-//! then handed over, so it lives with the encoding that owns it, as
-//! [`meta::MAGIC`] at [`meta::MAGIC_AT`]. It could not be one of
-//! [`Encoding::of`]'s signatures in any case: that function judges
-//! [`Encoding::HEAD_LEN`] bytes and the word sits at the sixteenth.
-//!
-//! This layer is also the one place §7's rule does not reach. A container
-//! function takes `impl Read + Seek`; a metadata payload is a whole small
-//! document — the largest `RBF` in the corpus is 57,378 bytes — with nothing to
-//! seek within, because the token stream is read once, front to back.
+//! Resource `Meta` is deliberately not one of [`Encoding`]'s variants: the
+//! entry table's resource bit is the only truth, and the magic that confirms it
+//! sits at offset `0x10`, past [`Encoding::HEAD_LEN`], as [`meta::MAGIC`].
 
 pub mod hash;
 pub mod meta;
@@ -44,71 +15,40 @@ pub(crate) mod text;
 pub mod view;
 
 /// The `RBF` magic: bytes 0..3 of a tokenised binary XML file.
-///
-/// `docs/rpf-format.md`, Metadata encodings, `verified` — 391 files, and the
-/// fourth byte is `0x30` in every one of them, so the strict four-byte test
-/// costs nothing and the loose three-byte one finds nothing extra.
 pub const MAGIC_RBF: [u8; 4] = *b"RBF0";
 
 /// The `PSO` magic: bytes 0..3 of a `PSO` file, which are the tag of its first
 /// section rather than a header of its own.
-///
-/// `docs/rpf-format.md`, Metadata encodings, `verified` — 9,753 files.
 pub const MAGIC_PSO: [u8; 4] = *b"PSIN";
 
 /// The UTF-8 byte-order mark, which a plain XML payload may carry before its
 /// first `<`.
-///
-/// `docs/rpf-format.md`, Metadata encodings, `verified` — 775 of 777,755 heads
-/// carry one and all 775 are followed by `<`.
 pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 /// What an entry's payload announces itself to be.
 ///
-/// **There is no resource variant, and that is the point.** A resource is a
-/// fact about the *entry*, not about its bytes: `docs/backlog.md` Q7 measured
-/// 694,470 of 694,470 resource entries in Rockstar's archives whose payload
-/// does not begin with `RSC7`, so a sniff for it answers `false` on every one
-/// of them. Nothing derived from a payload can name a resource, which is why
-/// [`crate::Classification`] and not this type is what a caller asks.
+/// There is no resource variant: a resource is a fact about the entry, not its
+/// bytes, so [`crate::Classification`] and not this type is what a caller asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     /// Plain XML.
-    ///
-    /// `docs/rpf-format.md`, Metadata encodings, `verified` — 5,814 binary
-    /// entries.
     Xml,
-    /// Text that is not XML — `.ugc`, `.sps`, `.dat`, `.txt`, `.nametable`.
-    ///
-    /// The claim is about [`Encoding::HEAD_LEN`] bytes and no further: a
-    /// payload whose head is text and whose tail is not reads as this.
-    /// `docs/rpf-format.md`, Metadata encodings, `verified` — 4,218 binary
-    /// entries.
+    /// Text that is not XML, judged over [`Encoding::HEAD_LEN`] bytes and no
+    /// further.
     Text,
     /// `RBF`, tokenised binary XML.
-    ///
-    /// `docs/rpf-format.md`, Metadata encodings, `verified` — 391 files.
     Rbf,
     /// `PSO`, a concatenation of tagged big-endian sections.
-    ///
-    /// `docs/rpf-format.md`, Metadata encodings, `verified` — 9,753 files.
     Pso,
 }
 
 impl Encoding {
-    /// How many bytes of a payload [`Encoding::of`] is given.
-    ///
-    /// Sixteen, which is what the corpus measurement read and four times the
-    /// longest signature. Nothing here needs more, and a classifier that
-    /// needed the whole payload would defeat DR-031: an entry is a stream, and
-    /// naming it must not cost holding it.
+    /// How many bytes of a payload [`Encoding::of`] is given: four times the
+    /// longest signature, and never the whole payload.
     pub const HEAD_LEN: usize = 16;
 
-    /// This encoding's name, in the one spelling everything reports it in.
-    ///
-    /// `docs/rpf-format.md`'s Metadata encodings section, and what a listing
-    /// row's `"encoding"` field carries on the wire. DR-032 makes those values
-    /// part of the contract, so they are spelled once (§3).
+    /// This encoding's name, in the one spelling everything reports it in;
+    /// a listing row's `"encoding"` field carries it on the wire.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -122,9 +62,8 @@ impl Encoding {
     /// What an entry holding this encoding refuses of a payload announcing
     /// `offered`, or `None` when it takes it.
     ///
-    /// **A tokenised encoding does not take a textual one.** What comes back
-    /// is the encoding refused, which is what [`crate::Error::WrongEncoding`]
-    /// names (§4); an `offered` of `None` contradicts no entry. DR-050.
+    /// A tokenised encoding does not take a textual one; what comes back is
+    /// the encoding refused.
     #[must_use]
     pub const fn refuses(self, offered: Option<Self>) -> Option<Self> {
         match (self, offered) {
@@ -137,16 +76,9 @@ impl Encoding {
     /// none.
     ///
     /// `head` is the first [`Encoding::HEAD_LEN`] bytes of the payload, or all
-    /// of it when it is shorter. Fewer bytes than a signature is an answer and
-    /// not an error: an empty payload, a two-byte one and a payload that is
-    /// entirely `<` each name something or name nothing, and none of them is a
-    /// failure.
-    ///
-    /// **All of it when it is shorter is load-bearing**: a fifteen-byte text
-    /// payload read into a sixteen-byte buffer is followed by a zero byte, and
-    /// judging the buffer rather than what was read calls it unknown binary.
-    ///
-    /// `None` is R3.7's unknown binary.
+    /// of it when it is shorter — passing a padded buffer instead of what was
+    /// read turns a short text payload into unknown binary. Fewer bytes than a
+    /// signature is an answer, not an error; `None` is unknown binary.
     #[must_use]
     pub fn of(head: &[u8]) -> Option<Self> {
         if head.starts_with(&MAGIC_RBF) {
@@ -169,16 +101,9 @@ impl Encoding {
 /// Whether these bytes open an XML tag: optional ASCII whitespace, `<`, then a
 /// byte a tag can begin with.
 ///
-/// The measured rule is "first byte `<`, or a byte-order mark then `<`", and
-/// this is that rule with both ends widened by one measurement each over the
-/// 777,755-entry corpus. Leading whitespace admits **26** files that are plainly
-/// XML — `\r\n<?xml`, ` <?xml`, `\r\n<StatsSetup` — and the byte after `<`
-/// refuses **12** `.awc` audio payloads whose first byte is `0x3c` by chance,
-/// which is the false-positive tail a one-byte signature has by construction.
-/// `docs/rpf-format.md`, Metadata encodings, `verified`.
-///
-/// A tag whose name begins with a non-ASCII byte is not admitted, and none
-/// occurs in the corpus.
+/// Leading whitespace is allowed, and the byte after `<` is checked so that a
+/// binary payload beginning `0x3c` by chance is not read as XML. A tag name
+/// beginning with a non-ASCII byte is not admitted.
 fn opens_a_tag(body: &[u8]) -> bool {
     let opened = trimmed(body);
     opened
@@ -212,12 +137,7 @@ const fn is_space(byte: u8) -> bool {
 }
 
 /// Whether a byte belongs to text: printable ASCII, or one of the three
-/// whitespace controls.
-///
-/// The window matters as much as the predicate. Over the corpus, judging eight
-/// bytes rather than sixteen calls **292** more binary entries text, and they
-/// are `.bik` and `.awc` payloads whose ASCII magic runs out after four.
-/// `docs/rpf-format.md`, Metadata encodings, `verified`.
+/// whitespace controls. The window matters as much as the predicate.
 const fn is_text(byte: u8) -> bool {
     byte.is_ascii_graphic() || is_space(byte)
 }
@@ -250,20 +170,16 @@ mod tests {
 
     #[test]
     fn the_rbf_magic_is_four_bytes_and_the_fourth_is_a_zero() {
-        // The fourth byte is `0x30` in all 391 files, so the strict test is
-        // what this implements. `RBF` with any other fourth byte is not one.
         assert_eq!(Encoding::of(&head(b"RBF0")), Some(Encoding::Rbf));
         assert_eq!(Encoding::of(&head(b"RBF1")), None);
         assert_eq!(Encoding::of(&head(b"RBF")), None);
-        // And with text after it, `RBF1` is text and still not `RBF`.
         assert_eq!(Encoding::of(&text_head(b"RBF1")), Some(Encoding::Text));
     }
 
     #[test]
     fn a_pso_is_its_first_section_tag() {
         assert_eq!(Encoding::of(&head(b"PSIN")), Some(Encoding::Pso));
-        // The other seven tags a `PSO` carries are sections *inside* one and
-        // never begin a file: `PSIN` is first in all 9,753.
+        // The other tags are sections inside a `PSO` and never begin a file.
         for tag in [b"PMAP", b"PSCH", b"PSIG", b"CHKS", b"STRE", b"STRF"] {
             assert_eq!(Encoding::of(&head(tag)), None, "{:?}", *tag);
         }
@@ -294,9 +210,8 @@ mod tests {
 
     #[test]
     fn an_angle_bracket_before_a_byte_no_tag_name_starts_with_is_not_xml() {
-        // The twelve `.awc` payloads that begin `0x3c` by chance. Their second
-        // byte is not one a tag name can begin with, and the head as a whole is
-        // not text either.
+        // An `.awc` payload beginning `0x3c` by chance: its second byte begins
+        // no tag name, and the head is not text either.
         let awc = [
             0x3c, 0xeb, 0x08, 0x4f, 0xd1, 0xa6, 0x5e, 0xcf, 0x87, 0xca, 0x5f, 0xbf, 0x57, 0x7e,
             0x5f, 0xc5,
@@ -315,8 +230,7 @@ mod tests {
 
     #[test]
     fn a_head_of_text_followed_by_a_high_byte_is_not_text() {
-        // The sixteenth byte decides, which is the window the corpus was
-        // measured over: eight bytes calls 292 more payloads text.
+        // The sixteenth byte decides.
         let mut bytes = b"ADATabcdefghijkl".to_vec();
         assert_eq!(Encoding::of(&bytes), Some(Encoding::Text));
         bytes.pop();
@@ -348,9 +262,7 @@ mod tests {
 
     #[test]
     fn no_head_of_any_shape_panics() {
-        // Every prefix of every byte, at every length up to the window: the
-        // classifier is given third-party bytes and some of them are malformed
-        // deliberately (§6).
+        // Every repeated byte at every length up to the window.
         for byte in 0..=u8::MAX {
             for len in 0..=Encoding::HEAD_LEN {
                 let bytes = vec![byte; len];

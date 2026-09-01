@@ -1,98 +1,22 @@
 //! Resource-embedded `Meta` — the header, the three info tables, and the two
 //! pointer kinds a file addresses itself with.
 //!
-//! `docs/metadata-encodings.md`, Resource-embedded `Meta`, `verified` against
-//! all **49,614** files both GTA V builds ship. Little-endian, unlike `PSO`;
-//! no checksum, no encrypted section, no `PSIG`. One measurement shapes the
-//! module exactly as it shapes [`super::pso`]: every file was walked from its
-//! root using **only its own tables** and reached **0** references it did not
-//! define, over 88,171,116 structures. So nothing here consults a builtin
-//! table and there is none to consult.
+//! Little-endian, unlike `PSO`; no checksum, no encrypted section. A file is
+//! walked from its root using only its own tables; nothing here consults a
+//! builtin schema.
 //!
-//! # Two pointer kinds, and the type system keeps them apart
+//! Two pointer kinds, kept apart at the type level because a value that is one
+//! is never the other: [`ResourcePointer`] addresses the file's pages
+//! (`space = p >> 28`, `offset = p & 0x0FFFFFFF`) and is resolved by `Pages`;
+//! [`MetaPointer`] addresses data inside a block (`blockId = p & 0xFFF`,
+//! `itemOffset = p >> 12`) and is resolved by [`Meta::landing`].
 //!
-//! [`ResourcePointer`] addresses the file: the header's own fields and the
-//! three info tables. [`MetaPointer`] addresses data: everything inside a data
-//! block. They decode differently — `space = p >> 28` and
-//! `offset = p & 0x0FFFFFFF` against `blockId = p & 0xFFF` and
-//! `itemOffset = p >> 12` — and a value that is one is never the other. They
-//! are therefore two types with no conversion between them and no shared
-//! trait: `Pages` resolves the first and nothing else, [`Meta::landing`]
-//! resolves the second and nothing else, and neither will accept the other's
-//! value. Conflating them is what
-//! `a_data_pointer_is_not_read_the_way_a_table_pointer_is` exists to catch.
+//! A `Meta` payload is a paged resource, inflated: system pages then graphics
+//! pages. `system_len` is that boundary, a fact about the entry rather than the
+//! payload, and a resource pointer's offset is flat within its space.
 //!
-//! # What the payload is, and what `system_len` is
-//!
-//! A `Meta` payload is a *paged* resource, inflated: its system pages, then
-//! its graphics pages. A resource pointer's space nibble says which of the two
-//! it addresses and its offset is flat within that space, so resolving one
-//! needs the boundary between them — which is a fact about the entry
-//! (`crate::format::resource::size_from_flags` of its system flags) and not
-//! about the payload. It reaches [`parse`] as a byte count and nothing else:
-//! this layer still takes bytes, never seeks, never opens a file and never
-//! learns that archives exist (`docs/conventions.md` §2).
-//!
-//! # The seam
-//!
-//! [`to_xml`] and [`from_xml`], bytes in and bytes out, exactly as `rbf`'s pair
-//! and `pso`'s are. Two arguments neither of those two needs, and each is a
-//! fact about this encoding rather than a widening of the seam:
-//!
-//! - **`system_len`**, because a `Meta` payload is a *paged* resource and a
-//!   resource pointer's offset is flat within the space its nibble names. The
-//!   boundary is a fact about the entry (`crate::format::resource::size_from_flags`
-//!   of its system flags) and appears nowhere in the payload, so a caller that
-//!   has the bytes has it too and nothing here can derive it.
-//! - **the payload, in the write direction**, because a document cannot carry
-//!   the file: page slack, inter-table padding, the 7.26% of a payload after
-//!   the last data block, and **2.48% that no walk reaches and that is not
-//!   zero**. DR-049, whose argument for `PSO`'s 2.86% is this one exactly. So
-//!   [`from_xml`] **edits** the payload the document came from, writing each
-//!   value at the address [`to_xml`] read it from and moving nothing
-//!   structural.
-//!
-//! A [`Dictionary`] decides how the hashes render, and is cosmetic by
-//! construction: 412 distinct member names and 73 structure hashes across the
-//! whole corpus, and an empty dictionary spells every one `hash_XXXXXXXX`.
-//!
-//! # What is measured here
-//!
-//! [`parse`] — the header, the three tables and both pointer kinds — is
-//! `verified` against all 49,614 files, and so is the value walk: every one of
-//! them renders and is written back **byte for byte**
-//! (`every_shipped_meta_file_round_trips_byte_for_byte` in
-//! `crates/rpf-core/tests/metadata.rs`), over 1,487,349,189 elements. The type
-//! table `kind` carries is that measurement's: 23 codes, which is the number
-//! `docs/metadata-encodings.md` counted, and `kind` says which and how each
-//! aggregate's width was derived.
-//!
-//! **What that round trip proves is narrower than it sounds, and the narrower
-//! claim is the one to quote.** [`from_xml`] applies the document [`to_xml`]
-//! has just written, so every value matches what is already there and nothing
-//! is written back at all: the payload comes out because it went in untouched.
-//! So 49,614 of 49,614 says *the walk reached every value without refusing and
-//! the re-parse agreed with the render* — it does not say a member's width is
-//! right. A stride that is wrong by eight and lands on a null, a zero or a
-//! pointer that still resolves round-trips byte for byte and renders nonsense.
-//! Which widths are pinned, and by what, is written down in `kind`: `0x50`'s
-//! is proved by its product equalling the gap to the next member in 51,168 of
-//! 51,168; `0x44`, `0x52` and `0x40` are consistent with every gap and not
-//! pinned by one; and `0x07`'s 8 is not disambiguated by the corpus at all.
-//!
-//! # What bounds it
-//!
-//! What [`parse`] allocates is the three tables, and each of them is bounded by
-//! the payload itself: a table of `n` records is refused unless its whole
-//! extent lies inside the space its pointer names, so `n` can never exceed the
-//! payload's own length divided by the record's. Members and enum entries are
-//! not collected at all — they are read from the payload on demand, through a
-//! slice whose extent [`parse`] has already checked — so a file declaring
-//! 65,535 structures of 65,535 members costs one refusal rather than 4 × 10⁹
-//! records. The walk carries its own three ceilings, which `kind` owns: a
-//! depth, and an element budget and an output budget both proportional to the
-//! payload, both floored or capped in absolute terms, and all three calibrated
-//! against the corpus.
+//! [`from_xml`] edits the payload the document came from, writing each value
+//! where [`to_xml`] read it and moving nothing structural.
 
 mod apply;
 mod data;
@@ -108,47 +32,29 @@ use crate::{
     metadata::hash::Dictionary,
 };
 
-/// The reserved XML name prefix this mapping's vocabulary lives under.
-///
-/// A prefix and deliberately **not** an XML namespace, for the reason DR-043
-/// gives for `RBF` and DR-047 carries into `PSO`: an element's name comes from
-/// a dictionary the user supplied, so namespace well-formedness is not this
-/// layer's to promise. Each encoding owns its own, because the prefixes differ;
-/// `data::spell` is the guard that keeps a dictionary name out of it.
+/// The reserved XML name prefix this mapping's vocabulary lives under, and
+/// deliberately not an XML namespace.
 pub const RESERVED_PREFIX: &str = "meta:";
 
 /// Reads a resource `Meta` payload and writes the XML that describes it.
 ///
-/// `payload` is the **inflated** payload of a resource entry and `system_len`
-/// how many of its bytes are system pages — see [`parse`], which this is the
-/// walk over.
+/// `payload` is the inflated payload of a resource entry and `system_len` how
+/// many of its bytes are system pages.
 ///
 /// # Errors
 ///
-/// [`Error::BadMeta`] if the file contradicts itself — a pointer outside its
-/// block, a member outside its structure, a walk deeper or larger than the
-/// ceilings allow — and [`Error::UnsupportedMeta`] if it is well formed and
-/// carries a member type code outside the 23 this build names.
+/// [`Error::BadMeta`] if the file contradicts itself, and
+/// [`Error::UnsupportedMeta`] for a member type code this build does not name.
 pub fn to_xml(payload: &[u8], system_len: usize, names: &Dictionary) -> Result<Vec<u8>> {
     render::write(payload, system_len, names)
 }
 
 /// Reads the XML [`to_xml`] wrote and applies it to the payload it came from.
 ///
-/// **Four arguments, and none of them will go away.** `payload` is the file
-/// being edited, because 2.48% of it is unreached and nonzero and no document
-/// can carry it (DR-049); `system_len` is the page boundary, which is a fact
-/// about the entry and not about these bytes; `document` is the edit; `names`
-/// spells the hashes, exactly as it does in the read direction.
-///
-/// The walk is [`to_xml`]'s, run backwards: every value the document carries is
-/// written at the address [`to_xml`] read it from, under the same bound — the
-/// block that holds it — and nothing structural moves. An edit that changes the
-/// **shape** — an array's length, a structure's member list, a value past the
-/// store its form gave it — is refused rather than guessed at. DR-052: editing
-/// is value-level and stays that way. So is an edit that two elements of the
-/// document disagree over, which a file pointing at one value twice makes
-/// possible: DR-059.
+/// The walk is [`to_xml`]'s run backwards: every value is written at the
+/// address it was read from, under the same bound. An edit that changes the
+/// shape — an array's length, a member list, a value past its store — is
+/// refused, as is one two elements of the document disagree over.
 ///
 /// # Errors
 ///
@@ -166,16 +72,8 @@ pub fn from_xml(
 
 /// The word at [`MAGIC_AT`] of an inflated resource `Meta` payload.
 ///
-/// `docs/rpf-format.md`, Metadata encodings, and
-/// `docs/metadata-encodings.md`, Recognition: `0x50524430` little-endian in
-/// **49,614 of 49,614**, and no `.ynv` or `.ytd` of the same resource version
-/// carries it — 0 of 21,135.
-///
-/// It is a metadata-layer test and never a container sniff: the word sits at
-/// offset `0x10` of a *paged, inflated* payload, which the container has by
-/// then already handed over. What names a resource is the entry's own row (Q7,
-/// DR-044), which is why [`super::Encoding`] has no variant for this and
-/// [`identifies`] is here instead.
+/// `0x50524430` little-endian, and a metadata-layer test rather than a
+/// container sniff.
 pub const MAGIC: u32 = 0x5052_4430;
 
 /// Where [`MAGIC`] sits in the payload.
@@ -186,17 +84,15 @@ pub const HEADER_LEN: usize = 0x50;
 
 /// How long one `StructureInfo` record is.
 ///
-/// `docs/metadata-encodings.md`, The three tables: `nameHash`, `nameHash2`, a
-/// `u32` that is `0x300` or `0x400`, a `u32` that is 0, `membersPtr`,
-/// `structLength`, a `u16` that is 0 in all 318,286, and `memberCount`.
+/// `nameHash`, `nameHash2`, a `u32` that is `0x300` or `0x400`, a zero `u32`,
+/// `membersPtr`, `structLength`, a zero `u16`, `memberCount`.
 const STRUCTURE_LEN: usize = 32;
 
 /// How long one structure member is.
 ///
-/// `docs/metadata-encodings.md`: `nameHash:u32, dataOffset:u32, type:u8,
-/// subtype:u8, arrayInfoIndex:u16, referenceKey:u32`. **`dataOffset` is a
-/// `u32` at offset 4**, not a `u16` late in the record — `PSO`'s twelve-byte
-/// member is not this one, and reading it as such shifts every field.
+/// `nameHash:u32, dataOffset:u32, type:u8, subtype:u8, arrayInfoIndex:u16,
+/// referenceKey:u32`. `dataOffset` is a `u32` at offset 4, not `PSO`'s `u16`
+/// late in a twelve-byte record.
 const MEMBER_LEN: usize = 16;
 
 /// How long one `EnumInfo` record is: `nameHash`, `unk`, `entriesPtr`,
@@ -210,13 +106,9 @@ const ENUM_ENTRY_LEN: usize = 8;
 const BLOCK_LEN: usize = 16;
 
 /// The version word of a version-2 file, at `0x14`.
-///
-/// `docs/metadata-encodings.md`: 49,608 of 49,614.
 pub const VERSION_TWO: u32 = 0x0001_0079;
 
-/// The version word of a version-3 file.
-///
-/// The six `.ymt` whose word at `0x14` is `0x79` rather than `0x00010079`.
+/// The version word of a version-3 file, `0x79` rather than `0x00010079`.
 pub const VERSION_THREE: u32 = 0x0000_0079;
 
 /// How far a resource pointer's space nibble sits above its offset.
@@ -233,11 +125,8 @@ const GRAPHICS_SPACE: u32 = 6;
 
 /// The low bits of a `Meta` pointer: its 1-based block id.
 ///
-/// `docs/metadata-encodings.md`: `PSO`'s pointer widened to 64 bits. The
-/// decisive case for the twelve-bit boundary is `hei_ch3_06.ymap`, whose
-/// entity pointer array reads `0x3, 0x80003, 0x100003, …` — block 3 at offsets
-/// 0, 128 and 256, filling all 16,384 bytes of each block, which a sixteen-bit
-/// split decodes to offsets of 8 addressing only the first 1,016 bytes.
+/// The split is twelve bits and not sixteen, which would leave most of a
+/// 16,384-byte block unreachable.
 const BLOCK_MASK: u64 = 0xFFF;
 
 /// How far a `Meta` pointer's item offset sits above its block id.
@@ -245,18 +134,13 @@ const ITEM_SHIFT: u32 = 12;
 
 /// Whether these bytes are a resource `Meta` payload.
 ///
-/// The whole test, and the only one: the word at [`MAGIC_AT`] is [`MAGIC`].
-/// `payload` is the *inflated* payload of a resource entry, so a caller that
-/// has not inflated one has not yet asked a question this can answer.
+/// The whole test is the word at [`MAGIC_AT`]; `payload` must be inflated.
 #[must_use]
 pub fn identifies(payload: &[u8]) -> bool {
     u32_at(payload, MAGIC_AT) == Some(MAGIC)
 }
 
 /// Which of a resource's two page spaces a [`ResourcePointer`] addresses.
-///
-/// `docs/metadata-encodings.md`, Two pointer kinds: 837,780 system and 176,598
-/// graphics over 49,614 files, and **0 in any other space**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Space {
     /// The system pages, which come first in the inflated payload.
@@ -268,9 +152,7 @@ pub enum Space {
 /// A pointer into the resource's pages: the header's fields and the three info
 /// tables.
 ///
-/// **Not interchangeable with [`MetaPointer`]**, which is the whole reason
-/// both are types rather than integers. This one is resolved by this module's
-/// `Pages` and by nothing else.
+/// Not interchangeable with [`MetaPointer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResourcePointer(u32);
 
@@ -278,10 +160,8 @@ impl ResourcePointer {
     /// The pointer this 64-bit field holds, or `None` when its high half is
     /// set.
     ///
-    /// A resource pointer occupies eight bytes and carries thirty-two: the
-    /// space nibble is at bit 28, and every one of the 1,014,378 pointers in
-    /// the corpus resolves under that reading. A value with anything above bit
-    /// 31 is not one, and is refused rather than truncated (§6).
+    /// It occupies eight bytes and carries thirty-two; anything above bit 31
+    /// is refused rather than truncated.
     #[must_use]
     pub fn wide(word: u64) -> Option<Self> {
         match u32::try_from(word) {
@@ -321,9 +201,7 @@ impl ResourcePointer {
 
 /// A pointer inside a data block: `PSO`'s pointer widened to 64 bits.
 ///
-/// **Not interchangeable with [`ResourcePointer`]**. This one is resolved by
-/// [`Meta::landing`] and by nothing else. Corpus maxima: block id 401, item
-/// offset 16,380.
+/// Not interchangeable with [`ResourcePointer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MetaPointer(u64);
 
@@ -362,8 +240,7 @@ impl MetaPointer {
 /// A 1-based data-block id, which is what a [`MetaPointer`] names and what the
 /// header's root field holds.
 ///
-/// It cannot be zero, because its constructor says so (§5): zero is the null
-/// pointer and never a block.
+/// It cannot be zero: zero is the null pointer and never a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(u16);
 
@@ -395,10 +272,8 @@ impl BlockId {
 
 /// The inflated payload, read as its system pages and then its graphics pages.
 ///
-/// The two spaces are separate: a system pointer never reaches a graphics byte
-/// and neither reaches past the payload. `docs/metadata-encodings.md`: the page
-/// split *within* a space is an allocation detail — 24,572 files span more than
-/// one system page, up to 124, and every one parses under the flat model.
+/// The two spaces are separate and each is read flat: a system pointer never
+/// reaches a graphics byte, and neither reaches past the payload.
 #[derive(Debug, Clone, Copy)]
 struct Pages<'a> {
     /// The system pages, flat.
@@ -412,9 +287,7 @@ impl<'a> Pages<'a> {
     ///
     /// # Errors
     ///
-    /// [`Malformed::Pages`] when `system_len` is longer than the payload, which
-    /// is a caller that has read the entry's flag words wrong rather than a
-    /// payload that is malformed.
+    /// [`Malformed::Pages`] when `system_len` is longer than the payload.
     fn split(payload: &'a [u8], system_len: usize) -> Result<Self> {
         let (system, graphics) = payload
             .split_at_checked(system_len)
@@ -434,13 +307,10 @@ impl<'a> Pages<'a> {
 
     /// `len` bytes at `pointer`, and where they begin in the payload.
     ///
-    /// `at` is where the pointer was read from, and is what a refusal reports.
-    ///
     /// # Errors
     ///
     /// [`Malformed::Space`] for a pointer that names neither space, and
-    /// [`Malformed::OutOfRange`] when the extent does not lie inside the one it
-    /// names.
+    /// [`Malformed::OutOfRange`] when the extent leaves the one it names.
     fn bytes(self, pointer: ResourcePointer, len: usize, at: u64) -> Result<(&'a [u8], usize)> {
         let gone = || bad(at, Malformed::OutOfRange);
         let (space, base) = self.space(pointer, at)?;
@@ -450,22 +320,15 @@ impl<'a> Pages<'a> {
         Ok((bytes, base.checked_add(from).ok_or_else(gone)?))
     }
 
-    /// Checks that this pointer lands inside the space it names, without an
-    /// extent.
-    ///
-    /// What the header's two unnamed pointers get: `docs/metadata-encodings.md`
-    /// measured 0 of 1,014,378 pointers out of range, and nothing says how many
-    /// bytes either of them owns.
+    /// Checks that this pointer lands inside the space it names, which is all
+    /// that can be asked of the header's two unnamed pointers.
     fn lands(self, pointer: ResourcePointer, at: u64) -> Result<()> {
         self.bytes(pointer, 0, at).map(|_| ())
     }
 }
 
-/// The fixed [`HEADER_LEN`] bytes a `Meta` payload opens with.
-///
-/// `docs/metadata-encodings.md`, The header. Every field is read; the ones the
-/// document names only by their offsets are carried rather than checked,
-/// because nothing says what they mean.
+/// The fixed [`HEADER_LEN`] bytes a `Meta` payload opens with; fields nothing
+/// explains are carried rather than checked.
 #[derive(Debug, Clone, Copy)]
 pub struct Header {
     /// The virtual function table pointer at `0x00`, which a shipped file
@@ -499,20 +362,13 @@ pub struct Header {
 }
 
 impl Header {
-    /// Reads the header, and nothing that a pointer in it names.
-    ///
-    /// This is the part of a `Meta` file that needs no page split, which is
-    /// what makes it the part a payload dumped without its entry's flag words
-    /// can still be checked against.
+    /// Reads the header, and nothing a pointer in it names; the one part of a
+    /// `Meta` file that needs no page split.
     ///
     /// # Errors
     ///
-    /// [`Malformed::Header`] when the payload is shorter than
-    /// [`HEADER_LEN`], [`Malformed::NotMeta`] when the word at [`MAGIC_AT`] is
-    /// not [`MAGIC`], [`Malformed::Version`] for a version word that is
-    /// neither of the two that occur, [`Malformed::PointerWidth`] for a
-    /// pointer field whose high half is set, and [`Malformed::RootBlock`] when
-    /// the root field is not a block id.
+    /// [`Malformed::Header`], [`Malformed::NotMeta`], [`Malformed::Version`],
+    /// [`Malformed::PointerWidth`] and [`Malformed::RootBlock`].
     pub fn read(payload: &[u8]) -> Result<Self> {
         let head = payload
             .get(..HEADER_LEN)
@@ -560,19 +416,12 @@ impl Header {
 
 /// A member's type code, as the file carries it.
 ///
-/// **No meaning is attached to it here.** `docs/metadata-encodings.md` records
-/// that 23 distinct codes occur over 3,891,369 members and does not say which,
-/// so a decoder that named them would be guessing; a caller gets the byte and
-/// this build refuses no value of it. What is settled is where the byte is —
-/// offset 8 of a sixteen-byte member — and that is what this type carries.
+/// No meaning is attached to it here; `kind` names the codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeCode(u8);
 
 impl TypeCode {
     /// This code, as the file carries it.
-    ///
-    /// The one way to make one, so that a code always comes from a byte
-    /// somewhere rather than from a number a caller invented.
     #[must_use]
     pub const fn new(code: u8) -> Self {
         Self(code)
@@ -588,20 +437,19 @@ impl TypeCode {
 /// One member of a structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Member {
-    /// Its name, a `joaat` hash. 412 distinct names across the whole corpus.
+    /// Its name, a `joaat` hash.
     pub name: u32,
     /// Its byte offset within the structure. A `u32` at offset 4 of the
     /// record.
     pub data_offset: u32,
     /// Its type code.
     pub type_code: TypeCode,
-    /// Its subtype: 0 on 3,811,021 members, `0x04` on 79,318, `0x24` on 1,030.
+    /// Its subtype, one of 0, `0x04` and `0x24`.
     pub subtype: u8,
     /// The index of the member describing this one's elements, for the array
     /// forms.
     pub array_info_index: u16,
-    /// The structure or enum this member refers to, or 0 — which is the "no
-    /// enum info" sentinel, the analogue of `PSO`'s `0xFFF`.
+    /// The structure or enum this member refers to, or 0 for none.
     pub reference_key: u32,
 }
 
@@ -639,7 +487,7 @@ impl Iterator for Members<'_> {
 /// One `StructureInfo`, with its member array already checked.
 #[derive(Debug, Clone, Copy)]
 pub struct Structure<'a> {
-    /// Its name, a `joaat` hash. 73 distinct across the whole corpus.
+    /// Its name, a `joaat` hash.
     pub name: u32,
     /// The second name hash the record carries.
     pub name2: u32,
@@ -719,13 +567,8 @@ impl<'a> Enumeration<'a> {
     }
 }
 
-/// What a data block's tag names.
-///
-/// `docs/metadata-encodings.md`: a structure the file defines (369,488 blocks)
-/// or a bare type code (93,454), and **0 resolve to neither**. Which of the two
-/// a tag is, is decided here by asking the file's own structure table — the
-/// only question that can be asked, because the 23 type codes are not
-/// enumerated anywhere.
+/// What a data block's tag names, decided by asking the file's own structure
+/// table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockTag {
     /// A structure this file defines.
@@ -739,8 +582,7 @@ pub enum BlockTag {
 pub struct Block<'a> {
     /// What its tag names.
     pub tag: BlockTag,
-    /// Where its bytes begin in the payload, which is what a refusal about one
-    /// of its pointers reports.
+    /// Where its bytes begin in the payload.
     at: usize,
     /// Its bytes, exactly the length its row declares.
     bytes: &'a [u8],
@@ -771,10 +613,8 @@ impl<'a> Block<'a> {
         address(self.at).saturating_add(u64::from(offset))
     }
 
-    /// The [`MetaPointer`] at `offset` inside it, or `None` when eight bytes do
-    /// not fit.
-    ///
-    /// A block's contents are little-endian, like the rest of the file.
+    /// The [`MetaPointer`] at `offset` inside it, or `None` when eight bytes
+    /// do not fit.
     #[must_use]
     pub fn pointer(&self, offset: u32) -> Option<MetaPointer> {
         let at = usize::try_from(offset).ok()?;
@@ -795,10 +635,8 @@ pub struct Landing<'a> {
 
 /// A parsed `Meta` document: its header, its three tables, and its data blocks.
 ///
-/// Everything it holds was checked when it was built (§5): every table lies
-/// inside the space its pointer names, every structure's members and every
-/// enum's entries lie inside theirs, every block's bytes are the length its row
-/// declares, and the root names a block.
+/// Everything it holds was checked when it was built: every table and array
+/// lies inside the space its pointer names, and the root names a block.
 #[derive(Debug, Clone)]
 pub struct Meta<'a> {
     /// The header.
@@ -861,25 +699,18 @@ impl<'a> Meta<'a> {
     }
 
     /// The root block, which exists because [`parse`] resolved it.
-    ///
-    /// `docs/metadata-encodings.md`: in range in **49,614 of 49,614**, values
-    /// 1..8, and its tag is always a structure the file defines.
     #[must_use]
     pub const fn root(&self) -> &Block<'a> {
         &self.root
     }
 
-    /// Where a [`MetaPointer`] lands, or `None` when it is null.
-    ///
-    /// `at` is where the pointer was read from — [`Block::address`] answers it
-    /// — and is what a refusal reports.
+    /// Where a [`MetaPointer`] lands, or `None` when it is null; `at` is where
+    /// the pointer was read from.
     ///
     /// # Errors
     ///
-    /// [`Malformed::Pointer`] when the pointer names a block the table does not
-    /// hold, or an offset at or past that block's length. 0 of the corpus's
-    /// 1,362,769 pointers do either, so a reader refuses rather than guessing,
-    /// which is what `CodeWalker`'s `offset = offset >> 8` recovery does.
+    /// [`Malformed::Pointer`] when the pointer names a block the table does
+    /// not hold, or an offset at or past that block's length.
     pub fn landing(&self, pointer: MetaPointer, at: u64) -> Result<Option<Landing<'a>>> {
         let Some(id) = pointer.block() else {
             return Ok(None);
@@ -902,17 +733,13 @@ impl<'a> Meta<'a> {
 
 /// Reads a resource `Meta` payload into the document it describes.
 ///
-/// `payload` is the **inflated** payload of a resource entry and `system_len`
-/// is how many of its bytes are system pages —
-/// `crate::format::resource::size_from_flags` of the entry's system flags. The
-/// two spaces are addressed separately, so a `system_len` that is not the
-/// entry's is a caller error rather than a malformed file; nothing in the
-/// payload states it.
+/// `payload` is the inflated payload of a resource entry and `system_len` how
+/// many of its bytes are system pages; a `system_len` that is not the entry's
+/// is a caller error rather than a malformed file.
 ///
 /// # Errors
 ///
-/// [`Error::BadMeta`] for every way the file can contradict itself: the
-/// variants of [`Malformed`], each at the payload offset that reached it.
+/// [`Error::BadMeta`], at the payload offset that reached the contradiction.
 pub fn parse(payload: &[u8], system_len: usize) -> Result<Meta<'_>> {
     let header = Header::read(payload)?;
     let pages = Pages::split(payload, system_len)?;
@@ -1038,10 +865,8 @@ fn read_blocks<'a>(
 /// `count` records of `stride` bytes at `pointer`, with where they begin in the
 /// payload, or the empty slice when the count is 0.
 ///
-/// **This is the only allocation bound the tables need.** A table is refused
-/// unless its whole extent lies inside the space its pointer names, so a count
-/// larger than the payload can hold is a refusal rather than a `Vec` of that
-/// many records.
+/// The only allocation bound the tables need: a count larger than the space its
+/// pointer names is a refusal rather than a `Vec` of that many records.
 fn table(
     pages: Pages<'_>,
     pointer: ResourcePointer,
@@ -1115,27 +940,16 @@ pub enum Malformed {
     /// The word at [`MAGIC_AT`] is not [`MAGIC`].
     NotMeta,
     /// The version word at `0x14` is neither of the two that occur.
-    ///
-    /// `docs/metadata-encodings.md`: `0x00010079` on 49,608 files and `0x79` on
-    /// the six version-3 `.ymt`.
     Version,
-    /// The system page length the caller gave is longer than the payload.
-    ///
-    /// A fact about the entry's flag words rather than about these bytes, which
-    /// is why it says so rather than blaming the file.
+    /// The system page length the caller gave is longer than the payload,
+    /// which is a fact about the entry rather than about these bytes.
     Pages,
     /// A resource pointer's high 32 bits are set, so it is not one.
     PointerWidth,
     /// A resource pointer's space nibble is neither system nor graphics.
-    ///
-    /// `docs/metadata-encodings.md`: **0** of 1,014,378 pointers are in any
-    /// other space.
     Space,
     /// A resource pointer, or the table or block it introduces, does not lie
     /// inside the space it names.
-    ///
-    /// `docs/metadata-encodings.md`: **0** of 1,014,378 pointers are out of
-    /// range.
     OutOfRange,
     /// The root field names no block.
     RootBlock,
@@ -1144,39 +958,17 @@ pub enum Malformed {
     Pointer,
     /// A read fell outside the data block it was made in.
     DataRange,
-    /// A member's value does not lie inside the structure that declares it.
-    ///
-    /// The one check that measures this build's `secondary` type widths against
-    /// something the file itself states — `kind` says why it is load-bearing.
+    /// A member's value does not lie inside the structure that declares it,
+    /// which is the one check on a derived type width.
     MemberExtent,
     /// A structure a pointer or a member reaches is not one the file defines.
-    ///
-    /// `docs/metadata-encodings.md`: 0 of 462,942 block tags resolve to neither
-    /// a structure the file defines nor a bare type code, and 0 of 167,988
-    /// structure references on real members are unresolvable — so a file where
-    /// one is, is not one Rockstar's packer wrote.
     UndefinedStructure,
     /// An array's elements are declared **no bytes wide**.
     ///
-    /// A stride of zero puts every element of an array at one address and makes
-    /// an array of any count occupy nothing, so [`Malformed::MemberExtent`]'s
-    /// check — the one that measures a derived width against a length the file
-    /// states — passes for every count there is. It is reachable two ways: a
-    /// `0x05` naming a structure the file declares zero bytes long, and a
-    /// `0x50` whose own `referenceKey` is zero. Neither describes anything, and
-    /// a `0x52` carrying a count of four billion over it writes four billion
-    /// elements out of a payload that never grows.
-    ///
-    /// Refused where the stride is derived rather than left to a ceiling: a
-    /// budget bounds the work, and what is wanted here is the answer that the
-    /// file is wrong. No shipped file has one — the 51,168 inline arrays of the
-    /// corpus all have a product equal to the gap to the next member, and a gap
-    /// of zero is not a member.
+    /// A stride of zero makes an array of any count occupy nothing, so the
+    /// extent check would pass while the walk writes one element per count.
     ZeroStride,
     /// An array member's `arrayInfoIndex` names no member of its structure.
-    ///
-    /// `docs/metadata-encodings.md`: 925,473 indices resolved and **0**
-    /// unresolvable.
     ArrayInfo,
     /// Structures nested deeper than this walk goes.
     TooDeep,
@@ -1192,8 +984,7 @@ mod tests {
 
     use crate::metadata::hash::placeholder;
 
-    /// A payload under construction, so that a test states the bytes it means
-    /// and nothing else.
+    /// A payload under construction.
     struct Payload(Vec<u8>);
 
     impl Payload {
@@ -1202,8 +993,7 @@ mod tests {
             Self(vec![0; len])
         }
 
-        /// Writes `bytes` at `at`, growing nothing: a test that writes past the
-        /// end has written the wrong test.
+        /// Writes `bytes` at `at`, growing nothing.
         fn put(&mut self, at: usize, bytes: &[u8]) -> &mut Self {
             self.0[at..at.saturating_add(bytes.len())].copy_from_slice(bytes);
             self
@@ -1255,12 +1045,7 @@ mod tests {
     }
 
     /// A file with one structure of one member, one enum of one entry, and one
-    /// data block, laid out at fixed offsets a test can name.
-    ///
-    /// ```text
-    /// 0x50 structure table    0x70 member array   0x80 enum table
-    /// 0x98 enum entries       0xA0 block table    0xB0 block data
-    /// ```
+    /// data block, at fixed offsets a test can name.
     fn whole() -> Payload {
         let mut payload = bare(0x100);
         payload
@@ -1307,8 +1092,7 @@ mod tests {
         }
     }
 
-    /// Where a refusal points, for a test that asserts the offset that reached
-    /// it rather than only the cause.
+    /// Where a refusal points.
     #[track_caller]
     fn refused_at(error: &Error) -> u64 {
         match *error {
@@ -1323,12 +1107,10 @@ mod tests {
         assert_eq!(MAGIC_AT, 0x10);
         let payload = bare(HEADER_LEN);
         assert!(identifies(payload.bytes()));
-        // And it is a word at 0x10 rather than a magic at the front: the same
-        // bytes at offset 0 name nothing.
+        // A word at 0x10 and not a magic at the front.
         let mut moved = Payload::of(HEADER_LEN);
         moved.u32(0, MAGIC);
         assert!(!identifies(moved.bytes()));
-        // A payload too short to hold it is not one, and does not panic.
         for len in 0..=MAGIC_AT + 4 {
             let _ = identifies(&vec![0xFF; len]);
         }
@@ -1340,8 +1122,6 @@ mod tests {
         let pointer = ResourcePointer::wide(system(0x1234)).expect("a 32-bit pointer");
         assert_eq!(pointer.space(), Some(Space::System));
         assert_eq!(pointer.offset(), 0x1234);
-        // The word it was read from is the space and the offset back together,
-        // and neither half of it alone.
         assert_eq!(pointer.word(), 0x5000_1234);
         let pointer = ResourcePointer::wide(graphics(0x0FFF_FFFF)).expect("a 32-bit pointer");
         assert_eq!(pointer.space(), Some(Space::Graphics));
@@ -1362,8 +1142,7 @@ mod tests {
                 "space {space:#x}"
             );
         }
-        // And a value that does not fit 32 bits is not a resource pointer at
-        // all, rather than one with its high bits dropped.
+        // A value that does not fit 32 bits is not a resource pointer at all.
         assert_eq!(ResourcePointer::wide(1_u64 << 32), None);
         assert_eq!(ResourcePointer::wide(u64::MAX), None);
     }
@@ -1373,20 +1152,16 @@ mod tests {
         let pointer = MetaPointer::wide(data_pointer(3, 128));
         assert_eq!(pointer.block().map(BlockId::get), Some(3));
         assert_eq!(pointer.item_offset(), 128);
-        // `hei_ch3_06.ymap`'s entity array, which is what settles the 12-bit
-        // boundary: block 3 at offsets 0, 128 and 256.
+        // A real entity array: block 3 at offsets 0, 128 and 256.
         for (word, offset) in [(0x3, 0), (0x8_0003, 128), (0x10_0003, 256)] {
             let pointer = MetaPointer::wide(word);
             assert_eq!(pointer.block().map(BlockId::get), Some(3));
             assert_eq!(pointer.item_offset(), offset);
         }
-        // A 16-bit split would read the same three as block 3 at offset 8 and
-        // reach only the first 1,016 bytes of a 16,384-byte block.
+        // A 16-bit split would read these as block 3 at offset 8.
         assert_ne!(MetaPointer::wide(0x10_0003).item_offset(), 16);
         // A block id of 0 is null, and the id is bounded by its 12 bits.
         assert!(MetaPointer::wide(data_pointer(0, 4096)).is_null());
-        // And one that names a block is not null, which is the half a
-        // one-sided assertion leaves free.
         assert!(!MetaPointer::wide(data_pointer(3, 128)).is_null());
         assert_eq!(BlockId::new(0), None);
         assert_eq!(BlockId::new(BLOCK_MASK).map(BlockId::get), Some(4095));
@@ -1395,12 +1170,8 @@ mod tests {
 
     #[test]
     fn a_table_pointer_is_not_read_the_way_a_data_pointer_is() {
-        // The conflation, in the direction the header takes it. The structure
-        // table sits at `0x50` and its pointer is `0x50000050`: a resource
-        // pointer of space 5, offset 0x50. Read as a `Meta` pointer the same
-        // word is block 0x050 at item offset 0x50000, which resolves to
-        // nothing here and would resolve to the wrong bytes in a file with
-        // eighty blocks.
+        // The structure table's pointer `0x50000050` is space 5, offset 0x50;
+        // read as a `Meta` pointer it is block 0x050 at offset 0x50000.
         let payload = whole();
         let conflated = MetaPointer::wide(system(0x50));
         assert_eq!(conflated.block().map(BlockId::get), Some(0x50));
@@ -1413,11 +1184,8 @@ mod tests {
 
     #[test]
     fn a_data_pointer_is_not_read_the_way_a_table_pointer_is() {
-        // The conflation in the other direction, and the case that would pass
-        // if the two kinds were one integer. The word inside the block is
-        // `0x5003`: as a `Meta` pointer it is block 3 at offset 5, and as a
-        // resource pointer it is space 0, offset 0x5003 — which lands on a
-        // marker this payload deliberately puts there.
+        // `0x5003` is block 3 at offset 5 as a `Meta` pointer, and space 0
+        // offset 0x5003 — where the marker is — as a resource pointer.
         let mut payload = bare(0x6000);
         payload
             .u64(0x30, system(0xA0))
@@ -1452,8 +1220,6 @@ mod tests {
             landing.bytes.starts_with(b"BLOCK"),
             "a conflated read lands on the resource-pointer marker instead"
         );
-        // The two decodes really do differ here: as a resource pointer the same
-        // word is space 0 at offset 0x5003, which is where `PAGES` is.
         let conflated = ResourcePointer::wide(pointer.word()).expect("a 32-bit word");
         assert_eq!(conflated.space(), None);
         assert_eq!(conflated.offset(), 0x5003);
@@ -1510,8 +1276,8 @@ mod tests {
         let members: Vec<Member> = structure.members().collect();
         assert_eq!(members.len(), 1);
         let member = members[0];
-        // The correction that matters: `dataOffset` is a `u32` at offset 4, so
-        // reading `PSO`'s twelve-byte member here shifts every field after it.
+        // `dataOffset` is a `u32` at offset 4; `PSO`'s twelve-byte member
+        // would shift every field after it.
         assert_eq!(member.name, 0x3333_3333);
         assert_eq!(member.data_offset, 0x10);
         assert_eq!(member.type_code.get(), 0x07);
@@ -1544,8 +1310,7 @@ mod tests {
         assert!(meta.enumeration(0).is_none());
         assert!(meta.block(BlockId::new(2).expect("a second id")).is_none());
 
-        // And the other side of the emptiness question: a row declaring no
-        // bytes gives a block that holds none.
+        // A row declaring no bytes gives a block that holds none.
         let mut hollow = whole();
         hollow.u32(0xA4, 0);
         let meta = parse(hollow.bytes(), hollow.bytes().len()).expect("a whole file");
@@ -1555,10 +1320,8 @@ mod tests {
 
     #[test]
     fn a_block_tag_is_a_structure_the_file_defines_or_a_bare_type_code() {
-        // The 23 type codes are not enumerated anywhere, so the only question
-        // that can be asked is whether the file's own structure table has the
-        // hash — which is the question `docs/metadata-encodings.md` measured:
-        // 369,488 structures, 93,454 bare codes, 0 neither.
+        // The only question that can be asked is whether the file's own
+        // structure table has the hash.
         let mut payload = whole();
         payload.u32(0xA0, 0x1111_1111);
         let meta = parse(payload.bytes(), payload.bytes().len()).expect("a whole file");
@@ -1571,9 +1334,8 @@ mod tests {
 
     #[test]
     fn the_two_page_spaces_are_separate_and_the_split_decides_which() {
-        // A graphics pointer's offset is flat within the graphics pages, so the
-        // same file read with a different split reads different bytes — which
-        // is why the split is a parameter and not a guess.
+        // A graphics pointer's offset is flat within the graphics pages, so a
+        // different split reads different bytes.
         let mut payload = bare(0x200);
         payload
             .u64(0x30, graphics(0x10))
@@ -1587,15 +1349,13 @@ mod tests {
         let meta = parse(payload.bytes(), 0x100).expect("a file with a graphics block");
         assert_eq!(u32_at(meta.root().bytes(), 0), Some(0x0BAD_F00D));
 
-        // With the whole payload declared system, the graphics space is empty
-        // and every graphics pointer is out of range rather than silently
-        // reading the system pages.
+        // With the whole payload declared system, every graphics pointer is
+        // out of range rather than reading the system pages.
         assert_eq!(
             refusal(&parse(payload.bytes(), payload.bytes().len()).expect_err("no graphics pages")),
             Malformed::OutOfRange
         );
-        // And a system table does not spill into the graphics pages: a block
-        // whose extent crosses the split is refused.
+        // A block whose extent crosses the split is refused.
         let mut crossing = bare(0x200);
         crossing
             .u64(0x30, system(0x110))
@@ -1610,14 +1370,8 @@ mod tests {
 
     #[test]
     fn every_refusal_is_reachable() {
-        // §6, and `docs/conventions.md` §12's rule that the malformed cases
-        // are tested deliberately: one payload per variant of `Malformed` that
-        // [`parse`] itself raises. The walk's own — `DataRange`,
-        // `MemberExtent`, `UndefinedStructure`, `ArrayInfo`, `TooDeep`,
-        // `TooManyNodes` and `TooLarge` — belong to `render` and `apply`, and
-        // are pinned in `crates/rpf-core/tests/metadata.rs` and, for the three
-        // that are ceilings, at their boundary in
-        // `crates/rpf-core/tests/boundaries.rs`.
+        // One payload per variant of `Malformed` that `parse` itself raises;
+        // the walk's own belong to `render` and `apply`.
         let short = vec![0_u8; HEADER_LEN - 1];
         assert_eq!(
             refusal(&parse(&short, 0).expect_err("shorter than a header")),
@@ -1671,7 +1425,6 @@ mod tests {
             refusal(&parse(root.bytes(), HEADER_LEN).expect_err("no root")),
             Malformed::RootBlock
         );
-        // And a root the block table does not reach, which is the other half.
         let mut missing = bare(HEADER_LEN);
         missing.u32(0x1C, 2);
         assert_eq!(
@@ -1702,8 +1455,6 @@ mod tests {
 
     #[test]
     fn a_pointer_at_or_past_its_blocks_length_is_refused_rather_than_guessed_at() {
-        // 0 of the corpus's pointers do either, which is what says
-        // `CodeWalker`'s `offset = offset >> 8` recovery is never needed.
         let payload = whole_with_pointer(data_pointer(1, 0x10));
         let meta_file = parse(payload.bytes(), payload.bytes().len()).expect("a whole file");
         let block = meta_file.root();
@@ -1716,8 +1467,7 @@ mod tests {
             ),
             Malformed::Pointer
         );
-        // One byte earlier resolves, so the boundary is at the length and not
-        // one past it.
+        // One byte earlier resolves: the boundary is at the length.
         let payload = whole_with_pointer(data_pointer(1, 0xF));
         let meta_file = parse(payload.bytes(), payload.bytes().len()).expect("a whole file");
         let block = meta_file.root();
@@ -1740,17 +1490,16 @@ mod tests {
 
     #[test]
     fn a_table_larger_than_the_payload_is_a_refusal_and_never_an_allocation() {
-        // The bound on every allocation `parse` makes: a table of `n` records
-        // has to lie inside the space its pointer names, so 65,535 structures
-        // in an 0x100-byte payload is one refusal rather than 65,535 records.
+        // A table of `n` records must lie inside the space its pointer names,
+        // so a hostile count is one refusal rather than `n` records.
         let mut payload = whole();
         payload.u16(0x48, u16::MAX);
         assert_eq!(
             refusal(&parse(payload.bytes(), payload.bytes().len()).expect_err("no room")),
             Malformed::OutOfRange
         );
-        // The same for a structure's members, which is where a hostile count
-        // costs most: nothing collects them, and the extent is still checked.
+        // The same for a structure's members: nothing collects them, and the
+        // extent is still checked.
         let mut payload = whole();
         payload.u16(0x6E, u16::MAX);
         assert_eq!(
@@ -1768,13 +1517,10 @@ mod tests {
 
     #[test]
     fn a_table_of_no_records_needs_no_pointer() {
-        // A count of 0 with a null pointer is an empty table and not a refusal:
-        // the pointer names nothing because there is nothing to name.
+        // A count of 0 with a null pointer is an empty table, not a refusal.
         let payload = bare(HEADER_LEN);
         let meta = parse(payload.bytes(), HEADER_LEN).expect_err("the root names no block");
         assert_eq!(refusal(&meta), Malformed::RootBlock);
-        // With one block, the same file parses and its two other tables are
-        // empty.
         let mut payload = bare(0x100);
         payload
             .u64(0x30, system(0xA0))
@@ -1790,9 +1536,8 @@ mod tests {
 
     #[test]
     fn no_payload_of_any_shape_panics() {
-        // §6: the bytes are third-party and some of them are malformed
-        // deliberately. Every prefix of a whole file, and every prefix with its
-        // last byte set, at every split.
+        // Every prefix of a whole file, and every prefix with its last byte
+        // set, at every split.
         let payload = whole();
         let bytes = payload.bytes();
         for len in 0..bytes.len() {
@@ -1805,18 +1550,14 @@ mod tests {
             }
             let _ = parse(&truncated, len);
         }
-        // And a header whose every field is set.
         let ones = vec![0xFF_u8; 0x200];
         let _ = parse(&ones, 0x100);
     }
 
     #[test]
     fn the_headers_two_unnamed_pointers_have_to_land_in_the_space_they_name() {
-        // `docs/metadata-encodings.md` measured 0 of 1,014,378 pointers out of
-        // range, and nothing says how many bytes either of these two owns — so
-        // all `parse` can ask of them is that they land, and it asks it of
-        // both. A file whose `pages_info` at `0x08` or whose pointer at `0x40`
-        // points past the space its nibble names is refused there.
+        // Nothing says how many bytes either of these two owns, so all
+        // `parse` can ask is that they land.
         for at in [0x08_usize, 0x40] {
             let mut payload = bare(HEADER_LEN);
             payload.u64(at, system(0x100));
@@ -1824,29 +1565,23 @@ mod tests {
             assert_eq!(refusal(&error), Malformed::OutOfRange, "at {at:#x}");
             assert_eq!(refused_at(&error), address(at), "at {at:#x}");
         }
-        // A null one names nothing, so there is nothing to check and it is
-        // accepted: `0x40` is 0 on most shipped files.
+        // A null one names nothing and is accepted.
         let mut payload = whole();
         payload.u64(0x08, 0).u64(0x40, 0);
         parse(payload.bytes(), payload.bytes().len()).expect("null pointers name nothing");
-        // As is one that does land.
         payload.u64(0x08, system(0x50)).u64(0x40, system(0xFF));
         parse(payload.bytes(), payload.bytes().len()).expect("both pointers land");
     }
 
     #[test]
     fn a_malformed_table_record_is_refused_at_its_own_address() {
-        // "each at the payload offset that reached it": a record's address is
-        // its table's base plus its index times its stride, so the second
-        // record of a table at `0x100` is reported at `0x120` and at `0x110`
-        // for the two strides below — never at the table's own address and
-        // never at the payload's.
+        // A record's address is its table's base plus index times stride,
+        // never the table's own address.
         let mut structures = bare(0x200);
         structures
             .u64(0x20, system(0x100))
             .u16(0x48, 2)
-            // The first record declares no members, so only the second is bad:
-            // its `membersPtr` has its high half set.
+            // Only the second record is bad: its `membersPtr` high half is set.
             .u64(0x130, 1_u64 << 32);
         let error = parse(structures.bytes(), structures.bytes().len())
             .expect_err("the second structure's pointer is not one");
@@ -1857,8 +1592,7 @@ mod tests {
         blocks
             .u64(0x30, system(0x100))
             .u16(0x4C, 2)
-            // The first row is an empty block at a pointer that lands; the
-            // second's pointer has its high half set.
+            // The second row's pointer has its high half set.
             .u64(0x108, system(0x180))
             .u64(0x118, 1_u64 << 32);
         let error = parse(blocks.bytes(), blocks.bytes().len())
@@ -1867,14 +1601,9 @@ mod tests {
         assert_eq!(refused_at(&error), 0x110);
     }
 
-    /// A file whose root structure holds a pointer into a block **tagged with
-    /// the bare pointer type code**, whose own first word points back at that
-    /// block.
-    ///
-    /// The cycle this makes runs through `target` and never through an element:
-    /// a typed block names its one value's type and nothing else, so following
-    /// a pointer into a block tagged `0x07` writes no element, charges no node,
-    /// and — until the walk was made to count the hop — deepened nothing.
+    /// A file whose root structure points into a block tagged `0x07` whose own
+    /// first word points back at it; the cycle writes no element and charges no
+    /// node, so only the depth counted for the hop refuses it.
     fn pointer_cycle() -> Payload {
         let mut payload = bare(0x100);
         payload

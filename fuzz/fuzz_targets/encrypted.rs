@@ -1,83 +1,16 @@
 //! The encrypted read path: `decrypt_table_of_contents`, `Plain::Keyed`,
 //! `Decrypting`, and the NG arm of `Cipher::block`.
 //!
-//! **Every other target here passes `Unlock::unkeyed()`, so every other target
-//! stops at `NeedsKey`.** Five of them open archives and none has ever
-//! decrypted a byte: the whole of `format::crypto`'s NG half, the table of
-//! contents decrypt, and the streaming decrypt an entry is read through were
-//! unreached by roughly three billion inputs. DR-048 argues why that was worth
-//! opening a seam for and why this is the seam that costs nothing.
+//! No key material is consulted: `Material::over_bytes` is `#[cfg(fuzzing)]`
+//! and takes bytes the caller already has. With every round key zero and the
+//! table for byte position `c` set to `T[c][b] = b << 8·(c mod 4)`, each round
+//! is a byte permutation and the rounds compose to one fixed permutation, which
+//! [`transform`] measures and [`sealed`] inverts. Every region an archive
+//! decrypts starts on a cipher block boundary of the file, so sealing blockwise
+//! from the end of the header seals all of them.
 //!
-//! # How a fuzz target holds a key
-//!
-//! It does not. `Material::over_bytes` — `#[cfg(fuzzing)]`, so it is in no
-//! release build and in nothing a dependent compiles — takes bytes the caller
-//! already has, and what this passes is a fill pattern and a table network
-//! built below. No anchor is consulted and nothing is searched for, so this
-//! reaches none of `keys::anchors` and says nothing about any real
-//! installation. DR-006 is untouched: it is about where a real key comes from
-//! and about what this repository carries, and neither is in question.
-//!
-//! # How an archive gets encrypted without an encryptor
-//!
-//! The library decrypts and never encrypts, so a target that wanted a real
-//! ciphertext would have to write the inverse of a white-box transform, which
-//! is not a thing that can be written. It does not have to: **the transform is
-//! driven entirely by tables the material carries, and the material here is
-//! ours.**
-//!
-//! `ng_round` makes each output word the exclusive-or of four table lookups
-//! and a round-key word. Give every round key zero, and give the table for
-//! byte position `c` the entry `T[c][b] = b << 8·(c mod 4)`, and each round
-//! becomes a **byte permutation**: the four positions feeding one output word
-//! land in four distinct lanes of it, so nothing is lost and nothing is mixed.
-//! Seventeen such rounds compose to one fixed permutation of the sixteen
-//! positions, whatever order the rounds read them in — which matters, because
-//! the two orders are private to `crypto` and this deliberately does not
-//! restate them (§3).
-//!
-//! So the permutation is **measured rather than derived**: decrypt the block
-//! `0, 1, … 15` and read off where each position went. [`sealed`] applies the
-//! inverse. [`transform`] asserts that what came back is a permutation at all
-//! and that sealing round-trips, so a change to the round orders, the round
-//! count or the table layout fails this target loudly instead of leaving it
-//! quietly fuzzing an archive nothing will open.
-//!
-//! Sealing the whole file past its header seals every region's **body**
-//! without knowing where any region is, which is the other thing that makes
-//! this cheap: the permutation is applied to each aligned block of a region
-//! independently, the header is one cipher block long, and every region an
-//! archive decrypts — the entry table, the names blob, a payload at a block
-//! offset — therefore starts on a cipher block boundary of the file itself.
-//!
-//! **A region whose length is not a whole number of blocks is a different
-//! matter, and the seeds are what answer it.** The tail shorter than a block
-//! is neither padded nor transformed — the format's rule, which `Cipher::apply`
-//! and `Decrypting` both keep — so the reader leaves those bytes alone while a
-//! seal that walks the file blockwise does not. Sealing them is not a defect
-//! and needs no correcting: a names blob or a payload whose last few bytes are
-//! not what the packer put there is hostile data, which is the whole supply
-//! this target is fed. It matters only for the **seeds**, because a seed whose
-//! names do not survive is a seed that reaches nothing past `check_names`. So
-//! the seeds are built with every region a whole number of blocks — searched
-//! for rather than reasoned about, and each one verified to read back its
-//! plaintext byte for byte before it was written down. Measured: four seeds,
-//! covering a stored payload, a deflated one, a mixed archive with a nested
-//! directory and an open entry beside keyed ones, and a payload of exactly one
-//! block.
-//!
-//! # What this does and does not say
-//!
-//! It says the encrypted **framing** holds against hostile bytes: which bytes
-//! are transformed, where a block begins, what a short tail does, what a
-//! stream hands out, and what the table-of-contents decrypt does with a table
-//! that lies. That is the same thing `Cipher::over_zeros` is for in the
-//! crate's own tests, one level up.
-//!
-//! It says nothing about the transform's **values**. The round keys are zero,
-//! so all 101 of them are one key and `ng_key_index`'s answer does not change
-//! what comes out — a defect in key *selection* is invisible here and is
-//! pinned by `crypto`'s own tests and by the corpus NG archive instead.
+//! It says nothing about the transform's values: the round keys are zero, so a
+//! defect in key selection is invisible here.
 
 #![no_main]
 
@@ -104,25 +37,23 @@ const WORDS: usize = CIPHER_BLOCK_LEN / size_of::<u32>();
 
 /// The fill the synthetic AES key is made of.
 ///
-/// Any bytes at all. It is here so that the AES-tagged arms have a key to fail
-/// against — they reach the table-of-contents decrypt and its refusal, which
-/// is the arm real archives take when a user points the tool at the wrong
-/// executable.
+/// Any bytes at all: it is here so the AES-tagged arms have a key to fail
+/// against, reaching the table-of-contents decrypt and its refusal.
 const AES_FILL: u8 = 0x11;
 
 /// The fill the synthetic hash lookup table is made of.
 ///
-/// The NG name hash folds each byte through it, so it decides which of the 101
-/// expanded keys a name chooses. A constant fill makes that choice a function
-/// of the name's length alone, which is enough: the keys are identical.
+/// The NG name hash folds each byte through it, so it decides which expanded
+/// key a name chooses. A constant fill makes that choice a function of the
+/// name's length alone, which is enough: the keys are identical.
 const LUT_FILL: u8 = 0x22;
 
 /// An archive, the name its key is derived from, and what to tag it.
 #[derive(Debug, Arbitrary)]
 struct Input<'a> {
     /// Which transform to tag the archive with, as an index into what
-    /// [`tags`] found. Not a tag: the tag values belong to `format::rpf7` and
-    /// are read out of the crate rather than copied into it (§3).
+    /// [`tags`] found. Not a tag: the values belong to `format::rpf7` and are
+    /// read out of the crate rather than copied into it.
     scheme: u8,
     /// The archive's own file name, which with its length is what an NG key
     /// index is a function of. A renamed archive does not open, and that is
@@ -147,14 +78,9 @@ static TAG_AT: OnceLock<usize> = OnceLock::new();
 /// Everything this target answers once per process, answered before the first
 /// input rather than on its clock.
 ///
-/// **`init` is `LLVMFuzzerInitialize`, which libFuzzer calls before the fuzzing
-/// loop, so nothing here is charged to a unit's `-timeout`.** Lazily, it was:
-/// the [`tags`] scan is the whole of this cost, and the first input of every
-/// worker paid it. Measured on this machine, `cargo fuzz`'s own build flags,
-/// one input executed twice: **1,571 ms then 0 ms before this, 0 ms and 0 ms
-/// after** — and the campaign box, where the scan is 2.68 s, reported that
-/// first input as a `-timeout=5` hang. `docs/backlog.md`, the campaign of
-/// 2026-08-31; DR-055.
+/// `init` is `LLVMFuzzerInitialize`, called before the fuzzing loop, so nothing
+/// here is charged to a unit's `-timeout`; lazily, the [`tags`] scan was, and
+/// read as a hang on the first input of every worker.
 fn setup() {
     let _ = synthetic();
     let _ = transform();
@@ -165,9 +91,8 @@ fn setup() {
 /// Whether [`setup`] has already run, which is what the target asserts on every
 /// input.
 ///
-/// A value here that is still empty means a per-process answer is being
-/// computed on some input's clock — the defect DR-055 records, which cost a
-/// campaign a finding that said nothing about the library.
+/// A value still empty means a per-process answer is being computed on some
+/// input's clock.
 fn ready() -> bool {
     MATERIAL.get().is_some()
         && SHAPE.get().is_some()
@@ -188,9 +113,8 @@ fuzz_target!(init: setup(), |input: Input| {
         return;
     };
 
-    // Once per process, outside the watched region, for the reason
-    // `nested.rs` builds its chain outside one: it is the same answer every
-    // time and it is not what any input is about.
+    // Once per process, outside the watched region: it is the same answer
+    // every time and not what any input is about.
     let material = Arc::clone(synthetic());
     let (forward, backward) = *transform();
 
@@ -201,21 +125,15 @@ fuzz_target!(init: setup(), |input: Input| {
 
         let mut sealed_bytes = data.to_vec();
         stamped(&mut sealed_bytes, tag);
-        // Sealing an archive that will be refused for its key anyway costs
-        // nothing and keeps one code path here rather than two. The AES arms
-        // are refused; the NG arm opens.
+        // Sealing an archive that will be refused for its key anyway keeps one
+        // code path here rather than two.
         sealed(&mut sealed_bytes, &backward);
 
-        // **The cipher this input's own name and length choose**, checked
-        // before anything is opened so that it is checked on every input and
-        // not only on the ones that open. `ng_key_index` is a function of both
-        // — this is the one place it is reached with a name a fuzzer wrote —
-        // and the answer must not change the transform, because all 101
-        // expanded keys here are zero and therefore one key. A `forward` that
-        // moved would mean the seal below no longer matches the opener, which
-        // is the failure that would otherwise show up as nothing at all: an
-        // archive that silently stops opening and a target that silently stops
-        // testing.
+        // The cipher this input's own name and length choose, checked before
+        // anything is opened so it is checked on every input. The key index
+        // must not change the transform — every expanded key here is one key —
+        // because a `forward` that moved means the seal no longer matches the
+        // opener, and the target silently stops testing.
         let mut probe = ladder();
         let cipher = Cipher::new(Scheme::Ng, synthetic(), name, sealed_len(&sealed_bytes))
             .expect("the synthetic material carries the NG half");
@@ -245,9 +163,8 @@ fuzz_target!(init: setup(), |input: Input| {
             let _ = archive.payload_at(index);
             let _ = archive.payload_is_resource(&mut src, index);
 
-            // The streaming decrypt. An entry whose own encryption field says
-            // keyed is read through `Decrypting`; one that says open is read
-            // through `Clear`, and which it is is the archive's to say.
+            // The streaming decrypt: a keyed entry is read through
+            // `Decrypting`, an open one through `Clear`.
             if let Ok(stream) = archive.extracted(Cursor::new(sealed_bytes.as_slice()), index) {
                 let _ = copy(&mut stream.take(DRAIN_LIMIT), &mut sink());
             }
@@ -272,10 +189,9 @@ fn ladder() -> [u8; CIPHER_BLOCK_LEN] {
 /// The material every input is opened with, built once.
 fn synthetic() -> &'static Arc<Material> {
     MATERIAL.get_or_init(|| {
-        // Zero, so that all 101 expanded keys are one key and each round
-        // contributes only its table lookups. A non-zero round key would make
-        // the transform affine rather than a permutation, and the inverse
-        // would then have to be measured in two steps instead of one.
+        // Zero, so every expanded key is one key and each round contributes
+        // only its table lookups: a non-zero round key would make the transform
+        // affine rather than a permutation.
         let expanded = vec![0_u8; NG_EXPANDED_KEY_COUNT.saturating_mul(NG_EXPANDED_KEY_LEN)];
         Arc::new(
             Material::over_bytes(
@@ -327,9 +243,8 @@ fn network() -> Vec<u8> {
 /// # Panics
 ///
 /// If what came back is not a permutation, or if sealing does not round-trip
-/// through it. Either means the transform is no longer the shape this target
-/// is built on, and a target that carried on would be fuzzing archives that
-/// cannot open.
+/// through it: either means the transform is no longer the shape this target
+/// is built on.
 fn transform() -> &'static ([u8; CIPHER_BLOCK_LEN], [u8; CIPHER_BLOCK_LEN]) {
     SHAPE.get_or_init(|| {
         let cipher = Cipher::new(Scheme::Ng, synthetic(), "", 0)
@@ -366,30 +281,12 @@ fn transform() -> &'static ([u8; CIPHER_BLOCK_LEN], [u8; CIPHER_BLOCK_LEN]) {
 
 /// Every encryption tag `Version::scheme` names, found by asking it.
 ///
-/// **Not written down.** `rpf7`'s tag values are that module's fact and §3
-/// gives them one home; a copy here would go stale silently and leave this
-/// target stamping a word the crate no longer recognises, which is exactly the
-/// failure `docs/backlog.md` records for the target that fuzzed `rebuild`
-/// where clients call `rewrite`. `Version::scheme` is a public total function
-/// over `u32`, so the tags can simply be looked for.
+/// Not written down: a copy of `rpf7`'s tag values would go stale silently and
+/// leave this stamping a word the crate no longer recognises. `Version::scheme`
+/// is a public total function over `u32`, so the tags are looked for instead.
 ///
-/// The scan stops at the first tag naming each distinct scheme, which takes
-/// 0.27 billion words. **Measured 2026-08-31 on the campaign box: 2.68 s of
-/// process startup against 0.02 s for a target without it** — the cost is the
-/// scan under AddressSanitizer, which instruments every one of those
-/// comparisons.
-///
-/// Paid anyway, and the arithmetic is worth writing down rather than
-/// re-deciding: libFuzzer's fork mode restarts a worker about every 45 s, so
-/// this is roughly six percent of the target's time. What it buys is that a
-/// tag value cannot go stale here without going stale in `rpf7` too — and
-/// `docs/backlog.md` records what a fuzz target that has quietly stopped
-/// testing what it claims costs, which is a whole campaign. The same trade
-/// `nested_to_the_bound` makes, at a higher price.
-///
-/// Paid in [`setup`], which is where the price stops being an input's. On the
-/// first input it read as a `-timeout=5` hang against 218 bytes that cost
-/// nothing — the finding DR-055 is about.
+/// The scan costs seconds of process startup under AddressSanitizer, which is
+/// why it is paid in [`setup`] rather than on an input's clock.
 fn tags() -> &'static [u32] {
     TAGS.get_or_init(|| {
         let version = Version::Rpf7;
@@ -402,8 +299,7 @@ fn tags() -> &'static [u32] {
                 found.push((tag, scheme));
             }
             // Every scheme an `AesKey` and the NG arm can name. Asserted below
-            // rather than assumed, so a scheme added later is a failure here
-            // instead of an arm this target silently stops stamping.
+            // so a scheme added later fails here rather than going unstamped.
             if found.len() == 3 {
                 break;
             }
@@ -421,10 +317,9 @@ fn tags() -> &'static [u32] {
 /// Where an archive's own encryption tag sits in its header, found rather than
 /// written down.
 ///
-/// `build` writes `Version::open()` there, so the offset is the one place in a
-/// header **this build wrote** that holds the tag it wrote. Asserted unique,
-/// so a header that grew a second field of the same value fails here instead
-/// of leaving the tag stamped over something else.
+/// `build` writes `Version::open()` there. Asserted unique, so a header that
+/// grew a second field of the same value fails here instead of leaving the tag
+/// stamped over something else.
 fn tag_offset() -> usize {
     *TAG_AT.get_or_init(|| {
         let header = nested_to_the_bound();
@@ -443,11 +338,9 @@ fn tag_offset() -> usize {
 
 /// How long a header is, which is where the encrypted regions begin.
 ///
-/// The tag is the header's last field, so the header ends four bytes after it.
-/// Asserted to be a whole number of cipher blocks, because that is the claim
-/// [`sealed`] rests on: every region an archive decrypts starts on a cipher
-/// block boundary of the file, so sealing from here blockwise seals all of
-/// them without knowing where any of them is.
+/// The tag is the header's last field. Asserted to be a whole number of cipher
+/// blocks, which is the claim [`sealed`] rests on: every region an archive
+/// decrypts then starts on a cipher block boundary of the file.
 fn header_len() -> usize {
     let end = tag_offset().saturating_add(size_of::<u32>());
     assert_eq!(

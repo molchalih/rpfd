@@ -1,19 +1,7 @@
-//! R0.4: unpack, pack, unpack, and compare.
+//! Unpack, pack, unpack, and compare.
 //!
-//! The rebuilt archive is not expected to be byte-identical to the original —
-//! a different deflate implementation makes different, equally valid streams,
-//! and this rebuilder packs tightly where the original carries 82.7% slack.
-//! What must survive is every entry's **contents**, and the checksums the
-//! oracle recorded for them.
-//!
-//! Green here means the archive is self-consistent and reads back. It does not
-//! mean the game will load it. Only R0.5 means that, and there is no machine
-//! for it yet.
-//!
-//! The tests at the end are corpus-free and build the archive they need. They
-//! are here rather than beside the corpus ones because they check the same
-//! thing from the other side: what a build writes, and what it refuses to write
-//! at all.
+//! A rebuild is not byte-identical to its original — what must survive is every
+//! entry's contents and the checksums the oracle recorded for them.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -41,8 +29,7 @@ use sha2::{Digest, Sha256};
 const FIXTURE: &str = "../../fixtures/rmrp_bp16_meringls63amg24.json";
 const RELATIVE_ARCHIVE: &str = "rmrp_bp16_meringls63amg24/dlc.rpf";
 
-/// Whether a name is a nested archive. `name` is already lower-cased, so the
-/// suffix comparison is exact rather than case-sensitive by accident.
+/// Whether a name is a nested archive; `name` is already lower-cased.
 #[allow(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "name is lower-cased"
@@ -51,10 +38,8 @@ fn is_nested_archive(name: &str) -> bool {
     name.ends_with(".rpf")
 }
 
-/// Scratch space on disk, as the frontends supply it.
-///
-/// Unnamed, so it is unlinked as soon as it is made and an interrupted rebuild
-/// leaves nothing behind.
+/// Scratch space on disk, as the frontends supply it — unnamed, so an
+/// interrupted rebuild leaves nothing behind.
 struct OnDisk;
 
 impl rpf_core::Scratch for OnDisk {
@@ -71,11 +56,7 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Asserts that a build was refused because two names in one directory are one
-/// name, naming both of them by path.
-///
-/// Names both, because which two collided is the whole of what a caller acts
-/// on: matching the variant alone accepts any pair against any archive.
+/// Asserts a build was refused for two names in one directory, naming both.
 fn collision<T: std::fmt::Debug>(refused: Result<T, Error>, path: &str, against: &str) {
     match refused {
         Err(Error::NameCollision {
@@ -90,11 +71,6 @@ fn collision<T: std::fmt::Debug>(refused: Result<T, Error>, path: &str, against:
 }
 
 /// Asserts that a build was refused for `path`, for `reason` and no other.
-///
-/// [`Error::BadPath`] carries several distinct reasons and the path each is
-/// about, and both are what a caller acts on: matching the variant alone
-/// accepts any reason against any path, which is every one of these tests
-/// passing for the wrong archive.
 fn refusal<T: std::fmt::Debug>(refused: Result<T, Error>, path: &str, reason: &str) {
     match refused {
         Err(Error::BadPath {
@@ -109,13 +85,7 @@ fn refusal<T: std::fmt::Debug>(refused: Result<T, Error>, path: &str, reason: &s
 }
 
 /// The archive this fixture describes, or `None` with `test` and a reason on
-/// stderr.
-///
-/// The ordinary case — no `RPF_CORPUS` at all — never reaches here: `build.rs`
-/// turns that into `#[ignore]`, which the harness reports by name whether or
-/// not output is captured. What is left is a corpus that was pointed at and
-/// does not hold this archive, and the one thing a reader needs then is which
-/// test went unrun.
+/// stderr. No `RPF_CORPUS` at all is turned into `#[ignore]` by `build.rs`.
 fn corpus_archive(test: &str) -> Option<(PathBuf, Value)> {
     let reason = match env::var_os("RPF_CORPUS") {
         None => "RPF_CORPUS is not set".to_owned(),
@@ -138,12 +108,8 @@ fn corpus_archive(test: &str) -> Option<(PathBuf, Value)> {
     None
 }
 
-/// Turns an archive we can read into the specification for one we can write.
-///
-/// The storage choice is taken from the original rather than guessed: an entry
-/// that was stored stays stored, and one that was deflated is offered to the
-/// compressor again. That is the manifest's job (R4.1) and this is it in
-/// miniature.
+/// Turns an archive we can read into the specification for one we can write,
+/// taking each entry's storage choice from the original rather than guessing.
 fn specs_for(archive: &Archive) -> Vec<(FileSpec, u32)> {
     let mut out = Vec::new();
     for index in 0..u32::try_from(archive.entries().len()).expect("fits") {
@@ -236,11 +202,9 @@ fn a_rebuilt_archive_holds_the_same_contents() {
     );
     rebuilt.as_file_mut().flush().expect("flushed");
 
-    // Read the rebuild back with the same reader.
     let mut handle = fs::File::open(rebuilt.path()).expect("rebuild opens");
     let round = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
 
-    // Same tree, by full path.
     let original_paths: Vec<String> = (0..original.entries().len() as u32)
         .map(|i| original.path(i).expect("path"))
         .collect();
@@ -253,7 +217,6 @@ fn a_rebuilt_archive_holds_the_same_contents() {
     b.sort();
     assert_eq!(a, b, "the rebuilt tree differs");
 
-    // Same contents, against the oracle's own record of the original.
     let mut round_sums = BTreeMap::new();
     leaf_checksums(&mut handle, &round, "", &mut round_sums);
 
@@ -273,9 +236,7 @@ fn a_rebuilt_archive_holds_the_same_contents() {
         "contents changed across the round trip"
     );
 
-    // Children come out in ascending name order, which is what every directory
-    // in every observed archive does. Whether the runtime requires it is Q1;
-    // until that is settled the rebuilder follows the observation.
+    // Ascending name order, which is what every observed directory does.
     let mut directories = 0_u32;
     for index in 0..round.entries().len() as u32 {
         let Ok(range) = round.children(index) else {
@@ -293,13 +254,11 @@ fn a_rebuilt_archive_holds_the_same_contents() {
         "directories in the rebuilt top-level archive"
     );
 
-    // Keeping the rebuild lets a different implementation read it, which is a
-    // stronger check than our reader reading our writer. tools/oracle/README.md
     if let Some(dest) = env::var_os("RPF_REBUILD_OUT") {
         fs::copy(rebuilt.path(), PathBuf::from(dest)).expect("rebuild is copyable");
     }
 
-    // Packing tightly is the visible difference. The original is 82.7% slack.
+    // Packing tightly is the visible difference: the original carries slack.
     let original_len = fs::metadata(&path).expect("stat").len();
     assert!(
         report.len < original_len,
@@ -366,12 +325,10 @@ fn an_injected_corruption_is_caught() {
     );
 }
 
-/// R4.9: changing an entry inside a nested archive rebuilds every ancestor.
+/// Changing an entry inside a nested archive rebuilds every ancestor.
 ///
-/// The swap is deliberate — a texture's payload replaced by a model's. The two
-/// carry different page flags (`0x00020000`/`0xD1020008` against
-/// `0xA10402C6`/`0x20000000`), so if the rebuilt entry ends up with the flags
-/// it had rather than the flags its new payload carries, this fails.
+/// A texture's payload is replaced by a model's: the two carry different page
+/// flags, so an entry keeping its old flags fails here.
 #[test]
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn replacing_a_nested_entry_cascades() {
@@ -407,8 +364,7 @@ fn replacing_a_nested_entry_cascades() {
         &original,
         &rpf_core::Changes::writing(edits),
         rebuilt.as_file_mut(),
-        // The corpus cascade: a 62 MB ancestor, rebuilt into scratch on disk
-        // rather than into memory. R4.13.
+        // A 62 MB ancestor, rebuilt into scratch on disk rather than memory.
         &mut OnDisk,
         &mut Unwatched,
     )
@@ -418,13 +374,11 @@ fn replacing_a_nested_entry_cascades() {
     let mut handle = fs::File::open(rebuilt.path()).expect("rebuild opens");
     let round = Archive::open(&mut handle, &rpf_core::Unlock::unkeyed()).expect("rebuild parses");
 
-    // The target now holds the donor's bytes.
     let (holder, index) = round.locate(&mut handle, TARGET).expect("target resolves");
     let bytes = holder.extract(&mut handle, index).expect("target extracts");
     assert_eq!(sha256(&bytes), donor_sum, "the replacement did not take");
 
-    // And the entry describing it carries the payload's flags, not the old
-    // entry's. This is the assertion the swap exists for.
+    // And the entry carries the payload's flags, not the old entry's.
     let EntryKind::Resource {
         system_flags: got_system,
         graphics_flags: got_graphics,
@@ -439,7 +393,6 @@ fn replacing_a_nested_entry_cascades() {
         "flags"
     );
 
-    // Every other leaf file is untouched.
     let mut sums = BTreeMap::new();
     leaf_checksums(&mut handle, &round, "", &mut sums);
     let expected: BTreeMap<String, String> = fixture["files"]
@@ -470,14 +423,8 @@ fn replacing_a_nested_entry_cascades() {
     }
 }
 
-/// R4.10 against the real thing: an entry added, one removed and one renamed
-/// inside a nested archive of the 145 MB sample, all in one change set.
-///
-/// What this proves is what this repository can prove — the archive parses,
-/// every entry reads back, and the tree is what was asked for. **It is not
-/// evidence the game loads it.** Whether the runtime accepts an entry count
-/// that is not the one its producer wrote is Q8 and needs a machine running
-/// the game; DR-026 records that the answer is unknown rather than assumed.
+/// An entry added, one removed and one renamed inside a nested archive of the
+/// 145 MB sample, all in one change set.
 #[test]
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn a_structural_change_to_the_sample_reads_back() {
@@ -558,20 +505,13 @@ fn a_structural_change_to_the_sample_reads_back() {
         b"<added/>".to_vec(),
     );
 
-    // And every entry of the whole archive still reads back as it describes
-    // itself, which is the strongest thing this end can say about it.
     rpf_core::Verified::of(&mut handle, &round, &mut Unwatched)
         .expect("verifies")
         .outcome()
         .expect("reads back clean");
 }
 
-// --- Corpus-free: what a build writes, and what it refuses ------------------
-
 /// Bytes that do not compress, so a deflate of them is larger than they are.
-///
-/// A xorshift rather than a pattern: anything with structure in it deflates,
-/// and this exists to reach the branch where deflate does not.
 fn incompressible(len: usize) -> Vec<u8> {
     let mut state = 0x1234_5678_u32;
     (0..len)
@@ -584,19 +524,10 @@ fn incompressible(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A payload offered to the compressor that comes back bigger is written as it
-/// came, and the archive is exactly as long as it says it is.
-///
-/// This is R4.4's fallback, and streaming changed how it is reached: the
-/// deflate stream is now written into the sink before its length is known, so
-/// the fallback overwrites it. It reached further than the plain bytes do, and
-/// what is left of it has to be accounted for — zeroed rather than left stale
-/// (§8), and inside the archive's own length rather than past it. Left
-/// unaccounted, the last such payload in an archive makes the file longer than
-/// `Report::len`, which is what `build_on_disk` asserts against.
-///
-/// Two entries, so the case is covered both with a payload after it and as the
-/// last thing in the archive.
+/// The deflate stream is written into the sink before its length is known, so
+/// the fallback overwrites it and the tail it reached past must be zeroed and
+/// counted inside the archive's own length. Two entries, so the case is covered
+/// both with a payload after it and as the last thing in the archive.
 #[test]
 fn a_deflate_that_does_not_pay_for_itself_is_stored_and_nothing_stale_is_left() {
     let deflated = |path: &str| FileSpec {
@@ -606,8 +537,8 @@ fn a_deflate_that_does_not_pay_for_itself_is_stored_and_nothing_stale_is_left() 
             encryption: 0,
         },
     };
-    // 511 bytes: one short of a block, so the padding a smaller payload would
-    // have left is not wide enough to absorb what deflate added.
+    // 511 bytes: one short of a block, so the padding left is not wide enough
+    // to absorb what deflate added.
     let bulk = incompressible(511);
     let files = [deflated("first.bin"), deflated("last.bin")];
     let (report, bytes) = build_on_disk(&files, &[], |_| Ok(bulk.clone()));
@@ -631,10 +562,8 @@ fn a_deflate_that_does_not_pay_for_itself_is_stored_and_nothing_stale_is_left() 
         );
     }
 
-    // `build_on_disk` already compares the file's length with the report's.
-    // This says the same thing from the archive's side: every byte past the
-    // last payload is the padding the archive claims, not a tail of a deflate
-    // stream nobody kept.
+    // Every byte past the last payload is the padding the archive claims, not
+    // a tail of a deflate stream nobody kept.
     let last = archive.find("last.bin").expect("resolves");
     let EntryKind::Binary { block, .. } = archive.entry(last).expect("in range").kind else {
         panic!("last.bin should be binary")
@@ -647,15 +576,8 @@ fn a_deflate_that_does_not_pay_for_itself_is_stored_and_nothing_stale_is_left() 
     assert_eq!(bytes.len() as u64, report.len, "length");
 }
 
-/// R11.4: an archive is written at the version its caller named, and `build`
-/// holds no opinion of its own about which that is.
-///
-/// Walked over [`rpf_core::Version::ALL`] rather than asserted of `RPF7`, for
-/// the reason that list exists: with one member this says only that the one
-/// version round-trips, and on the day a second codec lands it says the same of
-/// that one without anybody remembering to come back here. What it pins today
-/// is that the version reaching the header is the parameter and not a constant
-/// — delete the argument and this stops compiling.
+/// An archive is written at the version its caller named: the version reaching
+/// the header is the parameter and not a constant.
 #[test]
 fn an_archive_is_written_at_the_version_it_was_asked_for() {
     for &version in rpf_core::Version::ALL {
@@ -688,7 +610,6 @@ fn an_archive_is_written_at_the_version_it_was_asked_for() {
     }
 }
 
-/// A rebuild is not a conversion: it writes the version it read.
 #[test]
 fn a_rebuild_writes_the_version_the_original_was_read_at() {
     for &version in rpf_core::Version::ALL {
@@ -730,10 +651,8 @@ fn a_rebuild_writes_the_version_the_original_was_read_at() {
     }
 }
 
-/// One stored file. Stored, because a stored payload is the case with nothing
-/// to check it against — a deflate stream that lost its last byte fails to
-/// inflate, and a resource's page flags disagree with what it inflates to, but
-/// a stored entry reads back whatever is there and calls it correct.
+/// One stored file — the case with nothing to check it against, since a stored
+/// entry reads back whatever is there and calls it correct.
 fn stored(path: &str) -> FileSpec {
     FileSpec {
         path: path.to_owned(),
@@ -744,22 +663,12 @@ fn stored(path: &str) -> FileSpec {
     }
 }
 
-/// Builds an archive into a **real file**, and hands back the report with the
-/// bytes that ended up on disk.
+/// Builds an archive into a real file, and hands back the report with the bytes
+/// that ended up on disk.
 ///
-/// Deliberately not a `Cursor<Vec<u8>>`, and the difference is not a detail.
-/// `Cursor::write_all(&[])` at a seek position past the end of the vector
-/// **resizes the vector to that position**; `std::fs::File` writing nothing
-/// past the end of a file leaves the file exactly as long as it was. Every
-/// build test in this suite used a cursor, which made the suite structurally
-/// unable to see a build that wrote fewer bytes than it reported — the vector
-/// came back the right length because the cursor had grown it for free. It cost
-/// us a zero-length last payload truncating the archive, reachable from `pack`,
-/// from `put --rebuild` and from the daemon's commit, with `Report::len`
-/// claiming 1024 for a file of 516 bytes.
-///
-/// The length assertion lives here rather than in each caller so that every
-/// build that goes through it is checked against the file it wrote.
+/// Not a cursor: `Cursor::write_all(&[])` past the end of the vector resizes it,
+/// so a build writing fewer bytes than it reports stays invisible. The length
+/// assertion lives here so every build through it is checked against its file.
 fn build_on_disk<F>(
     files: &[FileSpec],
     directories: &[String],
@@ -788,8 +697,7 @@ where
     (report, bytes)
 }
 
-/// Rebuilds an archive into a real file, for the reason [`build_on_disk`]
-/// exists, and hands back what landed there.
+/// Rebuilds an archive into a real file and hands back what landed there.
 fn replaced_on_disk(source: &[u8], edits: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut src = Cursor::new(source.to_vec());
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -829,14 +737,8 @@ fn outer_archive(inner: &[u8]) -> Vec<u8> {
     built(&[stored("sub/inner.rpf")], inner)
 }
 
-/// The last payload of an archive keeps its last byte.
-///
-/// `build` used to extend the file to the block boundary by writing a zero at
-/// `length - 1`. Whenever the last payload ended exactly on a boundary that
-/// byte **was** the payload's last one, so the archive still parsed, the entry
-/// row still read right, and one byte of the file was quietly zero. The sweep
-/// is the point: the suite had no stored file of exactly 512 bytes, which is
-/// why this shipped.
+/// The last payload of an archive keeps its last byte — padding to the block
+/// boundary must not overwrite a payload that ends exactly on one.
 #[test]
 fn a_payload_ending_on_a_block_boundary_keeps_its_last_byte() {
     let files = [stored("raw.bin")];
@@ -844,8 +746,6 @@ fn a_payload_ending_on_a_block_boundary_keeps_its_last_byte() {
 
     for len in 1..=4096_usize {
         let contents = vec![0xAA_u8; len];
-        // On disk: `build_on_disk` also checks the file against the report, so
-        // the sweep covers both halves of the padding arithmetic at once.
         let (_, bytes) = build_on_disk(&files, &[], |_| Ok(contents.clone()));
 
         let mut file = Cursor::new(bytes);
@@ -862,8 +762,6 @@ fn a_payload_ending_on_a_block_boundary_keeps_its_last_byte() {
     );
 }
 
-/// An archive with no payloads at all is still padded to a block, from the end
-/// of its names blob. The other side of the same arithmetic.
 #[test]
 fn an_archive_with_no_files_is_still_a_whole_number_of_blocks() {
     let (report, bytes) = build_on_disk(&[], &[], |_| Ok(Vec::new()));
@@ -874,16 +772,9 @@ fn an_archive_with_no_files_is_still_a_whole_number_of_blocks() {
     assert_eq!(archive.entries().len(), 1, "the root, and nothing else");
 }
 
-/// A last payload of zero bytes must not shorten the archive.
-///
-/// `build` padded forward from where the last payload ended, and a zero-length
-/// payload moved that anchor to its own start while writing nothing at all. So
-/// nothing ever extended the file past the *previous* payload's last byte: the
-/// archive was truncated and its last entry addressed past the end of it.
-/// Reproduced here — `a.txt` of 4 bytes and `z-empty.txt` of none reported a
-/// length of 1024 for a file of 516 bytes — and reachable from `rpf pack`, from
-/// `put --rebuild`, which then persists the truncated file over a good archive,
-/// and from the daemon's commit.
+/// A last payload of zero bytes must not shorten the archive: padding forward
+/// from where the last payload ended anchors on its own start and leaves the
+/// file short of the previous payload's last byte.
 #[test]
 fn a_zero_length_last_payload_does_not_truncate_the_archive() {
     let files = [stored("a.txt"), stored("z-empty.txt")];
@@ -908,10 +799,8 @@ fn a_zero_length_last_payload_does_not_truncate_the_archive() {
     }
 }
 
-/// The same, reached without asking for it. `Storage::Deflate` on empty
-/// contents deflates to two bytes, which is not smaller than nothing, so the
-/// stored branch wins and zero bytes go out — a zero-length last payload from a
-/// caller who never wrote one.
+/// `Storage::Deflate` on empty contents deflates to two bytes, which is not
+/// smaller than nothing, so the stored branch wins and zero bytes go out.
 #[test]
 fn deflating_an_empty_file_does_not_truncate_the_archive() {
     let deflated = |path: &str| FileSpec {
@@ -940,8 +829,6 @@ fn deflating_an_empty_file_does_not_truncate_the_archive() {
     );
 }
 
-/// And through the write path an editor actually uses: emptying the entry that
-/// happens to be written last.
 #[test]
 fn emptying_the_last_payload_of_a_rebuild_does_not_truncate_it() {
     let source = built(&[stored("a.txt"), stored("z.txt")], b"contents");
@@ -963,24 +850,14 @@ fn emptying_the_last_payload_of_a_rebuild_does_not_truncate_it() {
     );
 }
 
-/// R4's stated top risk, on the one narrow field of [`file_row`] that had no
-/// test at all: a file entry's name offset is sixteen bits.
-///
-/// Deleting that check leaves the whole suite green. The archive it then builds
-/// parses, `Archive::open` succeeds and `verify` passes — and every entry whose
-/// name sits past 65,535 bytes into the names blob carries somebody else's
-/// name. Measured with the check removed: 4,000 files of 18-byte names, a
-/// `names_len` of 88,001, and 1,021 of the 4,000 names wrong. An archive that
-/// parses, packs, and fails to load, with no error anywhere.
+/// A file entry's name offset is sixteen bits, so a name sitting past 65,535
+/// bytes into the names blob would silently be somebody else's.
 #[test]
 fn a_file_name_offset_past_sixteen_bits_is_refused() {
-    // Each name is 18 bytes and costs 19 in the blob with its terminator; the
-    // root's empty name takes the first. So file `k` sits at 1 + 19k, and 3450
-    // is the first that will not fit: 1 + 19 × 3450 = 65,551.
+    // Each name costs 19 bytes in the blob and the root's empty name takes the
+    // first, so file `k` sits at 1 + 19k and 3450 is the first that will not fit.
     let files: Vec<FileSpec> = (0..=3450).map(|index| stored(&name_of(index))).collect();
 
-    // A cursor is the right sink here precisely because nothing should reach
-    // it: this asserts the refusal, not what was written.
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
@@ -1007,11 +884,8 @@ fn a_file_name_offset_past_sixteen_bits_is_refused() {
     }
 }
 
-/// The other side of the same limit: every name below it comes back exact.
-///
-/// Without this a limit set one too low would look as green as a correct one,
-/// and the last name here lands four bytes inside the field — at 65,532 — which
-/// is where an off-by-one would show.
+/// The other side of the same limit: the last name here lands four bytes inside
+/// the field, at 65,532, which is where an off-by-one would show.
 #[test]
 fn every_file_name_below_sixteen_bits_reads_back() {
     let files: Vec<FileSpec> = (0..=3449).map(|index| stored(&name_of(index))).collect();
@@ -1021,8 +895,7 @@ fn every_file_name_below_sixteen_bits_reads_back() {
     let mut file = Cursor::new(bytes);
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
     for index in 0..=3449_u32 {
-        // Entry 0 is the root; the files follow in ascending name order, which
-        // is the order they were generated in.
+        // Entry 0 is the root; the files follow in generation order.
         assert_eq!(
             archive.name(index + 1).expect("named"),
             name_of(index),
@@ -1031,15 +904,14 @@ fn every_file_name_below_sixteen_bits_reads_back() {
     }
 }
 
-/// The `index`th generated name: four digits and fourteen more bytes, 18 in
-/// all, so that byte order and generation order are the same thing.
+/// The `index`th generated name: 18 bytes, so byte order and generation order
+/// are the same thing.
 fn name_of(index: u32) -> String {
     format!("{index:04}-file-name.bin")
 }
 
-/// The same, one level down: a rebuild through nesting writes the inner
-/// archive as a payload of the outer one, so the outer build's last payload is
-/// whatever the inner build produced.
+/// A rebuild through nesting writes the inner archive as a payload of the outer
+/// one, so the outer build's last payload is whatever the inner build produced.
 #[test]
 fn a_nested_rebuild_keeps_the_last_byte_of_its_last_payload() {
     let contents = vec![0xAA_u8; 512];
@@ -1060,10 +932,7 @@ fn a_nested_rebuild_keeps_the_last_byte_of_its_last_payload() {
 }
 
 /// Replacing a nested archive wholesale and editing a file inside it are the
-/// same bytes twice. `plan` refuses the pair with `Overlapping`; the rebuild
-/// path used to accept it, drop the whole-archive edit on the floor and return
-/// `Ok`, so a caller falling back from one write path to the other got a
-/// different archive with no error anywhere.
+/// same bytes twice, so the pair is refused rather than one edit dropped.
 #[test]
 fn replacing_an_archive_and_a_file_inside_it_is_refused() {
     let inner = inner_archive(b"original");
@@ -1084,8 +953,7 @@ fn replacing_an_archive_and_a_file_inside_it_is_refused() {
         &mut rpf_core::InMemory,
         &mut Unwatched,
     );
-    // Which two collided, not merely that two did: the caller has to drop one
-    // of them or rebuild, and it can do neither without being told which.
+    // Which two collided: the caller cannot drop one without being told which.
     match refused {
         Err(Error::Overlapping { path, other }) => {
             assert_eq!(path, "sub/inner.rpf/f.txt");
@@ -1096,8 +964,7 @@ fn replacing_an_archive_and_a_file_inside_it_is_refused() {
 }
 
 /// Three spellings of one path resolve to one entry, because a reader folds
-/// case and ignores empty components. Keyed by the string they were written
-/// as, they used to collapse to whichever came last, silently.
+/// case and ignores empty components.
 #[test]
 fn several_spellings_of_one_edit_are_refused() {
     let inner = inner_archive(b"original");
@@ -1119,8 +986,7 @@ fn several_spellings_of_one_edit_are_refused() {
         &mut Unwatched,
     );
     // The edits are visited in sorted order, so the pair named is the third
-    // spelling against the second — the two that reached one path within the
-    // nested archive.
+    // spelling against the second.
     match refused {
         Err(Error::Overlapping { path, other }) => {
             assert_eq!(path, "sub/inner.rpf/f.txt");
@@ -1130,8 +996,6 @@ fn several_spellings_of_one_edit_are_refused() {
     }
 }
 
-/// The same collision without any nesting, so the refusal is not an artefact
-/// of how the descent groups edits.
 #[test]
 fn two_spellings_of_one_entry_are_refused_at_the_top_level() {
     let mut src = Cursor::new(built(&[stored("f.txt")], b"original"));
@@ -1159,8 +1023,6 @@ fn two_spellings_of_one_entry_are_refused_at_the_top_level() {
     }
 }
 
-/// One edit per entry still rebuilds, spelled loosely. The refusals above must
-/// not have cost the ordinary case.
 #[test]
 fn edits_in_one_nested_archive_still_rebuild_it_once() {
     let inner = built(&[stored("f.txt"), stored("g.txt")], b"original");
@@ -1197,10 +1059,8 @@ fn edits_in_one_nested_archive_still_rebuild_it_once() {
     }
 }
 
-/// Two directories differing only in case are one directory to every reader:
-/// `Archive::child_named` resolves with `eq_ignore_ascii_case`. Build used to
-/// write both, and everything under the second was then unreachable by any
-/// spelling of its own path.
+/// Two directories differing only in case are one directory to every reader,
+/// since `Archive::child_named` resolves with `eq_ignore_ascii_case`.
 #[test]
 fn two_directories_differing_only_in_case_are_refused() {
     let files = [stored("X64/alpha.txt"), stored("x64/beta.txt")];
@@ -1213,13 +1073,11 @@ fn two_directories_differing_only_in_case_are_refused() {
         |_: &str| Ok(Cursor::new(b"contents".to_vec())),
         &mut Unwatched,
     );
-    // Matching only the variant would accept any pair against any archive, and
-    // the whole value of this refusal to a caller is which two names collided.
-    // Those are the two directories, not the file whose path ran into them.
+    // The two names that collided are the directories, not the file whose path
+    // ran into them.
     collision(refused, "x64", "X64");
 }
 
-/// The same for two files in one directory.
 #[test]
 fn two_files_in_one_directory_differing_only_in_case_are_refused() {
     let files = [stored("data/notes.txt"), stored("data/NOTES.TXT")];
@@ -1235,7 +1093,6 @@ fn two_files_in_one_directory_differing_only_in_case_are_refused() {
     collision(refused, "data/NOTES.TXT", "data/notes.txt");
 }
 
-/// And an explicit directory list collides with a directory a path created.
 #[test]
 fn a_named_directory_colliding_with_a_path_is_refused() {
     let files = [stored("X64/alpha.txt")];
@@ -1249,15 +1106,11 @@ fn a_named_directory_colliding_with_a_path_is_refused() {
         &mut Unwatched,
     );
     // The named directories are claimed first, so `x64` is the spelling that
-    // took the name and `X64` is the one that could not have it. What used to
-    // be reported here was `"X64/alpha.txt" and its sibling "x64"`, which named
-    // two things that are neither siblings nor one name.
+    // took the name and `X64` is the one that could not have it.
     collision(refused, "X64", "x64");
 }
 
-/// One path listed twice is not a case collision, and `build` has always said
-/// so with its own reason. Nothing pinned the sentence, and the reader now
-/// gives the same one — `crates/rpf-core/tests/malformed.rs`.
+/// One path listed twice is not a case collision, and gets its own reason.
 #[test]
 fn one_path_listed_twice_is_refused_as_a_duplicate() {
     let files = [stored("data/notes.txt"), stored("data/notes.txt")];
@@ -1273,9 +1126,6 @@ fn one_path_listed_twice_is_refused_as_a_duplicate() {
     refusal(refused, "data/notes.txt", "is named twice in one directory");
 }
 
-/// A file and a directory of one name are not two things a reader can tell
-/// apart, and the file used to lose: `descend` replaced its tree entry, so its
-/// contents were never fetched and never written, and `build` returned `Ok`.
 #[test]
 fn a_file_and_a_directory_sharing_one_name_are_refused() {
     let files = [stored("x64"), stored("x64/alpha.txt")];
@@ -1296,11 +1146,8 @@ fn a_file_and_a_directory_sharing_one_name_are_refused() {
 }
 
 /// A directory named outright is checked as a path in its own right, and
-/// nothing else checks it: `build` derives parents from file paths, so a
-/// directory list holding `..` reaches `descend` with nothing between it and
-/// the entry table. Deleting the check left the whole suite green while a
-/// hostile manifest produced an archive with a `..` directory entry — which
-/// `extract` then creates above the target on the way to writing into it.
+/// nothing else checks it: `build` derives parents from file paths only, so a
+/// `..` in a directory list would otherwise reach the entry table unexamined.
 #[test]
 fn a_named_directory_that_climbs_out_of_the_tree_is_refused() {
     for directory in ["..", "../escaped", "a/../..", "/etc", "a\\b"] {
@@ -1324,8 +1171,6 @@ fn a_named_directory_that_climbs_out_of_the_tree_is_refused() {
     }
 }
 
-/// One spelling of a directory is not a collision with itself, and the reader
-/// finds it under any case. This is what the refusals above must not break.
 #[test]
 fn one_directory_is_reachable_under_any_case() {
     let mut file = Cursor::new(built(

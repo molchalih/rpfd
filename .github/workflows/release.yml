@@ -1,18 +1,28 @@
 name: release
 
-# R8.1: a tagged release publishes a binary per platform, so that installing
-# `rpf` is downloading one file. DR-001 chose a static binary for exactly this,
-# and `docs/approach.md`'s agent consumer wants nothing installed first.
+# A release publishes a binary per platform and the editor extension, so that
+# installing `rpf` is downloading one file.
+#
+# Started by hand, never by a push. A tag is cheap and is often pushed to mark
+# a point rather than to publish one, so the trigger is the decision to
+# release rather than the tag itself. The tag must already exist and is what
+# every artefact is named and versioned from.
 #
 # The gates live in ci.yml and run on every push to main and every pull request.
 # This workflow builds what has already been checked rather than checking it
 # again on four runners, three of which cannot execute what they produce.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "the existing tag to release, e.g. v0.1.0"
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
+  # One home for the tag. `GITHUB_*` is reserved, so it carries its own name.
+  TAG: ${{ inputs.tag }}
 
 permissions:
   contents: write
@@ -24,12 +34,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
       - name: the release this tag names, created if it is not there yet
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" \
-            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release view "$TAG" \
+            || gh release create "$TAG" --title "$TAG" --generate-notes
 
   binaries:
     needs: release
@@ -61,6 +73,8 @@ jobs:
             rustflags: -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
 
       # As in ci.yml: the toolchain is pinned in rust-toolchain.toml, and
       # `rustup target add` follows that override rather than the default
@@ -77,6 +91,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y musl-tools
 
+      # The version comes from the tag, as the extension's does. The manifests
+      # carry 0.0.0 and keep carrying it: a version committed to the tree is a
+      # second place to forget. `--locked` still holds because the workspace
+      # members are path dependencies and their version does not resolve.
+      - name: the tag's version
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          case "$v" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag $TAG is not a version" >&2; exit 1 ;;
+          esac
+          for m in Cargo.toml crates/*/Cargo.toml tools/*/Cargo.toml; do
+            [ -f "$m" ] || continue
+            perl -0pi -e "s/^version = \"0\\.0\\.0\"/version = \"$v\"/m" "$m"
+          done
+          cargo metadata --format-version 1 --no-deps >/dev/null
+
       # --locked, because a release is the one build where resolving a
       # dependency differently from Cargo.lock must be a failure rather than a
       # surprise.
@@ -92,7 +125,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          name="rpf-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="rpf-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/rpf.exe" "dist/$name/"
@@ -113,4 +146,61 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" "$ASSET" --clobber
+        run: gh release upload "$TAG" "$ASSET" --clobber
+
+  # R8.3's other half. The binaries above are what `rpf` is; the extension is
+  # how it is used from an editor, and a release that attached four binaries and
+  # no client would ship half the tool. One runner and no matrix: a `.vsix` is a
+  # zip of compiled JavaScript, and nothing in it varies by platform — the
+  # per-platform part is the binary, which is attached separately and found on
+  # PATH.
+  extension:
+    needs: release
+    name: vsix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v5
+        with:
+          # `engines.node` says 20 at least; 22 is the LTS that satisfies it and
+          # has `zlib.crc32`, which the packer uses to write the zip.
+          node-version: 22
+          cache: npm
+          cache-dependency-path: clients/vscode/package-lock.json
+
+      # --ci rather than --install, for --locked's reason one job up: a release
+      # is the one build where resolving a dependency differently from the lock
+      # file must be a failure rather than a surprise.
+      - run: npm ci
+        working-directory: clients/vscode
+
+      # `package.json` carries `0.0.0` and keeps carrying it: the version an
+      # artefact bears is a property of the tag that asked for it, not of the
+      # working tree, and a version committed to the manifest is a second place
+      # to forget to change. `npm version` writes the tag's version in for this
+      # build alone and refuses anything that is not semver, so `v1.2.3` becomes
+      # `1.2.3` and a tag that is not a version fails here rather than producing
+      # a package nobody can install.
+      #
+      # The publisher is named here and nowhere else. `package.json` does not
+      # carry one, deliberately: it is an identity rather than a fact about the
+      # extension, and the packer takes it as an argument so that packaging and
+      # publishing stay two acts. The repository variable lets a fork build its
+      # own package without editing this file.
+      - name: package
+        working-directory: clients/vscode
+        env:
+          PUBLISHER: ${{ vars.VSCE_PUBLISHER || 'molchalih' }}
+        run: |
+          set -euo pipefail
+          npm version --no-git-tag-version --allow-same-version "${TAG#v}"
+          out="$PWD/rpf-${TAG}.vsix"
+          npm run package -- --publisher "$PUBLISHER" --out "$out"
+          echo "ASSET=$out" >> "$GITHUB_ENV"
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$ASSET" --clobber

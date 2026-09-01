@@ -1,61 +1,47 @@
 // The acceptance loop's client half. It reports what the game found in the
 // mounted archive; it never reads the archive itself.
 //
-// WHY THIS FILE IS SHAPED THE WAY IT IS
-//
-// A native call on this model can kill the client outright. Measured twice:
-// 2026-08-30, an access violation at module offset 0xf4cb31 about a second
-// after IS_MODEL_IN_CDIMAGE and GET_VEHICLE_CLASS_FROM_NAME (docs/acceptance.md
-// §13); 2026-09-01, the same offset, this time with REQUEST_MODEL as the only
-// native the script had reached. So the rule is not "those two calls are
-// dangerous" — it is that any model-info lookup on this model may end the
-// process, and a probe that only speaks at the end of a sequence will be
-// killed before it says anything. Silence then means either "the payload did
-// not load" or "the probe never ran", which are opposite conclusions.
-//
-// Hence: every risky call is ANNOUNCED before it is made, and made a beat
-// later, so the announcement is on the wire before the call that may end the
-// process. Every path — success, ceiling, thrown error — reports. Nothing
-// spins: the clock is the render tick, which returns every frame, so the
-// network thread keeps servicing the connection.
-const MODEL_NAME = "meringls63amg24";
+// Any model-info lookup on this model may end the client process, so every
+// risky call is announced a beat before it is made and every path reports:
+// silence would be indistinguishable from a payload that did not load.
+const MODEL_NAME = "volga5";
 const MODEL = mp.game.joaat(MODEL_NAME);
 
-// The model the STREAMING half asks about, which is deliberately NOT the DLC's.
+// The models the streaming half asks about, in order, and why there are two.
+// The first is a stock one: it measures the probe itself, so that a
+// `model_loaded=false` on the second means the payload did not load rather than
+// the probe is broken. The second is the pack's OWN model, which is the
+// question this loop was built to reach — whether the game read a large binary
+// payload out of the archive under test.
 //
-// Measured 2026-09-01 on the CONTROL — the untouched sample: REQUEST_MODEL on
-// `meringls63amg24` returned, `stage=post_request` reached the server, and the
-// client was dead before `stage=pre_poll` 400 ms later, at the same 0xf4cb31
-// the two earlier crashes hit. Streaming this mod's vehicle kills this game
-// build whatever archive it came out of, so an observable built on it cannot
-// classify anything: it fails identically on a good archive and a bad one.
-//
-// So the streaming half asks about a stock model instead. That measures the
-// PROBE — that requesting and polling works here at all and does not fault —
-// which is what makes a future `model_loaded=false` on a sample whose model
-// does stream mean "the payload did not load" rather than "the probe is
-// broken". Point it at a DLC model only when that model is known not to fault.
-const STREAM_MODEL_NAME = "adder";
-const STREAM_MODEL = mp.game.joaat(STREAM_MODEL_NAME);
+// Asking the pack's model is new and deliberate. The first sample's could not
+// be asked: REQUEST_MODEL on `meringls63amg24` ended the client inside 400 ms
+// from the untouched archive, three times, at one instruction. This pack is a
+// different producer and a 2020 build, so the question is open again — and the
+// stock model goes first so that a death on the second is attributable.
+const STREAM_MODEL_NAMES = ["adder", MODEL_NAME];
+var streamIndex = 0;
 
-// The streaming ceiling. Kept well under the server's own drop timeout: the
-// server is not configured with one (`conf.json` has no timeout key) and the
-// only measurement of it is that a client whose process died was reported
-// `playerQuit type=timeout` some seconds later, so the ceiling is chosen to
-// finish the whole sequence inside ten seconds rather than to race it.
+function streamName() {
+    return STREAM_MODEL_NAMES[streamIndex];
+}
+
+function streamModel() {
+    return mp.game.joaat(streamName());
+}
+
+// The streaming ceiling, chosen to finish the whole sequence inside ten
+// seconds rather than race the server's unconfigured drop timeout.
 const STREAM_CEILING_MS = 8000;
 // The beat between announcing a risky call and making it, so the announcement
 // reaches the server even if the call does not return.
 const SETTLE_MS = 400;
-// How often the streamer is asked. Each ask is one native call on the render
-// tick and nothing else.
+// How often the streamer is asked: one native call on the render tick.
 const POLL_MS = 250;
 
-// Which half runs first. `true` — the acceptance natives, then the streaming
-// control — because a join that dies still has to have produced the `class=`
-// line that identifies which archive the game read. `false` puts the streaming
-// half first, and is only worth setting when the streamed model is known not
-// to fault this build.
+// Which half runs first. `true` puts the acceptance natives first, so a join
+// that dies has still produced the `class=` line naming the archive the game
+// read; `false` is only safe when the streamed model cannot fault this build.
 var NATIVES_FIRST = true;
 
 function say(event) {
@@ -63,8 +49,7 @@ function say(event) {
     try {
         mp.gui.chat.push("rpf:" + event + " " + args.join(" "));
     } catch (e) {
-        // The chat is a convenience for a person watching; the server line is
-        // the evidence. Never let it take the report down with it.
+        // The chat is a convenience; the server line is the evidence.
     }
     mp.events.callRemote.apply(mp.events, ["rpf:" + event].concat(args));
 }
@@ -79,9 +64,8 @@ function fail(where, e) {
     say("error", "where=" + where, "message=" + message.replace(/\s+/g, "_"));
 }
 
-// A tiny state machine on the render tick. Each step announces what it is about
-// to do, waits SETTLE_MS, does it, and moves on. No step loops, and no step
-// does more than one native call.
+// A state machine on the render tick: each step announces what it is about to
+// do, waits SETTLE_MS, does it. No step loops or makes two native calls.
 var STEP = {
     ANNOUNCE_REQUEST: 0,
     REQUEST: 1,
@@ -99,18 +83,14 @@ var pollStarted = 0;
 var lastPoll = 0;
 var broken = false;
 var inCdimage;
-// Each half runs once, whichever order they run in and however they end. Two
-// flags rather than an order-dependent chain, because the error paths join the
-// chain too and a cycle there is an infinite one.
+// Each half runs once, in either order. Two flags rather than a chain: the
+// error paths rejoin it too, and a cycle there would be infinite.
 var nativesDone = false;
 var streamDone = false;
 
-// Two clocks drive the same state machine, because a probe with one clock is a
-// probe that can be silent if that clock is missing — the failure this file
-// exists to make impossible. `setTimeout` is the primary: it is proven on this
-// client, docs/acceptance.md §7 used it. The render tick is the backup and
-// costs a comparison a frame. Both call the same guarded step, and JavaScript
-// is single-threaded, so a step cannot run twice.
+// Two clocks drive the same state machine, since a probe with one clock goes
+// silent if that clock is missing. Both call the same guarded step, and
+// JavaScript is single-threaded, so a step cannot run twice.
 function arm(delay) {
     try {
         if (typeof setTimeout === "function") {
@@ -149,15 +129,16 @@ function tick() {
 
     switch (step) {
         case STEP.ANNOUNCE_REQUEST:
-            say("probe", "stage=pre_request", "model=" + STREAM_MODEL_NAME);
+            say("probe", "stage=pre_request", "model=" + streamName());
             schedule(STEP.REQUEST, SETTLE_MS);
             return;
 
         case STEP.REQUEST:
             try {
-                mp.game.streaming.requestModel(STREAM_MODEL);
+                mp.game.streaming.requestModel(streamModel());
             } catch (e) {
                 fail("request_model", e);
+                streamIndex = STREAM_MODEL_NAMES.length;
                 schedule(afterStream(), SETTLE_MS);
                 return;
             }
@@ -179,9 +160,10 @@ function tick() {
             lastPoll = now;
             var loaded;
             try {
-                loaded = mp.game.streaming.hasModelLoaded(STREAM_MODEL);
+                loaded = mp.game.streaming.hasModelLoaded(streamModel());
             } catch (e) {
                 fail("has_model_loaded", e);
+                streamIndex = STREAM_MODEL_NAMES.length;
                 schedule(afterStream(), SETTLE_MS);
                 return;
             }
@@ -190,16 +172,20 @@ function tick() {
                 arm(POLL_MS);
             }
             if (loaded || waited >= STREAM_CEILING_MS) {
-                // Says whether the streamer answers here at all, on a model
-                // this build is known to hold. It is not yet evidence about a
-                // payload of ours: see STREAM_MODEL_NAME.
+                // For the stock model this says whether the streamer answers
+                // at all; for the pack's own it is the large-binary question.
                 say(
                     "streamed",
-                    "model=" + STREAM_MODEL_NAME,
+                    "model=" + streamName(),
                     "model_loaded=" + loaded,
                     "waited_ms=" + waited
                 );
-                schedule(afterStream(), SETTLE_MS);
+                streamIndex += 1;
+                if (streamIndex < STREAM_MODEL_NAMES.length) {
+                    schedule(STEP.ANNOUNCE_REQUEST, SETTLE_MS);
+                } else {
+                    schedule(afterStream(), SETTLE_MS);
+                }
             }
             return;
         }
@@ -217,8 +203,8 @@ function tick() {
                 schedule(afterNatives(), SETTLE_MS);
                 return;
             }
-            // Said on its own, one frame before the second call, because either
-            // call may end the process and half an answer beats none.
+            // Said before the second call: either may end the process, and
+            // half an answer beats none.
             say("probe", "stage=post_cdimage", "in_cdimage=" + inCdimage);
             schedule(STEP.NATIVE_CLASS, SETTLE_MS);
             return;

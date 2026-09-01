@@ -1,5 +1,5 @@
 //! Command-line frontend. Holds no archive knowledge: everything it does, it
-//! does through `rpf-core`. See `docs/conventions.md` §1.
+//! does through `rpf-core`.
 
 mod advice;
 mod commands;
@@ -27,7 +27,7 @@ struct Cli {
     /// Global, and it has to be: it is the one way to keep several game
     /// installs apart, and an archive command that could not name the cache
     /// would be unable to open what `rpf keys extract --cache-dir` had just
-    /// found. DR-041.
+    /// found.
     #[arg(long, global = true, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -166,17 +166,15 @@ enum Command {
 
 /// What can be asked about key material.
 ///
-/// **Nothing here prints a key.** DR-006 keeps extracted material off every
-/// output path, so what is reported is offsets, lengths, digests and cache
-/// paths — assume `--json` is piped into automation and pasted into a bug
-/// report. DR-020.
+/// Nothing here prints a key: what is reported is offsets, lengths, digests and
+/// cache paths.
 #[derive(Debug, Subcommand)]
 enum KeysCommand {
     /// Find the key material in a game source, and cache what it found.
     ///
     /// The source is a game executable, or a memory image of one. An executable
     /// carries the AES key and the hash lookup table; only an image carries the
-    /// NG expanded keys and decrypt tables. DR-040.
+    /// NG expanded keys and decrypt tables.
     Extract {
         /// The game executable, or a memory image of one.
         #[arg(value_name = "SOURCE")]
@@ -188,10 +186,8 @@ enum KeysCommand {
     Invalidate,
 }
 
-/// What `--overwrite`, or the wire's `overwrite`, means to an extraction.
-///
-/// One function so the flag and the wire parameter cannot come to mean two
-/// things. DR-029.
+/// What `--overwrite`, or the wire's `overwrite`, means to an extraction, so
+/// that the flag and the wire parameter cannot come to mean two things.
 const fn existing(overwrite: bool) -> commands::Existing {
     if overwrite {
         commands::Existing::Overwrite

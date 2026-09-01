@@ -1,14 +1,7 @@
 //! Reading, editing and rebuilding RAGE Package File (`.rpf`) archives.
 //!
-//! This crate is the product; the `rpf` binary and the editor client are both
-//! clients of it and hold no archive knowledge of their own. See
-//! `docs/conventions.md` §1.
-//!
-//! Every constant and decode in [`mod@format`] cites the row of `docs/rpf-format.md`
-//! it comes from. A fact is encoded here exactly once (§3), so that changing it
-//! is one edit rather than a search — and every fact that is one *version's*
-//! rather than the container's lives behind [`format::Version`], the seam
-//! DR-012 asks for. `RPF7` is its only implementation.
+//! Version-specific facts live behind [`format::Version`]; `RPF7` is its only
+//! implementation.
 
 pub mod archive;
 pub mod build;

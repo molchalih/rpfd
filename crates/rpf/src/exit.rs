@@ -1,14 +1,10 @@
 //! Exit codes, and the error type they come from.
 //!
-//! R6.3: a caller has to be able to tell "no such file" from "corrupt" from
-//! "needs a key" from "refused" — and from "this build cannot read that
-//! version" — without parsing a message. The classification
-//! of container failures lives in `rpf-core` so that adding an error variant
-//! cannot silently invent an exit code; this adds only what the command line
-//! itself can refuse.
-//!
-//! What each code classifies is what the caller has to do about the failure,
-//! not what the code was doing when it noticed. DR-010.
+//! A caller tells the kinds of failure apart without parsing a message. The
+//! classification of container failures lives in `rpf-core` so that adding an
+//! error variant cannot silently invent an exit code; this adds only what the
+//! command line itself can refuse. Each code says what the caller has to do
+//! about the failure, not what the code was doing when it noticed.
 
 use std::{io, path::PathBuf};
 
@@ -52,10 +48,8 @@ pub enum Failure {
     /// A directory above the archive would not say what is in it, so the game
     /// install guard has no answer rather than a negative one.
     ///
-    /// Separate from [`Failure::GameInstall`] because that one names an
-    /// installation, and naming one that was never found would assert
-    /// something nothing measured. Both refuse and both take `--force`; only
-    /// the sentence differs.
+    /// Separate from [`Failure::GameInstall`], which names an installation that
+    /// was actually found. Both refuse and both take `--force`.
     #[error(
         "refusing to write below {directory}: that directory cannot be \
          examined, so whether this is a game installation cannot be told from \
@@ -69,10 +63,9 @@ pub enum Failure {
 
 /// Process exit codes. Stable, and part of the contract.
 ///
-/// `Usage` and `Internal` are declared and not constructed here on purpose.
-/// `clap` exits with 2 on its own before any command runs, and 1 is reserved
-/// for a failure with no better classification. Leaving gaps in the table would
-/// make the contract harder to read than an unused variant does.
+/// `Usage` and `Internal` are declared and not constructed here: `clap` exits 2
+/// on its own before any command runs, and 1 is reserved for a failure with no
+/// better classification.
 #[derive(Debug, Clone, Copy)]
 #[repr(i32)]
 #[allow(dead_code, reason = "Usage comes from clap; Internal is reserved")]
@@ -91,14 +84,14 @@ pub enum Code {
     /// The archive needs key material that is not available.
     NeedsKey = 5,
     /// The command or the container declined to act, because the request or
-    /// its input was wrong. DR-010.
+    /// its input was wrong.
     Refused = 6,
     /// Reading or writing failed. The source or the sink, and nobody's input.
     Io = 7,
     /// The caller stopped the operation part-way.
     Cancelled = 8,
     /// The archive is intact and this build cannot read it — an RPF version
-    /// with no codec here. Nobody holding it can act. DR-010's amendment.
+    /// with no codec here.
     Unsupported = 9,
 }
 
@@ -106,7 +99,7 @@ impl Failure {
     /// The exit code for this failure.
     ///
     /// Not `const`, because `rpf_core::Error::category` is not: one container
-    /// variant is classified from the bytes it carries. DR-019.
+    /// variant is classified from the bytes it carries.
     #[must_use]
     pub fn code(&self) -> Code {
         match *self {
@@ -130,12 +123,10 @@ impl Failure {
 impl Failure {
     /// This failure's own name, as a stable symbol.
     ///
-    /// The exit code says who has to act; this says which failure it was, for a
-    /// caller that has a distinct answer for one of them and would otherwise
-    /// have to read the sentence to find out (§10). The daemon puts it beside
-    /// `error.code`; the command line has no JSON error object to put it in and
-    /// DR-010 already decided what a process gets, which is the number.
-    /// DR-032.
+    /// The exit code says who has to act; this says which failure it was, so a
+    /// caller with a distinct answer for one of them need not read the
+    /// sentence. The daemon puts it beside `error.code`; a process gets only
+    /// the number.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match *self {
@@ -190,8 +181,8 @@ mod tests {
 
     #[test]
     fn every_category_keeps_the_number_it_is_contracted_to() {
-        // The numbers are the contract (R6.3), so they are written out here
-        // rather than derived from the enum they are being checked against.
+        // The numbers are the contract, so they are written out here rather
+        // than derived from the enum they are being checked against.
         for (category, code) in [
             (Category::NotFound, 3),
             (Category::Corrupt, 4),
@@ -208,7 +199,7 @@ mod tests {
     #[test]
     fn what_the_binary_refuses_for_itself_lands_on_the_same_number() {
         // A refusal the command line makes and a refusal the container makes
-        // are one thing to a caller, so they are one number. DR-010.
+        // are one thing to a caller, so they are one number.
         assert_eq!(
             Failure::Refused {
                 reason: "no".to_owned(),
@@ -222,7 +213,7 @@ mod tests {
     fn both_halves_of_the_install_guard_refuse_on_the_same_number() {
         // The guard has two answers — an installation it found, and a
         // directory it could not look into — and one thing for the caller to
-        // do about either. Two sentences, one number. DR-010.
+        // do about either.
         for failure in [
             Failure::GameInstall {
                 root: "/games/GTAV".into(),

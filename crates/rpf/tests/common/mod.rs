@@ -1,16 +1,6 @@
-//! Real `RBF` and `PSO` payloads, and the documents they convert to.
+//! Real `RBF`, `PSO` and `Meta` payloads, and the documents they convert to.
 //!
-//! Both frontends have to be shown reading and writing the same two encodings —
-//! `docs/conventions.md` §1's test runs both ways — so the fixtures are here
-//! rather than written out twice. A second copy of the `PSO` builder in
-//! particular would be §3's duplicated constant in scaffolding: a revision to
-//! the layout would be applied to one of them, and the stale one would go on
-//! building files the parser happens to accept.
-//!
-//! No game data (DR-006). The `RBF` payload is written by the crate's own
-//! serialiser from the document beside it, and the `PSO` one is assembled by
-//! hand from `docs/metadata-encodings.md` — there is no `PSO` writer that works
-//! from a document alone, which is DR-049's whole subject.
+//! Shared by both frontends' tests. No game data: each payload is built here.
 #![allow(
     dead_code,
     reason = "each including test crate gets its own copy of this module and \
@@ -32,10 +22,8 @@
 
 use std::path::Path;
 
-/// The document [`rbf_payload`] is built from, and converts back to.
-///
-/// One string attribute and one value record — the pair DR-043 records as
-/// indistinguishable by spelling, so every type is written down.
+/// The document [`rbf_payload`] is built from, and converts back to: one string
+/// attribute and one value record, whose types no spelling distinguishes.
 pub const RBF_DOCUMENT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                                 <Root name=\"hello\">\n  \
                                 <count rbf:uint=\"7\"/>\n\
@@ -48,7 +36,7 @@ pub const RBF_EDITED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                               </Root>\n";
 
 /// The document [`minimal_pso`] converts to, with the empty dictionary that is
-/// the only one this repository ships (DR-006, R5.5).
+/// the only one this repository ships.
 pub const PSO_DOCUMENT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                                 <hash_D98BB561 pso:struct=\"hash_D98BB561\">\n  \
                                 <hash_12345678 pso:uint=\"7\"/>\n\
@@ -71,11 +59,8 @@ const ROOT_NAME: u32 = 0xD98B_B561;
 /// The name hash of its one member.
 const MEMBER_NAME: u32 = 0x1234_5678;
 
-/// A minimal valid `PSO`: one block, one structure, one `UINT` member.
-///
-/// The same fixture `crates/rpf-core/tests/metadata.rs` reasons over, and for
-/// the same reason it is built by hand: a payload built by the reader's own
-/// model could share the reader's bugs. `docs/metadata-encodings.md`.
+/// A minimal valid `PSO`: one block, one structure, one `UINT` member. Built by
+/// hand, because a payload built by the reader's own model shares its bugs.
 pub fn minimal_pso() -> Vec<u8> {
     let mut psin = Vec::new();
     psin.extend_from_slice(&rpf_core::metadata::pso::MAGIC);
@@ -124,30 +109,19 @@ pub fn tokenised() -> Vec<(Vec<u8>, &'static str, &'static str, &'static str)> {
 }
 
 // ---------------------------------------------------------------------------
-// Resource-embedded `Meta`, which is the third encoding a frontend has to show
-// reading and writing — and the one that is not a payload with a magic. R5.8.
+// Resource-embedded `Meta`: the encoding that is not a payload with a magic.
 // ---------------------------------------------------------------------------
 
-/// The flag words the `Meta` fixture's entry declares: one 512-byte system
-/// page and no graphics pages.
-///
-/// `docs/rpf-format.md`, Resource page flags. The top nibbles are the resource
-/// version, and these are the pair `crates/rpf-core/src/format/resource.rs`
-/// measured on real entries, so the fixture is shaped like something the corpus
-/// holds rather than like something only this test builds.
+/// The flag words the `Meta` fixture's entry declares: one 512-byte system page
+/// and no graphics pages. The top nibbles are the resource version.
 pub const META_FLAGS: rpf_core::ResourceFlags = rpf_core::ResourceFlags {
     system: 0xA800_0000,
     graphics: 0x2000_0000,
 };
 
-/// The same 512 bytes with the boundary declared in the wrong place: no system
-/// pages and one graphics page.
-///
-/// The entry reads back identically — the archive only ever checks the sum —
-/// and the `Meta` inside it does not, because every one of its pointers is
-/// resolved against the system half. This is the fixture for "the payload is a
-/// `Meta` and the row says the boundary is elsewhere", which is a refusal and
-/// must never be a guess.
+/// The same 512 bytes with the boundary declared in the wrong place. The entry
+/// reads back identically — only the sum is checked — and the `Meta` does not,
+/// because every pointer it holds is resolved against the system half.
 pub const META_ELSEWHERE: rpf_core::ResourceFlags = rpf_core::ResourceFlags {
     system: 0x2000_0000,
     graphics: 0xA800_0000,
@@ -166,8 +140,7 @@ pub const META_EDITED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                                </hash_D98BB561>\n";
 
 /// A `Meta` payload under construction, so that the fixture states the bytes it
-/// means and nothing else. The builder `crates/rpf-core/tests/metadata.rs`
-/// reasons over, in the smallest form a frontend needs.
+/// means and nothing else.
 struct MetaBytes(Vec<u8>);
 
 impl MetaBytes {
@@ -196,11 +169,6 @@ fn meta_system(offset: u32) -> u64 {
 
 /// The smallest `Meta` that reaches a value: one structure of one `UINT`, one
 /// data block holding it, in exactly one 512-byte system page.
-///
-/// Built by hand from `docs/metadata-encodings.md` for [`minimal_pso`]'s
-/// reason: a payload built by the reader's own model could share the reader's
-/// bugs. The length is the page, because a resource's inflated length is what
-/// its flag words say and nothing else.
 pub fn minimal_meta() -> Vec<u8> {
     let mut payload = MetaBytes(vec![0_u8; 512]);
     payload
@@ -233,14 +201,8 @@ pub fn minimal_meta() -> Vec<u8> {
     payload.0
 }
 
-/// [`minimal_meta`] as the **file outside the archive**: a payload whose
-/// framing carries no `RSC7` header, which is what all 696,578 of Rockstar's
-/// resources look like (Q7, DR-046).
-///
-/// 24 bytes that are not a deflate stream either, then the contents deflated —
-/// the shape `cat_put_round_trips_a_resource_that_carries_no_header` builds,
-/// so what the view reads is unframed by the archive's own boundary probe and
-/// not by anything the fixture arranged for it.
+/// [`minimal_meta`] as the **file outside the archive**: no `RSC7` header, 24
+/// bytes that are not a deflate stream either, then the contents deflated.
 pub fn meta_resource() -> Vec<u8> {
     use std::io::Write as _;
     let mut payload = vec![0xFF_u8; 24];
@@ -255,13 +217,8 @@ pub fn meta_resource() -> Vec<u8> {
 
 // ---------------------------------------------------------------------------
 // An AES-tagged archive holding a **keyed** resource, on a machine with no game
-// installed and no key material of any kind.
-//
-// The 3,022-of-696,578 case DR-051 measured, which a frontend could not reach
-// at all until this: `Material::over_zeros` is `#[cfg(test)]` and so is inside
-// `rpf-core` alone, and key extraction is anchored on digests of the real
-// values, so an executable cannot be faked. What is planted below is thirty-two
-// zero bytes and a table of zeros — not a key, and derived from none (DR-006).
+// installed. What is planted below is thirty-two zero bytes and a table of
+// zeros — not a key, and derived from none.
 // ---------------------------------------------------------------------------
 
 /// The bytes of a hexadecimal digest.
@@ -275,14 +232,7 @@ fn from_hex(hex: &str) -> Vec<u8> {
 }
 
 /// Plants material whose every value is zero in `at`, and answers the cache it
-/// planted it in.
-///
-/// The cache file is written here rather than through `Cache::store`, because
-/// storing needs a `Material` and nothing outside `rpf-core` can build one. The
-/// layout is `crates/rpf-core/src/keys/cache.rs`'s: the magic, the schema, the
-/// payload's length, its digest, and the payload — which for material carrying
-/// neither the NG half nor a launcher key is the AES key, the hash table and
-/// the two offsets they were found at.
+/// planted it in — written by hand, since nothing outside `rpf-core` builds one.
 pub fn zeroed_cache(at: &Path) -> rpf_core::keys::Cache {
     let payload = vec![
         0_u8;
@@ -315,17 +265,12 @@ pub fn zeroed_seal(cache: &rpf_core::keys::Cache) -> rpf_core::format::crypto::S
         .scheme(rpf_core::format::rpf7::ENCRYPTION_AES)
         .expect("the AES tag has a scheme");
     // The AES key is the tag's and nothing else, so the name and length a seal
-    // is keyed by are ignored on this arm — the NG arm is the one they are for.
+    // is keyed by are ignored on this arm.
     rpf_core::format::crypto::Seal::new(scheme, &material, "", 0).expect("AES seals")
 }
 
 /// [`meta_resource`] behind `prefix` opaque bytes, with its **stream** under
-/// `seal` — a resource the archive's own transform reaches, which is the case
-/// `Archive::resource_stream` recovers by reading and no row declares.
-///
-/// Sealed from the stream's own start rather than from the payload's, because
-/// that is where the reader counts its blocks from: the two differ for the 22
-/// of 7,072 resources whose stream begins at 24. DR-060 §2.
+/// `seal` — sealed from the stream's own start, where the reader counts from.
 pub fn keyed_meta_resource(seal: &rpf_core::format::crypto::Seal, prefix: usize) -> Vec<u8> {
     use std::io::Write as _;
     let mut payload = vec![0xFF_u8; prefix];
@@ -341,10 +286,6 @@ pub fn keyed_meta_resource(seal: &rpf_core::format::crypto::Seal, prefix: usize)
 
 /// An AES-tagged archive at `at` holding one resource, `data/thing.ymt`, whose
 /// payload is under the archive's own transform behind `prefix` opaque bytes.
-///
-/// Built twice: once in the clear, only to derive the manifest the entry table
-/// says — so the fixture does not write down a schema number of its own — and
-/// then packed under the tag, which is where the material is used.
 pub fn make_keyed_meta_archive(at: &Path, cache: &Path, prefix: usize) {
     let cache = zeroed_cache(cache);
     let payload = keyed_meta_resource(&zeroed_seal(&cache), prefix);

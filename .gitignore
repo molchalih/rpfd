@@ -65,3 +65,9 @@ dist/
 # it. Kept out of the tree for `mutants.out/`'s reason — a sweep is measurement
 # output, not source — and named by date so a finished one can be deleted.
 /.sweep-*
+
+# The working document that routes this repository's own work: authority order,
+# repository policy, the rules the hooks enforce. Present in the working tree
+# for the same reason `docs/` is, and untracked for the same reason — it is how
+# the work is thought through, not what the work ships.
+/AGENTS.md

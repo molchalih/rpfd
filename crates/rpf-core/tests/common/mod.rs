@@ -1,16 +1,6 @@
 //! The RPF7 header and entry-row layout, hand-encoded once for the tests that
-//! assemble an archive byte by byte.
-//!
-//! Two files needed this and each had written it out, which is §3's duplicated
-//! constant in test scaffolding: a revision to the layout would be applied to
-//! one copy, and the stale copy would go on building archives the parser
-//! happens to accept. One definition, so a layout change breaks the tests that
-//! are wrong rather than hiding behind the ones that are not.
-//!
-//! Nothing here holds a width of its own. The version seam is asked for every
-//! one, so moving a constant behind it cannot leave these builders writing the
-//! old value — which is the property that makes assembling bytes by hand safer
-//! than it sounds.
+//! assemble an archive byte by byte. No width is restated here; every one is
+//! asked of the version seam.
 #![allow(
     dead_code,
     reason = "each including test crate gets its own copy of this module and \
@@ -30,8 +20,7 @@ use rpf_core::format::{
 
 /// The version every archive assembled here is written at.
 pub const V: Version = Version::Rpf7;
-/// Its header length, entry-row width and block unit, asked of the seam rather
-/// than restated here.
+/// Its header length, entry-row width and block unit.
 pub const HEADER_LEN: u64 = V.header_len();
 pub const ENTRY_LEN: u64 = V.row_len();
 pub const BLOCK_LEN: u64 = V.block_len();
@@ -65,11 +54,8 @@ pub fn file_row(
     row
 }
 
-/// [`file_row`] for a stored binary file, whose compressed size is the zero
-/// sentinel and whose real length is the word at offset 8.
-///
-/// `docs/rpf-format.md`, Compression: an entry with compressed size 0 is
-/// stored, not compressed.
+/// [`file_row`] for a stored binary file: compressed size 0 is the stored
+/// sentinel, and the real length is the word at offset 8.
 pub fn stored_row(name_offset: u16, block: u32, len: u32) -> [u8; ROW_LEN] {
     file_row(name_offset, 0, block, len, 0)
 }

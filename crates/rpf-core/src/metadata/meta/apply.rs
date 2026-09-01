@@ -1,28 +1,17 @@
 //! The XML read back, and applied to the file it was written from.
 //!
-//! DR-049 for this encoding, and the argument is the same one `PSO` made. A
-//! resource `Meta` carries more than its data: page slack, inter-table padding,
-//! the 7.26% of a payload that follows the last data block, and — the row that
-//! decides it — **2.48% of the payload that no walk reaches and that is not
-//! zero** (`docs/metadata-encodings.md`, What a walk does not reach). None of
-//! that is in the document and none of it can be invented, so the write
-//! direction **edits** the file it came from.
+//! A resource `Meta` carries page slack, padding and bytes no walk reaches that
+//! are not zero, none of it in the document and none of it inventable, so this
+//! direction edits the file it came from rather than rebuilding it.
 //!
-//! The walk here is [`super::render`]'s walk read backwards: the same tables,
-//! the same blocks, the same addresses, in the same order. No structural fact
-//! of the file changes: no block moves, no pointer is rewritten, and no page is
-//! re-allocated. A value that no longer fits where it was is a refusal
-//! ([`NotMetaXml::TooLong`]), and so is an array of a different length or a
-//! structure of a different member list. DR-052 is why those are the permanent
-//! boundary of editing rather than work not yet done.
+//! The walk is [`super::render`]'s read backwards: the same tables, blocks and
+//! addresses, in the same order. No block moves, no pointer is rewritten, no
+//! page is re-allocated; a value that no longer fits, an array of a different
+//! length, or a different member list is a refusal.
 //!
-//! Two properties make "the same addresses" a checked claim rather than a
-//! description of the intent, and [`Applier::put`] is where both are checked:
-//! every write is bounded by the **block** the value lives in, which is the
-//! bound [`super::render`] reads it under; and two elements that write one
-//! address have to agree on what goes there, or the edit is refused
-//! ([`NotMetaXml::Aliased`]). DR-059, which is also why a file that points at
-//! one value twice still round-trips unedited.
+//! [`Applier::put`] checks both properties that make "the same addresses" a
+//! claim: every write is bounded by the block the value lives in, and two
+//! elements writing one address must agree on what goes there.
 
 use quick_xml::{
     Reader, XmlVersion,
@@ -61,11 +50,9 @@ pub(super) fn write(
     document: &[u8],
     names: &Dictionary,
 ) -> Result<Vec<u8>> {
-    // Before the document is parsed, because parsing it is what costs: the
-    // whole of it is materialised into a tree before the first comparison
-    // against the payload, so a document far larger than the file it edits has
-    // to be refusable on sight. The ceiling is the one `render` writes under,
-    // so a document `to_xml` wrote always fits.
+    // Before parsing, which is what costs: the whole document is materialised
+    // into a tree before the first comparison. The ceiling is the one `render`
+    // writes under, so a document `to_xml` wrote always fits.
     let budget = document_budget(payload.len());
     if document.len() > budget {
         return Err(Error::NotMetaXml {
@@ -104,15 +91,10 @@ pub(super) fn write(
 }
 
 /// One element of the document: its name, its one reserved attribute, and its
-/// children.
-///
-/// Every element [`super::render`] writes carries **exactly one** `meta:`
-/// attribute, which is what makes this shape total rather than a subset: the
-/// type of every record is written down, which is DR-047's central decision.
+/// children. Every element [`super::render`] writes has exactly one.
 #[derive(Debug)]
 struct Node {
-    /// Where in the document it opened, so a refusal names a place an editor
-    /// can put a cursor on.
+    /// Where in the document it opened.
     position: u64,
     /// Its element name.
     tag: String,
@@ -145,10 +127,9 @@ fn read_tree(document: &[u8]) -> Result<Node> {
                 if stack.is_empty() && root.is_some() {
                     return Err(at(&reader, NotMetaXml::SecondRoot));
                 }
-                // `>` and not `>=`: `stack.len()` is the depth the element about
-                // to be pushed will sit at, and both walks accept `MAX_DEPTH`
-                // itself. A level's difference here refuses a payload the other
-                // direction rendered, and blames the document for it.
+                // `>` and not `>=`: `stack.len()` is the depth the element
+                // about to be pushed sits at, and both walks accept
+                // `MAX_DEPTH` itself.
                 if stack.len() > MAX_DEPTH {
                     return Err(at(&reader, NotMetaXml::TooDeep));
                 }
@@ -178,8 +159,7 @@ fn read_tree(document: &[u8]) -> Result<Node> {
             Event::CData(_) => return Err(at(&reader, NotMetaXml::UnexpectedText)),
             Event::Eof => break,
             // `expand_empty_elements` turns every `<a/>` into a start and an
-            // end, so `Empty` cannot occur; the rest carry nothing this mapping
-            // reads.
+            // end, so `Empty` cannot occur.
             Event::Decl(_)
             | Event::Comment(_)
             | Event::PI(_)
@@ -244,16 +224,13 @@ fn opening(start: &BytesStart<'_>, position: u64) -> std::result::Result<Node, N
 /// The walk in progress: the payload it reads and the copy it writes.
 #[derive(Debug)]
 struct Applier<'a, 'b> {
-    /// The original payload, parsed. Every address, count and pointer the walk
-    /// follows is read from here, so an edit cannot move the walk.
+    /// The original payload, parsed: every address, count and pointer comes
+    /// from here, so an edit cannot move the walk.
     values: Values<'a, 'b>,
     /// The copy the values go into.
     edited: Vec<u8>,
-    /// Which bytes of it an element has already written.
-    ///
-    /// One flag per payload byte, because the question it answers is asked per
-    /// byte: a file may point at one value twice, and then two elements of the
-    /// document write one address. DR-059.
+    /// Which bytes of it an element has already written, one flag per byte: a
+    /// file may point at one value twice.
     written: Vec<bool>,
     names: &'b Dictionary,
 }
@@ -306,10 +283,8 @@ impl<'a> Applier<'a, '_> {
         node: &Node,
         depth: usize,
     ) -> Result<()> {
-        // The ceiling `structure` states, asked again here for the values that
-        // reach no structure: a pointer into a block tagged with a bare type
-        // code applies nothing of its own and recurses, which is the cycle
-        // `render` refuses at the same place.
+        // Asked again here for values that reach no structure: a pointer into
+        // a block tagged with a bare type code recurses.
         if depth > MAX_DEPTH {
             return Err(bad(spot.address(), Malformed::TooDeep));
         }
@@ -351,10 +326,9 @@ impl<'a> Applier<'a, '_> {
             Kind::Text => match self.values.counted(spot)? {
                 (None, _) => expect_null(node, tag, TEXT),
                 (Some(landing), store) => {
-                    // The terminator is one of the bytes the store holds, so a
-                    // value may fill the store less one — never less, though,
-                    // than the value already there, because an edit moves
-                    // nothing it did not change. DR-052.
+                    // The terminator is one of the store's bytes, so a value
+                    // may fill the store less one — but never less than the
+                    // value already there.
                     let was = until_nul(landing.bytes(store)?).len();
                     let len = self.put_text(landing, store.saturating_sub(1), was, tag, node)?;
                     match len {
@@ -364,9 +338,8 @@ impl<'a> Applier<'a, '_> {
                 }
             },
             Kind::InlineText(store) => {
-                // No count to rewrite: the buffer is the member's own bytes and
-                // its length is a fact about the structure, so a shortened
-                // string is a terminator and nothing else.
+                // No count to rewrite: the buffer's length is a fact about the
+                // structure, so a shortened string is just a terminator.
                 let was = until_nul(spot.bytes(store)?).len();
                 self.put_text(spot, store.saturating_sub(1), was, tag, node)
                     .map(|_| ())
@@ -381,10 +354,8 @@ impl<'a> Applier<'a, '_> {
             BlockTag::Type(word) => {
                 let code = u8::try_from(word)
                     .map_err(|_| bad(landing.address(), Malformed::UndefinedStructure))?;
-                // Deepened here and nowhere else on this path, for the reason
-                // `render::Writer::target` gives — and by the same level, or a
-                // payload one direction writes a document for is one the other
-                // refuses.
+                // Deepened here and nowhere else on this path, by the same
+                // level `render` uses, or the two directions disagree.
                 self.value(
                     Field {
                         member: typed(code),
@@ -432,27 +403,14 @@ impl<'a> Applier<'a, '_> {
     }
 }
 
-/// The writes. Every one is bounded by the block the value lives in — the same
-/// bound [`super::render`] reads the same value under — and no two of them
-/// disagree over one address.
+/// The writes: each bounded by the block the value lives in, and no two of them
+/// disagreeing over one address.
 impl<'a> Applier<'a, '_> {
     /// Writes `bytes` at `spot`.
     ///
-    /// Two bounds, and the walk supplies neither:
-    ///
-    /// - **The block.** [`Spot::bytes`] is what [`super::render`] reads every
-    ///   value through, and it is checked against the length the block's own
-    ///   row declares. A structure instance longer than the block holding it,
-    ///   or an array whose stride runs off the end of one, is a payload the
-    ///   read direction refuses — so the write direction refuses it at the same
-    ///   address, rather than writing over the 7.26% of the payload that
-    ///   follows the last block and the 2.48% that is unreached and nonzero.
-    ///   Bounding against `edited` alone bounds against the whole payload,
-    ///   which is no bound at all.
-    /// - **What another element already wrote.** DR-059: a second write to an
-    ///   address is accepted only when it writes the same bytes, which every
-    ///   unedited trip over an aliasing file does and a half-made edit does
-    ///   not.
+    /// Bounded by the block's own declared length, not by `edited` — bounding
+    /// against the whole payload is no bound at all — and a second write to an
+    /// address is accepted only when it writes the same bytes.
     ///
     /// # Errors
     ///
@@ -489,11 +447,7 @@ impl<'a> Applier<'a, '_> {
     }
 
     /// Writes a counted value into the `room` bytes it has, and answers how
-    /// many bytes it wrote.
-    ///
-    /// Nothing past the value is touched, which is what makes an unedited trip
-    /// identical rather than merely equivalent: what follows is whatever the
-    /// packer left, and the packer's leavings are 2.48% of a `Meta` payload.
+    /// many it wrote. Nothing past the value is touched.
     fn put_value(
         &mut self,
         landing: Spot<'a>,
@@ -516,14 +470,9 @@ impl<'a> Applier<'a, '_> {
         Ok(len)
     }
 
-    /// Writes a NUL-terminated string into the `room` bytes it has, and
-    /// answers the new length when it is one the caller has to record.
-    ///
-    /// `was` is how long the string already there is. `None` says the value is
-    /// unchanged, which is every unedited trip and is what keeps one
-    /// byte-perfect: nothing at all is written past the value, because what
-    /// follows is whatever the packer left and the packer's leavings are 2.48%
-    /// of a `Meta` payload.
+    /// Writes a NUL-terminated string into the `room` bytes it has, answering
+    /// a new length only when the caller has to record one; `was` is how long
+    /// the string already there is.
     fn put_text(
         &mut self,
         landing: Spot<'a>,
@@ -548,12 +497,8 @@ impl<'a> Applier<'a, '_> {
         Ok(Some(len))
     }
 
-    /// Rewrites the count a shortened value leaves behind.
-    ///
-    /// `count1` describes the bytes the edit changed, so it changes with them —
-    /// DR-049's amendment, which a shortened `ATSTRING` was found contradicting
-    /// in `PSO`. `count2` is the capacity of the allocation and is left alone,
-    /// because an edit that would change an allocation is refused instead.
+    /// Rewrites the count a shortened value leaves behind: `count1` describes
+    /// the bytes, and `count2` is the allocation's capacity and is left alone.
     fn put_count(&mut self, spot: Spot<'a>, len: u32, node: &Node) -> Result<()> {
         let stored = u16::try_from(len).map_err(|_| unreadable(node))?;
         self.put(spot.step(COUNT_AT)?, &stored.to_le_bytes(), node)
@@ -634,14 +579,8 @@ fn typed(code: u8) -> Member {
 }
 
 /// How many bytes a value may be written into: the `store` its form gives it,
-/// and never less than the `was` bytes already there.
-///
-/// The second half is DR-049's rule that an edit moves nothing it did not
-/// change, applied to a payload whose own value already fills its store. Such a
-/// payload is not one this writes, but it is representable and the read
-/// direction accepts it, so refusing to write it back unchanged would break the
-/// round trip for a shape nobody edited. What the bound refuses is an *edit*
-/// that would create the shape.
+/// and never less than the `was` bytes already there, so a payload that arrives
+/// overfull is still writable back unchanged.
 fn room(store: u32, was: usize) -> u32 {
     store.max(u32::try_from(was).unwrap_or(u32::MAX))
 }
@@ -694,10 +633,8 @@ fn expect_value(node: &Node, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks that a null pointer is still written down as one.
-///
-/// DR-047: the reserved word carries the type the value would have had,
-/// because an absent value and an empty one are different things.
+/// Checks that a null pointer is still written down as one, under the type
+/// word the value would have had.
 fn expect_null(node: &Node, tag: &str, word: &str) -> Result<()> {
     expect(node, tag, NULL)?;
     expect_value(node, word)
@@ -721,12 +658,6 @@ fn expect_children(node: &Node, wanted: usize) -> Result<&[Node]> {
 #[cfg(test)]
 mod tests {
     use super::{Error, NotMetaXml, read_tree};
-
-    // -------------------------------------------------------------------
-    // `is_space` — a mutant that always answers `true` would trim a stray
-    // word down to nothing and never see it. The same pair `PSO` carries,
-    // for the copy of the predicate this module holds.
-    // -------------------------------------------------------------------
 
     /// Text between elements that is not whitespace is a document this
     /// mapping does not write, and is answered rather than dropped.

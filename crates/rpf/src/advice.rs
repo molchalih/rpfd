@@ -1,18 +1,8 @@
 //! What a caller is told to do about a failure, beyond what the failure says.
 //!
-//! `rpf_core::Error` carries what a caller acts on and not a rendered sentence
-//! (§10), and a remedy is spelled in the frontend's own vocabulary — a command
-//! line switch — so it is added here rather than in the container. Both
-//! frontends render through this one function, so the daemon says what the
-//! command line says (§1).
-//!
-//! Two things are added. A path spelled the Windows way is respelt: DR-016
-//! makes `/` the only separator a path inside an archive has and `\` an
-//! ordinary character in an entry name, so a `\` a caller types is never
-//! rewritten and `data\greeting.txt` is simply not-found. That answer is
-//! correct and unhelpful, and R10.6 puts the rule and the caller's own path
-//! respelt at this boundary. And a refusal with a switch behind it names the
-//! switch: DR-050.
+//! Both frontends render through this one function, so the daemon says what the
+//! command line says. Two things are added: a path spelled with `\` is respelt
+//! with the separator, and a refusal with a switch behind it names the switch.
 
 use rpf_core::Error;
 
@@ -35,19 +25,9 @@ pub fn render(failure: &Failure) -> String {
 
 /// The way through a refusal that has one, in the caller's own vocabulary.
 ///
-/// One refusal has one: [`Error::WrongEncoding`]'s override is a switch of its
-/// own — `--force` means "write into a detected game install" and says so in
-/// its own sentence (DR-050).
-///
-/// [`rpf_core::NoWrite::NoInverse`] deliberately has none. Since DR-062 it says
-/// that this build has nothing to derive the archive's forward transform from —
-/// for NG that is a memory image of a running game (DR-040) — and naming a
-/// command as the way through would be a lie, because there is not one. `pack`
-/// over an
-/// AES-tagged tree had one until DR-057 — "edit through the archive instead" —
-/// and no longer needs it: it packs, given the material every other command
-/// already reaches, and says [`Error::NeedsKey`] when there is none, which is a
-/// state a caller acts on rather than a route to another command.
+/// Only [`Error::WrongEncoding`] has one. [`rpf_core::NoWrite::NoInverse`]
+/// deliberately has none: nothing here derives the archive's forward transform,
+/// so naming a command as the way through would be a lie.
 fn remedy(failure: &Failure) -> Option<&'static str> {
     match *failure {
         Failure::Container(Error::WrongEncoding { .. }) => {
@@ -61,9 +41,8 @@ fn remedy(failure: &Failure) -> Option<&'static str> {
 /// the failure is not one a separator explains.
 ///
 /// Only [`Error::NotFound`], because only there did the path come from the
-/// caller. [`Error::BadPath`] also names a path holding `\`, but that one came
-/// out of the archive, and respelling it would be advice to rename somebody
-/// else's entry.
+/// caller. [`Error::BadPath`]'s path came out of the archive, and respelling it
+/// would be advice to rename somebody else's entry.
 fn respelling(failure: &Failure) -> Option<String> {
     let Failure::Container(Error::NotFound { ref path, .. }) = *failure else {
         return None;
@@ -101,8 +80,8 @@ mod tests {
 
     #[test]
     fn only_the_separators_are_respelt_and_every_component_survives() {
-        // Not a `\` swept out of the name: what is offered is the same path
-        // read the other way, so a caller can see whether it is what they meant.
+        // What is offered is the same path read the other way, not a `\`
+        // swept out of the name.
         assert_eq!(
             respelling(&not_found("x64\\dlcpacks\\mp\\dlc.rpf")).as_deref(),
             Some("x64/dlcpacks/mp/dlc.rpf"),
@@ -123,7 +102,7 @@ mod tests {
     #[test]
     fn a_name_the_archive_holds_a_backslash_in_is_not_respelt() {
         // The `\` came from the archive rather than from the caller, so there
-        // is nothing to suggest. DR-016.
+        // is nothing to suggest.
         let failure = Failure::Container(Error::BadPath {
             path: "x64\\evil.txt".to_owned(),
             reason: "has a component holding \\, which is a separator on Windows",
@@ -133,9 +112,6 @@ mod tests {
     }
 
     /// A refusal with a way through names it, in the spelling a caller passes.
-    ///
-    /// R7.6 wants a message a caller can act on, and `rpf_core::Error` cannot
-    /// give one: it knows nothing of command-line switches (§2). DR-050.
     #[test]
     fn a_refusal_with_a_switch_behind_it_names_the_switch() {
         let failure = Failure::Container(Error::WrongEncoding {
@@ -156,14 +132,12 @@ mod tests {
         );
     }
 
-    /// The encrypted-write refusal, which is the case where the reason left is
-    /// a wall: nothing is offered, because there is nothing to offer.
-    /// DR-054, DR-057.
+    /// The encrypted-write refusal: nothing is offered, because there is
+    /// nothing to offer.
     #[test]
     fn the_encrypted_refusal_that_has_no_way_through_offers_none() {
         // Nothing here derives the transform, and no command changes that:
-        // offering one would be a lie. DR-062 re-aimed what the reason means
-        // and did not give it a route through.
+        // offering one would be a lie.
         let ng = Failure::Container(Error::CannotWriteEncrypted {
             tag: 0x0FEF_FFFF,
             reason: rpf_core::NoWrite::NoInverse,

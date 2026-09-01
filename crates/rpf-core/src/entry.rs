@@ -1,15 +1,7 @@
 //! One row of the entry table, once its version has been decoded away.
 //!
-//! A directory, a binary file and a resource file are separate variants because
-//! the two trailing words of the row mean different things in each (§5). A
-//! single struct with an `uncompressed_len` that is secretly two flag words is
-//! a bug waiting for its first resource.
-//!
-//! Version-independent by construction: nothing here knows a width, an offset
-//! or a marker. [`crate::format::Version::decode_row`] turns bytes into one of
-//! these and [`crate::format::Version::file_row`] turns the fields back into
-//! bytes, and both live behind the seam because the row is 16 bytes at `RPF7`,
-//! 20 at `RPF6` and 24 at `RPF8`. DR-012.
+//! Directory, binary and resource are separate variants because the two
+//! trailing words of the row mean different things in each.
 
 /// What an entry is, and the fields that only that kind has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +24,6 @@ pub enum EntryKind {
         uncompressed_len: u32,
         /// Per-entry encryption field: non-zero means the payload is under the
         /// archive's own transform.
-        ///
-        /// Two values and no others across 91,604 binary entries.
-        /// `docs/rpf-format.md`, Entry table, `verified` — which answered
-        /// `docs/backlog.md` Q10 and superseded the "zero on every entry
-        /// measured so far" this said while the sample was one archive.
         encryption: u32,
     },
     /// A file whose payload is an `RSC7` resource.

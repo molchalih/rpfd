@@ -1,16 +1,6 @@
-//! The metadata layer's laws, over documents nobody shipped.
-//!
-//! The corpus is the stronger evidence and `tests/metadata.rs` is where it is
-//! used: 391 real files reproduced byte-for-byte says more than any generator
-//! can. What a generator adds is the cases Rockstar's packer never emits — a
-//! `NaN` with a payload, a name reused at two types, a string that reads as a
-//! number, a blob of nothing but spaces — and the assurance that the round trip
-//! is a property of the code rather than of the corpus. R5.7,
-//! `docs/conventions.md` §14's property-tests row.
-//!
-//! The stream each case is checked against is built **here**, by a writer that
-//! is not the one under test. A reader and a writer that agree with each other
-//! and with nothing else would otherwise pass every round-trip test there is.
+//! The metadata layer's laws, over documents nobody shipped — the cases a real
+//! packer never emits. Each stream is built here by a writer that is not the
+//! one under test, so agreement between the two is evidence.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -27,13 +17,8 @@ use rpf_core::metadata::{
     rbf::{self, MAGIC},
 };
 
-/// The names a generated document draws from.
-///
-/// Deliberately the ones that make a naive mapping wrong: `x`, `y`, `z`, `w`
-/// and `type` are real attribute names in the corpus, so none of them can be
-/// reserved for a vector or for a type tag; `CriminalCareerDefs::Limits` is the
-/// shape of the one real name carrying a colon, which is why the XML uses a
-/// reserved prefix and not a namespace.
+/// The names a generated document draws from — the ones that make a naive
+/// mapping wrong: real attribute names, and one carrying a colon.
 const NAMES: [&str; 10] = [
     "a",
     "Item",
@@ -47,8 +32,7 @@ const NAMES: [&str; 10] = [
     "_9",
 ];
 
-/// A value, kept as the bits it is written as so that a `NaN` payload survives
-/// the generator as well as the code under test.
+/// A value, kept as the bits it is written as so a `NaN` payload survives.
 #[derive(Debug, Clone)]
 enum Value {
     Uint(u32),
@@ -140,10 +124,7 @@ fn dedupe(attributes: Vec<(usize, Value)>) -> Vec<(usize, Value)> {
     kept
 }
 
-/// Writes a generated document as an `RBF` payload.
-///
-/// Independent of `rpf-core`: `docs/metadata-encodings.md`'s token-stream table
-/// transcribed once more, so that agreement between the two is evidence.
+/// Writes a generated document as an `RBF` payload, independent of `rpf-core`.
 fn encode(root: &Element) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     let mut names: Vec<usize> = Vec::new();
@@ -203,10 +184,8 @@ fn write_value(out: &mut Vec<u8>, names: &mut Vec<usize>, name: usize, value: &V
     }
 }
 
-/// Writes a record's index and type, and its name if this is its first use.
-///
-/// Keyed by name alone, which is the measurement: 391 of 391 shipped files
-/// reproduce that way and 205 of 391 reproduce keyed by name and type.
+/// Writes a record's index and type, and its name on its first use — keyed by
+/// name alone, which is how shipped files reproduce.
 fn record(out: &mut Vec<u8>, names: &mut Vec<usize>, name: usize, kind: u8) {
     if let Some(index) = names.iter().position(|seen| *seen == name) {
         out.push(index as u8);
@@ -224,7 +203,7 @@ fn record(out: &mut Vec<u8>, names: &mut Vec<usize>, name: usize, kind: u8) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// R5.7's law: unedited in, unedited out, byte-identical.
+    /// Unedited in, unedited out, byte-identical.
     #[test]
     fn a_document_survives_the_trip_through_xml(root in element()) {
         let payload = encode(&root);
@@ -245,8 +224,8 @@ proptest! {
         );
     }
 
-    /// §6: a metadata payload is third-party data, and some of it is malformed
-    /// on purpose. Every one of these is an error or a document, never a panic.
+    /// A metadata payload is third-party data: every one of these is an error
+    /// or a document, never a panic.
     #[test]
     fn arbitrary_bytes_are_answered_and_never_crash(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
         let _ = rbf::to_xml(&bytes);
@@ -267,58 +246,19 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `PSO`
-// ---------------------------------------------------------------------------
+// The `PSO` generator below produces what the corpus does not: filler that is
+// neither zero nor `'p'` in every byte no walk reaches, and the rare member
+// shapes. Two laws follow — the identity, and the transfer of one payload's
+// document onto another payload of the same schema.
 
-// What follows is the same argument one encoding over, and it has to answer a
-// recorded failure rather than only repeat a pattern. `docs/backlog.md`'s
-// lesson — *a corpus and a generator that agree are still one opinion* — was
-// paid for by the `RBF` proptest above: its generator built the descriptor
-// table the way the reader rebuilds it, so the one stream that breaks the law
-// was outside the generator's reach.
-//
-// For `PSO` the reachable-but-wrong cases are the **value codecs**, because
-// that is where `from_xml` has to invert a rendering rather than copy a byte.
-// So the generator below is built to produce what the corpus does not:
-//
-// - filler that is **not** zero and not `'p'`, in every byte no walk reaches —
-//   between blocks, after a string's NUL, in the four bytes of a `VECTOR3` that
-//   carry no lane, in a pointer's dead second word. A writer that rebuilt the
-//   section instead of editing it fails here and passes on the corpus.
-// - a `BOOL` byte that is neither 0 nor 1, a `CHAR` that is negative, a `NaN`
-//   `FLOAT` with a payload, and every one of the 65,536 `FLOAT16` bit patterns.
-// - a fixed inline string that fills its buffer with no NUL at all, beside one
-//   whose NUL is followed by bytes that must survive untouched.
-// - an `ENUM` value its own table does not name, so the decimal fallback is
-//   exercised, and a `BITSET` with no enum info at all.
-//
-// And the law is two laws, not one. The identity — document out, document in,
-// same bytes — can be satisfied by a writer that recognises its own output and
-// copies. The **transfer** law cannot: one payload's document is applied to a
-// *different* payload built over the same schema, and the result has to render
-// back as that document. Every value codec is on the line there, against values
-// the payload never held.
-//
-// The payload is built here, by a second transcription of
-// `docs/metadata-encodings.md`'s `PSO` tables, so that agreement with
-// `rpf-core` is evidence rather than a tautology.
-
-/// The name hash of the generated root structure. Any `u32` does: with no
-/// dictionary every name renders as `hash_XXXXXXXX`, which is DR-047's
-/// round-trip-safe spelling.
+/// The name hash of the root structure; with no dictionary any `u32` does.
 const ROOT: u32 = 0xD98B_B561;
 
-/// The name hash the first nested structure a generated file holds takes; each
-/// one after it takes the next.
-///
-/// Distinct per structure on purpose: a block's `nameHash` is the **only**
-/// place a pointer's concrete type is written down — a `STRUCT` member of
-/// subtype 3 carries `referenceKey == 0` in 43,225 of 43,225 — so two blocks
-/// sharing a name would be two shapes claiming one layout.
+/// The name hash the first nested structure takes; each one after it the next.
+/// A block's `nameHash` is the only place a pointer's type is written down.
 const NESTED: u32 = 0x82D6_FC83;
 
-/// The `ARRAYINFO` sentinel, from `docs/metadata-encodings.md`.
+/// The `ARRAYINFO` sentinel.
 const ARRAYINFO: u32 = 0x0000_0100;
 
 /// The `BITSET` "no enum info" sentinel, in place of a member index.
@@ -327,15 +267,11 @@ const NO_ENUM: u16 = 0x0FFF;
 /// Where the lowest block sits: after `PSIN`'s header and its eight `'p'`s.
 const FIRST_BLOCK: u32 = 16;
 
-/// A byte that is neither zero nor `'p'`, so that filler a walk never reaches
-/// is visibly filler.
+/// A byte that is neither zero nor `'p'`, so unreached filler is visible.
 const FILLER: u8 = 0xA7;
 
-/// One fixed-width value, as the bytes it is stored as.
-///
-/// Kept as bytes rather than as a number so that a `NaN` payload, a half-float
-/// bit pattern and a `BOOL` of 7 all survive the generator as well as the code
-/// under test.
+/// One fixed-width value, as the bytes it is stored as, so a `NaN` payload or
+/// a `BOOL` of 7 survives the generator.
 #[derive(Debug, Clone)]
 struct Fixed {
     code: u8,
@@ -343,7 +279,6 @@ struct Fixed {
     bytes: Vec<u8>,
 }
 
-/// What one member of a generated structure holds.
 #[derive(Debug, Clone)]
 enum Field {
     /// A fixed-width value, inline.
@@ -376,54 +311,31 @@ enum Field {
     /// `ARRAY` subtype 0: the 16-byte counted form, out of line.
     CountedArray { items: Vec<Fixed> },
     /// `STRUCT` subtype 3 or 4: a pointer to a structure, or null.
-    ///
-    /// Subtype 4 is `SIMPLE_POINTER`, 33,893 of 580,044 members and the third
-    /// most common `STRUCT` form after the inline one. It behaves identically
-    /// and is generated anyway, because "behaves identically" is the claim
-    /// under test.
     Pointer {
         subtype: u8,
         fields: Option<Vec<Fixed>>,
     },
     /// `STRUCT` subtype 0: the structure inline at the member's own offset.
-    ///
-    /// 82,549 of 580,044 members — the second most common member shape in the
-    /// corpus, and the one the generator did not reach.
     InlineStruct { fields: Vec<Fixed> },
-    /// `ARRAY` subtype 0 whose element is a structure rather than a scalar.
-    ///
-    /// The `ARRAYINFO` member describes the element, and nothing says it has to
-    /// describe a fixed-width one. An array of structures is the case where the
-    /// stride comes from the schema's own `extent` rather than from a width.
+    /// `ARRAY` subtype 0 whose element is a structure rather than a scalar, so
+    /// the stride comes from the schema's `extent` rather than from a width.
     StructArray { rows: Vec<Vec<Fixed>> },
     /// `MAP` subtype 1, `ATBINARYMAP`: a 24-byte header whose counted pointer
     /// lands on an array of key/value structures.
-    ///
-    /// 98 members in 26 of 9,753 files, which is why the corpus alone is thin
-    /// evidence for it.
     Map { rows: Vec<Vec<Fixed>> },
     /// `ARRAY` subtype `0x81`: inline, at a `dataOffset` that has wrapped past
-    /// the sixteen bits the field has.
-    ///
-    /// Carries its own preceding `UINT`, because the recovery is only unique
-    /// when a member before it ends past the raw offset — which is the whole of
-    /// `docs/metadata-encodings.md`'s argument that recovering it is not a
-    /// guess. Generated last and only last: it puts its elements at 65,536, and
-    /// a member after it could not state its own offset in a `u16`.
+    /// the sixteen bits the field has. Carries its own preceding `UINT`, and
+    /// must be generated last: its elements sit at 65,536.
     Wrapped { items: Vec<Fixed> },
 }
 
-/// A generated document: the root structure's members.
 #[derive(Debug, Clone)]
 struct Generated {
     fields: Vec<Field>,
 }
 
-/// How many bytes one fixed-width value occupies.
-///
-/// `docs/metadata-encodings.md`'s census: a `VECTOR3` is **sixteen** bytes
-/// carrying three floats, not twelve, and the four that carry no lane are what
-/// the filler above is for.
+/// How many bytes one fixed-width value occupies. A `VECTOR3` is sixteen bytes
+/// carrying three floats, not twelve; the four spare ones are filler.
 fn width_of(code: u8, subtype: u8) -> u32 {
     match (code, subtype) {
         (0x00..=0x02, _) => 1,
@@ -434,10 +346,8 @@ fn width_of(code: u8, subtype: u8) -> u32 {
     }
 }
 
-/// Every fixed-width `(type, subtype)` pair a generated file draws from.
-///
-/// The sixteen scalar kinds `docs/metadata-encodings.md`'s census lists, with
-/// `UINT`'s `COLOR` subtype beside its plain one.
+/// Every fixed-width `(type, subtype)` pair a generated file draws from: the
+/// sixteen scalar kinds, with `UINT`'s `COLOR` subtype beside its plain one.
 const FIXED_KINDS: [(u8, u8); 17] = [
     (0x00, 0),
     (0x01, 0),
@@ -475,19 +385,14 @@ fn fixed() -> impl Strategy<Value = Fixed> {
     })
 }
 
-/// A run of bytes with no NUL in it, which is what a rendered string is made
-/// of: [`rpf_core::metadata::pso::to_xml`] reads up to the first NUL, so a NUL
-/// inside the value would not come back.
+/// A run of bytes with no NUL in it: a renderer reads up to the first NUL, so
+/// a NUL inside the value would not come back.
 fn body(len: std::ops::Range<usize>) -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(1u8..=255, len)
 }
 
-/// An enum or bitset table: distinct keys, and **distinct name hashes**.
-///
-/// Two keys whose names render the same is a real case and it is not this law's:
-/// the document cannot say which of them it means, so `from_xml` refuses it,
-/// and `an_enum_two_keys_render_the_same_name_for_is_refused` is where that is
-/// pinned.
+/// An enum or bitset table: distinct keys, and distinct name hashes. Two keys
+/// rendering the same name are refused elsewhere, not here.
 fn table(bits: u32) -> impl Strategy<Value = Vec<(i32, u32)>> {
     prop::collection::vec(0..bits, 1..6).prop_map(move |keys| {
         let mut seen = Vec::new();
@@ -506,9 +411,8 @@ fn field() -> impl Strategy<Value = Field> {
     prop_oneof![
         fixed().prop_map(Field::Fixed),
         (body(0..7), 0usize..3, any::<bool>()).prop_map(|(bytes, slack, terminated)| {
-            // `terminated` false is a buffer the value fills exactly, with no
-            // NUL to stop at; the slack bytes after a NUL are filler that has
-            // to survive.
+            // `terminated` false fills the buffer exactly, with no NUL to stop
+            // at; the bytes after a NUL are filler that must survive.
             let len = bytes.len() + if terminated { slack + 1 } else { 0 };
             Field::Inline {
                 len: u16::try_from(len.max(1)).expect("a test length fits"),
@@ -552,8 +456,7 @@ fn field() -> impl Strategy<Value = Field> {
             }
         ),
         prop::collection::vec(fixed(), 0..3).prop_map(|items| {
-            // One array holds one element type, which is what an `ARRAYINFO`
-            // member says.
+            // One array holds one element type, per its `ARRAYINFO` member.
             let items = one_kind(items);
             Field::InlineArray { items }
         }),
@@ -571,11 +474,8 @@ fn field() -> impl Strategy<Value = Field> {
     ]
 }
 
-/// Rows of one shape: `count` instances of the same generated structure.
-///
-/// One array holds one element type and one map holds one entry type, so every
-/// row after the first is forced to the first's member list — the same rule
-/// [`one_kind`] applies to a scalar array's items.
+/// Rows of one shape: `count` instances of the same generated structure. One
+/// array holds one element type, so every row is forced to the first's members.
 fn rows(count: std::ops::Range<usize>) -> impl Strategy<Value = Vec<Vec<Fixed>>> {
     prop::collection::vec(prop::collection::vec(fixed(), 1..3), count).prop_map(|rows| {
         let Some(first) = rows.first().cloned() else {
@@ -632,11 +532,7 @@ fn generated() -> impl Strategy<Value = Generated> {
         })
 }
 
-/// One `PSCH` structure member, as its twelve bytes.
-///
-/// `referenceKey` is at offset **8**, not 10 — `docs/metadata-encodings.md`,
-/// and getting it wrong leaves types and offsets plausible while every hash is
-/// garbage.
+/// One `PSCH` structure member, twelve bytes, `referenceKey` at offset 8.
 fn member(name: u32, code: u8, subtype: u8, offset: u16, reference: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(12);
     out.extend_from_slice(&name.to_be_bytes());
@@ -653,9 +549,7 @@ struct Chunk {
     bytes: Vec<u8>,
 }
 
-/// What the builder has produced so far.
 struct Building {
-    /// The root instance's bytes.
     root: Vec<u8>,
     /// The blocks that hold everything out of line.
     chunks: Vec<Chunk>,
@@ -664,7 +558,6 @@ struct Building {
     /// The enum entries each generated table wants, by the name hash the member
     /// references it under.
     enums: Vec<(u32, Vec<(i32, u32)>)>,
-    /// The nested structures a pointer needs, by name hash.
     structures: Vec<(u32, Vec<Vec<u8>>, u32)>,
 }
 
@@ -677,10 +570,7 @@ fn place(root: &mut Vec<u8>, offset: usize, bytes: &[u8]) {
 }
 
 /// The 16-byte counted form: the pointer, `count1`, `count2` and a dead word.
-///
-/// `count2` and the dead word are filler on purpose. They are read by nothing —
-/// `count1` is the length — so a writer that rebuilt them would differ here and
-/// nowhere in the corpus.
+/// `count1` is the length; the other two are filler nothing reads.
 fn counted(block: u32, count: u16) -> Vec<u8> {
     let mut out = pointer(block, 0);
     out.extend_from_slice(&count.to_be_bytes());
@@ -717,8 +607,6 @@ fn encode_pso(document: &Generated) -> Vec<u8> {
     let length = u32::try_from(build.root.len().max(offset)).expect("fits");
     build.root.resize(length as usize, FILLER);
 
-    // Lay the blocks out: the root first, then everything out of line, with
-    // filler between them.
     let mut data = vec![FILLER; FIRST_BLOCK as usize];
     data[..4].copy_from_slice(b"PSIN");
     data[8..16].copy_from_slice(b"pppppppp");
@@ -749,10 +637,6 @@ fn encode_pso(document: &Generated) -> Vec<u8> {
 
 /// Writes one field: its bytes into the root, its member into the schema, and
 /// whatever it needs out of line into a block. Answers the offset after it.
-///
-/// One arm per `PSO` member shape, which is what makes it long: splitting it
-/// would put each arm's three related decisions — where the bytes go, what the
-/// member says, and what the block holds — in three places.
 #[allow(clippy::too_many_lines, reason = "one arm per member shape")]
 fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize {
     let at = u16::try_from(offset).expect("a test offset fits");
@@ -831,8 +715,7 @@ fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize 
                 Some(entries) => {
                     let table = 0x3000_0000u32 + u32::try_from(build.enums.len()).expect("fits");
                     build.enums.push((table, entries.clone()));
-                    // The `ARRAYINFO` member goes immediately after this one,
-                    // so its index is known before either is written.
+                    // The `ARRAYINFO` member goes immediately after this one.
                     u32::try_from(build.members.len() + 1).expect("fits")
                 }
             };
@@ -870,8 +753,8 @@ fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize 
             let block = if items.is_empty() {
                 0
             } else {
-                // The first `stride` bytes are filler the items sit after, so
-                // the item offset inside the block is not zero either.
+                // The first `stride` bytes are filler, so the item offset
+                // inside the block is not zero either.
                 let block = u32::try_from(build.chunks.len() + 2).expect("fits");
                 build.chunks.push(Chunk { name: 0x0C, bytes });
                 block
@@ -916,8 +799,8 @@ fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize 
         }
         Field::StructArray { rows } => {
             let shape = define(build, rows.first().map_or(&[][..], Vec::as_slice));
-            // The first `length` bytes are filler the items sit after, so the
-            // item offset inside the block is not zero either.
+            // The first `length` bytes are filler, so the item offset inside
+            // the block is not zero either.
             let mut bytes = vec![FILLER; shape.length.max(1) as usize];
             for row in rows {
                 bytes.extend_from_slice(&row_bytes(row, &shape));
@@ -934,17 +817,15 @@ fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize 
             word.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
             place(&mut build.root, offset, &word);
             build.members.push(member(name, 0x0D, 0, at, element));
-            // The element descriptor is a `STRUCT` subtype 0, so the stride
-            // comes from the schema rather than from a scalar's width.
+            // A `STRUCT` subtype 0 element takes its stride from the schema.
             build
                 .members
                 .push(member(ARRAYINFO, 0x0C, 0, 0, shape.name));
             offset + 16
         }
         Field::Map { rows } => {
-            // `docs/metadata-encodings.md`: 24 bytes, laid out as `0x01000000`
-            // and 0 — 17,560 of 17,560 — then the same 16-byte counted pointer
-            // an `ATARRAY` uses.
+            // 24 bytes, laid out as `0x01000000` and 0, then the same 16-byte
+            // counted pointer an `ATARRAY` uses.
             place(&mut build.root, offset, &0x0100_0000u32.to_be_bytes());
             place(&mut build.root, offset + 4, &0u32.to_be_bytes());
             let word = if rows.is_empty() {
@@ -968,10 +849,7 @@ fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize 
         }
         Field::Wrapped { items } => {
             // The recovery is unique only when a member before this one ends
-            // past the raw offset, so this carries its own: a `UINT` at the
-            // offset the field would otherwise have taken. With the raw offset
-            // 0 and the structure exactly 65,536 bytes longer than the elements
-            // themselves, one multiple satisfies both constraints and it is 1.
+            // past the raw offset, so this carries its own `UINT`.
             place(&mut build.root, offset, &0x0000_0001u32.to_be_bytes());
             build.members.push(member(name, 0x06, 0, at, 0));
 
@@ -995,25 +873,18 @@ fn emit(build: &mut Building, name: u32, offset: usize, field: &Field) -> usize 
 }
 
 /// How far one wrap moves a `dataOffset`: the width of the `u16` field it is.
-///
-/// `docs/metadata-encodings.md`, `ARRAY` subtype `0x81`.
 const WRAP: usize = 0x1_0000;
 
-/// A structure the generator defined, as everything placing an instance of it
-/// needs.
+/// A structure the generator defined, as placing an instance of it needs.
 struct Shape {
     /// Its name hash, which is also the `nameHash` of every block holding one.
     name: u32,
-    /// Its declared length.
     length: u32,
-    /// Where each of its members sits inside it.
     offsets: Vec<usize>,
 }
 
 /// Defines a structure whose members are `row`, and answers what places one.
-///
-/// The gap after each member is deliberate: a byte no member covers has to
-/// survive a round trip through a document that never mentions it.
+/// The gap after each member is a byte no member covers, which has to survive.
 fn define(build: &mut Building, row: &[Fixed]) -> Shape {
     let name = NESTED + u32::try_from(build.structures.len()).expect("fits");
     let mut members = Vec::new();
@@ -1039,7 +910,6 @@ fn define(build: &mut Building, row: &[Fixed]) -> Shape {
     }
 }
 
-/// One instance of `shape`, as the bytes it occupies.
 fn row_bytes(row: &[Fixed], shape: &Shape) -> Vec<u8> {
     let mut bytes = vec![FILLER; shape.length as usize];
     for (value, at) in row.iter().zip(&shape.offsets) {
@@ -1049,13 +919,9 @@ fn row_bytes(row: &[Fixed], shape: &Shape) -> Vec<u8> {
 }
 
 /// Adds the `ARRAYINFO` member that describes one element, immediately after
-/// the array member that indexes it.
-///
-/// `docs/metadata-encodings.md`, The `ARRAYINFO` indirection: an array member
-/// does not name its element type, `referenceKey & 0xFFFF` indexes another
-/// member of the same structure whose `entryNameHash` is `0x00000100`, and that
-/// member describes the element. It is put next so that the index is arithmetic
-/// rather than a number the whole member list has to be finished to know.
+/// the array member that indexes it: an array member does not name its element
+/// type, and `referenceKey & 0xFFFF` indexes the member of the same structure
+/// whose `entryNameHash` is `0x00000100`.
 fn array_info(build: &mut Building, items: &[Fixed]) {
     let (code, subtype) = items
         .first()
@@ -1155,14 +1021,9 @@ fn chks() -> Vec<u8> {
     out
 }
 
-/// Writes the file's own size and checksum into the `CHKS` it ends with.
-///
-/// `docs/metadata-encodings.md`, `CHKS`, transcribed a second time so that
-/// agreement with `rpf-core` is evidence: a Jenkins one-at-a-time hash seeded
-/// `0x3FAC7125` over the whole file, each byte taken as a **signed** `int8`,
-/// with the size and the checksum zeroed first. The magic is not reversed and
-/// the length field is not overwritten; both of those transcriptions fail on
-/// every real file.
+/// Writes the file's own size and checksum into the `CHKS` it ends with: a
+/// Jenkins one-at-a-time hash seeded `0x3FAC7125` over the whole file, each
+/// byte taken as a signed `int8`, with the size and the checksum zeroed first.
 fn stamp(file: &mut [u8]) {
     let at = file.len() - 20;
     let size = u32::try_from(file.len()).expect("fits");
@@ -1181,10 +1042,6 @@ fn stamp(file: &mut [u8]) {
 }
 
 /// The generated payload, and the same schema carrying different values.
-///
-/// The pair is what the transfer law needs: two payloads a document can move
-/// between, so that every value codec is exercised against a value the payload
-/// it is written into never held.
 fn a_pair() -> impl Strategy<Value = (Generated, Generated)> {
     generated().prop_flat_map(|first| {
         let strategy = values_for(&first);
@@ -1192,7 +1049,6 @@ fn a_pair() -> impl Strategy<Value = (Generated, Generated)> {
     })
 }
 
-/// A second document of the same shape as `shape`, with new values in it.
 fn values_for(shape: &Generated) -> impl Strategy<Value = Generated> + use<> {
     let fields = shape.fields.clone();
     prop::collection::vec(any::<u64>(), fields.len().max(1)).prop_map(move |seeds| Generated {
@@ -1204,11 +1060,8 @@ fn values_for(shape: &Generated) -> impl Strategy<Value = Generated> + use<> {
     })
 }
 
-/// The same field with a different value, keeping every length and every table.
-///
-/// The shape has to stay identical because `from_xml` refuses a change of shape
-/// — that is the whole of what it refuses — so a pair that differed in shape
-/// would be testing the refusal rather than the codecs.
+/// The same field with a different value: `from_xml` refuses a change of shape,
+/// so every length and every table has to stay identical.
 fn revalue(field: &Field, seed: u64) -> Field {
     let refill = |bytes: &Vec<u8>| -> Vec<u8> {
         bytes
@@ -1325,8 +1178,8 @@ fn revalued(values: &[Fixed], refill: &impl Fn(&Vec<u8>) -> Vec<u8>) -> Vec<Fixe
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// R5.7's law for `PSO`: unedited in, unedited out, byte-identical — over
-    /// payloads whose every unreached byte is `0xA7` rather than zero or `'p'`.
+    /// Unedited in, unedited out, byte-identical, over payloads whose every
+    /// unreached byte is `0xA7`.
     #[test]
     fn a_pso_payload_survives_the_trip_through_xml(document in generated()) {
         let names = Dictionary::default();
@@ -1347,10 +1200,6 @@ proptest! {
 
     /// The law the identity cannot imply: one payload's document applied to
     /// another payload of the same shape has to render back as that document.
-    ///
-    /// This is what a writer that recognised its own output and copied would
-    /// fail, and it is the answer to `docs/backlog.md`'s recorded lesson about
-    /// a generator that agrees with the reader by construction.
     #[test]
     fn a_document_carries_its_values_onto_another_payload((first, second) in a_pair()) {
         let names = Dictionary::default();
@@ -1372,8 +1221,7 @@ proptest! {
         );
     }
 
-    /// §6, the write direction: arbitrary text against a real payload is an
-    /// error or a payload, never a panic.
+    /// Arbitrary text against a real payload is an error, never a panic.
     #[test]
     fn arbitrary_xml_against_a_payload_is_answered(
         document in generated(),
@@ -1399,10 +1247,8 @@ proptest! {
 
 #[test]
 fn every_half_float_narrows_back_to_the_bits_it_widened_from() {
-    // `FLOAT16` is the one scalar with no `f32` of its own on the pinned
-    // toolchain, so the widening and the narrowing are both written by hand and
-    // both have to be exact. All 65,536 of them, which is the whole domain
-    // rather than a sample.
+    // `FLOAT16` has no `f32` of its own on the pinned toolchain, so both the
+    // widening and the narrowing are written by hand and have to be exact.
     let names = Dictionary::default();
     let mut checked = 0usize;
     for bits in 0..=u16::MAX {
@@ -1431,20 +1277,14 @@ fn uint(seed: u32) -> Fixed {
     }
 }
 
-/// Every member shape the generator can emit, one document each.
-///
-/// The two laws above draw shapes at random, which says nothing about a shape
-/// that is drawn rarely — `ATBINARYMAP` is 98 members in 26 of 9,753 files, and
-/// "the corpus covers it" was the whole of the evidence for four of these. This
-/// names each one and puts both laws on it: the identity, and the transfer the
-/// identity cannot imply.
+/// Every member shape the generator can emit, one document each, with both
+/// laws on it — the two above draw at random and reach a rare shape rarely.
 #[test]
 fn every_member_shape_the_generator_reaches_carries_its_values_and_its_bytes() {
     let names = Dictionary::default();
     for (what, field) in every_shape() {
         // Every shape gets a `UINT` before it: `Field::Wrapped`'s offset
-        // recovery needs a member ahead of it, and giving them all one keeps
-        // the cases the same shape as each other.
+        // recovery needs a member ahead of it.
         let first = Generated {
             fields: vec![Field::Fixed(uint(0xAABB_CCDD)), field.clone()],
         };
@@ -1482,7 +1322,6 @@ fn every_member_shape_the_generator_reaches_carries_its_values_and_its_bytes() {
     }
 }
 
-/// Every member shape the generator can emit, named.
 #[allow(clippy::too_many_lines, reason = "one entry per member shape")]
 fn every_shape() -> Vec<(&'static str, Field)> {
     vec![

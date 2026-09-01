@@ -1,21 +1,11 @@
 //! What to look for in a game executable: the SHA-1 digest of each value.
 //!
-//! **There is no key in this file.** Every constant is the SHA-1 digest of a
-//! value that lives in the user's own installation, which is what makes
-//! extraction possible without shipping the value — DR-006. A digest names a
-//! block of bytes; it does not yield one.
+//! There is no key in this file. A digest names a block of bytes in the user's
+//! own installation; it does not yield one.
 //!
 //! Ported from `CodeWalker.Core/GameFiles/Utils/GTAKeys.cs`, copyright (c) 2015
-//! Neodymium, MIT, whose own header states the same thing about the same
-//! digests. DR-007 permits the port with attribution. `AGENTS.md` authority
-//! row 3: that is one reference implementation, so a digest here is `secondary`
-//! until a scan matches it — and a match is its own proof, because the bytes
-//! found are the bytes that hash to what was asked for.
-//!
-//! [`LAUNCHER_AES_KEY`] comes from a second source and carries its own
-//! attribution: `Disquse/RGLExtractor`'s `aes.go` (MIT), whose `aesKeyHash` is
-//! the same digest. It is also the one anchor here that was **measured** on
-//! this machine before it was read anywhere. DR-042.
+//! Neodymium, MIT. [`LAUNCHER_AES_KEY`] comes instead from
+//! `Disquse/RGLExtractor`'s `aes.go` (MIT), whose `aesKeyHash` is this digest.
 
 use super::ANCHOR_DIGEST_LEN;
 
@@ -28,13 +18,7 @@ pub(super) const AES_KEY: [u8; ANCHOR_DIGEST_LEN] = [
 /// The Rockstar Games Launcher's own AES-256 key, which is not the RAGE one.
 ///
 /// The tag `0x0FFFFFF7` names the same transform as `0x0FFFFFF9` under this key
-/// instead (`docs/rpf-format.md`, Encryption). Two independent routes give this
-/// digest and neither informed the other: an oracle-anchored sweep over the
-/// launcher's own binaries, which judged a candidate by whether it decrypted
-/// the archive's root directory row and printed one hit in 2.4 billion
-/// (DR-042); and `RGLExtractor`'s published `aesKeyHash`, ported with
-/// attribution under DR-007. `verified`, 2026-08-30 — the first anchor here of
-/// which that is true.
+/// instead.
 pub(super) const LAUNCHER_AES_KEY: [u8; ANCHOR_DIGEST_LEN] = [
     0x0E, 0x6B, 0x42, 0x74, 0x7E, 0xDF, 0x51, 0xDC, 0xE7, 0x8E, 0xD0, 0xA0, 0xA8, 0xFB, 0x22, 0xE9,
     0x71, 0xC3, 0x16, 0x83,
@@ -46,7 +30,7 @@ pub(super) const HASH_LUT: [u8; ANCHOR_DIGEST_LEN] = [
     0x9E, 0x7F, 0xBA, 0xD4,
 ];
 
-/// The NG expanded keys, in the order the reference indexes them.
+/// The NG expanded keys, in the order they are indexed.
 pub(super) const NG_EXPANDED_KEYS: [[u8; ANCHOR_DIGEST_LEN]; super::NG_EXPANDED_KEY_COUNT] = [
     [
         0xEB, 0x09, 0x15, 0x12, 0x03, 0x97, 0xCE, 0x2E, 0x17, 0x82, 0x8D, 0xD7, 0x7E, 0x32, 0x18,

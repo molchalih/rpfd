@@ -1,13 +1,6 @@
-//! R3.9: one entry out of an archive, without holding it.
-//!
-//! `Archive::extract` answers the bytes and `Archive::extracted` answers the
-//! same read as a stream. What these pin is that they are the **same read**:
-//! the same bytes in the same order for each of the three forms a payload
-//! takes, the same failures at the same places, and a rewind that gives the
-//! stream back from its start — which is what `build` needs of a payload it
-//! offers to the compressor twice.
-//!
-//! What they do not measure is memory. That is `memory.rs`, which counts.
+//! `Archive::extract` answers an entry's bytes and `Archive::extracted`
+//! answers the same read as a stream: the same bytes, the same failures, and a
+//! rewind that gives the stream back from its start.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -40,11 +33,8 @@ fn incompressible(len: usize) -> Vec<u8> {
 }
 
 /// A resource payload: an `RSC7` header for one 512-byte system page, then a
-/// deflate stream of exactly that much.
-///
-/// `docs/rpf-format.md`, Resource page flags, `verified`: the top nibble of
-/// each flag word is the header's version field and the rest decodes to the
-/// length.
+/// deflate stream of exactly that much. The top nibble of each flag word is the
+/// header's version field and the rest decodes to the length.
 fn resource() -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RSC7");
@@ -58,7 +48,6 @@ fn resource() -> Vec<u8> {
     bytes
 }
 
-/// What each of the three entries of [`archive`] holds outside the archive.
 fn contents(path: &str) -> Vec<u8> {
     match path {
         "stored.bin" => (0..8_192_u32).map(|byte| byte as u8).collect(),
@@ -67,8 +56,6 @@ fn contents(path: &str) -> Vec<u8> {
     }
 }
 
-/// An archive holding one stored entry, one deflated entry and one resource —
-/// the three forms a payload takes.
 fn archive() -> Vec<u8> {
     let files = vec![
         FileSpec {
@@ -103,11 +90,8 @@ fn archive() -> Vec<u8> {
     out
 }
 
-/// The whole of one entry, read through the stream a byte at a time.
-///
-/// A byte at a time on purpose: a stream that only answered correctly when
-/// asked for everything at once would pass a `read_to_end` and fail the
-/// `io::copy` every caller actually does.
+/// The whole of one entry, read through the stream a byte at a time — a stream
+/// correct only for one big read would still pass a `read_to_end`.
 fn streamed(bytes: &[u8], archive: &Archive, index: u32) -> Vec<u8> {
     let mut src = Cursor::new(bytes);
     let mut stream = archive.extracted(&mut src, index).expect("opens");
@@ -143,9 +127,6 @@ fn a_streamed_entry_is_the_bytes_extract_answers() {
             "{path} streams the bytes `extract` answers",
         );
 
-        // The length is the entry's own, known before anything is read: a
-        // caller sizing a buffer or reporting progress does not have to read
-        // the entry to find out how long it is.
         let mut src = Cursor::new(bytes.clone());
         let stream = parsed.extracted(&mut src, index).expect("opens");
         assert_eq!(
@@ -159,12 +140,8 @@ fn a_streamed_entry_is_the_bytes_extract_answers() {
 
 #[test]
 fn a_digest_of_a_stream_is_the_digest_of_the_bytes() {
-    // DR-023 defines the manifest's checksum as being of what `extract`
-    // answers, and a resource is the case that would move if anything about
-    // the framing changed: what is digested is its `RSC7` file, header and
-    // deflated body, not what that body inflates to. Nothing that streams the
-    // entry may change that value — a manifest already written would become
-    // wrong, and silently.
+    // What a resource digests to is its `RSC7` file — header and deflated body
+    // — not what that body inflates to.
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
     let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -183,10 +160,8 @@ fn a_digest_of_a_stream_is_the_digest_of_the_bytes() {
 
 #[test]
 fn a_stream_read_again_from_its_start_is_the_same_stream() {
-    // What `build` does to a payload whose deflate does not pay for itself: it
-    // reads it, finds the deflated form no smaller, rewinds and writes the
-    // plain bytes over the top. A stream that could not do that would make a
-    // rebuild silently write the tail of an entry.
+    // `build` rewinds a payload whose deflate does not pay for itself and
+    // writes the plain bytes over the top.
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
     let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -203,7 +178,6 @@ fn a_stream_read_again_from_its_start_is_the_same_stream() {
         assert_eq!(first, contents(path), "{path}");
         assert_eq!(again, first, "{path} reads the same twice");
 
-        // And from the middle, which is the general case of the same thing.
         stream.rewind().expect("rewinds");
         let mut head = vec![0_u8; 100];
         stream.read_exact(&mut head).expect("reads a hundred");
@@ -238,24 +212,8 @@ fn a_stream_knows_where_its_end_is_without_reading_to_it() {
     }
 }
 
-/// A forward seek in a deflated entry lands on the bytes it claims to.
-///
-/// Seeking forward has no shortcut: the stream inflates what it passes over
-/// and throws it away, in pieces, and then records the destination as its
-/// position. Stopping that walk early still records the destination, so the
-/// stream's real position and its reported one disagree and **every later read
-/// answers from the wrong place** — with no error anywhere, which is what
-/// makes it worth a test rather than a comment.
-///
-/// Nothing compared what a forward seek landed on. The test above seeks to the
-/// last sixteen bytes and asserts that they are sixteen bytes, never that they
-/// are the last sixteen; the one test that does compare bytes seeks
-/// *backwards*, which restarts the stream and takes the other branch.
-///
-/// The payload is deliberately longer than one piece of the walk, so that
-/// reaching the destination takes several: an entry small enough to be passed
-/// over in one go cannot tell a loop that runs once from a loop that runs
-/// until it is done.
+/// The payload is longer than one piece of the forward-seek walk, so reaching
+/// the destination takes several passes rather than one.
 #[test]
 fn a_forward_seek_in_a_deflated_entry_lands_on_the_right_bytes() {
     // Compressible, so `build` really does deflate it, and periodic with a
@@ -307,9 +265,7 @@ fn a_forward_seek_in_a_deflated_entry_lands_on_the_right_bytes() {
 #[test]
 fn a_stream_carries_the_failure_it_really_had() {
     // A `Read` can only fail with an `io::Error`, so the container failure
-    // travels inside one. A caller that could not get it back out would report
-    // a corrupt archive as a disk failure — a different exit code, blaming the
-    // wrong party. DR-010.
+    // travels inside one and must come back out.
     let mut bytes = archive();
     let parsed = Archive::open(
         &mut Cursor::new(bytes.clone()),
@@ -345,7 +301,6 @@ fn a_stream_of_something_that_is_not_a_file_is_refused_before_any_of_it() {
     let mut src = Cursor::new(bytes.clone());
     let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
-    // Entry 0 is the root directory, which has no payload to stream.
     let refused = parsed.extracted(&mut src, 0).expect_err("refused");
     assert!(
         matches!(

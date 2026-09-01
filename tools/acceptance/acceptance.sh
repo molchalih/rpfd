@@ -80,14 +80,31 @@ server_start() {
 }
 
 stage() {
-    local archive=${1:?usage: stage <archive>}
+    local archive=${1:?usage: stage <archive> [--allow-unverified]}
+    local allow_unverified=${2:-}
     [ -f "$archive" ] || die "no such archive: $archive"
     [ -d "$DLC_DIR" ] || die "no dlcpack directory at $DLC_DIR"
 
     # The tool reads its own output back before the game is asked to. An archive
     # our own reader rejects would make the run a test of the harness.
+    #
+    # `--allow-unverified` is for the one case that is not that: a producer's
+    # own archive, unmodified, that this reader is stricter than the game about.
+    # It says so loudly, because the difference between "our reader is strict"
+    # and "this file is damaged" is a judgement, and a run made on the wrong
+    # side of it is worthless.
     if command -v "$RPF" >/dev/null 2>&1; then
-        "$RPF" verify "$archive" >&2 || die "$archive does not verify; not staging it"
+        if ! "$RPF" verify "$archive" >&2; then
+            if [ "$allow_unverified" = "--allow-unverified" ]; then
+                log ""
+                log "WARNING: staging an archive this reader does not accept."
+                log "WARNING: the run measures the game, so state in the record why the"
+                log "WARNING: refusal is this reader's strictness and not damage."
+                log ""
+            else
+                die "$archive does not verify; not staging it (--allow-unverified overrides)"
+            fi
+        fi
     else
         log "warning: no $RPF on PATH, staging unverified"
     fi

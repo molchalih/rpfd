@@ -1,18 +1,11 @@
 /**
  * The archive's shape, as one recursive listing describes it.
  *
- * The daemon's `list` reports the same rows `rpf --json ls` prints, and a
- * recursive one walks through nesting: an archive holding `x64/inner.rpf`
- * reports that entry *and* `x64/inner.rpf/data/vehicles.meta` beneath it. So a
- * nested archive is not recognised here by its name or its first four bytes —
- * it is recognised by the daemon having listed something inside it, which is
- * the only reading of "this is an archive" that this client is entitled to
- * (`docs/conventions.md` §1).
- *
- * One listing rather than one per directory: an editor asks for a file's kind
- * and size far more often than an archive changes, and the alternative — a
- * round trip per directory opened — cannot tell a nested archive from a plain
- * entry without a second round trip per entry.
+ * A nested archive is recognised by the daemon having listed something inside
+ * it, never by its name or its first bytes: classification belongs to the side
+ * that knows the format. One listing rather than one per directory, because an
+ * editor asks for a file's kind and size far more often than an archive
+ * changes.
  */
 
 import type { Listed } from './protocol.js';

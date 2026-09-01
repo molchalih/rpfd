@@ -27,25 +27,11 @@ mod common;
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
 /// How long anything here waits on the daemon before the wait is a failure.
-///
-/// Generous, because a loaded machine is not a defect; finite, because a wait
-/// that cannot fail can only spin. Every loop below reads an answer off a pipe,
-/// and unbounded each one turns "the answer is wrong" into "the suite never
-/// comes back" — the same failure for a reader, and a much more expensive one
-/// for a mutation sweep, where at the harness level it is indistinguishable
-/// from a mutant that loops. Two mutations of `View::name` cost one sweep the
-/// full per-mutant timeout here for exactly that reason.
+/// Finite, because a wait that cannot fail can only spin.
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A bound on one wait, naming what the wait is for.
-///
-/// [`Deadline::check`] fails a loop that comes back around of its own accord.
-/// A loop blocked inside a read of the daemon's output never reaches its own
-/// check, so a deadline also arms a watchdog that ends the process once the
-/// patience is spent: a diagnostic and a non-zero exit, rather than a test
-/// binary that hangs until something outside it runs out of patience instead.
-/// The watchdog is disarmed when the deadline is dropped, so a wait that
-/// finishes leaves nothing behind.
+/// A bound on one wait, naming what the wait is for. [`Deadline::check`] fails
+/// a loop that returns; the watchdog ends a process blocked inside a read.
 struct Deadline {
     what: &'static str,
     started: std::time::Instant,
@@ -68,10 +54,8 @@ impl Deadline {
             if watching.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            // Straight at the descriptor: the test harness captures what the
-            // print macros write and drops it when the process ends this way,
-            // and a watchdog whose diagnostic is lost is a watchdog that only
-            // reports a signal number.
+            // Straight at the descriptor: the harness captures what the print macros
+            // write and drops it when the process ends this way.
             let said = format!("waited {PATIENCE:?} for {what}, and it never arrived\n");
             let mut stderr = std::io::stderr();
             let _ = stderr.write_all(said.as_bytes());
@@ -104,14 +88,8 @@ impl Drop for Deadline {
 
 /// An archive with one deflated file and one resource.
 fn make_archive(at: &Path) -> Vec<u8> {
-    // A minimal but real resource: an RSC7 header whose flags describe one
-    // 512-byte system page and no graphics pages, followed by a deflate stream
-    // of exactly that. The flags are what `verify` reads the payload back
-    // against — `docs/rpf-format.md`, Resource page flags — so a resource whose
-    // flags described 131,072 bytes of a 512-byte payload would fail it, and
-    // this one did until `verify` was something the daemon could be asked for.
-    // The top nibbles give the header's version field, 162, as the same table
-    // says they must.
+    // An RSC7 header whose flags describe one 512-byte system page and no
+    // graphics pages, then a deflate stream of exactly that; version field 162.
     let mut resource = Vec::new();
     resource.extend_from_slice(b"RSC7");
     resource.extend_from_slice(&162_u32.to_le_bytes());
@@ -156,15 +134,10 @@ fn make_archive(at: &Path) -> Vec<u8> {
 }
 
 /// An archive whose one resource is shaped the way a Rockstar archive holds
-/// one: an opaque header that is not `RSC7`, then the deflate stream. Returns
-/// the payload.
-///
-/// The flag words come from the entry the writer is told to make, because
-/// nothing else knows them — which is the whole of DR-046 in one fixture.
+/// one: an opaque header that is not `RSC7`, then the deflate stream.
 fn make_rockstar_archive(at: &Path) -> Vec<u8> {
-    // 24 bytes of 0xFF: not `RSC7`, and not the start of a deflate stream
-    // either, since the low three bits are BFINAL = 1 with the reserved
-    // BTYPE = 11.
+    // 24 bytes of 0xFF: not `RSC7`, and not a deflate stream either — the low
+    // three bits are BFINAL = 1 with the reserved BTYPE = 11.
     let mut resource = vec![0xFF_u8; 24];
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -194,11 +167,8 @@ fn make_rockstar_archive(at: &Path) -> Vec<u8> {
     resource
 }
 
-/// An archive holding two entries that fold to one name, returning its bytes.
-///
-/// `build` will not write one, so it is built under two names of the same
-/// length and then the second is edited in the names blob: everything but that
-/// one name is what the writer produced.
+/// An archive holding two entries that fold to one name, returning its bytes:
+/// `build` will not write one, so the second name is edited in the names blob.
 fn make_colliding_archive(at: &Path) -> Vec<u8> {
     let files = ["A.txt", "b.txt"].map(|name| FileSpec {
         path: name.to_owned(),
@@ -239,8 +209,7 @@ fn make_colliding_archive(at: &Path) -> Vec<u8> {
 }
 
 /// Where one entry's payload sits and how much room it has, read from the
-/// archive so that a report about them can be checked against something other
-/// than itself.
+/// archive so that a report about them can be checked against something else.
 fn spans(at: &Path, inside: &str) -> (u64, u64) {
     let mut file = fs::File::open(at).expect("archive opens");
     let archive =
@@ -250,19 +219,14 @@ fn spans(at: &Path, inside: &str) -> (u64, u64) {
     (payload_at, archive.allocation(index).expect("allocation"))
 }
 
-/// Feeds every request in, and returns the responses.
-///
-/// Responses only: progress arrives as JSON-RPC notifications, which carry no
-/// `id`, and a client reads past them looking for the one it sent. DR-008.
+/// Feeds every request in, and returns the responses. Progress arrives as
+/// notifications, which carry no `id`, and a client reads past them.
 fn talk(requests: &[Value]) -> Vec<Value> {
     narrated(requests).0
 }
 
-/// The response carrying an id.
-///
-/// By id rather than by position: `cancel` is answered by the reading thread
-/// without waiting its turn, so it can overtake a response to a request sent
-/// before it. DR-008.
+/// The response carrying an id. By id rather than by position: `cancel` is
+/// answered by the reading thread and can overtake an earlier response.
 fn answer(responses: &[Value], id: u64) -> &Value {
     responses
         .iter()
@@ -403,11 +367,8 @@ fn nothing_reaches_disk_before_commit() {
 
 #[test]
 fn a_resource_entry_takes_a_payload_its_own_archive_produced() {
-    // R6.6 and DR-046. The daemon used to refuse an incoming payload that did
-    // not begin with `RSC7`, which refused every resource Rockstar ever packed:
-    // `docs/backlog.md` Q7 measured 696,578 of 696,578 whose payload does not.
-    // So the round trip below — read an entry, write exactly those bytes back —
-    // was a refusal, and it is now what it looks like.
+    // A Rockstar resource payload does not begin with `RSC7`, so refusing an
+    // incoming one that does not refuses every resource the reader hands out.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let resource = make_rockstar_archive(&archive);
@@ -441,9 +402,8 @@ fn a_resource_entry_takes_a_payload_its_own_archive_produced() {
     );
     assert_eq!(answer(&responses, 4)["result"]["committed"], json!(1));
 
-    // The row it went back into still declares what the payload is, which is
-    // the half a byte-comparison cannot see: the flag words are the only record
-    // of its length and the payload does not carry them.
+    // The row still declares what the payload is, which a byte comparison cannot
+    // see: the flag words are the only record of its length.
     let verified = &answer(&responses, 5)["result"];
     assert_eq!(
         verified["problems"].as_array().map(Vec::len),
@@ -462,10 +422,8 @@ fn a_resource_entry_takes_a_payload_its_own_archive_produced() {
 
 #[test]
 fn a_resource_entry_refuses_a_payload_too_short_to_be_one() {
-    // What is left of the guard, and the whole of what a content test can
-    // honestly say: a payload that cannot hold a resource header cannot be
-    // written into a resource entry, whatever it begins with. Exit 6 on both
-    // frontends, because the rule is `rpf-core`'s (§1).
+    // A payload that cannot hold a resource header cannot be written into a
+    // resource entry, whatever it begins with. Exit 6 on both frontends.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_rockstar_archive(&archive);
@@ -503,11 +461,8 @@ fn a_resource_entry_refuses_a_payload_too_short_to_be_one() {
 
 #[test]
 fn unknown_methods_and_handles_are_refused_not_ignored() {
-    // Two numbering schemes, and which one a code comes from is the answer to
-    // "whose fault is this". Negative is JSON-RPC's own: the request did not
-    // follow the protocol. Positive is the process exit code the same failure
-    // would produce on the command line: the request was well formed and the
-    // work did not succeed.
+    // Negative is JSON-RPC's own: the request did not follow the protocol.
+    // Positive is the exit code the same failure has on the command line.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -557,8 +512,8 @@ fn incompressible(len: u32) -> Vec<u8> {
 
 #[test]
 fn a_commit_that_fits_patches_in_place() {
-    // R4.14. The whole point: an edit that fits costs the bytes of the edit,
-    // not the bytes of the archive.
+    // The whole point: an edit that fits costs the bytes of the edit, not the
+    // bytes of the archive.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -677,16 +632,15 @@ fn a_commit_can_be_told_to_rebuild_even_when_it_could_patch() {
 
 #[test]
 fn a_dry_run_commit_reports_what_it_would_do_and_keeps_the_edits() {
-    // R6.7. An editor asking "what does saving cost" must not lose the buffer
-    // by asking, and must not have to guess which of the two ways it will go.
+    // An editor asking "what does saving cost" must not lose the buffer by
+    // asking, and must not have to guess which of the two ways it will go.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
     let archive_str = archive.display().to_string();
     let before = fs::read(&archive).expect("readable");
-    // Read from the archive rather than believed from the answer: "an offset,
-    // a length and some room" is true of every archive ever written, and an
-    // editor deciding whether to save acts on the numbers.
+    // Read from the archive rather than believed from the answer: an editor
+    // deciding whether to save acts on the numbers.
     let (at, allocation) = spans(&archive, "data/greeting.txt");
 
     let responses = talk(&[
@@ -720,9 +674,6 @@ fn a_dry_run_commit_reports_what_it_would_do_and_keeps_the_edits() {
         before,
         "a dry run wrote to the archive"
     );
-    // That the real commit then goes the way this predicted is what
-    // `a_commit_that_fits_patches_in_place` asserts, against the same archive
-    // and the same edit.
 }
 
 #[test]
@@ -754,8 +705,8 @@ fn a_dry_run_commit_says_when_it_would_rebuild_and_why() {
 
 #[test]
 fn a_rebuild_reports_progress_as_notifications() {
-    // R6.8, DR-008. The objects carry no id, so a client reading for its own
-    // response reads past them.
+    // The objects carry no id, so a client reading for its own response reads
+    // past them.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -785,9 +736,8 @@ fn a_rebuild_reports_progress_as_notifications() {
         assert_eq!(params["skipped"], json!(0), "{notification}");
     }
 
-    // Every entry of the archive is accounted for, in order, and each is named
-    // by the entry it is reporting. A path that says only "a string" would let
-    // every notification carry the same one.
+    // Every entry is accounted for, in order, and named: a path asserted only as
+    // "a string" would let every notification carry the same one.
     let steps: Vec<(u64, &str)> = notifications
         .iter()
         .map(|n| {
@@ -806,10 +756,8 @@ fn a_rebuild_reports_progress_as_notifications() {
 
 #[test]
 fn a_dry_run_commit_told_to_rebuild_says_so_and_keeps_the_edits() {
-    // The one dry-run branch that answers without calling `plan` at all: the
-    // rebuild was asked for rather than forced by an edit that will not fit, so
-    // nothing computes the answer — and an answer nothing computes is an answer
-    // nothing checks.
+    // The one dry-run branch that answers without calling `plan`: nothing
+    // computes the answer, and an answer nothing computes is one nothing checks.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -839,10 +787,6 @@ fn a_dry_run_commit_told_to_rebuild_says_so_and_keeps_the_edits() {
         before,
         "a dry run wrote to the archive"
     );
-    // The same edit, not told to rebuild, is reported as a patch. So this
-    // answer is the flag being obeyed rather than the edit not fitting;
-    // `a_dry_run_commit_reports_what_it_would_do_and_keeps_the_edits` is that
-    // case in full, against the same archive and the same edit.
 }
 
 #[test]
@@ -878,14 +822,12 @@ fn a_cancel_with_nothing_running_is_answered_not_stored() {
 #[test]
 fn a_rebuild_can_be_cancelled_while_it_is_running() {
     // The whole reason standard input is read on its own thread: a cancel sent
-    // during the only period when it is useful has to arrive then, not after.
-    // DR-008.
+    // while it is useful has to arrive then, not after.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("big.rpf");
 
-    // Big enough, and incompressible enough, that the rebuild takes far longer
-    // than the interval the cancels are sent at. Sixteen entries also means
-    // sixteen chances to observe the flag.
+    // Big enough, and incompressible enough, that the rebuild outlasts the
+    // interval the cancels are sent at.
     let files: Vec<FileSpec> = (0..16)
         .map(|i| FileSpec {
             path: format!("bulk/{i:02}.bin"),
@@ -976,11 +918,8 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
     );
 }
 
-/// An archive of `entries` files, each of `payload` zero bytes.
-///
-/// Zeros so that building it costs little, and many entries so that a rebuild
-/// of it reports more progress than a pipe will hold: 64 KB of notifications
-/// is what it takes to make a daemon that writes them synchronously block.
+/// An archive of `entries` files, each of `payload` zero bytes — enough
+/// notifications on a rebuild to fill the 64 KB a pipe holds.
 fn make_bulk_archive(at: &Path, entries: u32, payload: usize) {
     let files: Vec<FileSpec> = (0..entries)
         .map(|i| FileSpec {
@@ -1006,17 +945,10 @@ fn make_bulk_archive(at: &Path, entries: u32, payload: usize) {
 
 /// A change that collides only with another buffered change is refused when it
 /// is offered, rather than accepted and failed at the commit.
-///
-/// Both arms were measured against a live daemon on 2026-08-29 and are rows of
-/// DR-030's table. `allows` resolved each change against the archive on disk
-/// alone, so neither collision was visible until the commit had already
-/// decided everything else. DR-032.
 #[test]
 fn a_change_that_collides_only_with_a_buffered_one_is_refused_when_it_is_offered() {
     let dir = tempfile::tempdir().expect("temp dir");
 
-    // `rename a -> b` then `write b {create: true}`: accepted, `pending: 2`,
-    // and the commit answered `AlreadyExists`.
     let claimed = dir.path().join("claimed.rpf");
     make_archive(&claimed);
     let responses = talk(&[
@@ -1042,9 +974,8 @@ fn a_change_that_collides_only_with_a_buffered_one_is_refused_when_it_is_offered
         answer(&responses, 5),
     );
 
-    // Renaming a directory and then something inside it: accepted twice, and
-    // the commit answered exit 3, because `tree_of` applies renames in path
-    // order and the directory's runs first.
+    // Renaming a directory and then something inside it: `tree_of` applies
+    // renames in path order, and the directory's runs first.
     let inside = dir.path().join("inside.rpf");
     make_archive(&inside);
     let responses = talk(&[
@@ -1077,14 +1008,8 @@ fn a_change_that_collides_only_with_a_buffered_one_is_refused_when_it_is_offered
     assert!(paths.contains(&"info/greeting.txt"), "{paths:?}");
 }
 
-/// DR-026's replacing rename can be assembled over the wire: a removal in the
-/// same session frees the path a rename moves onto.
-///
-/// The record says a caller that means to replace the target removes it in the
-/// same change set, which is why removals are applied before renames. The
-/// library accepted that set and no order of requests could build it — `delete
-/// readme.txt` then `rename x -> readme.txt` was exit 6, `"readme.txt" is
-/// already in the archive`, measured 2026-08-29. DR-032.
+/// A removal in the same session frees the path a rename moves onto: removals
+/// are applied before renames, so a replacing rename can be assembled.
 #[test]
 fn a_removal_in_the_same_session_frees_the_path_a_rename_moves_onto() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1122,13 +1047,7 @@ fn a_removal_in_the_same_session_frees_the_path_a_rename_moves_onto() {
 }
 
 /// A second change of another kind at one path is refused rather than quietly
-/// replacing the first.
-///
-/// Measured 2026-08-29: `rename art.yft -> moved.yft` then `write art.yft`
-/// answered `pending: 1`, and the commit renamed nothing — the rename left the
-/// buffer with an `Ok` and no client could tell. A set holds one change per
-/// path and that is not changing; what changes is that the wire says so.
-/// DR-032.
+/// replacing the first: a change set holds one change per path.
 #[test]
 fn a_second_change_of_another_kind_at_one_path_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1176,12 +1095,8 @@ fn a_second_change_of_another_kind_at_one_path_is_refused() {
     assert_eq!(bytes, b"twice", "the second save is what the buffer holds");
 }
 
-/// `forget` takes one buffered change back and says what is left.
-///
-/// Withdrawing a gesture — create a file and delete it, rename an entry back to
-/// the name it started with — used to cost a `discard` and a replay of
-/// everything else, so a client had to retain every buffered payload in order
-/// to send it again. DR-030 asked for this; DR-032 decided it.
+/// `forget` takes one buffered change back and says what is left, so
+/// withdrawing a gesture costs no `discard` and no replay of the rest.
 #[test]
 fn one_buffered_change_can_be_taken_back_without_discarding_the_rest() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1230,9 +1145,8 @@ fn one_buffered_change_can_be_taken_back_without_discarding_the_rest() {
     assert_ne!(fs::read(&archive).expect("readable"), before);
 }
 
-/// Withdrawing a rename lets the path be changed again, which is the gesture
-/// the wire had no way to express: the buffer took a change at a path and had
-/// no way to take one away.
+/// Withdrawing a rename lets the path be changed again: the buffer holds one
+/// change per path and had no way to take one away.
 #[test]
 fn a_rename_taken_back_frees_the_path_for_another_change() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1277,15 +1191,7 @@ fn a_rename_taken_back_frees_the_path_for_another_change() {
 }
 
 /// A buffered structural change does not turn every later write into a walk of
-/// the entry table.
-///
-/// The shape this guards is the one that was measured to time out: `allows`
-/// walks the entry table, and asking it per change over a four-thousand-entry
-/// archive with four thousand buffered writes is quadratic. Judging a change
-/// against the buffered set could have reintroduced exactly that, so the
-/// question "could anything buffered have moved this path" is answered from the
-/// set alone, and only a `true` costs the walk. Measured with the question
-/// forced to `true`: 1.5 seconds becomes 34. DR-032.
+/// the entry table, which over thousands of buffered writes is quadratic.
 #[test]
 fn writes_beside_a_buffered_removal_do_not_each_walk_the_entry_table() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1338,15 +1244,7 @@ fn writes_beside_a_buffered_removal_do_not_each_walk_the_entry_table() {
 }
 
 /// Every error object carries the failure's own name beside its number, so a
-/// client tells `AlreadyExists` from every other refusal without reading the
-/// sentence.
-///
-/// DR-026 made `AlreadyExists` its own variant *because* a client mapping it
-/// onto an editor's filesystem has a distinct answer for it (`FileExists`), and
-/// the wire carried only `code: 6`, shared with every refusal there is — so the
-/// stated reason for the variant was not true over the wire. DR-030 found that;
-/// DR-032 answers it. The number is unchanged and is still what DR-010 says it
-/// is.
+/// client tells `AlreadyExists` from every other refusal sharing code 6.
 #[test]
 fn an_error_names_the_failure_beside_the_number() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1378,14 +1276,8 @@ fn an_error_names_the_failure_beside_the_number() {
 
 #[test]
 fn a_second_session_on_one_archive_is_refused_rather_than_detected_later() {
-    // Two sessions on one archive is the shape all three demonstrated
-    // corruptions took: the first rebuilds, so the file is replaced by rename
-    // and every offset in it moves, and the second is still holding the entry
-    // table it parsed at open. Committing that patched at offsets that now land
-    // inside another entry's payload — and the result still verified.
-    //
-    // It is not detected any more, it is unreachable: the second session is
-    // refused where the client can still do something about it. DR-009.
+    // Two sessions on one archive: the first rebuilds and every offset moves,
+    // while the second still holds the entry table it parsed at open.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1432,8 +1324,7 @@ fn a_second_session_on_one_archive_is_refused_rather_than_detected_later() {
 #[test]
 fn a_claim_is_on_the_archive_and_not_on_the_spelling_of_its_path() {
     // A claim that could be walked around by writing the same path differently
-    // would be no claim at all, and every one of these is a path a client
-    // plausibly sends. DR-009.
+    // would be no claim at all, and each of these is a path a client sends.
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().canonicalize().expect("canonical temp dir");
     make_archive(&root.join("test.rpf"));
@@ -1448,10 +1339,8 @@ fn a_claim_is_on_the_archive_and_not_on_the_spelling_of_its_path() {
         root.join("test.rpf").display().to_string(),
         root.join(".").join("test.rpf").display().to_string(),
     ];
-    // `cfg!` rather than `#[cfg]`: an attribute removes the push outright,
-    // which leaves the binding needlessly mutable on Windows and the whole list
-    // a candidate for an array. A run-time-shaped branch on a compile-time
-    // constant costs nothing and keeps one spelling of the list.
+    // `cfg!` rather than `#[cfg]`: an attribute removes the push outright, which
+    // leaves the binding needlessly mutable on Windows.
     if cfg!(unix) {
         spellings.push("link.rpf".to_owned());
     }
@@ -1500,10 +1389,8 @@ fn an_archive_that_cannot_be_resolved_is_an_ordinary_open_failure() {
 
 #[test]
 fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
-    // The flags were global while sessions are per-handle, so a cancel aimed at
-    // one commit landed on whichever commit happened to be running. A cancel
-    // names what it is cancelling: the request that started it, or the handle
-    // it is running against.
+    // Sessions are per-handle, so a cancel names what it is cancelling: the
+    // request that started it, or the handle it is running against.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("big.rpf");
     let files: Vec<FileSpec> = (0..16)
@@ -1612,11 +1499,8 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
 
 #[test]
 fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
-    // The job is registered for exactly as long as there is something to name.
-    // Left registered, a cancel arriving afterwards is answered as though the
-    // finished commit were still going — and, the rebuild being stoppable, it
-    // is also marked cancelled, so the next rebuild in that session stops at
-    // its first entry having been cancelled by nobody.
+    // The job is registered for exactly as long as there is something to name:
+    // left registered, a later cancel marks a commit that nobody is running.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1684,12 +1568,8 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
 
 #[test]
 fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
-    // Progress is dropped rather than queued without bound, so a client reading
-    // slower than the rebuild writes sees gaps in `done`. `skipped` is what
-    // makes a gap readable: it counts what was dropped since the last
-    // notification that got through, so between two that arrive it is exactly
-    // the distance between them. Nothing else here reads the counter, and a
-    // counter nothing reads may as well be a constant.
+    // Progress is dropped rather than queued without bound, so `skipped` counts
+    // what was dropped since the last notification that got through.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     make_bulk_archive(&archive, 3000, 1024);
@@ -1756,14 +1636,8 @@ fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
 
 #[test]
 fn a_broken_standard_output_is_reported_rather_than_swallowed() {
-    // The reading thread broke out of its loop when it could not write the
-    // answer to a cancel, and run() then returned Ok(()): the daemon stopped
-    // accepting requests, said nothing about why, and exited 0 having failed.
-    // Which of the two conditions it broke on was not reported either.
-    //
     // Enough cancels that the answers cannot all have been written into a pipe
-    // nobody is reading, so the reading end below closes on a write that is
-    // either in flight or still queued.
+    // nobody is reading, so the reading end closes on a write still in flight.
     let mut child = Command::new(RPF)
         .args(["serve", "--stdio"])
         .stdin(Stdio::piped())
@@ -1807,16 +1681,8 @@ fn a_broken_standard_output_is_reported_rather_than_swallowed() {
 
 #[test]
 fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
-    // `stopped_as` is unit-tested, and the unit test passes with nothing
-    // calling it. This is the bug it was written for, end to end: a rebuild
-    // reporting progress to a client that has gone away stops itself, the
-    // library reports that as `Cancelled` because a watcher said stop, and
-    // reporting it onward as a cancellation tells the caller it asked for
-    // something it did not ask for — and hands automation exit 8, "you stopped
-    // it", for a broken pipe.
-    //
-    // Enough entries that the rebuild is still running, and still writing
-    // progress, when the reading end closes.
+    // A rebuild reporting progress to a client that has gone away stops itself;
+    // reporting that onward as a cancellation would blame the caller for it.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     make_bulk_archive(&archive, 4000, 1024);
@@ -1842,9 +1708,8 @@ fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
     // next write into a broken pipe, which is the moment the rebuild gives up.
     std::thread::sleep(std::time::Duration::from_millis(50));
     drop(child.stdout.take());
-    // And standard input ends, because nothing more is coming: a daemon
-    // waiting for the next request would otherwise wait for ever, and what is
-    // under test is what it exits with, not when.
+    // And standard input ends, because nothing more is coming: what is under
+    // test is what the daemon exits with, not when.
     drop(stdin);
 
     let status = child.wait().expect("the daemon exits");
@@ -1921,12 +1786,8 @@ fn progress_can_be_turned_off_for_one_commit() {
 
 #[test]
 fn a_cancel_parameter_that_is_ill_typed_is_refused_not_read_as_absent() {
-    // `cancel` with no parameters means "whatever is running", which is the
-    // destructive default, and a parameter that was *given* but not *seen*
-    // degraded to it: `{"handle": "2"}` and the rest all answered
-    // `cancelling: true` and stopped a commit on handle 1 that they had named
-    // handle 2 to spare. Every other method answers -32602 for a parameter of
-    // the wrong type, and this one is answered ahead of them all.
+    // `cancel` with no parameters means "whatever is running", the destructive
+    // default, so a parameter given but not read must not degrade to it.
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"cancel","params":{"handle":"2"}}),
         json!({"jsonrpc":"2.0","id":2,"method":"cancel","params":{"handle":2.0}}),
@@ -1963,9 +1824,8 @@ fn a_cancel_parameter_that_is_ill_typed_is_refused_not_read_as_absent() {
 
 #[test]
 fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
-    // The fault as it actually presented: a rebuild running on handle 1, a
-    // cancel aimed at handle 2, and the handle not of a type the daemon read.
-    // Every one of these killed handle 1's commit, ten times out of ten.
+    // A rebuild running on handle 1, a cancel aimed at handle 2, and the handle
+    // not of a type the daemon read.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("big.rpf");
     let files: Vec<FileSpec> = (0..16)
@@ -2070,10 +1930,8 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
     }
 }
 
-/// Reads everything on `stdout`, taking `piece` bytes and then pausing.
-///
-/// An ordinary client, reading at an ordinary rate. The daemon has to deliver
-/// an answer larger than it can write in one grace to one of these.
+/// Reads everything on `stdout`, taking `piece` bytes and then pausing — an
+/// ordinary client, reading at an ordinary rate.
 fn read_slowly(
     mut stdout: std::process::ChildStdout,
     piece: usize,
@@ -2095,20 +1953,8 @@ fn read_slowly(
 
 #[test]
 fn an_answer_bigger_than_the_grace_survives_standard_input_ending() {
-    // `rpf serve --stdio < requests.jsonl` is the shape the module doc names as
-    // the primary consumer, and standard input ends there the moment the last
-    // request has been read — long before the answer to it has been written.
-    // The daemon gave standard output a flat two seconds from that point and
-    // then exited, which cut the response off mid-object with no terminating
-    // newline: that breaks the framing contract, not merely the response.
-    // Measured ten times out of ten against the sample's 62,611,968-byte
-    // `x64/vehicles.rpf` — 83,482,931 bytes of response on one line — with a
-    // client reading at about 13 MB/s: ~18.1 MB arrived, unterminated, and the
-    // read was never answered. Exit 7.
-    //
-    // Half a megabyte and a reader taking 8 KB every 40 ms is the same shape,
-    // small enough to build in a test: 700 KB of base64 at 200 KB/s is three
-    // and a half seconds, and the old grace was two.
+    // Standard input ends the moment the last request is read, long before the
+    // answer to it is written: a fixed grace cut the response off mid-object.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("one.rpf");
     make_bulk_archive(&archive, 1, 512 * 1024);
@@ -2163,11 +2009,8 @@ fn an_answer_bigger_than_the_grace_survives_standard_input_ending() {
     assert_eq!(bytes, vec![0_u8; 512 * 1024], "the entry came back wrong");
 }
 
-/// The resident size of a running process, in kilobytes.
-///
-/// `ps` because the question is what the operating system is actually holding
-/// for the daemon, which is the thing that was measured going up and never
-/// coming down.
+/// The resident size of a running process, in kilobytes. `ps`, because the
+/// question is what the operating system is holding for the daemon.
 #[cfg(unix)]
 fn resident_kilobytes(pid: u32) -> u64 {
     let reported = Command::new("ps")
@@ -2182,16 +2025,8 @@ fn resident_kilobytes(pid: u32) -> u64 {
 
 #[test]
 fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
-    // PROGRESS_BACKLOG bounded the one thing that may be dropped and nothing
-    // else. `Wire::answer` queued a response and returned, so the worker went
-    // on accepting requests and materialising answers however far behind the
-    // client was: measured against the sample with nothing drained, queueing
-    // reads of one 20 MB entry, 24 answers reached 369 MB of resident memory
-    // and 96 reached 1,393 MB. Linear, with no ceiling. The same runs with the
-    // bound in place measure 56 MB either way.
-    //
-    // Zero-byte payloads, so the archive is small and quick to build and each
-    // answer is still megabytes of base64.
+    // A queued response the worker never waits on grows without bound while the
+    // client is behind. Zero-byte payloads, so each answer is still megabytes.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("bulk.rpf");
     let entry = 2 * 1024 * 1024;
@@ -2261,26 +2096,8 @@ fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
 #[test]
 #[cfg(any(unix, windows))]
 fn a_second_name_for_one_file_is_the_same_archive() {
-    // A hard link is a second directory entry for one file, and both spellings
-    // canonicalise to themselves, so a claim keyed on the canonical path
-    // accepted both. That is two sessions on one archive — the state DR-009
-    // exists to make unreachable — and after either one rebuilds, the other
-    // holds an entry table describing bytes that have moved.
-    //
-    // `#[cfg(any(unix, windows))]` rather than no gate: `FileId` still has an
-    // identity-less arm, and a refusal is something it can never produce, so
-    // this asserts nothing a third platform could pass. On Windows
-    // `fs::hard_link` is `CreateHardLinkW` and the identity is the volume
-    // serial and file index, so this is the same test against the same
-    // filesystem feature; it ran only on Unix until R10.5, and it failed on
-    // Windows before that. DR-037.
-    //
-    // **It requires a volume that names its files**, which every NTFS volume
-    // does and the temporary directory is on in both places this suite runs. A
-    // volume that answers with a zero serial — a redirector, measured in
-    // DR-037 — leaves DR-009's claim on the path alone, and there is nothing
-    // here to catch. That is the same NTFS-shaped assumption DR-035 already
-    // makes about `fs::rename`, stated rather than discovered.
+    // Both spellings of a hard link canonicalise to themselves, so a path-keyed
+    // claim accepts both: it needs a volume that gives its files an identity.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2321,11 +2138,7 @@ fn a_second_name_for_one_file_is_the_same_archive() {
 #[cfg(target_os = "macos")]
 fn a_firmlink_spelling_is_the_same_archive() {
     // Every macOS since Catalina gives every writable file a second true
-    // canonical path under `/System/Volumes/Data`. Verified on 2026-08-27:
-    // `/private/var/folders/.../probe.txt` and
-    // `/System/Volumes/Data/private/var/folders/.../probe.txt` each resolve to
-    // themselves — two different canonical paths — and both name device
-    // 16777229, inode 55712401.
+    // canonical path under `/System/Volumes/Data`, on the same device and inode.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2366,13 +2179,7 @@ fn a_firmlink_spelling_is_the_same_archive() {
 #[cfg(any(unix, windows))]
 fn a_session_still_holds_its_archive_after_its_own_rebuild() {
     // A rebuild replaces the archive by rename, so the file the session holds
-    // afterwards is not the file it opened — a different inode on Unix, a
-    // different file index on Windows. A claim that kept the identity it first
-    // saw would go on claiming a file nobody has and stop recognising the one
-    // it does have — and a second session on that is the corruption again.
-    //
-    // Gated and preconditioned exactly as the hard-link test above is, and for
-    // the same two reasons.
+    // afterwards is a different inode: a claim must follow identity, not keep it.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2458,10 +2265,8 @@ fn a_session_still_holds_its_archive_after_its_own_rebuild() {
 
 #[test]
 fn close_on_a_handle_that_was_never_open_is_refused() {
-    // It answered `{"closed": true, "discarded": 0}`, which tells a client that
-    // closed the wrong handle that a claim was released when it was not —
-    // precisely the "locked out of your own archive" case DR-009 says is
-    // diagnosable. Every other method answers code 6 for the same handle.
+    // A close of a handle nobody opened must not report a claim released: every
+    // other method answers code 6 for the same handle.
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"close","params":{"handle":99}}),
         json!({"jsonrpc":"2.0","id":2,"method":"pending","params":{"handle":99}}),
@@ -2484,15 +2289,8 @@ fn close_on_a_handle_that_was_never_open_is_refused() {
 #[test]
 #[cfg(unix)]
 fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
-    // `Cancellation::ask` echoed the running job's `request` — the client's own
-    // JSON-RPC id, an arbitrary value it wrote once — into every cancel answer,
-    // and cancel answers are queued by the reading thread, whose queue is
-    // uncounted and unbounded so that the thread never waits. Measured with a
-    // client that never reads standard output, a `commit` carrying a 256 KiB id
-    // and a stream of 65-byte cancels: 222 KB of standard input grew the daemon
-    // 855 MB, 1.19 MB grew it 4.57 GB and 1.48 MB grew it 5.67 GB — around
-    // 3,900 times what the client wrote, linear and with no ceiling. The same
-    // run with an eight-byte id grew it 1.4 MB.
+    // A cancel answer echoing the running job's `request` — an arbitrary value the
+    // client wrote once — into an unbounded queue grows the daemon without bound.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     // Incompressible, so that deflating it takes long enough for the cancels
@@ -2539,11 +2337,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         writeln!(stdin, "{request}").expect("writable");
     }
     // The rebuild writes into a temporary file beside the archive, so a second
-    // file in that directory is the rebuild having started. Waiting for it
-    // rather than for a fixed interval, because how long a rebuild takes is a
-    // property of the build profile: three hundred milliseconds was under way
-    // in a debug build and long finished in a release one, where every cancel
-    // below was then answered against nothing at all.
+    // file there is the rebuild having started; waited for rather than timed.
     let waiting = std::time::Instant::now();
     while fs::read_dir(dir.path())
         .into_iter()
@@ -2614,10 +2408,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
 }
 
 /// Reads everything on `stdout` at full speed, pausing once after `after`
-/// bytes.
-///
-/// A client that hiccups: reading, reading fast, and once stopping for longer
-/// than the daemon looks at it in one go.
+/// bytes — a client that hiccups for longer than the daemon's grace.
 fn read_with_one_pause(
     mut stdout: std::process::ChildStdout,
     after: usize,
@@ -2643,14 +2434,8 @@ fn read_with_one_pause(
 
 #[test]
 fn a_client_that_pauses_once_still_gets_every_answer_whole() {
-    // The grace is an idle grace, and it was sampled against a counter that
-    // only moved once a whole eight-kilobyte piece had cleared — so one pause
-    // longer than the grace was indistinguishable from a client that had gone.
-    // Measured with three requests, standard input closed at once and a client
-    // reading at full speed that paused once at 200 KB: 1.0 s and 1.8 s
-    // delivered three whole objects and exit 0; 2.2 s, ten times out of ten,
-    // delivered one whole object and then between 270,336 and 311,296 bytes of
-    // a second with no terminating newline, never sent the third, and exited 7.
+    // The grace is an idle grace: sampled against a counter that moves only once
+    // a whole piece has cleared, one long pause reads as a client that has gone.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("one.rpf");
     let entry = 512 * 1024;
@@ -2713,10 +2498,8 @@ fn a_client_that_pauses_once_still_gets_every_answer_whole() {
 
 #[test]
 fn a_client_that_never_reads_does_not_hold_the_daemon_open_for_ever() {
-    // The other side of the pause above, and the reason the wait is bounded at
-    // all: a client that holds standard output open and never takes a byte of
-    // it cannot be told from one that has gone, and waiting on it for ever
-    // would let it stop the daemon exiting.
+    // The reason the wait is bounded at all: a client that holds standard output
+    // open and never takes a byte cannot be told from one that has gone.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("one.rpf");
     make_bulk_archive(&archive, 1, 512 * 1024);
@@ -2776,9 +2559,8 @@ fn cli_json(args: &[&str]) -> Value {
 
 #[test]
 fn the_daemon_answers_info_and_verify_as_the_command_line_does() {
-    // §1's own test: anything one frontend can do the other must be able to do,
-    // and until this both lived in the binary — so `rpf-editor`, which reaches
-    // the container only through the daemon, could ask neither question.
+    // Anything one frontend can do the other must be able to do; both of these
+    // lived in the binary, out of reach of a client that has only the daemon.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2818,20 +2600,17 @@ fn the_daemon_answers_info_and_verify_as_the_command_line_does() {
 
 #[test]
 fn verify_names_the_entry_that_did_not_read_back_and_still_answers() {
-    // A failing verify is a finding, not a failure of the call: the daemon did
-    // exactly what it was asked and what it found is the answer. The command
-    // line exits 4 because a process has one bit to say it with.
+    // A failing verify is a finding, not a failure of the call. The command line
+    // exits 4 because a process has one bit to say it with.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
-    // The resource, because it is the entry that is actually deflated: eleven
-    // bytes of greeting deflate to more than eleven, so `build` stores them,
-    // and a stored entry has nothing to check its contents against.
+    // The resource, because it is the entry that is actually deflated: the
+    // greeting deflates to more than it is, so `build` stores it.
     let (at, _) = spans(&archive, "art.yft");
 
     // Past the RSC7 header, where the deflate stream begins. 0xFF opens a block
-    // with the reserved type, so the stream is refused rather than inflating to
-    // some other length.
+    // with the reserved type, so the stream is refused rather than inflating.
     let header = usize::try_from(rpf_core::format::resource::RESOURCE_HEADER_LEN).expect("16 fits");
     let mut bytes = fs::read(&archive).expect("readable");
     let start = usize::try_from(at).expect("a test offset fits") + header;
@@ -2860,9 +2639,8 @@ fn verify_names_the_entry_that_did_not_read_back_and_still_answers() {
         "{verified}"
     );
 
-    // Both entries reported themselves on the way past, the failing one
-    // included: `done` counts it, so leaving it out would be a gap the client
-    // cannot account for.
+    // Both entries reported themselves on the way past, the failing one included:
+    // `done` counts it, so leaving it out would be a gap in the client's count.
     let named: Vec<&str> = notifications
         .iter()
         .filter_map(|n| n["params"]["path"].as_str())
@@ -2891,10 +2669,8 @@ fn verify_reports_no_progress_to_a_caller_that_asked_for_none() {
 
 #[test]
 fn a_write_to_a_name_two_entries_answer_to_is_refused() {
-    // The daemon resolves a write through `locate` exactly as `put` does, and
-    // it echoed the caller's own spelling back in the answer while buffering an
-    // edit against the other entry. Reproduced: the commit then patched `A.txt`
-    // and reported `{"committed": 1, "method": "patch"}`.
+    // The daemon resolves a write through `locate` exactly as `put` does, so a
+    // folded-case spelling could buffer an edit against the other entry.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let before = make_colliding_archive(&archive);
@@ -2932,9 +2708,8 @@ fn a_write_to_a_name_two_entries_answer_to_is_refused() {
 
 #[test]
 fn the_daemon_respells_a_backslashed_path_exactly_as_the_command_line_does() {
-    // §1's test applied to a diagnostic: what the binary tells a caller about
-    // the separator, the daemon tells them too, or the two frontends have
-    // diverged. DR-016.
+    // What the binary tells a caller about the separator, the daemon tells them
+    // too, or the two frontends have diverged.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2995,10 +2770,8 @@ fn make_nested(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 
 #[test]
 fn info_addresses_a_nested_archive_as_the_command_line_does() {
-    // R6.11, and §1's own test with it: `info` grew an in-archive path, and
-    // the daemon has to be able to ask the same question. The daemon names the
-    // archive by handle, so `path` here means the same thing it means to
-    // `list` — a path inside the archive the handle holds.
+    // The daemon names the archive by handle, so `path` here means what it means
+    // to `list`: a path inside the archive the handle holds.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, _) = make_nested(dir.path());
     let outer = outer_path.display().to_string();
@@ -3038,7 +2811,7 @@ fn info_addresses_a_nested_archive_as_the_command_line_does() {
     assert_ne!(nested["len"], whole["len"], "the outer is not the inner");
 
     // A directory is not an archive, and saying so is a refusal rather than a
-    // malformed archive. DR-010.
+    // malformed archive.
     let refusal = answer(&responses, 4);
     assert_eq!(refusal["error"]["code"], json!(6), "{refusal}");
 }
@@ -3046,8 +2819,7 @@ fn info_addresses_a_nested_archive_as_the_command_line_does() {
 #[test]
 fn opening_a_path_that_continues_past_an_archive_is_refused() {
     // The same complaint the command line makes, with the same number: an
-    // in-archive path spelled as a filesystem one is a request the daemon does
-    // not accept, not the disk misbehaving. DR-010.
+    // in-archive path spelled as a filesystem one is not the disk misbehaving.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, _) = make_nested(dir.path());
     let through = outer_path.join("x64").join("inner.rpf");
@@ -3065,9 +2837,8 @@ fn opening_a_path_that_continues_past_an_archive_is_refused() {
 
 #[test]
 fn list_and_ls_report_the_same_rows_through_the_same_nesting() {
-    // §1's own test, made mechanical for the one command whose rows were built
-    // in the binary until now: both frontends read them out of `rpf-core`, so a
-    // row that differs between them means the walk has been written twice.
+    // Both frontends read the rows out of `rpf-core`, so a row that differs
+    // between them means the walk has been written twice.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, _) = make_nested(dir.path());
     let outer = outer_path.display().to_string();
@@ -3106,10 +2877,8 @@ fn list_and_ls_report_the_same_rows_through_the_same_nesting() {
 
 #[test]
 fn the_daemon_extracts_and_packs_as_the_command_line_does() {
-    // §1's own test, and the last place it failed: `extract` and `pack` lived
-    // in the binary, so an editor client — which reaches the container only
-    // through the daemon — could do neither. A tree is a path on the daemon's
-    // own filesystem, the same thing `open`'s path already is. DR-014.
+    // A tree is a path on the daemon's own filesystem, the same thing `open`'s
+    // path already is.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3167,10 +2936,8 @@ fn the_daemon_extracts_and_packs_as_the_command_line_does() {
 
 #[test]
 fn packing_over_an_archive_a_session_holds_is_refused() {
-    // DR-009 arriving through a new door. `pack` is the one method that names
-    // its output by path rather than by handle, and writing over an archive a
-    // session holds moves every offset that session is still working from —
-    // which is exactly the corruption DR-009 exists to make unreachable.
+    // `pack` is the one method that names its output by path, and writing over an
+    // archive a session holds moves every offset that session works from.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3211,10 +2978,8 @@ fn packing_over_an_archive_a_session_holds_is_refused() {
 
 #[test]
 fn extract_and_pack_report_progress_as_notifications() {
-    // Writing every entry of a 2.7 GB archive out to a tree, and reading one
-    // back in, is unbounded work in the same way a rebuild is — so both take
-    // DR-008's seam rather than running silently. A `pack` has no handle to be
-    // named by, so its notifications carry none.
+    // Writing every entry out to a tree is unbounded work in the same way a
+    // rebuild is. A `pack` has no handle, so its notifications carry none.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3260,16 +3025,8 @@ fn extract_and_pack_report_progress_as_notifications() {
 
 #[test]
 fn extracting_from_a_session_with_buffered_edits_is_refused_and_names_them() {
-    // `read` prefers a buffered edit, because an editor that wrote a buffer
-    // and read it back should see what it wrote. `extract` did neither: it
-    // read the archive off disk and reported success, so a `write`, `extract`,
-    // `pack` sequence produced an archive without the edit and said nothing.
-    //
-    // The answer is a refusal rather than a merge, because a tree means one
-    // thing in both frontends — the archive as it is on disk, which is what
-    // `rpf extract` produces and what `pack` reads back. A merged tree would
-    // be an archive-shaped thing no archive holds, and packing it would leave
-    // the edit in two places at once.
+    // `read` prefers a buffered edit; `extract` reads the archive off disk, so a
+    // tree with buffered edits outstanding is refused rather than merged.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3312,10 +3069,8 @@ fn extracting_from_a_session_with_buffered_edits_is_refused_and_names_them() {
 
 #[test]
 fn extracting_over_an_archive_an_open_session_holds_is_refused() {
-    // DR-009 arriving through a third door. A session's offsets are true only
-    // of the bytes it parsed, and an extraction writing an entry over that
-    // file moves all of them while the session goes on committing against the
-    // old ones — which is what `pack`'s guard was added to make unreachable.
+    // A session's offsets are true only of the bytes it parsed, and an extraction
+    // writing an entry over that file moves all of them.
     let dir = tempfile::tempdir().expect("temp dir");
     let held = dir.path().join("held.rpf");
     make_archive(&held);
@@ -3348,9 +3103,7 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
         json!({"jsonrpc":"2.0","id":2,"method":"open","params":{
             "path": source.display().to_string()}}),
         // `overwrite` because the directory being extracted into is the one the
-        // archives sit in, which DR-029 refuses on its own. That refusal is not
-        // what this test is about, and it is the cheaper of the two, so it is
-        // waived to reach the claim.
+        // archives sit in, which is refused on its own and is not what is tested.
         json!({"jsonrpc":"2.0","id":3,"method":"extract","params":{
             "handle":2,"into": dir.path().display().to_string(),"overwrite":true}}),
     ]);
@@ -3370,17 +3123,11 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
     );
 }
 
-// Key material — R2.7, DR-020. Three methods with no handle, because there is
-// no archive open: an executable and a cache are named by paths on the
-// daemon's own filesystem, which is the one thing a path on this wire has ever
-// meant. DR-014.
+// Key material: three methods with no handle, because there is no archive
+// open. An executable and a cache are paths on the daemon's own filesystem.
 
 /// Reports a skip, naming the test, the gate that was not there, and what it
-/// would have read.
-///
-/// `RPF_REQUIRE_<GATE>` turns **that** gate's absence into a failure and no
-/// other's, so asking for an executable does not fail a test that only wanted
-/// an image.
+/// would have read. `RPF_REQUIRE_<GATE>` makes that gate's absence a failure.
 fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -3408,10 +3155,8 @@ fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// The memory image the NG material is extracted from, or a loud skip.
-///
-/// A gate of its own for DR-040's reason: no executable carries that material
-/// and an image carries all of it.
+/// The memory image the NG material is extracted from, or a loud skip. A gate
+/// of its own, because no executable carries that material.
 fn game_image(test: &str) -> Option<std::path::PathBuf> {
     let Some(named) = std::env::var_os("RPF_GAME_IMAGE") else {
         return skip(test, "RPF_GAME_IMAGE", "RPF_GAME_IMAGE is not set");
@@ -3448,8 +3193,8 @@ fn hex(bytes: &[u8]) -> String {
 
 #[test]
 fn the_daemon_answers_every_keys_command_the_binary_does() {
-    // §1's test, for the three commands R2.7 added: if `rpf` can do it and
-    // `serve --stdio` cannot, the logic is in the wrong crate.
+    // If `rpf` can do it and `serve --stdio` cannot, the logic is in the wrong
+    // crate.
     let dir = tempfile::tempdir().expect("temp dir");
     let source = dir.path().join("not-a-game.exe");
     fs::write(&source, vec![0_u8; 1 << 16]).expect("writable");
@@ -3471,8 +3216,8 @@ fn the_daemon_answers_every_keys_command_the_binary_does() {
         json!({"jsonrpc":"2.0","id":4,"method":"keys.cache","params":{"cache": at}}),
     ]);
 
-    // The same number the command line exits with: intact file, and the part
-    // that is missing is here. DR-010's fifth category.
+    // The same number the command line exits with: an intact file, and the part
+    // that is missing is here.
     let refused = answer(&responses, 1);
     assert_eq!(refused["error"]["code"], json!(9), "{refused}");
     assert!(
@@ -3503,10 +3248,8 @@ fn a_keys_method_says_which_parameter_it_wanted() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn the_daemon_reports_offsets_and_never_a_key() {
-    // DR-006 over the wire. The key is read in this process and every line the
-    // daemon wrote is searched for it, raw, as hexadecimal and as base64 —
-    // base64 especially, because `read` already puts entry payloads on this
-    // wire that way and a key must never travel the same road.
+    // The key is read in this process and every line the daemon wrote is searched
+    // for it — as base64 especially, which is how payloads travel this wire.
     let test = "the_daemon_reports_offsets_and_never_a_key";
     let Some(path) = executable(test, "GTA5.exe") else {
         return;
@@ -3566,12 +3309,8 @@ fn the_daemon_reports_offsets_and_never_a_key() {
 
 #[test]
 fn the_daemon_verifies_against_a_tree_as_the_command_line_does() {
-    // §1's own test, on the last thing `rpf-core` could do that neither
-    // frontend could ask for: DR-023 gave the library a per-entry checksum and
-    // `Verified::against` to check it, and nothing outside the library could
-    // reach either. `against` is a path on the daemon's own filesystem, the
-    // same thing `open`'s `path`, `extract`'s `into` and `pack`'s `from`
-    // already are. DR-014, DR-025.
+    // `against` is a path on the daemon's own filesystem, the same thing `open`'s
+    // `path`, `extract`'s `into` and `pack`'s `from` already are.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3612,9 +3351,7 @@ fn the_daemon_verifies_against_a_tree_as_the_command_line_does() {
 #[test]
 fn a_byte_changed_inside_a_stored_entry_is_a_finding_on_the_wire_too() {
     // The archive says nothing about a stored entry's bytes, so this is the one
-    // failure only a manifest can see. It is still an answer rather than an
-    // error — the call did what it was asked and what it found is its result —
-    // which is what the command line spends its exit code 4 on.
+    // failure only a manifest can see. Still an answer rather than an error.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3653,9 +3390,8 @@ fn a_byte_changed_inside_a_stored_entry_is_a_finding_on_the_wire_too() {
 
 #[test]
 fn a_tree_of_another_archive_is_refused_on_the_wire_as_it_is_on_the_command_line() {
-    // Refused rather than answered with nothing checked, and refused with the
-    // exit code the command line uses for it, because the two must not answer
-    // one mistake with two numbers. DR-025.
+    // Refused rather than answered with nothing checked, and with the exit code
+    // the command line uses, so the two do not answer one mistake with two.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3685,9 +3421,7 @@ fn a_tree_of_another_archive_is_refused_on_the_wire_as_it_is_on_the_command_line
 #[test]
 fn a_verify_against_a_tree_still_reports_one_step_per_entry() {
     // Digesting an entry's contents is bounded work per entry, so it happens
-    // inside the step that entry already reports: `done` and `total` are the
-    // same numbers with a manifest and without one, and a `cancel` lands in the
-    // same places. DR-008.
+    // inside the step that entry already reports: `done` and `total` are the same.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3738,7 +3472,7 @@ fn make_other_archive(at: &Path) {
     .expect("builds");
 }
 
-// --- R4.10 on the wire: adding, deleting and renaming an entry --------------
+// --- adding, deleting and renaming an entry on the wire ---------------------
 
 /// Every path an open archive holds, from a recursive `list`.
 fn listed(archive: &str) -> Vec<String> {
@@ -3756,8 +3490,7 @@ fn listed(archive: &str) -> Vec<String> {
 }
 
 /// `write` with `create` adds an entry the archive did not hold, and `commit`
-/// rebuilds for it. The wire can do what `rpf put --create` can, which is the
-/// whole of §1's test.
+/// rebuilds for it.
 #[test]
 fn a_created_entry_is_buffered_and_committed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3812,8 +3545,7 @@ fn a_created_entry_is_buffered_and_committed() {
 }
 
 /// `delete` buffers a removal, and a directory that holds something needs
-/// saying so — the same rule the command line has, because it is the same rule
-/// in `rpf-core`.
+/// saying so — the same rule the command line has.
 #[test]
 fn delete_buffers_a_removal_and_asks_before_taking_children() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3974,16 +3706,10 @@ fn a_structural_change_is_refused_when_it_is_offered() {
     assert_eq!(answer(&responses, 4)["result"]["paths"], json!([]));
 }
 
-// --- What `list` answers, and how a caller reads it. DR-028 -----------------
+// --- What `list` answers, and how a caller reads it -------------------------
 
-/// `list` of a file answers that one entry, which is what makes it a `stat`.
-///
-/// Pinned because a client depends on it and nothing said so: the editor client
-/// builds its whole tree out of `list`, and "is this a file" is the question it
-/// asks most. The tie-break is the row's `path` against the one that was asked
-/// for — equal means the path named that entry, different means it named the
-/// directory the entry is in — and it is exact, because a child's path is its
-/// parent's plus a separator and a name and can never equal its parent's.
+/// `list` of a file answers that one entry, which makes it a `stat`: the
+/// tie-break is the row's `path` against the one that was asked for.
 #[test]
 fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4021,14 +3747,8 @@ fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
     );
 }
 
-/// R3.7 on the wire, which is what R7.4 needs from it: a row says what the
-/// payload announces itself to be, and a resource row says nothing.
-///
-/// The field is an addition rather than a change — `"kind"` still says
-/// `binary` and `resource` as it always has — and DR-032 makes its name part of
-/// the contract from here on. A resource's `null` is not "nothing was found":
-/// its payload is never read, because `docs/backlog.md` Q7 measured that the
-/// magic in front of one says `false` on every Rockstar resource there is.
+/// A row says what the payload announces itself to be, and a resource row says
+/// nothing: its payload is never read, so `null` is not "nothing was found".
 #[test]
 fn a_list_row_says_what_the_payload_announces_and_a_resource_says_nothing() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4064,12 +3784,8 @@ fn a_list_row_says_what_the_payload_announces_and_a_resource_says_nothing() {
     assert_eq!(row("data")["encoding"], Value::Null);
 }
 
-/// A row's `path` is the whole in-archive path, not a name.
-///
-/// So a client uses it directly with `read`, `write` or `list`, and a client
-/// that joined it onto the path it asked for would build
-/// `x64/inner.rpf/x64/inner.rpf/art.yft`. Addressed from the path that was
-/// asked for, in the caller's own spelling of it.
+/// A row's `path` is the whole in-archive path, not a name, so a client that
+/// joined it onto the path it asked for would build the prefix twice.
 #[test]
 fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4080,9 +3796,8 @@ fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": outer}}),
         json!({"jsonrpc":"2.0","id":2,"method":"list","params":{
             "handle":1,"path":"x64/inner.rpf"}}),
-        // The caller's own spelling is what comes back, folded case and all:
-        // the rows are addressed from what was asked for, not from what the
-        // archive spells the components as.
+        // The caller's own spelling is what comes back, folded case and all: the
+        // rows are addressed from what was asked for.
         json!({"jsonrpc":"2.0","id":3,"method":"list","params":{
             "handle":1,"path":"X64/INNER.RPF"}}),
     ]);
@@ -4120,7 +3835,7 @@ fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
 }
 
 /// The wire refuses a non-empty target the way the command line does, and takes
-/// the same way through. Both, or neither. DR-029.
+/// the same way through. Both, or neither.
 #[test]
 fn extract_over_a_target_that_holds_something_is_refused_on_the_wire_too() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4154,14 +3869,8 @@ fn extract_over_a_target_that_holds_something_is_refused_on_the_wire_too() {
     assert_eq!(answer(&responses, 4)["result"]["files"], json!(2));
 }
 
-/// A listing is the archive **on disk**: a buffered change is not in it until
-/// the commit, and `read` is the one method that prefers what was buffered.
-///
-/// Pinned because the asymmetry is easy to read as a bug and is deliberate:
-/// nothing on disk changes until `commit`, so a listing that showed an entry no
-/// archive holds would describe something that does not exist. A client showing
-/// a buffered addition keeps that view itself, and `pending` is what it
-/// confirms it against.
+/// A listing is the archive on disk — nothing changes there until `commit` —
+/// and `read` is the one method that prefers what was buffered.
 #[test]
 fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4207,18 +3916,15 @@ fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
     );
 }
 
-/// The AES-encrypted archive in the corpus, by the relative path that addresses
-/// it. `docs/corpus.md`.
+/// The AES-encrypted archive in the corpus, by its relative path.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
 /// The Rockstar Games Launcher's own archive: AES-tagged under the launcher key
-/// and, alone in the corpus, holding **no resource entry at all**, which is
-/// what makes an extracted tree of it one this packer can rebuild whole.
-/// `docs/corpus.md`; DR-042, DR-057.
+/// and, alone in the corpus, holding **no resource entry at all**.
 const LAUNCHER_ARCHIVE: &str = "rockstar_launcher/Launcher.rpf";
 
 /// The NG-encrypted archive, whose **file name is load-bearing**: an NG key is
-/// chosen by the archive's own name. `docs/rpf-format.md`, Encryption.
+/// chosen by the archive's own name.
 const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 
 /// One corpus archive by its fixed relative path.
@@ -4259,16 +3965,14 @@ fn talk_homed(home: &Path, requests: &[Value]) -> Vec<Value> {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
-    // **`no_wire_method_writes_into_an_ng_archive`, re-aimed.** §1 in both
-    // directions: what `rpf put` can now do over an NG archive, `serve --stdio`
-    // can do, and the archive it left behind is opened by a **second daemon**
-    // from the bytes on disk. R4.7's NG half, DR-062.
+    // What `rpf put` can do over an NG archive, `serve --stdio` can do, and the
+    // archive it left is opened by a second daemon from the bytes on disk.
     let test = "the_wire_writes_into_an_ng_archive_and_it_opens_again";
     let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
     };
-    // A memory image: no executable carries the NG material, so extracting
-    // from one would leave this at `NeedsKey`. DR-040.
+    // A memory image: no executable carries the NG material, so extracting from
+    // one would leave this at `NeedsKey`.
     let Some(source) = game_image(test) else {
         return;
     };
@@ -4290,9 +3994,8 @@ fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
     );
     assert!(answer(&extracted, 1)["result"].is_object(), "{extracted:?}");
 
-    // Twenty bytes, `00 01 .. 13`, in base64 — a length the entry did not have,
-    // so the payload goes back under a different one of the 101 keys than it
-    // came out from (Q2).
+    // A length the entry did not have, so the payload goes back under a different
+    // one of the keys than it came out from.
     let responses = talk_homed(
         &home,
         &[
@@ -4308,9 +4011,7 @@ fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
     assert_eq!(answer(&responses, 3)["result"]["committed"], json!(1));
 
     // A fresh daemon over the file that is now on disk: a table of contents
-    // that went out in the clear does not open, one sealed under the wrong key
-    // does not either, and a payload keyed by the size it used to be does not
-    // read back.
+    // written in the clear does not open, nor does a payload keyed by the old size.
     let reopened = talk_homed(
         &home,
         &[
@@ -4333,9 +4034,8 @@ fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
-    // §1 in the other direction: what `rpf put` can do over an AES archive,
-    // `serve --stdio` can do, and the archive it left behind is opened by a
-    // **second daemon** from the bytes on disk. R4.7's AES half.
+    // What `rpf put` can do over an AES archive, `serve --stdio` can do, and the
+    // archive it left is opened by a second daemon from the bytes on disk.
     let test = "the_wire_writes_into_an_aes_archive_and_it_opens_again";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -4360,9 +4060,8 @@ fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
     );
     assert!(answer(&extracted, 1)["result"].is_object(), "{extracted:?}");
 
-    // Twenty bytes, `00 01 .. 13`, in base64. Deliberately not text:
-    // `_manifest.ymf` holds a tokenised encoding, so R6.6's guardrail refuses a
-    // textual payload into it before any of this is reached.
+    // Deliberately not text: `_manifest.ymf` holds a tokenised encoding, so a
+    // textual payload is refused before any of this is reached.
     let responses = talk_homed(
         &home,
         &[
@@ -4378,8 +4077,7 @@ fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
     assert_eq!(answer(&responses, 3)["result"]["committed"], json!(1));
 
     // A fresh daemon over the file that is now on disk: a table of contents
-    // that went out in the clear does not open, and a payload that did does
-    // not read back.
+    // written in the clear does not open, and a payload that did does not read.
     let reopened = talk_homed(
         &home,
         &[
@@ -4402,10 +4100,8 @@ fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
-    // §1's test: `rpf ls --cache-dir D` opens it, so `serve --stdio` must. The
-    // flag is on the process rather than on every method that opens an archive,
-    // which is what DR-041 rejected widening the wire for — and `keys.extract`
-    // takes the same default while still honouring a `cache` it is given.
+    // `rpf ls --cache-dir D` opens it, so `serve --stdio` must. The flag is on
+    // the process rather than on every method that opens an archive.
     let test = "the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -4441,14 +4137,8 @@ fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
     let opened = answer(&responses, 2);
     assert_eq!(opened["result"]["entries"], json!(11), "{opened}");
 
-    // And the same flag reaches `pack`, which is §1 for DR-057: the daemon
-    // takes the cache from the process it was started with, exactly as `open`
-    // does — DR-041 is what says the wire is not widened per method. What says
-    // the flag arrived is that the tree packs at all: this archive holds nine
-    // resources whose payloads carry no `RSC7` header, so the material has to
-    // be found for the seal and the manifest's page-flag words have to be read
-    // for the rows (DR-058). Without the cache the same request answers
-    // `NeedsKey` instead, below.
+    // The same flag reaches `pack`: what says it arrived is that the tree packs
+    // at all, the material being needed for the seal and the rows' flag words.
     let tree = dir.path().join("tree").display().to_string();
     let packed = dir.path().join("packed.rpf").display().to_string();
     let mut started = daemon();
@@ -4473,8 +4163,7 @@ fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
     assert!(Path::new(&packed).exists(), "the pack wrote no archive");
 
     // With no cache to reach, the same request answers for the material rather
-    // than writing a cleartext archive under an encrypted tag: exit code 5's
-    // reason over the wire.
+    // than writing a cleartext archive under an encrypted tag.
     let bare = dir.path().join("bare.rpf").display().to_string();
     let mut started = daemon();
     started
@@ -4506,12 +4195,8 @@ fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource() {
-    // The half of DR-057 that goes all the way through over the wire, on the
-    // one corpus archive it can: `docs/corpus.md` records `Launcher.rpf` as the
-    // only archive here with no resource entry at all, so every entry of an
-    // extracted tree of it is one this packer can rebuild. Extract, pack, and
-    // open what was written — under the launcher's own AES key, which only
-    // `Launcher.exe` carries (DR-042).
+    // `Launcher.rpf` is the one corpus archive with no resource entry, so every
+    // entry of an extracted tree of it is one this packer can rebuild.
     let test = "the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource";
     let Some(archive) = corpus(test, LAUNCHER_ARCHIVE) else {
         return;
@@ -4552,9 +4237,8 @@ fn the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource() {
     assert_eq!(opened["result"]["entries"], json!(118), "{opened}");
     let repacked = answer(&responses, 4);
     assert!(repacked["result"].is_object(), "{repacked}");
-    // Against what the source archive answered rather than against 118 again:
-    // whether a packed tree reproduces the entry *count* is `build`'s question
-    // and not this test's, and the claim here is that what was written opens.
+    // Against what the source archive answered rather than a fixed count: whether
+    // a packed tree reproduces the entry count is `build`'s question.
     let reopened = answer(&responses, 5);
     assert!(reopened["result"].is_object(), "{reopened}");
     assert_eq!(
@@ -4629,13 +4313,8 @@ fn make_metadata_archive(at: &Path, contents: &[u8]) {
     .expect("builds");
 }
 
-/// R6.6 on the wire: an entry holding `RBF` or `PSO` takes neither XML nor
-/// text, and `"allow_encoding_change": true` is the way through.
-///
-/// **The refusal arrives at the commit**, which is where every refusal the
-/// daemon cannot decide from the entry table alone arrives — this one needs
-/// both payloads read. The command line refuses the same four pairs with the
-/// same error and the same number (§1, `crates/rpf/tests/cli.rs`). DR-050.
+/// An entry holding `RBF` or `PSO` takes neither XML nor text, and
+/// `"allow_encoding_change": true` is the way through — refused at the commit.
 #[test]
 fn a_write_of_text_into_a_tokenised_metadata_entry_is_refused_at_the_commit() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4694,12 +4373,7 @@ fn a_write_of_text_into_a_tokenised_metadata_entry_is_refused_at_the_commit() {
 }
 
 /// A dry run reports the refusal the real commit makes, whichever way it is
-/// told to go.
-///
-/// R6.7: a dry run is a prediction rather than an estimate. `"rebuild": true`
-/// used to answer `"method": "rebuild"` and no error for a set the real commit
-/// refuses, because it reported the decision without taking it. The command
-/// line had the same hole and is pinned in `crates/rpf/tests/cli.rs` (§1).
+/// told to go: a dry run is a prediction rather than an estimate.
 #[test]
 fn a_dry_run_told_to_rebuild_reports_the_refusal_the_commit_would_make() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4746,12 +4420,6 @@ fn a_dry_run_told_to_rebuild_reports_the_refusal_the_commit_would_make() {
 
 /// The daemon's own `"force"` is the game-install override and carries no
 /// second meaning, **on either verb it could be sent to**.
-///
-/// Both are asked because only one of them takes it: `commit` has a `"force"`
-/// and `write` has none, so a `write` that grew one would be a second meaning
-/// on a name a caller already reads as "write into a game install". Sending it
-/// on the request that carries the payload is the way that mistake would
-/// actually be made. DR-050.
 #[test]
 fn force_does_not_let_text_into_a_tokenised_metadata_entry() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4783,13 +4451,8 @@ fn force_does_not_let_text_into_a_tokenised_metadata_entry() {
     }
 }
 
-/// R7.4 on the wire: `read` answers the view it was asked for and names what
-/// the entry holds, and `write` takes the document back.
-///
-/// Both encodings for the reason the command-line test gives, and all three
-/// views, because the answer has to say which of them it gave: a client that
-/// asked for `"auto"` presents what it is handed and must not have to guess
-/// whether it was converted.
+/// `read` answers the view it was asked for and names which view it gave, so a
+/// client that asked for `"auto"` need not guess whether it was converted.
 #[test]
 fn read_answers_the_view_it_was_asked_for_and_names_what_the_entry_holds() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4831,12 +4494,8 @@ fn read_answers_the_view_it_was_asked_for_and_names_what_the_entry_holds() {
     }
 }
 
-/// A document written back is converted, buffered as the payload, read back as
-/// the document, and committed with no override.
-///
-/// The buffered read is the half that would break silently: `read` prefers a
-/// pending write, so a client that saved and re-opened a file must see its own
-/// edit and not what is still on disk.
+/// A document written back is converted, buffered, read back as the document,
+/// and committed with no override: a client must see its own pending edit.
 #[test]
 fn a_document_is_written_back_read_back_and_committed_as_the_entrys_encoding() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4884,12 +4543,8 @@ fn a_document_is_written_back_read_back_and_committed_as_the_entrys_encoding() {
     }
 }
 
-/// Converting is not a way round DR-050 on the wire either.
-///
-/// The same document into the same entry: as bytes it is refused at the commit
-/// with `WrongEncoding` and the archive is untouched; as a document it is
-/// converted, taken with no `"allow_encoding_change"`, and what lands in the
-/// entry is the tokenised payload. The command line does the same (§1).
+/// Converting is not a way round the encoding guard: as bytes the document is
+/// refused, and as a document it lands as the entry's tokenised payload.
 #[test]
 fn a_document_is_refused_as_bytes_and_taken_as_a_document_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4938,12 +4593,8 @@ fn a_document_is_refused_as_bytes_and_taken_as_a_document_on_the_wire() {
     );
 }
 
-/// A payload that is not a document is offered to the entry as it is.
-///
-/// `"auto"` is what an editor client sends on every write, including the ones
-/// that are not edits of a view — pasting a second `RBF` payload over the
-/// first. A conversion attempted on those would refuse a write `"raw"` takes,
-/// which is the way this would break a client that asked for it once.
+/// A payload that is not a document is offered to the entry as it is: `"auto"`
+/// must not refuse a write that `"raw"` takes.
 #[test]
 fn auto_offers_a_payload_that_is_not_a_document_exactly_as_it_is() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4981,9 +4632,8 @@ fn an_entry_with_no_xml_view_refuses_one_on_the_wire() {
 
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": path}}),
-        // A resource: its payload is not read at all, so it has no view and
-        // its `"encoding"` is `null` for the reason a listing row's is. R5.8
-        // is what gives it one. DR-044, Q7.
+        // A resource: its payload is not read at all, so it has no view and its
+        // `"encoding"` is `null` for the reason a listing row's is.
         json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
             "handle":1,"path":"art.yft","as":"xml"}}),
         json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
@@ -5049,8 +4699,7 @@ fn a_view_the_wire_does_not_name_is_refused_as_a_parameter() {
 }
 
 /// An archive holding one resource entry at `data/thing.ymt` whose contents are
-/// a `Meta`, with `flags` as the row's two flag words. The command line builds
-/// the same one (§1).
+/// a `Meta`, with `flags` as the row's two flag words.
 fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
     let payload = common::meta_resource();
     let mut out = fs::File::create(at).expect("creatable");
@@ -5070,18 +4719,8 @@ fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
     .expect("builds");
 }
 
-/// R5.8 on the wire: a resource carrying `Meta` reads as XML, takes a document
-/// back, reads the buffered document back, and commits.
-///
-/// The buffered read is the half that would break silently for this encoding in
-/// particular: what the daemon holds after a converted write is a resource
-/// **payload**, framed and deflated, and reading it back as the document means
-/// unframing it again against the entry's own flag words. A client that saved
-/// and re-opened the file sees its own edit or it sees a base64 blob.
-///
-/// `"encoding"` stays `null` throughout, before and after: a resource's payload
-/// is not what a listing reads, and having a view does not change what the
-/// entry is (Q7, DR-044).
+/// A resource carrying `Meta` reads as XML, takes a document back, reads the
+/// buffered document back, and commits; `"encoding"` stays `null` throughout.
 #[test]
 fn a_resource_meta_is_read_and_written_as_xml_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5142,18 +4781,7 @@ fn a_resource_meta_is_read_and_written_as_xml_on_the_wire() {
 }
 
 /// A buffered resource payload whose own `RSC7` header contradicts the entry's
-/// row has no view, in either direction.
-///
-/// DR-059's rule over the one address two elements describe. A payload in hand
-/// is unframed against the row's flag words, and `build::store_resource` records
-/// the **payload's** words when it carries a header (DR-046) — so a header
-/// declaring the boundary elsewhere is a different entry's, and reading the
-/// buffer against the row's boundary answered a document resolved at addresses
-/// that are not its own, with no diagnostic. The write that followed then
-/// re-framed with the row's flags and threw away what the client had written.
-///
-/// The two flag pairs declare the same total length, so nothing but the words
-/// themselves tells them apart.
+/// row has no view, in either direction: the two pairs declare one length.
 #[test]
 fn a_buffered_resource_whose_header_contradicts_its_row_has_no_view() {
     use std::io::Write as _;
@@ -5218,12 +4846,8 @@ fn a_buffered_resource_whose_header_contradicts_its_row_has_no_view() {
     );
 }
 
-/// As [`talk`], with the daemon given a keys cache of its own.
-///
-/// `--cache-dir` is a global flag, so it comes before the subcommand. An
-/// archive under a transform opens for the daemon exactly as it does for the
-/// command line — through `commands::open` — and this is what makes the keyed
-/// half reachable from a test at all.
+/// As [`talk`], with the daemon given a keys cache of its own. `--cache-dir`
+/// is a global flag, so it comes before the subcommand.
 fn talk_with_cache(cache: &Path, requests: &[Value]) -> Vec<Value> {
     let mut daemon = Command::new(RPF);
     daemon.args([
@@ -5236,14 +4860,7 @@ fn talk_with_cache(cache: &Path, requests: &[Value]) -> Vec<Value> {
 }
 
 /// A buffered converted write into a **keyed** resource reads back as its own
-/// document.
-///
-/// What `view::apply` buffers for a keyed resource is the payload as it will
-/// sit on disk, which is ciphertext — it has to be, because the writer is
-/// handed resource payloads as they sit (DR-054 §3, DR-060 §2). So the seam
-/// that reads a buffer needs the key too, and until it had one this answered
-/// `NoXmlView` for the one flow the daemon exists for: an editor that saved and
-/// asked for its own file back.
+/// document: what is buffered is the payload as it will sit on disk, keyed.
 #[test]
 fn a_keyed_resource_reads_its_own_buffered_edit_back_as_xml() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5295,14 +4912,7 @@ fn a_keyed_resource_reads_its_own_buffered_edit_back_as_xml() {
 }
 
 /// A second `auto` write over a buffered converted write into a **keyed**
-/// resource edits the payload rather than becoming it.
-///
-/// The severe one, and the assertion is over the bytes on disk. What the daemon
-/// buffered after the first write is ciphertext; a seam that could not take it
-/// apart answered "this entry has no view", and `auto`'s fallback then wrote
-/// the **document** into the resource's entry as its payload, with nothing
-/// refused and nothing reported. `edit::check_encoding` cannot see it either: a
-/// resource carries no encoding for a document to be an encoding change from.
+/// resource edits the payload rather than becoming it, asserted on disk.
 #[test]
 fn a_second_auto_write_over_a_keyed_resource_does_not_land_the_document_as_the_payload() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5369,14 +4979,7 @@ fn a_second_auto_write_over_a_keyed_resource_does_not_land_the_document_as_the_p
 }
 
 /// A resource whose payload cannot be taken apart refuses an `auto` write of a
-/// document rather than letting it become the payload.
-///
-/// The pre-existing half of the same defect, and it needs no key: a payload
-/// that begins no deflate stream at either boundary — a corrupt entry — is a
-/// resource all the same, because `Archive::classify` reads that off the row.
-/// `auto`'s fallback is "these bytes are not a document for this entry", and
-/// for an entry whose payload nothing here can interpret that answer wrote the
-/// document into the archive.
+/// document rather than letting the document become the payload.
 #[test]
 fn an_auto_write_of_a_document_into_an_unreadable_resource_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5427,13 +5030,8 @@ fn an_auto_write_of_a_document_into_an_unreadable_resource_is_refused() {
     );
 }
 
-/// The three refusals a `Meta` earns, on the wire, with nothing written.
-///
-/// A resource that is not a `Meta` has no view at all; a `Meta` whose row
-/// declares the page boundary somewhere else is malformed rather than guessed
-/// at; and a document that does not describe the payload is the codec's
-/// refusal and never a fallback to writing it as bytes. The command line
-/// refuses the same three (§1).
+/// The three refusals a `Meta` earns, with nothing written: no view at all, a
+/// row declaring the boundary elsewhere, and a document it cannot take.
 #[test]
 fn a_meta_refuses_a_wrong_boundary_and_a_document_it_cannot_take() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5484,12 +5082,7 @@ fn a_meta_refuses_a_wrong_boundary_and_a_document_it_cannot_take() {
 }
 
 /// A resource that is not a `Meta` still has no view, and `"auto"` still hands
-/// back its bytes.
-///
-/// The other half of R5.8's answer, and the one a client meets far more often:
-/// 694,470 of the corpus's resources are not `Meta` and every one of them must
-/// come back as itself. `art.ydr` here is a page of zeroes, which is a resource
-/// whose contents carry no `Meta` magic.
+/// back its bytes — which is nearly every resource there is.
 #[test]
 fn a_resource_that_is_not_a_meta_still_has_no_xml_view() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5520,16 +5113,8 @@ fn a_resource_that_is_not_a_meta_still_has_no_xml_view() {
     );
 }
 
-/// A resource entry does not take a document, on the wire. DR-061.
-///
-/// `art.yft` is an ordinary resource: its payload comes apart, inflates to what
-/// its flag words declare, and is not a `Meta` — the shape 694,470 of the
-/// corpus's 696,578 resources are in. `write {"as":"auto"}` of an XML document
-/// answered `{"pending":1}` and `commit` wrote the document in as the payload,
-/// because "no view" means "hand the bytes back" and a resource carries no
-/// encoding for the encoding guard to see a change in. The assertion is over
-/// the bytes a raw read gives back, not over a length: the length that landed
-/// was the document's own.
+/// A resource entry does not take a document; asserted over the bytes a raw
+/// read gives back, since the length that landed was the document's own.
 #[test]
 fn an_auto_write_of_a_document_into_a_resource_is_refused_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");

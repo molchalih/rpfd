@@ -1,14 +1,6 @@
 //! Where a resource's deflate stream begins, and where its entry's flag words
-//! come from.
-//!
-//! Both are the same question asked from the two sides: nothing in an RPF7
-//! entry declares either, because offsets 8 and 12 of a resource row are both
-//! page flags. `docs/rpf-format.md`, Compression and Resource entries.
-//! DR-045 is where the stream's boundary comes from and DR-046 is where the
-//! entry's flag words come from.
-//!
-//! Corpus-free. Every archive here is assembled byte by byte, so the facts are
-//! pinned on a machine with no game installed.
+//! come from. Nothing in an RPF7 entry declares either: offsets 8 and 12 of a
+//! resource row are both page flags.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -38,43 +30,26 @@ use rpf_core::{
 mod common;
 
 /// Flags describing one 512-byte system page and no graphics pages.
-///
-/// `docs/rpf-format.md`, Resource page flags. Spelled as flags rather than as
-/// the number 512 because that is what an entry carries, and `resource_len` is
-/// asked for the number below rather than told it.
 const SYSTEM_FLAGS: u32 = 0xA800_0000;
 const GRAPHICS_FLAGS: u32 = 0x2000_0000;
 
 /// Bytes that cannot begin a raw deflate stream: the low three bits are
-/// `BFINAL = 1` and `BTYPE = 11`, which RFC 1951 reserves and no decoder
-/// accepts. A header of these is a header no candidate boundary can mistake for
-/// the stream, which is what makes the recovery below a measurement rather than
-/// a coincidence.
+/// `BFINAL = 1` and `BTYPE = 11`, which RFC 1951 reserves.
 const OPAQUE: u8 = 0xFF;
 
 /// The header lengths measured in the corpus, spelled out here rather than
-/// imported.
-///
-/// A test that took the widths from the code it checks would agree with
-/// whatever that code came to believe — `crates/rpf-core/tests/patch.rs` says
-/// the same about `MAX_SIZE_24`. These two are the measurement:
-/// `docs/rpf-format.md`, Compression, `verified` — 7,050 resources of
-/// `x64f.rpf` at 16 and 22 at 24.
+/// imported from the code under test.
 const MEASURED: [usize; 2] = [16, 24];
 
 /// A resource payload as a Rockstar archive holds one: an opaque header of
 /// `header_len` bytes that is not an `RSC7` header, then the deflate stream.
-///
-/// `docs/backlog.md` Q7: 696,578 of 696,578 Rockstar resource payloads do not
-/// begin with `RSC7`.
 fn opaque_resource(header_len: usize) -> Vec<u8> {
     let mut payload = vec![OPAQUE; header_len];
     payload.extend_from_slice(&deflated_page());
     payload
 }
 
-/// One 512-byte page of zeroes, deflated — the contents every resource here
-/// inflates to.
+/// One 512-byte page of zeroes, deflated.
 fn deflated_page() -> Vec<u8> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -82,9 +57,8 @@ fn deflated_page() -> Vec<u8> {
     encoder.finish().expect("finishes")
 }
 
-/// An archive holding one resource per header length in `headers`, named
-/// `r0`, `r1` and so on in ascending order, each one payload of
-/// [`opaque_resource`].
+/// An archive holding one resource per header length in `headers`, named `r0`,
+/// `r1` and so on in ascending order, each one payload of [`opaque_resource`].
 fn archive_of(headers: &[usize]) -> Vec<u8> {
     let mut names = vec![0_u8];
     let mut rows = vec![common::directory_row(0, 1, headers.len() as u32)];
@@ -131,13 +105,6 @@ fn contents_of(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The measurement this file exists for: the header length is not one value,
-/// and the boundary is found rather than assumed.
-///
-/// `x64f.rpf` holds 7,050 resources whose stream begins 16 bytes into the
-/// payload and 22 whose stream begins 24 bytes in, and two of them carry
-/// identical flag words — so no field and no derivation separates the cases.
-/// `docs/rpf-format.md`, Compression.
 #[test]
 fn a_resource_stream_is_found_at_whichever_boundary_its_payload_uses() {
     let bytes = archive_of(&MEASURED);
@@ -158,13 +125,9 @@ fn a_resource_stream_is_found_at_whichever_boundary_its_payload_uses() {
     );
 }
 
-/// A `verify` over the same archive reports nothing, at either boundary.
-///
-/// The half a read alone cannot see: the stream's length is the payload's
-/// extent **less the header it actually carries**, so a boundary recovered at
-/// 24 while the length was still taken from 16 would leave eight bytes
-/// unaccounted for and `verify` would report [`rpf_core::Error::TrailingBytes`]
-/// on an archive that is perfectly sound. R6.10, DR-033.
+/// The stream's length is the payload's extent less the header it actually
+/// carries, so a boundary and a length taken from different candidates would
+/// leave bytes unaccounted for.
 #[test]
 fn a_resource_at_any_boundary_accounts_for_its_whole_payload() {
     let bytes = archive_of(&MEASURED);
@@ -184,12 +147,6 @@ fn a_resource_at_any_boundary_accounts_for_its_whole_payload() {
     );
 }
 
-/// The payload comes out of `extract` whole whatever its header length.
-///
-/// Passthrough is a commitment (`docs/approach.md`) and it is what makes the
-/// round trip possible at all: an entry this build cannot interpret still
-/// leaves and re-enters the archive byte for byte. DR-023's checksum is over
-/// exactly these bytes.
 #[test]
 fn extract_hands_back_the_payload_whole_at_any_boundary() {
     for &header in &MEASURED {
@@ -204,8 +161,6 @@ fn extract_hands_back_the_payload_whole_at_any_boundary() {
     }
 }
 
-/// The constant says what was measured, and says the shortest of them is the
-/// floor a payload has to clear.
 #[test]
 fn the_boundaries_the_code_carries_are_the_ones_that_were_measured() {
     let carried: Vec<usize> = RESOURCE_HEADER_LENS
@@ -224,18 +179,10 @@ fn the_boundaries_the_code_carries_are_the_ones_that_were_measured() {
     );
 }
 
-/// A payload that begins no stream at any boundary is reported as the first
-/// boundary's failure, not the last one's.
-///
-/// `docs/backlog.md` Q14's populations 2 and 3 are exactly this, 3,190 entries
-/// of them, and the answer a caller gets about them must not change with the
-/// length of the candidate list.
 #[test]
 fn a_payload_that_begins_no_stream_reports_the_first_boundarys_failure() {
-    // A near miss at the *second* boundary: a whole deflate stream lives 24
-    // bytes in, and it inflates to half of what the flags declare. At the first
-    // boundary there is no stream at all. So the two boundaries fail
-    // differently, and which failure comes back says which one is reported.
+    // A near miss at the second boundary: a whole stream 24 bytes in inflating
+    // to half of what the flags declare, where the first boundary has none.
     let mut short = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     short.write_all(&vec![0_u8; 256]).expect("deflates");
     let short = short.finish().expect("finishes");
@@ -248,8 +195,6 @@ fn a_payload_that_begins_no_stream_reports_the_first_boundarys_failure() {
         *byte = 0;
     }
     bytes[at..at + payload.len()].copy_from_slice(&payload);
-    // The row is rebuilt rather than poked at, so the field offsets stay
-    // `common`'s and this test carries no copy of the layout.
     let row = common::HEADER_LEN as usize + ROW_LEN;
     bytes[row..row + ROW_LEN].copy_from_slice(&common::file_row(
         1,
@@ -268,21 +213,8 @@ fn a_payload_that_begins_no_stream_reports_the_first_boundarys_failure() {
     );
 }
 
-/// A resource whose stream is whole and stops short of what its flags declare
-/// is **named**, and no candidate rescues it.
-///
-/// This is the shape of the only two entries in the corpus that do not read
-/// back — `x64a.rpf/textures/parachute_decals.ytd`, in both installs and
-/// differently: the Enhanced copy is a clean stream that terminates 68,056
-/// bytes short of the 794,624 its flags declare, and the Legacy copy is a
-/// different payload that breaks mid-stream. `docs/corpus.md`. They are damaged
-/// in the archive Rockstar ships, and what the tool does about them is report
-/// them against the entry they belong to and offer no bytes for them.
-///
-/// It is pinned because the candidate list grew: a boundary and a transform are
-/// now recovered by trying, and a payload that satisfies no candidate must
-/// still come back as the failure it is rather than as whichever attempt got
-/// furthest. DR-045 §1a, DR-051.
+/// A payload that satisfies no candidate comes back as the failure it is,
+/// rather than as whichever attempt got furthest.
 #[test]
 fn a_resource_that_inflates_short_of_its_flags_is_reported_against_its_entry() {
     let mut encoder =
@@ -332,8 +264,7 @@ fn a_resource_that_inflates_short_of_its_flags_is_reported_against_its_entry() {
         "the walk names the one entry that did not read back and no other"
     );
 
-    // Passthrough is untouched by any of it: the payload still leaves the
-    // archive byte for byte, which is what makes the damaged pair rebuildable.
+    // Passthrough is untouched: the payload leaves the archive byte for byte.
     assert_eq!(
         archive.extract(&mut src, 1).expect("extracts")[..payload.len()],
         payload[..],
@@ -341,11 +272,6 @@ fn a_resource_that_inflates_short_of_its_flags_is_reported_against_its_entry() {
     );
 }
 
-/// A resource written into an entry that declares its flag words keeps them,
-/// and the archive that results reads back.
-///
-/// This is the round trip Q7 forbids doing any other way: the payload carries
-/// no `RSC7` header, so its flags exist only in the row it is going into.
 #[test]
 fn a_resource_write_takes_its_flag_words_from_the_entry_when_the_payload_has_none() {
     let payload = opaque_resource(MEASURED[1]);
@@ -367,8 +293,6 @@ fn a_resource_write_takes_its_flag_words_from_the_entry_when_the_payload_has_non
     );
 }
 
-/// With nothing declaring them and no header to read them out of, the write is
-/// refused rather than guessed at.
 #[test]
 fn a_resource_write_with_no_flag_words_anywhere_is_refused() {
     let payload = opaque_resource(MEASURED[1]);
@@ -386,8 +310,6 @@ fn a_resource_write_with_no_flag_words_anywhere_is_refused() {
     }
 }
 
-/// A payload that *does* carry a header states its own flags, and they beat the
-/// entry's — the header describes the payload, and the row is being replaced.
 #[test]
 fn a_payload_with_its_own_header_beats_the_flag_words_the_entry_declares() {
     let mut payload = b"RSC7".to_vec();
@@ -396,8 +318,8 @@ fn a_payload_with_its_own_header_beats_the_flag_words_the_entry_declares() {
     payload.extend_from_slice(&GRAPHICS_FLAGS.to_le_bytes());
     payload.extend_from_slice(&deflated_page());
 
-    // Flags declaring 128 KB, which the payload is not. If the entry's were
-    // taken the read below would be a length mismatch.
+    // Flags declaring 128 KB, which the payload is not: taking the entry's
+    // would make the read below a length mismatch.
     let built = build_one(
         FileKind::Resource {
             declared: Some(ResourceFlags {
@@ -412,20 +334,8 @@ fn a_payload_with_its_own_header_beats_the_flag_words_the_entry_declares() {
     assert_eq!(contents_of(&built)[0].1, vec![0_u8; 512]);
 }
 
-/// The rule DR-046 puts in the library, pinned **in the library**: an in-place
-/// write into a resource entry takes its flag words from the entry it lands on.
-///
-/// `docs/conventions.md` §1 is why this test is here rather than only on a
-/// frontend. Until it was, the only thing that failed when `build::kind_of`
-/// stopped carrying the row's flags was a subprocess test of the command line —
-/// the whole of `rpf-core` stayed green, because `patch.rs`, `roundtrip.rs` and
-/// `stream.rs` each build their specs by hand and never ask an entry what it
-/// declares.
-///
-/// The payload written carries no `RSC7` header, which is the case Q7 measured
-/// at 696,578 of 696,578: the row is the only record of its length and version
-/// there is, so a write that did not take it from there would produce an entry
-/// declaring something else.
+/// The payload written carries no `RSC7` header, so the row is the only record
+/// of its length and version there is.
 #[test]
 fn a_patch_of_a_resource_that_carries_no_header_takes_the_entrys_flag_words() {
     let mut file = Cursor::new(archive_of(&[MEASURED[0]]));
@@ -433,8 +343,7 @@ fn a_patch_of_a_resource_that_carries_no_header_takes_the_entrys_flag_words() {
     let index = archive.find("r0.ydr").expect("resolves");
     let (payload_at, _) = archive.payload_at(index).expect("span");
 
-    // The same contents behind a header of the other measured length, so the
-    // bytes on disk really change and the row really is rewritten.
+    // The other measured header length, so the bytes on disk really change.
     let replacement = opaque_resource(MEASURED[1]);
     let plan = rpf_core::plan(
         &mut file,
@@ -461,9 +370,6 @@ fn a_patch_of_a_resource_that_carries_no_header_takes_the_entrys_flag_words() {
 }
 
 /// A source that counts the bytes read out of it.
-///
-/// The only way to observe how many times a payload was inflated: an inflate
-/// reads its input, so two inflates read it twice.
 struct Counting<S> {
     inner: S,
     read: u64,
@@ -489,22 +395,14 @@ impl<S: std::io::Seek> std::io::Seek for Counting<S> {
     }
 }
 
-/// DR-046's loosening, pinned as a loosening: a payload that is nothing like a
-/// resource is **accepted** into a resource entry and **caught by `verify`**.
-///
-/// The guard that used to refuse this at the moment it was offered was
-/// measuring the wrong thing — `docs/backlog.md` Q7 — so it went, and §8's rule
-/// that every write path has a read path that checks it is what is left. Both
-/// halves are the record's claim and both are asserted here, because a
-/// refusal that came back would look like a fix and is the defect being
-/// undone.
+/// The write is not refused when it is offered; the read path is what catches
+/// it.
 #[test]
 fn a_text_payload_written_into_a_resource_entry_is_taken_and_then_caught() {
     let mut file = Cursor::new(archive_of(&[MEASURED[0]]));
     let archive = Archive::open(&mut file, &Unlock::unkeyed()).expect("parses");
 
-    // Longer than a resource header, so the one content test that survives —
-    // the floor — has nothing to say about it.
+    // Longer than a resource header, so the floor has nothing to say about it.
     let text = b"plain text, not a resource at all".to_vec();
     assert!(text.len() as u64 > RESOURCE_HEADER_LEN);
     let plan = rpf_core::plan(
@@ -539,30 +437,19 @@ fn a_text_payload_written_into_a_resource_entry_is_taken_and_then_caught() {
     );
 }
 
-/// Flags declaring 128 pages of the base 512 bytes — 65,536 bytes.
-///
-/// `docs/rpf-format.md`, Resource page flags: bit 5 is worth 128 pages. The
-/// cost test below needs contents large enough that one pass over them is not
-/// lost in the head a walk peeks at.
+/// Flags declaring 128 pages of the base 512 bytes — 65,536 bytes; bit 5 is
+/// worth 128 pages.
 const SYSTEM_FLAGS_64K: u32 = 0xA000_0020;
 
-/// Bytes that compress poorly, so the stream deflated from them is long rather
-/// than a handful of bytes of run-length.
+/// Bytes that compress poorly, so the deflated stream is long.
 fn noise(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect()
 }
 
-/// DR-045 §3, pinned: a `verify` settles a resource's boundary and reports what
-/// it found from **one** inflate, where a per-entry `Archive::read` pays for
-/// two.
-///
-/// The claim is a cost decision over a walk measured in hundreds of gigabytes,
-/// and nothing failed when `Archive::read_back` stopped short-circuiting into
-/// `Archive::resource_stream` and went through `opened` instead — the answers
-/// are identical, so only what the source is asked for tells them apart. An
-/// inflate reads its input, so a second inflate reads the stream a second time.
+/// An inflate reads its input, so the bytes asked of the source are what
+/// separates one pass over the stream from two.
 #[test]
 fn a_verify_inflates_a_resource_once_where_a_read_of_it_pays_twice() {
     let plain = noise(65_536);
@@ -634,8 +521,7 @@ fn rows_of(bytes: &[u8]) -> BTreeMap<String, (u32, u32)> {
         .collect()
 }
 
-/// Every entry of an archive as the file `extract` writes into a tree, by path
-/// — the payload itself for a resource, which is what packing it back reads.
+/// Every entry of an archive as the file `extract` writes into a tree, by path.
 fn extracted_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut src = Cursor::new(bytes.to_vec());
     let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
@@ -660,9 +546,6 @@ fn pack(manifest: &Manifest, contents: &BTreeMap<String, Vec<u8>>) -> rpf_core::
     Ok(out.into_inner())
 }
 
-/// The round trip DR-058 exists for, and the one `extract` followed by `pack`
-/// has never been: a resource whose payload carries no `RSC7` header packs back
-/// from the words its manifest recorded, into the row it came out of.
 #[test]
 fn a_resource_packs_from_the_flag_words_its_manifest_records() {
     let bytes = archive_of(&[MEASURED[0]]);
@@ -693,12 +576,8 @@ fn a_resource_packs_from_the_flag_words_its_manifest_records() {
     );
 }
 
-/// A tree extracted by a build that recorded no flag words still reads, and is
-/// refused where the fact is missing rather than where the file is.
-///
-/// The refusal is the unchanged [`rpf_core::Error::NotAResource`]: what is not
-/// recorded is never guessed at, because a guessed version produces an archive
-/// that parses, packs, verifies and does not load. DR-058 §3.
+/// Flag words that were not recorded are never guessed at: a guess produces an
+/// archive that parses, packs and verifies but does not load.
 #[test]
 fn a_tree_whose_manifest_records_no_flag_words_is_refused_at_the_entry_that_lacks_them() {
     let bytes = archive_of(&[MEASURED[0]]);
@@ -724,9 +603,6 @@ fn a_tree_whose_manifest_records_no_flag_words_is_refused_at_the_entry_that_lack
     }
 }
 
-/// DR-046 §1's first arm still wins, so a schema-3 tree of resources that carry
-/// their own headers keeps packing: the field records what a payload cannot
-/// say, and says nothing about one that can.
 #[test]
 fn a_resource_that_carries_its_own_header_packs_from_a_manifest_that_records_none() {
     let mut payload = b"RSC7".to_vec();

@@ -1,46 +1,23 @@
-//! The XML text, names and numbers both metadata encodings write.
+//! The XML text, names and numbers both metadata encodings write: how a byte
+//! string becomes XML text, how a float is spelled so it reads back to the same
+//! bits, and what counts as a name.
 //!
-//! One owner for the three questions `RBF` and `PSO` ask identically
-//! (`docs/conventions.md` §3): how an arbitrary byte string becomes XML text,
-//! how a float is spelled so it reads back to the same bits, and what counts as
-//! a name. `RBF` asks them of literal descriptor names and blobs, `PSO` of a
-//! name a dictionary offered for a hash and of a counted string in a block.
-//!
-//! # The escape
-//!
-//! `RBF` string values and raw blobs are **bytes**, and XML text is characters.
-//! Three measured facts decide the shape of this:
-//!
-//! - 1,038 records in the corpus carry a byte at or above `0x80`, and the blobs
-//!   holding them are not valid UTF-8. `CodeWalker` routes them through
-//!   `Encoding.ASCII` and turns every one into `?`.
-//! - 42,368 NUL bytes appear inside blobs, and 42,366 blobs end in one while
-//!   5,676 do not. A NUL is not a character XML can carry at all.
-//! - Tab, newline and carriage return are rewritten by XML's own attribute-value
-//!   and line-end normalisation, so a byte string carrying them cannot survive
-//!   as literal text.
-//!
-//! So the escape is byte-exact rather than character-exact, and it escapes
-//! everything XML would otherwise change. The encoder is canonical — it escapes
-//! exactly what it must — which is what makes [`decode`] of [`encode`] the
-//! identity on every byte string.
+//! Values are bytes and XML text is characters, so the escape is byte-exact and
+//! escapes everything XML would otherwise normalise. It is canonical, which
+//! makes [`decode`] of [`encode`] the identity on every byte string.
 
 /// The escape character, and the one character that always escapes itself.
 const ESCAPE: char = '\\';
 
-/// A space at either end of the text.
-///
-/// Escaped so that a text node made only of XML whitespace is unambiguously
-/// indentation and never a blob. Without it `<Name> </Name>` could be either.
+/// A space at either end of the text, escaped so a text node made only of
+/// whitespace is unambiguously indentation and never a blob.
 const SPACE: u8 = b' ';
 
 /// How an escaped space is written.
 const ESCAPED_SPACE: &str = "\\x20";
 
-/// Writes `bytes` as XML text.
-///
-/// The result is valid UTF-8, contains no character XML has to normalise, and
-/// begins and ends with no space.
+/// Writes `bytes` as XML text: valid UTF-8, with no character XML has to
+/// normalise and no space at either end.
 pub(crate) fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     let mut body = bytes;
@@ -75,8 +52,8 @@ fn encode_body(out: &mut String, bytes: &[u8]) {
         if let Ok(text) = str::from_utf8(valid) {
             push_text(out, text);
         }
-        // `None` means the input ended part-way through a sequence, so every
-        // byte that is left is unusable.
+        // `None` means the input ended mid-sequence: every remaining byte is
+        // unusable.
         let width = error.error_len().unwrap_or(invalid.len());
         let Some((bad, next)) = invalid.split_at_checked(width) else {
             return;
@@ -117,11 +94,9 @@ fn nibble(value: u8) -> char {
 
 /// Whether a character may appear literally in the XML.
 ///
-/// The escape character never may, because it is what marks the others. `0x7F`
-/// never may, because it is legal XML and invisible. Everything else outside
-/// XML 1.0's `Char` production never may, which is what excludes the control
-/// characters — tab, newline and carriage return included, since XML rewrites
-/// all three.
+/// Not the escape character, not `0x7F` (legal XML but invisible), and nothing
+/// outside XML 1.0's `Char` production — which excludes tab, newline and
+/// carriage return, all three of which XML rewrites.
 fn literal(character: char) -> bool {
     character != ESCAPE
         && character != '\u{7f}'
@@ -155,19 +130,12 @@ pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A float written as its raw bits rather than as a decimal, for the values
-/// whose shortest decimal does not read back to the same bits.
-///
-/// No shipped file needs it: all 48,324 `RBF` floats in the corpus are finite
-/// and round-trip through their shortest decimal. A NaN carrying a payload does
-/// not, and this is what keeps such a value exact rather than canonical.
-/// DR-043.
+/// A float written as its raw bits, for the values whose shortest decimal does
+/// not read back to the same bits.
 const BITS_PREFIX: &str = "0x";
 
-/// A float, as the shortest decimal that reads back to the same bits.
-///
-/// Falls back to the bits themselves when no decimal does — which is a NaN
-/// carrying a payload, and nothing else.
+/// A float, as the shortest decimal that reads back to the same bits, falling
+/// back to the bits themselves when no decimal does.
 pub(crate) fn float(number: f32) -> String {
     let shortest = format!("{number:?}");
     if shortest.parse::<f32>().map(f32::to_bits) == Ok(number.to_bits()) {
@@ -185,12 +153,8 @@ pub(crate) fn unfloat(text: &str) -> Option<f32> {
     }
 }
 
-/// Whether `text` is an XML name of the shape this layer writes.
-///
-/// A deliberate subset of XML 1.0's `Name`: ASCII only, starting with a letter,
-/// `_` or `:`. All 6,112 `RBF` descriptor names in the corpus match it, and `:`
-/// is here because a real name uses it —
-/// `CriminalCareerDefs::ShoppingCartItemCategoryLimits`.
+/// Whether `text` is an XML name of the shape this layer writes: a subset of
+/// XML 1.0's `Name`, ASCII only, starting with a letter, `_` or `:`.
 pub(crate) fn is_xml_name(text: &str) -> bool {
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
@@ -206,16 +170,13 @@ mod tests {
 
     #[test]
     fn a_shipped_blob_shows_its_own_trailing_nul() {
-        // docs/metadata-encodings.md: `RbfXml` strips the last byte of every
-        // blob unconditionally, and 5,676 of 48,042 blobs do not have one to
-        // strip. A blob that writes its own bytes cannot reproduce that.
+        // A trailing NUL is part of the blob, never stripped.
         assert_eq!(encode(b"DES_gasstation01\0"), "DES_gasstation01\\x00");
         assert_eq!(encode(b"DES_gasstation01"), "DES_gasstation01");
     }
 
     #[test]
     fn a_byte_that_is_not_utf8_survives() {
-        // The 1,038 records CodeWalker turns into `?`.
         assert_eq!(encode(b"\x913"), "\\x913");
         assert_eq!(decode("\\x913").as_deref(), Some(&b"\x913"[..]));
     }
@@ -253,9 +214,6 @@ mod tests {
 
     #[test]
     fn a_float_no_decimal_reads_back_to_is_written_as_its_bits() {
-        // A NaN carrying a payload: `docs/metadata-encodings.md` measured all
-        // 48,324 floats in the corpus finite, so this is what makes the round
-        // trip a property of the code rather than of the corpus. DR-043.
         let payload = f32::from_bits(0x7fc0_0001);
         assert_eq!(float(payload), "0x7fc00001");
         assert_eq!(unfloat("0x7fc00001").map(f32::to_bits), Some(0x7fc0_0001));
@@ -263,8 +221,6 @@ mod tests {
 
     #[test]
     fn a_name_is_ascii_and_starts_with_a_letter_an_underscore_or_a_colon() {
-        // `CriminalCareerDefs::ShoppingCartItemCategoryLimits` is a real
-        // descriptor name, which is why `:` is admitted.
         for name in ["a", "_a", ":a", "CriminalCareerDefs::Shopping", "a-b.c1"] {
             assert!(is_xml_name(name), "{name}");
         }

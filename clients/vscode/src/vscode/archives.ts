@@ -1,14 +1,8 @@
 /**
  * The archives this window has open, and the one daemon behind them.
  *
- * One daemon per window rather than one per archive: DR-002's whole argument is
- * that the table of contents is parsed once and kept warm, and a process per
- * archive would pay the process cost instead.
- *
- * One session per archive, and the registry is what makes that true on this
- * side. DR-009 refuses the second `open` anyway, but a client that had to
- * discover its own duplicate mount from a refusal would be finding out at the
- * wrong end.
+ * One daemon per window, so a table of contents is parsed once and kept warm;
+ * one session per archive, which this registry is what makes true on this side.
  */
 
 import * as vscode from 'vscode';
@@ -43,9 +37,8 @@ export class Archives {
     /**
      * Fires when a handed-off file has been read back.
      *
-     * Here rather than on each {@link HandOff} so that a listener is attached
-     * once per mount: a command that subscribed each time it ran would report
-     * one re-import as many times as it had been invoked.
+     * Here rather than on each {@link HandOff} so a listener is attached once
+     * per mount rather than once per invocation of the command that wants it.
      */
     readonly onImported = this.imported.event;
 
@@ -66,9 +59,8 @@ export class Archives {
     /**
      * Mounts an archive, or gives back the session already holding it.
      *
-     * The daemon reports the path it resolved, and that is what the registry is
-     * keyed on: two spellings of one archive are one mount, which is the same
-     * rule DR-009 applies one layer down.
+     * Keyed on the path the daemon resolved, so two spellings of one archive
+     * are one mount.
      */
     async mount(archive: string): Promise<Mounted> {
         const existing = this.mounted.get(archive);
@@ -158,13 +150,10 @@ export class Archives {
     }
 
     /**
-     * What to do when the daemon has gone. DR-002 assigns this to the client.
+     * What to do when the daemon has gone.
      *
-     * Every handle it issued went with it, and so did every buffered edit —
-     * they were held in the daemon's session, which is the point of DR-002's
-     * warm state. So the archives are opened again against a new daemon and the
-     * user is told what was lost, rather than being left with a folder whose
-     * every read fails.
+     * Every handle it issued went with it, and so did every buffered edit, so
+     * the archives are opened again and the user is told what was lost.
      */
     private async recover(gone: Daemon): Promise<void> {
         if (this.closing || this.daemon !== gone) {

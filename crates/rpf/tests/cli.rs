@@ -1,8 +1,6 @@
 //! Command-line behaviour: exit codes, the round trip, and the write guard.
 //!
-//! These build their own archive with `rpf_core::build`, so they need no
-//! corpus and run everywhere. R8.4 wants the suite to mean something on a
-//! machine with no game data, and this is most of what that means.
+//! These build their own archive, so they need no corpus and run everywhere.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -80,10 +78,7 @@ fn run_err(args: &[&str]) -> (i32, String) {
 }
 
 /// Runs the binary from inside `directory`, returning its exit code and
-/// standard error.
-///
-/// A child process rather than `set_current_dir`, which is process-global and
-/// would race every other test in this binary.
+/// standard error. A child process, since `set_current_dir` would race.
 fn run_err_in(directory: &Path, args: &[&str]) -> (i32, String) {
     let output = Command::new(RPF)
         .current_dir(directory)
@@ -97,8 +92,7 @@ fn run_err_in(directory: &Path, args: &[&str]) -> (i32, String) {
 }
 
 /// Where one entry's payload sits, how much room it has, and where its entry
-/// row is — read from the archive, so a report about them can be checked
-/// against something other than itself.
+/// row is — read from the archive, so a report can be checked against it.
 fn spans(at: &Path, inside: &str) -> (u64, u64, u64) {
     let mut file = fs::File::open(at).expect("archive opens");
     let archive =
@@ -113,9 +107,6 @@ fn spans(at: &Path, inside: &str) -> (u64, u64, u64) {
 }
 
 /// Which byte positions differ, refusing a pair that is not the same length.
-///
-/// The same shape as `rpf-core`'s own `differences`; an integration test is its
-/// own crate, so the two cannot be one function.
 fn differences(before: &[u8], after: &[u8]) -> Vec<usize> {
     assert_eq!(
         before.len(),
@@ -145,10 +136,8 @@ fn exit_codes_distinguish_the_failures() {
     assert_eq!(run(&["info", &archive]).0, 0, "a good archive");
     assert_eq!(run(&["cat", &archive, "nope/missing"]).0, 3, "not found");
 
-    // Both shapes of "not an archive". Neither is an i/o failure — nothing
-    // failed, the bytes are simply not an archive — and the two are not one
-    // exit code either: what the four bytes claim decides who has to act on
-    // them. DR-019.
+    // Two shapes of "not an archive": what the four bytes claim decides who
+    // has to act on them, so they are not one exit code.
     let wrong_magic = dir.path().join("plain.txt");
     fs::write(&wrong_magic, b"this is definitely not an archive at all").expect("writable");
     assert_eq!(
@@ -169,17 +158,16 @@ fn exit_codes_distinguish_the_failures() {
     fs::write(&empty, b"").expect("writable");
     assert_eq!(run(&["info", &empty.display().to_string()]).0, 6, "empty");
 
-    // The case DR-019 is about: an entry that is an ordinary file, named as an
-    // archive by the caller's own path. Nothing in `test.rpf` is wrong.
+    // An entry that is an ordinary file, named as an archive by the caller's
+    // own path. Nothing in `test.rpf` is wrong.
     assert_eq!(
         run(&["info", &archive, "stored.bin"]).0,
         6,
         "an ordinary entry named as a nested archive"
     );
 
-    // An RPF of a version with no codec here is not the same failure as either
-    // of those: nothing is malformed and the caller's request was fine. It used
-    // to report `not an RPF7 archive` and exit 4. R11.1, DR-010's amendment.
+    // An RPF of a version with no codec here: nothing is malformed and the
+    // caller's request was fine.
     let other_version = dir.path().join("rpf2.rpf");
     let mut header = b"RPF2".to_vec();
     header.extend_from_slice(&1_u32.to_le_bytes());
@@ -200,18 +188,15 @@ fn exit_codes_distinguish_the_failures() {
 
 #[test]
 fn a_payload_that_does_not_inflate_is_a_corrupt_archive_and_not_a_disk_failure() {
-    // DR-010. Every byte asked for arrived and then failed to decode, which is
-    // a fact about the archive. Reported as exit 7 it read as "the disk
-    // misbehaved, try again", and an agent consumer that retries on i/o retried
-    // for ever.
+    // Every byte asked for arrived and then failed to decode, which is a fact
+    // about the archive rather than an i/o failure.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
     let (at, _, _) = spans(&archive, "data/greeting.txt");
 
     // 0xFF opens a deflate block with the reserved type, so the stream is
-    // refused rather than inflating to the wrong length — which is
-    // LengthMismatch, a different variant that was already classified right.
+    // refused rather than inflating to the wrong length.
     let mut bytes = fs::read(&archive).expect("readable");
     let start = index_of(at);
     bytes[start..start + 8].fill(0xFF);
@@ -229,7 +214,6 @@ fn cat_edit_put_round_trips() {
     let contents = make_archive(&archive);
     let archive = archive.display().to_string();
 
-    // What comes out is what went in.
     let (code, out) = run(&["cat", &archive, "data/greeting.txt"]);
     assert_eq!(code, 0);
     assert_eq!(
@@ -237,7 +221,6 @@ fn cat_edit_put_round_trips() {
         "cat returned something else"
     );
 
-    // Change it, put it back, read it again.
     let edited = dir.path().join("edited.txt");
     fs::write(&edited, b"replaced").expect("writable");
     assert_eq!(
@@ -255,15 +238,13 @@ fn cat_edit_put_round_trips() {
     assert_eq!(code, 0);
     assert_eq!(out, b"replaced", "the edit did not survive");
 
-    // The other entry is untouched, and the archive still verifies.
     let (_, out) = run(&["cat", &archive, "stored.bin"]);
     assert_eq!(out, contents["stored.bin"], "an unrelated entry changed");
     assert_eq!(run(&["verify", &archive]).0, 0, "verify");
 }
 
 /// An archive whose one resource is shaped the way a Rockstar archive holds
-/// one: an opaque header that is not `RSC7`, then the deflate stream. Returns
-/// the payload.
+/// one: an opaque header that is not `RSC7`, then the deflate stream.
 fn make_rockstar_archive(at: &Path) -> Vec<u8> {
     // 24 bytes of 0xFF: not `RSC7`, and not the start of a deflate stream
     // either — the low three bits are BFINAL = 1 with the reserved BTYPE = 11.
@@ -299,12 +280,7 @@ fn make_rockstar_archive(at: &Path) -> Vec<u8> {
 }
 
 /// An archive holding one resource entry at `data/thing.ymt` whose contents are
-/// a `Meta`, with `flags` as the row's two flag words.
-///
-/// The payload is the file outside the archive — no `RSC7` header, a stream
-/// beginning at 24 — so nothing about the fixture arranges for the view to find
-/// it: the boundary is recovered by the archive's own probe, exactly as it is
-/// for a Rockstar resource.
+/// a `Meta` behind an opaque prefix, with `flags` as the row's two flag words.
 fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
     let payload = common::meta_resource();
     let mut out = fs::File::create(at).expect("archive is creatable");
@@ -326,11 +302,8 @@ fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
 
 #[test]
 fn cat_put_round_trips_a_resource_that_carries_no_header() {
-    // R6.6 and DR-046, on the command line: `docs/backlog.md` Q7 measured
-    // 696,578 of 696,578 Rockstar resource payloads that do not begin with
-    // `RSC7`, so a build that required the magic on the way in refused every
-    // resource its own reader had just handed out. §1 — the daemon does this
-    // too, `crates/rpf/tests/serve.rs`.
+    // A Rockstar resource payload does not begin with `RSC7`, so a build that
+    // required the magic on the way in would refuse every one of them.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let resource = make_rockstar_archive(&archive);
@@ -377,13 +350,8 @@ fn make_metadata_archive(at: &Path, contents: &[u8]) {
     .expect("archive builds");
 }
 
-/// Every value the `"encoding"` field can carry, spelled out.
-///
-/// DR-032 makes the field names *and* their values part of the wire contract,
-/// and there are exactly five: `"xml"`, `"text"`, `"rbf"`, `"pso"` and `null`.
-/// They are written out here rather than derived from `Encoding::name`, because
-/// a test that asked the code what it spells them would agree with a rename and
-/// every client's listing filter would not. R6.2, DR-032.
+/// The five `"encoding"` values are spelled out rather than derived from
+/// `Encoding::name`, so a rename cannot quietly change the wire contract.
 #[test]
 fn a_listing_spells_every_encoding_the_wire_contract_names() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -441,12 +409,8 @@ fn a_listing_spells_every_encoding_the_wire_contract_names() {
     }
 }
 
-/// R6.6 on the command line: an entry holding `RBF` or `PSO` takes neither XML
-/// nor text, and `--allow-encoding-change` is the way through.
-///
 /// Both targets and both payloads, because a guard written for one of them
-/// lets the other through. The daemon does the same, under the same name —
-/// `crates/rpf/tests/serve.rs`, §1. DR-050.
+/// lets the other through.
 #[test]
 fn put_refuses_text_into_a_tokenised_metadata_entry() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -458,10 +422,8 @@ fn put_refuses_text_into_a_tokenised_metadata_entry() {
             (&b"<CVehicleModelInfo />"[..], "xml"),
             (&b"a plain line of text\n"[..], "text"),
         ] {
-            // Both ways a write can go. The patch path is what a small edit
-            // takes and the rebuild path is what a frontend falls back to, and
-            // every fixture here fits in place, so without `--rebuild` the
-            // second one is never reached from the command line.
+            // Both ways a write can go: every fixture here fits in place, so without
+            // `--rebuild` the rebuild path is never reached.
             for way in [&[][..], &["--rebuild"][..]] {
                 let archive = dir.path().join("test.rpf");
                 make_metadata_archive(&archive, held);
@@ -474,10 +436,9 @@ fn put_refuses_text_into_a_tokenised_metadata_entry() {
                 args.extend_from_slice(way);
                 let (code, err) = run_err(&args);
                 assert_eq!(code, 6, "expected the refusal DR-010 numbers 6: {err}");
-                // Everything R7.6 asks a refusal to carry: which entry, what it
-                // holds, what was offered, and the way through. A message missing
-                // any of them leaves the caller to guess, and an assertion on the
-                // sentence's connective tissue alone would pass one that did.
+                // A refusal names the entry, what it holds, what was offered, and the way
+                // through; asserting on the connective tissue alone would pass one that
+                // did not.
                 for wanted in ["data/thing.ymt", holds, offers, "--allow-encoding-change"] {
                     assert!(
                         err.contains(wanted),
@@ -512,11 +473,6 @@ fn put_refuses_text_into_a_tokenised_metadata_entry() {
 
 /// A dry run reports the refusal the real call makes, whichever way it is told
 /// to go.
-///
-/// R6.7: what a dry run reports is what would happen, "so a refusal is reported
-/// as a refusal". `--rebuild --dry-run` used to answer "would rebuild the
-/// archive" and exit 0 for a write `--rebuild` refuses, because it reported the
-/// decision without taking it.
 #[test]
 fn a_dry_run_reports_the_refusal_the_real_call_makes() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -557,9 +513,6 @@ fn a_dry_run_reports_the_refusal_the_real_call_makes() {
 
 /// The override is its own switch: `--force` is the game-install override and
 /// says nothing about what an entry will take.
-///
-/// A caller that wanted one must not be given the other, which is the whole of
-/// DR-050's second half.
 #[test]
 fn force_does_not_let_text_into_a_tokenised_metadata_entry() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -687,14 +640,8 @@ fn ls_of_a_nested_archive_lists_what_is_inside_it() {
     assert_eq!(out.len(), 300, "cat through nesting");
 }
 
-/// R11.4: `pack` writes the version the manifest names, and holds no default
-/// of its own.
-///
-/// Walked over [`rpf_core::Version::ALL`], which has one member: today this
-/// says the version reaching the header came through the manifest rather than
-/// from a constant in `build`, and on the day a second codec lands it says the
-/// same of that one without anybody editing this. DR-018 is the record that
-/// asked for it — a tree extracted from one version must not pack as another.
+/// `pack` writes the version the manifest names, and holds no default of its
+/// own — walked over every member of [`rpf_core::Version::ALL`].
 #[test]
 fn pack_writes_the_version_the_manifest_names() {
     for &version in rpf_core::Version::ALL {
@@ -744,16 +691,8 @@ fn pack_writes_the_version_the_manifest_names() {
     }
 }
 
-/// What `pack` answers for a tree whose manifest names a transform, on a
-/// machine with no key material at all — which is every machine in continuous
-/// integration.
-///
-/// Two answers and they are different: a tag this build can write forwards is
-/// missing **material**, exit 5, and a tag it cannot is missing the
-/// **algorithm**, exit 9. Neither writes an archive, and the first is the one
-/// that matters most: a `pack` that fell back to writing the tree in the clear
-/// under an encrypted tag would exit 0 over an archive that opens for nobody.
-/// DR-057.
+/// A tag this build can write forwards but has no material for is exit 5; one
+/// whose algorithm it lacks is exit 9. Neither writes an archive.
 #[test]
 fn an_encrypted_tree_packs_for_material_or_refuses_for_the_algorithm() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -776,10 +715,7 @@ fn an_encrypted_tree_packs_for_material_or_refuses_for_the_algorithm() {
     let cache = dir.path().join("keys").display().to_string();
 
     // Rewritten through `Manifest` rather than as text, so this does not encode
-    // how the field is spelled on disk a second time. Read once and edited per
-    // tag; since DR-062 an NG manifest reads back rather than being refused at
-    // parse time, and the refusal below is the pack's, with nothing in this
-    // test's own empty cache to derive the transform from.
+    // how the field is spelled on disk a second time.
     let extracted =
         rpf_core::Manifest::from_json(&fs::read_to_string(&at).expect("manifest readable"))
             .expect("manifest parses");
@@ -808,9 +744,8 @@ fn an_encrypted_tree_packs_for_material_or_refuses_for_the_algorithm() {
         );
     }
 
-    // And the plain tag still packs, on the same machine with the same empty
-    // cache: nothing was made to depend on material that has no reason to be
-    // wanted (R2.6).
+    // And the plain tag still packs with the same empty cache: nothing was made
+    // to depend on material there is no reason to want.
     fs::write(&at, extracted.to_json().expect("renders")).expect("manifest writable");
     let packed = dir.path().join("packed-open.rpf");
     let (code, message) = run_err(&[
@@ -864,13 +799,8 @@ fn extract_then_pack_preserves_the_tree() {
     }
 }
 
-/// R4.17 and DR-058, through the binary: a tree extracted from an archive
-/// holding a Rockstar resource packs back, and the row it packs back into
-/// declares the words the row it came out of declared.
-///
-/// Here rather than only in `rpf-core` for the reason DR-046 measured on this
-/// same rule: a mutation of where a resource's flag words come from left the
-/// whole of `rpf-core` green and failed only a subprocess test.
+/// A tree extracted from an archive holding a Rockstar resource packs back,
+/// and the row it packs back into declares the words it came out of.
 #[test]
 fn extract_then_pack_preserves_a_resources_page_flags() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -882,9 +812,7 @@ fn extract_then_pack_preserves_a_resources_page_flags() {
     let (code, err) = run_err(&["extract", &archive, &tree.display().to_string()]);
     assert_eq!(code, 0, "extract: {err}");
 
-    // The manifest carries them in the spelling every other document uses, so
-    // a reader diffing it against `docs/rpf-format.md` reads the same
-    // characters. DR-058 §1.
+    // The manifest spells the flag words the way `docs/rpf-format.md` does.
     let manifest = fs::read_to_string(tree.join(rpf_core::MANIFEST_NAME)).expect("manifest");
     assert!(
         manifest.contains("\"system\": \"0xa8000000\""),
@@ -990,13 +918,8 @@ fn an_empty_directory_survives_extract_and_pack() {
     assert!(listing.contains("x64/empty"), "listing was: {listing}");
 }
 
-/// R3.7 on the command line: a listing says what an entry's payload announces
-/// itself to be, and says nothing where nothing announced anything.
-///
-/// The text entry is **deflated**, so a classifier reading the payload where it
-/// sits on disk would answer `-` for it; the stored one is 300 bytes of `0x07`,
-/// which is text in no window. Neither is decided by an extension: `.txt` and
-/// `.bin` are read past.
+/// The text entry is deflated, so a classifier reading the payload where it
+/// sits would answer `-`; neither entry is decided by its extension.
 #[test]
 fn a_listing_says_what_each_payload_announces_itself_to_be() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1090,14 +1013,11 @@ fn packing_without_a_manifest_is_refused() {
 
 #[test]
 fn a_dry_run_reports_the_patch_it_would_make_and_writes_nothing() {
-    // R6.7. The primary consumer is automation deciding whether to go ahead;
-    // what it needs is the decision, not the write.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
-    // Read from the archive, not from the report: "an offset, and room enough"
-    // is true of every archive ever written, so a report saying only that says
-    // nothing. R6.7 promises the caller the offset it would be written at.
+    // Read from the archive, not from the report: a report saying only "an
+    // offset, and room enough" says nothing.
     let (at, allocation, _) = spans(&archive, "data/greeting.txt");
     let archive = archive.display().to_string();
     let before = fs::read(&archive).expect("readable");
@@ -1138,15 +1058,8 @@ fn a_dry_run_reports_the_patch_it_would_make_and_writes_nothing() {
 
 #[test]
 fn a_put_that_fits_patches_in_place_rather_than_rebuilding() {
-    // The claim `docs/approach.md` makes for `put`: an edit that fits costs the
-    // bytes of the edit, not the bytes of the archive. Nothing else here can
-    // tell the two apart — a rebuild round-trips just as well, and the dry runs
-    // that report `"patch"` never write — so this is the only test that fails
-    // when every `put` quietly rebuilds.
-    //
-    // `big.bin` is eight blocks of payload replaced by eight bytes, so the two
-    // answers differ in length as well as in content: a patch leaves the seven
-    // spare blocks where they are, and a rebuild packs them out.
+    // Nothing else here tells a patch from a rebuild: a rebuild round-trips
+    // just as well. `big.bin` is eight blocks replaced by eight bytes.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let stored = |path: &str| FileSpec {
@@ -1185,9 +1098,8 @@ fn a_put_that_fits_patches_in_place_rather_than_rebuilding() {
         0,
     );
 
-    // `differences` refuses a pair of different lengths, which is where a
-    // rebuild is caught; the loop is what catches one that came out the same
-    // size anyway.
+    // `differences` refuses a pair of different lengths; the loop catches a
+    // rebuild that came out the same size anyway.
     let after = fs::read(&archive).expect("readable");
     let payload = index_of(at)..index_of(at.saturating_add(allocation));
     let row = index_of(row_at)..index_of(row_at.saturating_add(rpf_core::Version::Rpf7.row_len()));
@@ -1208,11 +1120,8 @@ fn a_put_that_fits_patches_in_place_rather_than_rebuilding() {
 
 #[test]
 fn a_dry_run_told_to_rebuild_says_so_and_writes_nothing() {
-    // `--rebuild --dry-run` is the one dry run that answers without calling
-    // `plan`: the rebuild was asked for rather than forced by a payload that
-    // will not fit, so there is no allocation to report against and nothing
-    // computes the answer. An answer nothing computes is an answer nothing
-    // checks.
+    // The one dry run that answers without calling `plan`: nothing computes
+    // the answer, and an answer nothing computes is an answer nothing checks.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1287,9 +1196,8 @@ fn a_dry_run_says_when_it_would_have_to_rebuild() {
     let report: serde_json::Value = serde_json::from_slice(&out).expect("json");
     assert_eq!(report["method"], serde_json::json!("rebuild"));
     assert_eq!(report["dry_run"], serde_json::json!(true));
-    // `needed` is what would actually be written — the payload after the
-    // entry's own storage rule has been applied, not the size of the file on
-    // disk. Reporting the latter would explain the wrong number.
+    // `needed` is the payload after the entry's own storage rule, not the size
+    // of the file on disk.
     let needed = report["needed"].as_u64().unwrap_or_default();
     let allocation = report["allocation"].as_u64().unwrap_or_default();
     assert!(
@@ -1335,10 +1243,6 @@ fn a_dry_run_needs_no_write_permission() {
 
 #[test]
 fn verify_counts_every_entry_it_read_and_says_what_went_wrong() {
-    // R6.9. `checked` counted only the entries that passed, so a two-entry
-    // archive with one bad payload reported "1 of 1 entries failed"; and the
-    // non-zero exit was carried by LengthMismatch, which renders as a sentence
-    // about inflation that has nothing to do with what happened.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1385,15 +1289,8 @@ fn verify_counts_every_entry_it_read_and_says_what_went_wrong() {
 
 #[test]
 fn info_subtracts_the_entry_table_and_the_names_blob_from_the_slack() {
-    // `docs/rpf-format.md`, Slack: unreferenced is the archive's length less
-    // the header, the entry table, the names blob and every payload. It counted
-    // only the header and the payloads, so it over-reported by the two regions
-    // in between — 320 bytes on the sample, and it disagreed with the verified
-    // row it derives from.
-    //
-    // The three sizes are written out here rather than taken from `format`, so
-    // that this checks the arithmetic against the format document instead of
-    // against the same constants the code uses.
+    // Unreferenced is the archive's length less the header, the entry table,
+    // the names blob and every payload; the sizes are stated, not derived.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("test.rpf");
     make_archive(&path);
@@ -1432,13 +1329,7 @@ fn info_subtracts_the_entry_table_and_the_names_blob_from_the_slack() {
 }
 
 /// Builds an archive of `names`, then rewrites `placeholder` in its names blob
-/// to `actual`.
-///
-/// `build` refuses the names these tests need — that refusal is the write half
-/// of the same rules — so the archive is made with a legal name of equal length
-/// and edited afterwards. The two must be the same length so that nothing in
-/// the archive moves, and the substitution asserts the placeholder occurs
-/// exactly once, so what is edited is the name and nothing else.
+/// to `actual` — equal lengths, so nothing else in the archive moves.
 fn archive_named(at: &Path, names: &[&str], placeholder: &str, actual: &str) {
     assert_eq!(
         placeholder.len(),
@@ -1488,9 +1379,6 @@ fn archive_named(at: &Path, names: &[&str], placeholder: &str, actual: &str) {
 
 #[test]
 fn extract_refuses_a_name_that_climbs_out_of_the_target() {
-    // Reproduced before this was refused: the file landed one level above the
-    // target and the command reported `1 files and 1 directories into <target>`
-    // with exit 0. R10.3.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     archive_named(
@@ -1523,8 +1411,6 @@ fn extract_refuses_a_name_that_climbs_out_of_the_target() {
 
 #[test]
 fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree() {
-    // Reproduced before this was refused: `pack` read a file from above the
-    // tree it was given and exited 0. R10.3.
     let dir = tempfile::tempdir().expect("temp dir");
     let tree = dir.path().join("tree");
     fs::create_dir(&tree).expect("tree");
@@ -1566,10 +1452,6 @@ fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree() {
 
 #[test]
 fn an_entry_named_like_the_sidecar_manifest_is_refused_both_ways() {
-    // Reproduced: `extract` writes every entry and then writes the manifest
-    // over the top of it, so the file on disk held the manifest rather than the
-    // entry's bytes and the report said "2 files", exit 0. `pack` read the same
-    // name as the manifest *and* as an entry payload, also exit 0.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let name = rpf_core::MANIFEST_NAME;
@@ -1629,10 +1511,8 @@ fn an_entry_named_like_the_sidecar_manifest_is_refused_both_ways() {
 
 #[test]
 fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree_with_a_backslash() {
-    // R10.3's refusal split on the separator: `name::check` divided on `/`
-    // only, so `..\escaped.txt` was one legal component and `pack` exited 0.
-    // On Windows `Path::join` reads it as two and the tree is escaped at
-    // whatever depth the name asks for.
+    // The refusal splits on both separators: on Windows `Path::join` reads
+    // `..\escaped.txt` as two components and the tree is escaped.
     let dir = tempfile::tempdir().expect("temp dir");
     let tree = dir.path().join("tree");
     fs::create_dir(&tree).expect("tree");
@@ -1671,10 +1551,8 @@ fn pack_refuses_a_manifest_name_that_climbs_out_of_the_tree_with_a_backslash() {
 
 #[test]
 fn an_archive_a_host_cannot_hold_is_still_repairable() {
-    // The cost DR-013 recorded, and its second amendment removes: an archive
-    // holding `aux.ytd` could be read and could not be rebuilt, so `put` on any
-    // other entry in it printed `rebuilding` and then refused. The host rules
-    // are `extract`'s and `pack`'s; the tree rules are everyone's.
+    // The host rules are `extract`'s and `pack`'s; the tree rules are
+    // everyone's.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     archive_named(&archive, &["b.txt", "zzz.ytd"], "zzz.ytd", "aux.ytd");
@@ -1721,10 +1599,8 @@ fn an_archive_a_host_cannot_hold_is_still_repairable() {
 
 #[test]
 fn extract_refuses_two_siblings_it_cannot_tell_apart() {
-    // Measured on macOS before this was refused: `extract` reported "2 files",
-    // wrote one — holding the second entry's bytes — and `pack` of that tree
-    // then failed one command later. On Linux the same archive round-tripped,
-    // so one archive was two trees. R10.4.
+    // One archive was two trees: these names collide on macOS and not on Linux,
+    // so turning it into a tree is refused everywhere.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     archive_named(&archive, &["A.txt", "b.txt"], "b.txt", "a.txt");
@@ -1751,11 +1627,8 @@ fn extract_refuses_two_siblings_it_cannot_tell_apart() {
 
 #[test]
 fn put_refuses_a_name_two_entries_answer_to() {
-    // Reproduced before this was refused: `rpf put … a.txt` against an archive
-    // holding `A.txt` beside `a.txt` reported `patched 8 bytes in place`, exit
-    // 0, and `A.txt` is what changed. `Archive::check_names` is reached only by
-    // whoever turns the archive into a tree; the patch-in-place path resolves
-    // through `locate`, which folded case and took the first match.
+    // The patch-in-place path resolves through `locate`, which folded case and
+    // took the first match; `check_names` is reached only by tree conversion.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     archive_named(&archive, &["A.txt", "b.txt"], "b.txt", "a.txt");
@@ -1790,9 +1663,8 @@ fn put_refuses_a_name_two_entries_answer_to() {
 
 #[test]
 fn a_bare_archive_name_inside_an_installation_is_still_refused() {
-    // `Path::new("dlc.rpf").parent()` is the empty path, so the guard ascended
-    // exactly once and stopped: it never saw the installation it was standing
-    // in, and it fails open. R10.10.
+    // `Path::new("dlc.rpf").parent()` is the empty path, so a guard that
+    // ascends from the archive's path alone never sees the installation.
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().join("Grand Theft Auto V");
     let deep = root.join("mods/update/x64/dlcpacks");
@@ -1817,9 +1689,8 @@ fn a_bare_archive_name_inside_an_installation_is_still_refused() {
 
 #[test]
 fn a_path_spelled_with_backslashes_is_not_found_and_the_message_respells_it() {
-    // DR-016: `\` is an ordinary character in an entry name, so this addresses
-    // an entry the archive does not hold rather than `data/greeting.txt`. The
-    // not-found is where a caller who spells paths the Windows way finds out.
+    // `\` is an ordinary character in an entry name, so this addresses an entry
+    // the archive does not hold.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1852,12 +1723,8 @@ fn a_not_found_holding_no_backslash_is_reported_as_it_was() {
 
 #[test]
 fn info_summarises_a_nested_archive() {
-    // R6.11. `ls`, `cat`, `put` and `verify` all take an in-archive path and
-    // descend through nesting; `info` took the archive alone, so the entry
-    // count, size and slack of `x64/vehicles.rpf` could not be asked for at
-    // all. R6's exit criterion is an agent working inside a nested archive
-    // using only documented output, and this was the one reporting command
-    // that could not address one.
+    // `ls`, `cat`, `put` and `verify` all take an in-archive path; `info` took
+    // the archive alone, so a nested archive could not be asked about.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, inner_path) = make_nested(dir.path());
     let outer = outer_path.display().to_string();
@@ -1902,10 +1769,8 @@ fn info_summarises_a_nested_archive() {
 
 #[test]
 fn info_of_something_that_is_not_an_archive_is_refused_rather_than_summarised() {
-    // A directory inside the archive is a well-formed request for something
-    // `info` cannot answer: it summarises an archive, and a directory is not
-    // one. The caller has to change what it asked for, which DR-010 puts under
-    // exit 6.
+    // A directory is a well-formed request for something `info` cannot answer,
+    // which is the caller's to fix rather than the archive's.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("test.rpf");
     make_archive(&path);
@@ -1914,9 +1779,8 @@ fn info_of_something_that_is_not_an_archive_is_refused_rather_than_summarised() 
     let (code, message) = run_err(&["info", &archive, "data"]);
     assert_eq!(code, 6, "{message}");
     assert!(message.contains("directory"), "{message}");
-    // Naming the path the caller gave, not the index the archive happens to
-    // hold it at: an entry index is a fact about this archive's table and not
-    // something a caller asked with or can act on.
+    // Naming the path the caller gave, not the entry index: an index is a fact
+    // about this archive's table and not something a caller can act on.
     assert!(
         message.contains("\"data\""),
         "the refusal names the path: {message}",
@@ -1926,10 +1790,8 @@ fn info_of_something_that_is_not_an_archive_is_refused_rather_than_summarised() 
         "the refusal should not name an entry index: {message}",
     );
 
-    // And through nesting, where the two spellings genuinely differ: the entry
-    // is `data` inside `x64/inner.rpf`, and what the caller typed is the whole
-    // path. Naming the entry's own path would send the caller looking in the
-    // wrong archive.
+    // Through nesting the two spellings differ: naming the entry's own path
+    // would send the caller looking in the wrong archive.
     let (outer_path, _) = make_nested(dir.path());
     let outer = outer_path.display().to_string();
     let (code, message) = run_err(&["info", &outer, "x64/inner.rpf/data"]);
@@ -1942,12 +1804,8 @@ fn info_of_something_that_is_not_an_archive_is_refused_rather_than_summarised() 
 
 #[test]
 fn a_path_that_continues_past_the_archive_is_refused_rather_than_blamed_on_the_disk() {
-    // R6.11. `rpf info outer.rpf/x64/inner.rpf` is an in-archive path spelled
-    // as a filesystem one. The open failed with "Not a directory (os error
-    // 20)" and exit 7 — an i/o failure, which tells an agent consumer that the
-    // disk misbehaved and retrying is reasonable. Nothing on the disk failed;
-    // the request named something the tool does not accept, and DR-010 puts
-    // that under exit 6.
+    // An in-archive path spelled as a filesystem one: nothing on the disk
+    // failed, so it is a refusal rather than an i/o failure.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, _) = make_nested(dir.path());
     let through = outer_path.join("x64").join("inner.rpf");
@@ -1971,12 +1829,8 @@ fn a_path_that_continues_past_the_archive_is_refused_rather_than_blamed_on_the_d
 
 #[test]
 fn an_extraction_that_would_write_over_the_archive_it_is_reading_is_refused() {
-    // `rpf extract test.rpf .` where the archive holds an entry of its own
-    // name: `write_file` truncated and rewrote the file the extraction was
-    // reading from, and every remaining entry then came out of a file that had
-    // been replaced part-way through. Refused before anything is created, so a
-    // refusal leaves nothing behind — a tree cannot be renamed into place the
-    // way a rebuilt archive can. DR-009's shape, and `pack` already had it.
+    // Extracting over the archive being read replaced the file mid-read.
+    // Refused before anything is created, so a refusal leaves nothing behind.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let files = [FileSpec {
@@ -2021,9 +1875,8 @@ fn an_extraction_that_would_write_over_the_archive_it_is_reading_is_refused() {
     );
 }
 
-// Key material — R2.7. Everything below asserts on offsets, lengths, digests
-// and paths. Nothing asserts on a key, and one test asserts that nothing the
-// binary writes could be one. DR-006, DR-020.
+// Key material. Nothing below asserts on a key, and one test asserts that
+// nothing the binary writes could be one.
 
 /// A source that carries none of the anchored values.
 fn carries_nothing(at: &Path) {
@@ -2031,11 +1884,7 @@ fn carries_nothing(at: &Path) {
 }
 
 /// Reports a skip, naming the test, the gate that was not there, and what it
-/// would have read.
-///
-/// `RPF_REQUIRE_<GATE>` turns **that** gate's absence into a failure and no
-/// other's: a green suite and a suite that ran must not be different claims,
-/// and asking for an executable must not fail a test that only wanted an image.
+/// would have read. `RPF_REQUIRE_<GATE>` makes that gate's absence a failure.
 fn skip_gated<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -2063,11 +1912,8 @@ fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// The memory image the NG material is extracted from, or a loud skip.
-///
-/// A separate gate from `RPF_GAME_EXE` for DR-040's reason: an executable
-/// carries none of that material and an image carries all of it, and a machine
-/// can have one and not the other.
+/// The memory image the NG material is extracted from, or a loud skip. A gate
+/// of its own, because an executable carries none of that material.
 fn game_image(test: &str) -> Option<std::path::PathBuf> {
     let Some(named) = std::env::var_os("RPF_GAME_IMAGE") else {
         return skip_gated(test, "RPF_GAME_IMAGE", "RPF_GAME_IMAGE is not set");
@@ -2112,9 +1958,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Whether the permission bits on a directory are enforced for this process.
-///
-/// They are not for `root`, and a test that reads a refusal out of them would
-/// pass there for the wrong reason.
+/// Not for `root`, where a refusal test would pass for the wrong reason.
 #[cfg(unix)]
 fn writes_are_refused(directory: &Path) -> bool {
     let probe = directory.join("probe");
@@ -2127,10 +1971,8 @@ fn writes_are_refused(directory: &Path) -> bool {
 
 #[test]
 fn an_executable_carrying_nothing_is_this_build_s_problem_rather_than_the_caller_s() {
-    // A file that is intact and holds none of the anchored values is the same
-    // shape as an RPF version with no codec here: nothing the caller supplies
-    // opens it. DR-010's fifth category, exit 9. The counts are in the message
-    // because "1 of 2" and "0 of 2" are different situations to be in.
+    // A file that is intact and holds none of the anchored values: nothing the
+    // caller supplies opens it, which is exit 9. The counts are in the message.
     let dir = tempfile::tempdir().expect("temp dir");
     let source = dir.path().join("not-a-game.exe");
     carries_nothing(&source);
@@ -2155,9 +1997,8 @@ fn an_executable_carrying_nothing_is_this_build_s_problem_rather_than_the_caller
 
 #[test]
 fn an_executable_that_is_not_there_is_an_i_o_failure_naming_it() {
-    // The same answer `rpf info` gives an absent archive: a filesystem path
-    // that leads nowhere is the source failing, and exit 3 is reserved for a
-    // path that is not in an archive.
+    // A filesystem path that leads nowhere is the source failing; exit 3 is
+    // reserved for a path that is not in an archive.
     let dir = tempfile::tempdir().expect("temp dir");
     let absent = dir.path().join("GTA5.exe").display().to_string();
 
@@ -2193,10 +2034,8 @@ fn the_cache_command_says_where_the_material_is_kept_and_how_much_is_there() {
 
 #[test]
 fn invalidate_removes_every_entry_at_once_and_says_how_many() {
-    // Whole rather than per entry, and DR-020 says why: re-extraction already
-    // replaces the entry for one executable, so the only thing a per-entry
-    // removal could do that extraction does not is leave the other entries'
-    // key material on the machine.
+    // Whole rather than per entry: a per-entry removal would only leave the
+    // other entries' key material on the machine.
     let dir = tempfile::tempdir().expect("temp dir");
     let cache = dir.path().join("cache");
     fs::create_dir_all(cache.join("held")).expect("creatable");
@@ -2230,9 +2069,8 @@ fn invalidate_removes_every_entry_at_once_and_says_how_many() {
 #[test]
 #[cfg(unix)]
 fn a_cache_that_cannot_be_written_is_an_i_o_failure_naming_the_directory() {
-    // The sink failed and nobody's input is in question, which is exactly what
-    // DR-010 narrows exit 7 to. The directory is named because fixing its
-    // permissions is what the caller has to do.
+    // The sink failed and nobody's input is in question, which is exit 7. The
+    // directory is named because fixing its permissions is the caller's move.
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2260,11 +2098,8 @@ fn a_cache_that_cannot_be_written_is_an_i_o_failure_naming_the_directory() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn a_game_executable_reports_offsets_and_never_a_key() {
-    // The only test here that proves the surface against a real executable,
-    // and the only one that can check DR-006 end to end: the key is read in
-    // this process, and what the binary printed is searched for it in every
-    // encoding an output path could have used. Nothing is written anywhere the
-    // repository can reach, and no assertion names a byte of it.
+    // The key is read in this process, and what the binary printed is searched
+    // for it in every encoding an output path could have used.
     let test = "a_game_executable_reports_offsets_and_never_a_key";
     let Some(path) = executable(test, "GTA5.exe") else {
         return;
@@ -2340,9 +2175,7 @@ fn a_game_executable_reports_offsets_and_never_a_key() {
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn the_launcher_executable_reports_one_more_offset_and_never_that_key() {
     // The same end-to-end check as the test above, on the value this build
-    // added: the key is read in this process and what the binary printed is
-    // searched for it in every encoding an output path could have used. A
-    // second key is a second way to lose one. DR-006, DR-020, DR-042.
+    // added: a second key is a second way to lose one.
     let test = "the_launcher_executable_reports_one_more_offset_and_never_that_key";
     let Some(path) = executable(test, "Launcher.exe") else {
         return;
@@ -2409,9 +2242,8 @@ fn the_launcher_executable_reports_one_more_offset_and_never_that_key() {
 #[cfg(unix)]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn a_cache_directory_that_cannot_be_created_fails_the_extraction_that_needed_it() {
-    // Four situations, and this is the third: the material was found and the
-    // sink failed. Reported rather than swallowed, because a silent exit 0
-    // leaves every later command rescanning and nobody told why. Exit 7.
+    // The material was found and the sink failed: reported rather than
+    // swallowed, because a silent exit 0 leaves every later command rescanning.
     use std::os::unix::fs::PermissionsExt as _;
 
     let test = "a_cache_directory_that_cannot_be_created_fails_the_extraction_that_needed_it";
@@ -2442,10 +2274,8 @@ fn a_cache_directory_that_cannot_be_created_fails_the_extraction_that_needed_it(
     assert!(message.contains(&at), "{message}");
 }
 
-/// A second archive, sharing no path with [`make_archive`]'s.
-///
-/// So that a manifest of one names nothing in the other, which is the mistake a
-/// caller who has two extracted trees on disk will make.
+/// A second archive, sharing no path with [`make_archive`]'s, so that a
+/// manifest of one names nothing in the other.
 fn make_other_archive(at: &Path) {
     let files = vec![FileSpec {
         path: "elsewhere.bin".to_owned(),
@@ -2474,10 +2304,8 @@ fn cli_json(args: &[&str]) -> serde_json::Value {
 
 #[test]
 fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_tree() {
-    // The whole reason DR-023's checksum exists, from outside the library for
-    // the first time. A stored entry declares no inflated length and carries no
-    // deflate stream that ends, so nothing in the archive says what its bytes
-    // should be and a `verify` given the archive alone reads it back clean.
+    // A stored entry declares no inflated length and carries no deflate stream
+    // that ends, so a `verify` given the archive alone reads it back clean.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2510,9 +2338,8 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_tree() {
         "{report}"
     );
     assert_eq!(report["against"], serde_json::json!(tree_str), "{report}");
-    // One object per problem, the same shape the daemon answers: a reason
-    // carries colons of its own — "entry 0: payload did not inflate" — so a
-    // consumer cannot split "path: reason" back apart. DR-027.
+    // One object per problem: a reason carries colons of its own, so a consumer
+    // cannot split "path: reason" back apart.
     let problems = report["problems"].as_array().expect("an array");
     assert_eq!(problems.len(), 1, "{report}");
     assert_eq!(
@@ -2530,9 +2357,8 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_tree() {
 
 #[test]
 fn a_verify_with_no_manifest_does_not_report_a_zero_as_a_pass() {
-    // `contents_checked` is zero without a manifest, and a report that prints
-    // the number without saying why reads as "nothing was wrong with the
-    // contents" rather than "the contents were not looked at". DR-023.
+    // `contents_checked` is zero without a manifest, and the report has to say
+    // why: "not looked at" is not "nothing was wrong".
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2562,12 +2388,8 @@ fn a_verify_with_no_manifest_does_not_report_a_zero_as_a_pass() {
 
 #[test]
 fn a_tree_extracted_from_another_archive_is_refused_rather_than_checking_nothing() {
-    // A manifest is joined to entries by path, so one describing a different
-    // archive matches nothing and `Verified::against` reports no failure at all
-    // — deliberately, because inventing one would be a confident lie about a
-    // sound archive. Reporting nothing is the other half of the mistake, so the
-    // frontend refuses the pairing instead: exit 6, which is the caller's to
-    // fix, rather than exit 4, which would blame the archive.
+    // A manifest is joined to entries by path, so one describing another archive
+    // matches nothing; the frontend refuses the pairing rather than the archive.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2598,9 +2420,8 @@ fn a_tree_extracted_from_another_archive_is_refused_rather_than_checking_nothing
 
 #[test]
 fn a_tree_with_no_manifest_in_it_is_reported_as_the_missing_file_it_is() {
-    // Not the archive's fault, and not a checksum mismatch: the caller named a
-    // tree that has no manifest in it, and `pack` answers the same way for the
-    // same file.
+    // Not the archive's fault and not a checksum mismatch: the tree named has no
+    // manifest in it.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2622,11 +2443,8 @@ fn a_tree_with_no_manifest_in_it_is_reported_as_the_missing_file_it_is() {
 
 #[test]
 fn a_tree_whose_manifest_records_no_checksum_is_refused_rather_than_passed() {
-    // The other way a manifest can check nothing, and it is not the same
-    // mistake: every schema-1 and schema-2 manifest recorded none, which
-    // `Manifest::from_json` reads rather than refuses (DR-023's migration
-    // rule). A caller who asked for a contents check and got a tree that
-    // cannot answer one is told so, rather than told that nothing was wrong.
+    // Every schema-1 and schema-2 manifest records no contents, which is read
+    // rather than refused; a caller who asked for a contents check is told so.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2661,7 +2479,163 @@ fn a_tree_whose_manifest_records_no_checksum_is_refused_rather_than_passed() {
     assert!(message.contains("nothing was checked"), "{message}");
 }
 
-// --- R4.10: adding, deleting and renaming an entry --------------------------
+/// An archive holding one resource whose payload carries four bytes past the
+/// end of its deflate stream, as a zlib stream stripped of its header does.
+fn make_trailing_resource(at: &Path) {
+    let mut resource = Vec::new();
+    resource.extend_from_slice(b"RSC7");
+    resource.extend_from_slice(&162_u32.to_le_bytes());
+    resource.extend_from_slice(&0xA800_0000_u32.to_le_bytes());
+    resource.extend_from_slice(&0x2000_0000_u32.to_le_bytes());
+    let mut encoder =
+        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&vec![0_u8; 512]).expect("deflates");
+    resource.extend_from_slice(&encoder.finish().expect("finishes"));
+    resource.extend_from_slice(&[1_u8, 2, 3, 4]);
+
+    let files = vec![FileSpec {
+        path: "tiny.yft".to_owned(),
+        kind: FileKind::Resource { declared: None },
+    }];
+    let mut out = fs::File::create(at).expect("archive is creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_: &str| Ok(Cursor::new(resource.clone())),
+        &mut Unwatched,
+    )
+    .expect("archive builds");
+}
+
+/// The lines `verify --against` printed for an archive and the tree it was
+/// extracted to, with the exit code.
+fn verified_against(archive: &Path, tree: &Path) -> (i32, String) {
+    let (code, out) = run(&[
+        "verify",
+        &archive.display().to_string(),
+        "--against",
+        &tree.display().to_string(),
+    ]);
+    (code, String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Extracts `archive` to a tree beside it, which writes the manifest a
+/// `--against` reads.
+fn extracted_to(archive: &Path, tree: &Path) {
+    assert_eq!(
+        run(&[
+            "extract",
+            &archive.display().to_string(),
+            &tree.display().to_string(),
+        ])
+        .0,
+        0,
+        "extract",
+    );
+}
+
+#[test]
+fn an_entry_that_did_not_read_back_is_not_counted_as_two_kinds_of_gap() {
+    // Its contents were never checked, so it is missing from
+    // `contents_checked`; subtracting that from both counts once made it an
+    // entry with no recorded checksum *and* a checksum naming nothing.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("tiny.rpf");
+    make_trailing_resource(&archive);
+    let tree = dir.path().join("tree");
+    extracted_to(&archive, &tree);
+
+    let (code, report) = verified_against(&archive, &tree);
+    assert_eq!(
+        code, 4,
+        "the entry does not read back as described: {report}"
+    );
+    assert!(
+        report.contains("the deflate stream ends after"),
+        "the report was: {report}",
+    );
+    assert!(
+        report.contains("0 of 1 recorded checksums checked"),
+        "the report was: {report}",
+    );
+    assert!(
+        !report.contains("carry no recorded checksum"),
+        "there is no nested archive here: {report}",
+    );
+    assert!(
+        !report.contains("name nothing this archive holds"),
+        "the manifest's one checksum does name this entry: {report}",
+    );
+    assert!(
+        report.contains("1 entries did not read back"),
+        "the gap is explained by the entry that failed: {report}",
+    );
+}
+
+#[test]
+fn a_checksum_that_was_checked_and_failed_is_not_a_gap_in_the_coverage() {
+    // A mismatch was checked, unlike a payload that would not read back, so
+    // every recorded checksum was still consulted.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let tree = dir.path().join("tree");
+    extracted_to(&archive, &tree);
+
+    let (at, _, _) = spans(&archive, "stored.bin");
+    let mut bytes = fs::read(&archive).expect("readable");
+    let start = index_of(at);
+    bytes[start] ^= 0xFF;
+    fs::write(&archive, &bytes).expect("writable");
+
+    let (code, report) = verified_against(&archive, &tree);
+    assert_eq!(code, 4, "{report}");
+    assert!(
+        report.contains("2 of 2 recorded checksums checked"),
+        "the report was: {report}",
+    );
+    assert!(
+        !report.contains("carry no recorded checksum"),
+        "the report was: {report}",
+    );
+    assert!(
+        !report.contains("name nothing this archive holds"),
+        "the report was: {report}",
+    );
+    assert!(
+        !report.contains("did not read back"),
+        "a mismatch was read back and checked: {report}",
+    );
+}
+
+#[test]
+fn an_entry_inside_a_nested_archive_is_the_one_with_no_recorded_checksum() {
+    // The sentence is true here: a manifest records the nested archive as the
+    // one file it is, and the entries inside it are covered by that checksum.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer, _) = make_nested(dir.path());
+    let tree = dir.path().join("tree");
+    extracted_to(&outer, &tree);
+
+    let (code, report) = verified_against(&outer, &tree);
+    assert_eq!(code, 0, "the archive reads back clean: {report}");
+    assert!(
+        report.contains("3 entries read back; 1 of 1 recorded checksums checked"),
+        "the report was: {report}",
+    );
+    assert!(
+        report.contains("2 entries carry no recorded checksum"),
+        "the two entries inside the nested archive: {report}",
+    );
+    assert!(
+        !report.contains("name nothing this archive holds"),
+        "the report was: {report}",
+    );
+}
+
+// --- adding, deleting and renaming an entry --------------------------------
 
 /// Every path an archive holds, as `ls -R` reports them.
 fn listing(archive: &Path) -> Vec<String> {
@@ -2716,10 +2690,7 @@ fn put_creates_an_entry_when_it_is_asked_to() {
 #[test]
 fn put_creates_an_entry_through_a_view_as_the_daemon_does() {
     // A path being created has no entry to convert against, so `--as` has
-    // nothing to read an encoding from. The daemon answers that case; the
-    // command line reached `locate` first and refused a request the wire
-    // protocol accepts, which is the crate boundary's own test failing in the
-    // direction it does not usually fail in (§1). DR-053.
+    // nothing to read an encoding from; the daemon accepts that case.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2861,9 +2832,8 @@ fn a_structural_dry_run_says_what_it_would_do_and_writes_nothing() {
 
 #[test]
 fn every_structural_command_refuses_a_game_installation() {
-    // The invariant `AGENTS.md` states, asked of each new verb rather than of
-    // one of them: a tool refuses to write into a detected install unless it is
-    // told to. Each is a separate entry point and each has to ask.
+    // Asked of each new verb rather than of one of them: each is a separate
+    // entry point and each has to refuse a detected install unless told to.
     let dir = tempfile::tempdir().expect("temp dir");
     let install = dir.path().join("Grand Theft Auto V");
     fs::create_dir_all(&install).expect("creatable");
@@ -2884,7 +2854,7 @@ fn every_structural_command_refuses_a_game_installation() {
 }
 
 /// `extract` refuses a target that already holds something, and `--overwrite`
-/// is the way through. DR-029.
+/// is the way through.
 #[test]
 fn extract_refuses_a_target_that_already_holds_something() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2955,14 +2925,8 @@ fn a_refused_extraction_writes_nothing_at_all() {
     assert_eq!(left, vec!["mine.txt".to_owned()], "it wrote something");
 }
 
-/// A rebuild replaces an archive this process still holds open, which is what
-/// every rebuild does: the read handle on the archive lives until the rewrite
-/// that reads it is finished, and the replace happens after that.
-///
-/// The condition is invisible on Unix and was the whole of Windows' first test
-/// run: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` refuses a destination anything
-/// holds open, so five rebuild tests failed there with `Access is denied`.
-/// DR-035.
+/// A rebuild replaces an archive this process still holds open, which Windows
+/// refuses unless the read handle is closed before the replace.
 #[test]
 fn a_rebuild_replaces_an_archive_something_holds_open() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2992,13 +2956,8 @@ fn a_rebuild_replaces_an_archive_something_holds_open() {
     assert_eq!(run(&["verify", &archive_str]).0, 0, "verify");
 }
 
-/// A donor that is not there names itself and says what was wrong with it.
-///
-/// `Change::Write` names a source rather than carrying bytes (DR-036), so the
-/// failure comes back out of the library rather than off the `fs::read` that
-/// used to happen first. A review of that change measured what it had cost: a
-/// missing donor, a permission-denied one and a directory all rendered as
-/// `i/o failure at offset 0`, with the path gone.
+/// A donor that is not there names itself and says what was wrong with it: the
+/// failure comes out of the library rather than off an `fs::read`.
 #[test]
 fn a_donor_that_is_not_there_is_named_and_so_is_the_reason() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3020,12 +2979,8 @@ fn a_donor_that_is_not_there_is_named_and_so_is_the_reason() {
     );
 }
 
-/// A donor that cannot be reopened or seeked is still accepted.
-///
-/// DR-036 opens a regular file when the library wants it, which a FIFO cannot
-/// answer twice. `rpf put … <(gzip -dc x)` is the shape that would otherwise
-/// have stopped working, so a donor that is not a regular file is read once and
-/// held — the cost every donor used to pay.
+/// A donor that cannot be reopened or seeked is still accepted: a FIFO cannot
+/// answer twice, so a donor that is not a regular file is read once and held.
 #[test]
 #[cfg(unix)]
 fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
@@ -3059,13 +3014,11 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
     assert_eq!(bytes, b"through a pipe".to_vec());
 }
 
-/// The AES-encrypted archive in the corpus, by the relative path that addresses
-/// it. `docs/corpus.md`.
+/// The AES-encrypted archive in the corpus, by its relative path.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
 /// The NG-encrypted archive in the corpus, whose **file name is load-bearing**:
-/// an NG key is chosen by the archive's own name, so a copy under another name
-/// does not open. `docs/rpf-format.md`, Encryption.
+/// an NG key is chosen by the archive's own name, so a copy does not open.
 const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 
 /// The Rockstar Games Launcher's own archive, likewise: the only kind here
@@ -3073,10 +3026,6 @@ const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 const LAUNCHER_ARCHIVE: &str = "rockstar_launcher/Launcher.rpf";
 
 /// One corpus archive by its fixed relative path.
-///
-/// It reports its own skip rather than borrowing [`skip`]'s: the two gates name
-/// two different things, and a skip that does not say which one is missing
-/// sends the reader to check the wrong variable.
 fn corpus(test: &str, relative: &str) -> Option<std::path::PathBuf> {
     let missing = |reason: String| -> Option<std::path::PathBuf> {
         assert!(
@@ -3098,12 +3047,7 @@ fn corpus(test: &str, relative: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Runs the binary with a configuration directory of its own, returning its
-/// exit code and standard error.
-///
-/// The key cache lives under the platform's configuration root, so a test that
-/// wants a cache it controls gives the child a `HOME` of its own. A child
-/// process rather than `set_var`, which is process-global and would race every
-/// other test in this binary.
+/// exit code and standard error: the key cache lives under that root.
 fn run_err_homed(home: &Path, args: &[&str]) -> (i32, String) {
     let output = Command::new(RPF)
         .env("HOME", home)
@@ -3124,24 +3068,13 @@ fn run_err_homed(home: &Path, args: &[&str]) -> (i32, String) {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
-    // **`no_command_writes_into_an_ng_archive`, re-aimed.** It used to pin that
-    // every command refused an NG archive, because the transform had no forward
-    // direction in this build. It has one since DR-062, derived from the
-    // decrypt tables the memory image carries and from nothing else — so the
-    // command line writes one back, and the refusal that remains is about
-    // *material* rather than about an algorithm. Both halves are here.
-    //
-    // The read-back is through a **separate process** that opens the archive
-    // from the bytes on disk: a rebuild that sealed the table of contents under
-    // the length the archive had before, or a patch that keyed a payload by the
-    // size it used to be, fails at the `cat`.
+    // Both halves: the command line writes an NG archive back, and the refusal
+    // that remains is about material rather than about an algorithm.
     let test = "an_ng_archive_is_written_back_through_the_command_line_and_opens_again";
     let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
     };
-    // A memory image, not an executable: no executable carries the NG material
-    // at all, so extracting from one would leave the archive at `NeedsKey`.
-    // DR-040.
+    // A memory image, not an executable: no executable carries the NG material.
     let Some(source) = game_image(test) else {
         return;
     };
@@ -3150,8 +3083,7 @@ fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
     // Not compressible and not a whole number of cipher blocks, so the tail
-    // rule is exercised; and not the length the entry had, so the payload goes
-    // back under a different one of the 101 keys than it came out from (Q2).
+    // rule is exercised; and not the length the entry had.
     let donor = dir.path().join("payload.bin");
     let bytes: Vec<u8> = (0..401_u32)
         .map(|n| u8::try_from(n % 251).unwrap_or(0))
@@ -3162,11 +3094,8 @@ fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
     let (code, message) = run_err_homed(&home, &["keys", "extract", &source.display().to_string()]);
     assert_eq!(code, 0, "{message}");
 
-    // Patching in place, and then rebuilding, each over its own copy — each in
-    // a directory of its own and each keeping the **file name `dlc.rpf`**,
-    // because the NG key for a table of contents is a function of the
-    // archive's own name: copied as `patch.rpf` it would not open at all, and
-    // that is the format's behaviour rather than ours.
+    // Each copy keeps the file name `dlc.rpf`: the NG key for a table of
+    // contents is a function of the archive's own name.
     for (what, extra) in [("patch", None), ("rebuild", Some("--rebuild"))] {
         let at_dir = dir.path().join(what);
         fs::create_dir_all(&at_dir).expect("a directory per write path");
@@ -3201,8 +3130,7 @@ fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
     }
 
     // And the third write path. `pack` opens no archive, so it reaches the same
-    // cache `keys extract` filled above (DR-057) and packs the tree back under
-    // the NG tag its manifest names.
+    // cache `keys extract` filled above.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(
         &home,
@@ -3220,11 +3148,8 @@ fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
     let (code, message) = run_err_homed(&home, &["verify", &at]);
     assert_eq!(code, 0, "the packed NG archive does not verify: {message}");
 
-    // **The re-aimed refusal, through the binary.** The same tree, from a home
-    // with nothing in it: exit 9, and a message that names material rather than
-    // an algorithm. `--force` does not reach it — a capability that is absent
-    // is not a safety interlock (DR-041) — and no remedy is offered, because
-    // there is no command that supplies a memory image.
+    // The same tree, from a home with nothing in it: exit 9, naming material
+    // rather than an algorithm. `--force` does not reach it.
     let bare = dir.path().join("no-keys");
     fs::create_dir_all(&bare).expect("home");
     let unpacked = dir.path().join("unkeyed.rpf");
@@ -3254,15 +3179,8 @@ fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
-    // R4.7's AES half, end to end through the binary: both write paths, and
-    // then the archive read back through a **separate process** that opens it
-    // from the bytes on disk. A rebuild that wrote the table of contents in the
-    // clear, or a patch that wrote a plaintext payload, fails at the `cat`.
-    //
-    // All three write paths, `pack` included: it builds from a tree and opens
-    // no archive, so what it packs back is what the tree's own manifest says
-    // — the key from the cache (DR-057) and the resources' page flags from the
-    // manifest (DR-058).
+    // Both write paths, then the archive read back through a separate process:
+    // a rebuild that wrote the table of contents in the clear fails at the `cat`.
     let test = "an_aes_archive_is_written_back_through_the_command_line_and_opens_again";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -3274,10 +3192,8 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
     let dir = tempfile::tempdir().expect("temp dir");
     let home = dir.path().join("home");
     fs::create_dir_all(&home).expect("home");
-    // Deliberately not text and deliberately not a whole number of cipher
-    // blocks: `_manifest.ymf` holds a tokenised encoding, so a textual payload
-    // is refused by R6.6's guardrail before any of this is reached, and a
-    // length that is a multiple of sixteen would leave the tail rule untested.
+    // Not text and not a whole number of cipher blocks: a textual payload is
+    // refused before this, and a multiple of sixteen leaves the tail untested.
     let donor = dir.path().join("payload.bin");
     let bytes: Vec<u8> = (0..401_u32)
         .map(|n| u8::try_from(n % 251).unwrap_or(0))
@@ -3321,13 +3237,8 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
         );
     }
 
-    // And the third write path, which is the round trip R4.17 was measured
-    // failing on: this archive's nine resources carry no `RSC7` header of their
-    // own (Q7), so before DR-058 the manifest recorded that they were resources
-    // and not what their rows declared, and the pack was refused at the first
-    // of them. It now reaches the same cache `keys extract` filled above with
-    // no flag anywhere, packs back sealed under the archive's own transform,
-    // and opens again in a separate process. DR-057, DR-058.
+    // And the third write path: these resources carry no `RSC7` header of their
+    // own, so the manifest is what records the words their rows declare.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(
         &home,
@@ -3358,10 +3269,8 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
         "the entry did not survive extract and pack"
     );
 
-    // And the pack that must not silently succeed: no material anywhere is exit
-    // 5, naming the missing material, with no archive left behind — and it is
-    // answered before a payload is read, which is why it is the key's refusal
-    // and not the resource's.
+    // No material anywhere is exit 5, naming the missing material, with no
+    // archive left behind, and it is answered before a payload is read.
     let bare = dir.path().join("no-keys");
     fs::create_dir_all(&bare).expect("home");
     let unpacked = dir.path().join("unkeyed.rpf");
@@ -3384,12 +3293,8 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_launcher_archive_opens_once_the_launcher_key_is_extracted() {
-    // The whole chain the library tests cover in pieces: an executable is
-    // scanned, its material reaches a cache file, and an archive under a key no
-    // game carries opens because of it. And the other half, which is the answer
-    // a machine with a game install and no launcher gets: a game executable's
-    // material is real, complete, and not this archive's key, and the exit code
-    // says to go and extract rather than that the archive is broken. DR-042.
+    // An executable is scanned, its material reaches a cache, and an archive
+    // under a key no game carries opens because of it.
     let test = "the_launcher_archive_opens_once_the_launcher_key_is_extracted";
     let Some(archive) = corpus(test, LAUNCHER_ARCHIVE) else {
         return;
@@ -3423,12 +3328,8 @@ fn the_launcher_archive_opens_once_the_launcher_key_is_extracted() {
     let (code, message) = run_err_homed(&home, &["ls", "-R", &at]);
     assert_eq!(code, 0, "{message}");
 
-    // And the whole of DR-057 through the binary, on the one corpus archive it
-    // can be shown on: `docs/corpus.md` records `Launcher.rpf` as the only
-    // archive here with no resource entry at all, so an extracted tree of it is
-    // a tree this packer can rebuild entirely. Extract, pack, and list what was
-    // written — reaching the same cache `keys extract` filled above, with no
-    // flag anywhere.
+    // `Launcher.rpf` is the one corpus archive with no resource entry, so an
+    // extracted tree of it is one this packer can rebuild entirely.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(&home, &["extract", &at, &tree.display().to_string()]);
     assert_eq!(code, 0, "{message}");
@@ -3456,12 +3357,8 @@ fn the_launcher_archive_opens_once_the_launcher_key_is_extracted() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
-    // DR-041 rejects a `--keys` flag on the ground that "`--cache-dir` already
-    // exists for a caller who wants to keep several installs apart". It did not
-    // reach opening: `keys extract --cache-dir D` wrote the entry and the next
-    // `ls` of an encrypted archive answered `NeedsKey` and made a platform
-    // cache of its own. One flag, one function — `commands::cache_of` — and
-    // both ends of the record are true.
+    // One flag, one function: `--cache-dir` has to reach opening as well as
+    // extraction, or an encrypted archive answers `NeedsKey` regardless.
     let test = "a_named_cache_opens_the_archive_the_platform_one_would_not";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -3492,20 +3389,14 @@ fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
     let (code, message) = run_err_homed(&home, &["ls", &at, "--cache-dir", &named]);
     assert_eq!(code, 0, "{message}");
 
-    // And the platform cache, which nothing was put in, is still what says
-    // "needs a key" — so the first answer came from the named directory and
-    // not from somewhere else on this machine.
+    // And the platform cache, which nothing was put in, still says "needs a
+    // key" — so the first answer came from the named directory.
     let (code, message) = run_err_homed(&home, &["ls", &at]);
     assert_eq!(code, 5, "{message}");
     assert!(message.contains("no key material available"), "{message}");
 
-    // `pack` was the one command the flag did not reach at all — it was refused
-    // from the manifest's tag before a cache could matter. Both ends of that
-    // are pinned here, and the difference between the two answers is what says
-    // the flag reached the key: **with** the flag the material is found and the
-    // tree packs all the way back (exit 0); **without** it, on the same
-    // machine, the answer is for the material and nothing is read at all
-    // (exit 5). DR-057, DR-058.
+    // With the flag the material is found and the tree packs all the way back;
+    // without it, on the same machine, nothing is read at all.
     let tree = dir.path().join("tree");
     let (code, message) = run_err_homed(
         &home,
@@ -3535,13 +3426,8 @@ fn a_named_cache_opens_the_archive_the_platform_one_would_not() {
     );
 }
 
-/// R7.4 on the command line: a metadata entry reads as XML and takes one back.
-///
-/// Both encodings, because a route written for one of them misses the other —
-/// `RBF` converts from the document alone and `PSO` is an **edit** of the file
-/// the document came from (DR-049), so they reach the codec by different
-/// arguments and only one of the two would notice a seam that dropped the
-/// payload. The daemon does the same, over the same fixtures (§1).
+/// A metadata entry reads as XML and takes one back — both encodings, because
+/// `RBF` converts from the document and `PSO` edits the file it came from.
 #[test]
 fn a_metadata_entry_is_read_as_xml_and_an_edited_document_is_written_back() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3607,11 +3493,8 @@ fn a_metadata_entry_is_read_as_xml_and_an_edited_document_is_written_back() {
     }
 }
 
-/// A document put back with nothing changed leaves the entry byte for byte.
-///
-/// R5.7's law — 391 of 391 and 9,753 of 9,753 — asserted where a person meets
-/// it: opening a file in an editor and saving it without typing must not
-/// rewrite the archive's bytes.
+/// A document put back with nothing changed leaves the entry byte for byte:
+/// saving a file without typing must not rewrite the archive's bytes.
 #[test]
 fn a_document_written_back_unedited_leaves_the_entry_identical() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3642,11 +3525,8 @@ fn a_document_written_back_unedited_leaves_the_entry_identical() {
     }
 }
 
-/// An entry with no XML view says so, and says what it holds.
-///
-/// A resource is here for the reason DR-044 gives: its payload is not read at
-/// all, so it has no view however XML-looking its bytes are. R5.8 is what
-/// gives it one, and it will give it one from the entry's kind.
+/// An entry with no XML view says so, and says what it holds. A resource's
+/// payload is not read at all, so it has no view however XML-looking it is.
 #[test]
 fn an_entry_with_no_xml_view_is_refused_with_its_own_reason() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3683,14 +3563,8 @@ fn an_entry_with_no_xml_view_is_refused_with_its_own_reason() {
     );
 }
 
-/// Converting is not a way round DR-050, and DR-050 is not in the way of
-/// converting.
-///
-/// The same document, into the same entry, twice: offered as bytes it is a
-/// textual payload into a tokenised entry and is refused with the switch named,
-/// and offered as a document it is converted and taken with no switch at all —
-/// because what is written is `RBF`, which is what the entry held. There is no
-/// third outcome in which XML lands in the entry.
+/// The same document into the same entry twice: refused as bytes, and taken as
+/// a document because what is written then is the `RBF` the entry held.
 #[test]
 fn a_document_is_refused_as_bytes_and_taken_as_a_document() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3746,11 +3620,8 @@ fn a_document_the_entry_cannot_take_is_refused_at_the_conversion() {
         "xml",
     ]);
     assert_eq!(code, 6, "{message}");
-    // The refusal is the **converter's**, not the guardrail's. A conversion
-    // that quietly fell back to writing the document as bytes would also exit
-    // 6 — DR-050 would catch it one step later — so the two have to be told
-    // apart, and the message is what tells them: only the guardrail names
-    // `--allow-encoding-change`, and only the codec names the position.
+    // The refusal is the converter's, not the guardrail's: only the guardrail
+    // names `--allow-encoding-change`, and only the codec names the position.
     assert!(
         message.contains("does not describe an RBF document"),
         "must be the codec's own refusal: {message}"
@@ -3766,15 +3637,8 @@ fn a_document_the_entry_cannot_take_is_refused_at_the_conversion() {
     );
 }
 
-/// R5.8 on the command line: a resource carrying `Meta` reads as XML and takes
-/// an edited document back.
-///
-/// The third encoding, and the one that is not a payload with a magic. What is
-/// being asserted past the round trip is that the **entry** is what carries the
-/// conversion's other argument: a `Meta` is inside a resource's inflated
-/// payload and the boundary between its system and graphics pages is
-/// `size_from_flags` of the row's system flags, which appears nowhere in the
-/// bytes. The daemon does this too, over the same fixture (§1).
+/// A resource carrying `Meta` reads as XML and takes an edited document back.
+/// The page boundary is the row's flag words and appears in no byte of it.
 #[test]
 fn a_resource_meta_is_read_as_xml_and_an_edited_document_is_written_back() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3789,9 +3653,8 @@ fn a_resource_meta_is_read_as_xml_and_an_edited_document_is_written_back() {
         common::META_DOCUMENT,
         "the view is the document"
     );
-    // And `auto` answers the same, which is what a client that must not guess
-    // from the extension asks. `.ymt` is a resource here and metadata
-    // elsewhere, which is the whole reason it may not guess.
+    // And `auto` answers the same: `.ymt` is a resource here and metadata
+    // elsewhere, so a client may not guess from the extension.
     assert_eq!(
         run(&["cat", &at, "data/thing.ymt", "--as", "auto"]).1,
         shown,
@@ -3815,9 +3678,8 @@ fn a_resource_meta_is_read_as_xml_and_an_edited_document_is_written_back() {
         common::META_EDITED,
         "the edit did not land"
     );
-    // The entry is the resource it always was — a listing reads no resource
-    // payload, so its encoding is `null` before and after (Q7, DR-044) — and
-    // the archive still reads back against the flag words its row declares.
+    // A listing reads no resource payload, so the encoding is `null` before and
+    // after, and the archive still reads back against its row's flag words.
     let (code, listed) = run(&["--json", "ls", &at, "", "-R"]);
     assert_eq!(code, 0);
     let rows: serde_json::Value = serde_json::from_slice(&listed).expect("an array");
@@ -3832,15 +3694,8 @@ fn a_resource_meta_is_read_as_xml_and_an_edited_document_is_written_back() {
     assert_eq!(run(&["verify", &at]).0, 0, "verify");
 }
 
-/// A `Meta` document put back with nothing changed leaves the entry reading the
-/// same, value for value.
-///
-/// Not byte for byte at the payload, and that is stated rather than glossed: a
-/// converted write is the one write that is not passthrough, so its contents are
-/// deflated again at this build's own compression level rather than at the
-/// producer's (DR-060). What must not move is the file — the 2.48% no walk
-/// reaches included — and the way to see that is that a second read of the entry
-/// is the same document.
+/// A `Meta` document put back unedited reads back the same value for value,
+/// not byte for byte: a converted write deflates at this build's own level.
 #[test]
 fn a_meta_written_back_unedited_reads_back_as_the_same_document() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3871,13 +3726,6 @@ fn a_meta_written_back_unedited_reads_back_as_the_same_document() {
 
 /// The opaque bytes in front of a resource's deflate stream cross a converted
 /// write untouched, and the write is idempotent from the second time on.
-///
-/// DR-060. `docs/rpf-format.md` records that no Rockstar resource payload begins
-/// with `RSC7` and that nothing decrypts those bytes into one, so nobody knows
-/// what they are — and `docs/approach.md` commits that what this build cannot
-/// interpret still round-trips byte for byte. The fixture's stream begins at 24,
-/// which is the case that made this visible: writing a 16-byte header of this
-/// build's own moved the stream by 8 and threw the original bytes away.
 #[test]
 fn a_converted_meta_write_keeps_the_payloads_opaque_prefix_byte_for_byte() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3918,15 +3766,8 @@ fn a_converted_meta_write_keeps_the_payloads_opaque_prefix_byte_for_byte() {
     assert_eq!(run(&["verify", &at]).0, 0, "verify");
 }
 
-/// A `Meta` whose row declares the page boundary somewhere else is refused, in
-/// both directions, and nothing is written.
-///
-/// The same 512 bytes as the test above, in an entry whose flag words put all
-/// of them in the graphics half. The archive cannot tell the two apart — it
-/// checks the sum, and the sum is the same — and the `Meta` inside can, because
-/// every pointer it holds is resolved against the system half. So this is the
-/// one thing a frontend cannot get right by carrying the payload alone, and a
-/// wrong answer here would be a file edited at addresses that are not its own.
+/// A `Meta` whose row declares the page boundary elsewhere is refused in both
+/// directions — the archive checks only the sum, so nothing else catches it.
 #[test]
 fn a_meta_read_against_a_boundary_its_row_does_not_declare_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3998,17 +3839,8 @@ fn a_document_the_meta_cannot_take_is_refused_at_the_conversion() {
     );
 }
 
-/// A resource entry does not take a document, on the command line. DR-061.
-///
-/// The entry here is an ordinary resource: its payload comes apart at the
-/// boundary its stream begins at, inflates to exactly what its row declares,
-/// and carries no `Meta` — which is 694,470 of the corpus's 696,578 resources.
-/// `put --as auto` of an XML document over it exited 0 and wrote the document's
-/// own bytes in as the payload, with nothing refused: a resource carries no
-/// encoding, so `edit::check_encoding` had nothing to compare. The assertion is
-/// over the bytes `cat` gives back afterwards and not over their length, which
-/// is what could not tell this apart — the length that landed *was* the
-/// document's.
+/// A resource entry does not take a document. The assertion is over the bytes
+/// `cat` gives back and not their length, which could not tell this apart.
 #[test]
 fn put_as_auto_refuses_a_document_into_a_resource_that_is_not_a_meta() {
     use std::io::Write as _;

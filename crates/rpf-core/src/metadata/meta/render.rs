@@ -1,22 +1,14 @@
 //! The walk from the root block, and the XML it writes.
 //!
-//! Driven by the file's own three tables and by nothing else, which is what
-//! `docs/metadata-encodings.md` measured: 49,614 files walked from their root
-//! using only their own tables, 88,171,116 nodes and **0** references a file
-//! did not define. So nothing here consults a builtin table and there is none
-//! to consult.
+//! Driven by the file's own three tables and nothing else; no builtin schema.
+//! Every element carries exactly one reserved `meta:` attribute whose name is
+//! its type and whose value is its value, a structure carries `meta:struct`
+//! naming its own type, and an array's items are `<meta:item>`. `meta:` is a
+//! name prefix and deliberately not a namespace.
 //!
-//! The mapping is DR-047's, carried across from `PSO` with one prefix of its
-//! own: every element carries exactly one reserved `meta:` attribute whose
-//! *name* is its type and whose *value* is its value, a structure carries
-//! `meta:struct` naming its own type — the only place a pointer's concrete type
-//! is written down — and an array's items are `<meta:item>`. `meta:` is a
-//! reserved name **prefix** and deliberately not a namespace, for DR-043's
-//! reason: what a name may be is decided by a dictionary the user supplied.
-//!
-//! Every read is bounds-checked against the block it is in, and the walk
-//! carries a depth ceiling, a node budget and an output budget, because the
-//! block graph is attacker-chosen and can name a cycle or a diamond.
+//! Every read is bounds-checked against its block, and the walk carries a depth
+//! ceiling, a node budget and an output budget: the block graph is
+//! attacker-chosen and can name a cycle or a diamond.
 
 use quick_xml::escape::escape;
 
@@ -60,9 +52,6 @@ const INDENT: &str = "  ";
 
 /// An array as both directions see it: which of the two layouts it is, where
 /// its items are, and how many there are.
-///
-/// The two layouts differ in where the items live and in nothing else, so the
-/// walk that writes one writes the other and this is what it is handed.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Items<'a> {
     /// The word the layout is written under: [`COUNTED`] or [`INLINE`].
@@ -104,11 +93,9 @@ pub(super) fn write(payload: &[u8], system_len: usize, names: &Dictionary) -> Re
         &tag,
         Place::root(),
     )?;
-    // The per-element check is asked before the element is written, so the
-    // document may overshoot by the last one. Asking again here is what makes
-    // the budget a bound the answer obeys rather than one the walk aims at —
-    // and what lets `apply` refuse a longer document on sight without refusing
-    // anything this ever wrote.
+    // The per-element check runs before the element is written, so the
+    // document may overshoot by the last one; this makes the budget a bound
+    // the answer obeys.
     if writer.out.len() > writer.budget {
         return Err(bad(0, Malformed::TooLarge));
     }
@@ -153,14 +140,8 @@ impl Place {
         }
     }
 
-    /// One level deeper, at the same indent.
-    ///
-    /// A pointer hop is a level of the walk and not a level of the document:
-    /// the element a pointer's target writes **is** the pointer's own element,
-    /// so the indentation is the same one and only the ceiling moves. The two
-    /// are separate fields for exactly this, and a hop that moved neither is
-    /// what let a block tagged with a bare pointer code name itself and recurse
-    /// without bound.
+    /// One level deeper, at the same indent: a pointer hop is a level of the
+    /// walk and not of the document, so only the ceiling moves.
     const fn deeper(self) -> Self {
         Self {
             depth: self.depth.saturating_add(1),
@@ -213,10 +194,8 @@ impl<'a> Writer<'a, '_> {
 
     /// Writes one value — a member of a structure, or one item of an array.
     fn value(&mut self, field: Field<'a>, tag: &str, spot: Spot<'a>, place: Place) -> Result<()> {
-        // Here as well as in `spend`, because not every value writes an
-        // element: a pointer into a block tagged with a bare type code writes
-        // nothing of its own and recurses, so the ceiling has to be asked on
-        // the way in rather than only where the output is charged.
+        // Here as well as in `spend`: a pointer into a block tagged with a
+        // bare type code writes no element of its own and recurses.
         if place.depth > MAX_DEPTH {
             return Err(bad(spot.address(), Malformed::TooDeep));
         }
@@ -267,28 +246,17 @@ impl<'a> Writer<'a, '_> {
         }
     }
 
-    /// Writes what a pointer landed on.
-    ///
-    /// `docs/metadata-encodings.md`: a block's tag is a structure the file
-    /// defines (369,488) or a bare type code (93,454), and **0** resolve to
-    /// neither — so the block table is what carries a pointer's target type,
-    /// and this asks it rather than an external schema.
+    /// Writes what a pointer landed on, whose type is the landing block's tag.
     fn target(&mut self, landing: Spot<'a>, tag: &str, place: Place) -> Result<()> {
         match landing.block.tag {
             BlockTag::Structure(name) => self.structure(name, landing, tag, place),
             BlockTag::Type(word) => {
                 let code = u8::try_from(word)
                     .map_err(|_| bad(landing.address(), Malformed::UndefinedStructure))?;
-                // A typed block carries values and no member record, so there
-                // is no structure an `ARRAYINFO` index could resolve against —
-                // which is why the owner is an option rather than a borrow of
-                // whatever structure happened to be nearby.
-                //
+                // A typed block carries values and no member record, so no
+                // structure an `ARRAYINFO` index could resolve against.
                 // `deeper` and not `inside`: this hop writes no element of its
-                // own — the element is the pointer's — so nothing else charges
-                // it, and a block tagged `0x07` holding a pointer at itself
-                // recurses forever if this does not. The indent stays put
-                // because the document does.
+                // own, so nothing else charges it against the ceiling.
                 self.value(
                     Field {
                         member: typed(code),
@@ -308,8 +276,7 @@ impl<'a> Writer<'a, '_> {
         let attributes = attribute(&reserved(ARRAY), items.layout);
         let (Some(base), true) = (items.base, items.count != 0) else {
             // An empty array's element type is never asked for: a file may
-            // describe an element it never instantiates, which is one of the
-            // ways a structure goes unreached.
+            // describe an element it never instantiates.
             return self.empty(tag, &attributes, place);
         };
         let described = field.element(base.address())?;
@@ -365,11 +332,7 @@ impl<'a> Writer<'a, '_> {
 }
 
 /// A member of no structure, standing for the one value a typed data block
-/// holds.
-///
-/// A block tagged with a bare type code names its element type and nothing
-/// else, so there is no member record to read: this is the type word, in the
-/// shape the walk takes everywhere else.
+/// holds, since such a block has no member record to read.
 fn typed(code: u8) -> Member {
     Member {
         name: 0,
@@ -387,20 +350,13 @@ fn attribute(name: &str, value: &str) -> String {
 }
 
 /// A word, as the reserved name that carries it.
-///
-/// One spelling of the prefix, in one place. DR-047: the prefix and the
-/// vocabulary it guards are one fact rather than two kept equal by hand.
 pub(super) fn reserved(word: &str) -> String {
     format!("{RESERVED_PREFIX}{word}")
 }
 
 impl Writer<'_, '_> {
-    /// Charges one element against the ceilings.
-    ///
-    /// Called from [`Writer::empty`] and [`Writer::open`], which is every
-    /// element this mapping writes and the only way to write one. Charging at
-    /// the structure instead leaves the whole array path free of both, which is
-    /// the defect `PSO`'s budget was repaired for.
+    /// Charges one element against the ceilings, from [`Writer::empty`] and
+    /// [`Writer::open`], which between them write every element.
     fn spend(&mut self, place: Place) -> Result<()> {
         if place.depth > MAX_DEPTH {
             return Err(bad(0, Malformed::TooDeep));
@@ -409,9 +365,8 @@ impl Writer<'_, '_> {
         if self.nodes > self.nodes_allowed {
             return Err(bad(0, Malformed::TooManyNodes));
         }
-        // In bytes as well as in elements, because an element is not a fixed
-        // number of bytes: it carries two spaces of indent per level, so a deep
-        // million costs several times a shallow million.
+        // In bytes as well as elements: an element carries two spaces of
+        // indent per level, so a deep million costs more than a shallow one.
         if self.out.len() > self.budget {
             return Err(bad(0, Malformed::TooLarge));
         }

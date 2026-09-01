@@ -1,24 +1,15 @@
 /**
- * A client for `rpf serve --stdio`. DR-002.
+ * A client for `rpf serve --stdio`, holding no archive knowledge.
  *
- * What the daemon requires of whoever talks to it, and where each of these is
- * answered here:
+ * What the daemon requires of whoever talks to it:
  *
  * - **Objects with no `id` arrive before the response to a request.** They are
- *   progress notifications, and a client reads past them looking for the `id`
- *   it sent. DR-008.
- * - **Progress is lossy.** At most 64 notifications may be queued before
- *   further ones are dropped, and the next one that gets through carries
- *   `skipped`. Nothing is computed here from how many arrived.
- * - **A cancel overtakes.** It is answered on the daemon's reading thread
- *   without waiting its turn, so a response can arrive out of order and
- *   correlation is by `id` rather than by position.
+ *   progress notifications, and a client reads past them.
+ * - **Progress is lossy.** Nothing may be computed from how many arrived.
+ * - **A cancel overtakes**, so correlation is by `id` and not by position.
  * - **Standard output must keep being read.** A client that takes less than
- *   about four kilobytes a second cannot be told from one that has gone, and
- *   is cut off. So the `data` handler here never stops consuming, and nothing
- *   in this file waits on anything while holding the stream.
- *
- * It holds no archive knowledge: `docs/conventions.md` §1.
+ *   about four kilobytes a second is cut off, so nothing in this file waits on
+ *   anything while holding the stream.
  */
 
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
@@ -132,9 +123,8 @@ export class Daemon {
     /**
      * Settles when the process has gone, with whatever it exited with.
      *
-     * DR-002 makes process lifetime and crash recovery the client's problem,
-     * and this is what a client watches to notice. Every handle the daemon
-     * issued goes with it, buffered edits included.
+     * Process lifetime and crash recovery are the client's problem, and this
+     * is what it watches. Every handle goes with it, buffered edits included.
      */
     get exited(): Promise<number | null> {
         return this.finished;
@@ -150,9 +140,8 @@ export class Daemon {
      * for.
      *
      * Zero in every ordinary run: the ids sent here are small numbers, which
-     * DR-008's third amendment echoes back whole. A non-zero count means the
-     * daemon named work this client did not start, and it is counted rather
-     * than guessed at.
+     * the daemon echoes back whole. A non-zero count means it named work this
+     * client did not start.
      */
     get unroutedProgress(): number {
         return this.unrouted;
@@ -199,8 +188,7 @@ export class Daemon {
      * started.
      *
      * Naming the request rather than nothing: a cancel that names nothing means
-     * "whatever is running", which is somebody else's commit as readily as
-     * this one. DR-008.
+     * "whatever is running", which is somebody else's commit as readily.
      */
     cancel(target: RequestId, handle?: number): Promise<Cancelled> {
         const params: Record<string, Json> = { request: target };
@@ -213,9 +201,8 @@ export class Daemon {
     /**
      * Ends standard input and waits for the daemon to go.
      *
-     * Standard input ending does not cost a client the answer to a request it
-     * already sent — the daemon drains what it has queued for as long as this
-     * end keeps reading — so this waits rather than killing at once. DR-008.
+     * The daemon drains what it has queued for as long as this end keeps
+     * reading, so this waits rather than killing at once.
      */
     async dispose(): Promise<number | null> {
         if (this.ended) {
@@ -238,9 +225,8 @@ export class Daemon {
 
     private write(request: object): void {
         const line = `${JSON.stringify(request)}\n`;
-        // Queued rather than written outright: a request carrying a 20 MB
-        // payload does not fit the pipe in one go, and the writes have to reach
-        // the daemon in the order they were made.
+        // Queued rather than written outright: a large payload does not fit the
+        // pipe in one go, and writes have to arrive in the order they were made.
         this.writes = this.writes.then(
             () =>
                 new Promise<void>((done) => {
@@ -312,9 +298,8 @@ export class Daemon {
         }
         const progress = params as unknown as Progress;
         const named = (params as Record<string, Json>).request;
-        // `request` is the whole `id` when it is small and a string describing
-        // its size when it is not, and this client only ever sends small
-        // numbers — so anything else names work it did not start. DR-008.
+        // `request` is the whole `id` when it is small, and this client only ever
+        // sends small numbers — so anything else names work it did not start.
         if (typeof named !== 'number') {
             this.unrouted += 1;
             return;
@@ -330,10 +315,8 @@ export class Daemon {
     /**
      * The failure's own name, out of the error object's `data`.
      *
-     * Empty when there is none, which this daemon never writes — DR-032 §5 puts
-     * it on every error object — and which an older one would. Read here rather
-     * than in `errors.ts` because this file is the one that knows the wire's
-     * shapes.
+     * Empty only for an older daemon that wrote none. Read here rather than in
+     * `errors.ts` because this file is the one that knows the wire's shapes.
      */
     private static nameOf(failure: Record<string, Json>): string {
         const data = failure.data;

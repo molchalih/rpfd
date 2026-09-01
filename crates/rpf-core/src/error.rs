@@ -1,9 +1,7 @@
 //! The container error type.
 //!
-//! Variants are structured, not stringly (§10): exit codes are derived from
-//! them (R6.3), which makes the variant set part of the public contract. Each
-//! carries what a caller needs to act on or report, never a pre-rendered
-//! sentence.
+//! Variants are structured rather than stringly and exit codes are derived
+//! from them, which makes the variant set part of the public contract.
 
 use std::io;
 
@@ -13,33 +11,12 @@ use crate::{
 };
 
 /// Why an encrypted archive cannot be written.
-///
-/// A typed reason rather than a rendered sentence (§10). It carried a second
-/// value until DR-057 — `pack` refusing an AES tree because it held no key —
-/// and that is now a state rather than a wall: `pack` asks for material like
-/// every other command and answers [`Error::NeedsKey`] when there is none, so
-/// what is left here is the wall. DR-054, DR-057.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NoWrite {
     /// Nothing here derives the archive's forward transform.
     ///
-    /// **Re-aimed by DR-062, not retired.** It used to mean the NG transform
-    /// had no inverse at all in this build — a white-box construction whose
-    /// inverse was believed to need a 2^32 sweep per column for fourteen of its
-    /// seventeen rounds. That was measured and is false: every round derives
-    /// from the decrypt tables alone, in milliseconds, and the tool writes an
-    /// NG archive back when it holds them (`docs/ng-scheme.md`, DR-062).
-    ///
-    /// So what it now says is that **this build has nothing to derive the
-    /// transform from**: no NG decrypt tables here, which take a memory image
-    /// of a running game (DR-040); or an encrypted tag this build holds no
-    /// transform for at all; or a container version whose entry-table row is
-    /// not one aligned cipher block, which sealing a table row by row needs.
-    ///
-    /// Distinct from [`Error::NeedsKey`], and the distinction is the whole
-    /// point: `NeedsKey` tells an automation to go and extract a key, and what
-    /// is missing here is not a key and no retry finds it.
+    /// Not [`Error::NeedsKey`]: what is missing is not key material.
     #[error(
         "nothing here derives this archive's forward transform, so it is \
          read and never written"
@@ -62,12 +39,6 @@ pub enum Error {
     },
 
     /// A source of contents the caller supplied could not be read.
-    ///
-    /// [`crate::Contents`] is answered by the frontend, so this crate cannot
-    /// say what the source was — the implementation names it, and this carries
-    /// that name back out unchanged. Distinct from [`Error::Io`], which is
-    /// about the archive and names an offset in it; a donor file has no offset
-    /// in the archive, and what the caller needs is which file. DR-036.
     #[error("{name}: {source}")]
     Contents {
         /// The source, as the frontend that supplied it names it.
@@ -79,28 +50,18 @@ pub enum Error {
 
     /// The bytes at the archive's base are not an RPF7 header.
     ///
-    /// **Its category is decided by `found`.** The four bytes are the only
-    /// thing in the format that ever claims an archive is here — no entry row
-    /// marks a payload as one, which is why every walk sniffs — so bytes that
-    /// name a container version and then fail to hold a whole header are a
-    /// malformed archive, and bytes that name nothing are a request that
-    /// called an ordinary file an archive. DR-019.
+    /// Its category is decided by `found`: bytes naming a container version are
+    /// a malformed archive, bytes naming nothing a misdirected request.
     #[error("not an RPF7 archive at offset {base}: magic reads {found:02x?}")]
     NotAnArchive {
         /// Where the archive was expected to begin.
         base: u64,
-        /// The four bytes actually found there. Also what decides whether this
-        /// is [`Category::Corrupt`] or [`Category::Refused`].
+        /// The four bytes found there, which decide the category.
         found: [u8; 4],
     },
 
     /// The bytes at the archive's base are an RPF header of a version this
     /// build does not read.
-    ///
-    /// Distinct from [`Error::NotAnArchive`], which is what the version used to
-    /// be reported as: nothing here is malformed. The version is in the first
-    /// four bytes and throwing it away told a caller the archive was broken.
-    /// DR-012, and DR-010's amendment for the category.
     #[error(
         "RPF{version} archive at offset {base}: magic reads {found:02x?}, \
          and this build reads only RPF7 in its 7FPR spelling"
@@ -110,15 +71,13 @@ pub enum Error {
         base: u64,
         /// The version number the magic names.
         version: u8,
-        /// The four bytes actually found there, which say which of the two
-        /// byte orders the archive was written in.
+        /// The four bytes found there, which name the byte order used.
         found: [u8; 4],
     },
 
     /// The archive is encrypted and no key material is available.
     ///
-    /// Distinct from [`Category::Corrupt`] on purpose: the archive is fine, we
-    /// simply cannot open it here. R2 and R6.3.
+    /// Not [`Category::Corrupt`]: the archive is fine, it cannot be opened here.
     #[error("archive is encrypted (tag {tag:#010x}); no key material available")]
     NeedsKey {
         /// The encryption tag from the header.
@@ -128,17 +87,9 @@ pub enum Error {
     /// The archive is encrypted, key material **is** available, and none of it
     /// opens the archive.
     ///
-    /// Distinct from [`Error::NeedsKey`] because the two name different things
-    /// to do (DR-010): the first is answered by extracting key material, and
-    /// this one cannot be — the material in hand is the wrong material, or the
-    /// archive was renamed after it was packed, which changes the key it is
-    /// under (`docs/rpf-format.md`, Encryption). Both are
-    /// [`Category::NeedsKey`], because the person holding the archive is the
-    /// one who acts either way.
-    ///
-    /// It is decided by the archive's own root directory row, not by a guess:
-    /// a table of contents that decrypts to something whose entry 0 is not the
-    /// root directory was decrypted with the wrong key. DR-041.
+    /// Unlike [`Error::NeedsKey`], extracting more material does not answer it.
+    /// Decided by the archive's own root row: a table of contents whose entry 0
+    /// is not the root was decrypted with the wrong key.
     #[error(
         "the {scheme} key material available does not open this archive \
          (tag {tag:#010x}, {tried} source(s) tried)"
@@ -146,8 +97,7 @@ pub enum Error {
     WrongKey {
         /// The encryption tag from the header.
         tag: u32,
-        /// Which transform the tag names, for a caller deciding what material
-        /// to go and get. Never a key, and never a key index: DR-020.
+        /// Which transform the tag names. Never a key, and never a key index.
         scheme: &'static str,
         /// How many sources' material was tried before this was answered.
         tried: u32,
@@ -155,17 +105,8 @@ pub enum Error {
 
     /// The archive is encrypted and this write cannot produce one.
     ///
-    /// `reason` says which gap it is — [`NoWrite`]. An AES-tagged archive is
-    /// written back, by every write path there is; an NG-tagged one is written
-    /// back by nobody outside Rockstar.
-    ///
-    /// Every write path answers this before it touches a byte, so an archive
-    /// refused here is exactly as it was.
-    ///
-    /// [`Category::Unsupported`] rather than [`Category::NeedsKey`]: no
-    /// material closes either gap, because the missing part is here and not
-    /// there. Not [`Category::Refused`] either — the request was reasonable and
-    /// the container simply cannot. DR-010's amendment, DR-041, DR-054.
+    /// Answered before a byte is touched, and [`Category::Unsupported`] rather
+    /// than [`Category::NeedsKey`]: no material closes the gap.
     #[error("archive is encrypted (tag {tag:#010x}); {reason}")]
     CannotWriteEncrypted {
         /// The encryption tag from the header.
@@ -177,23 +118,10 @@ pub enum Error {
     /// An entry holding an archive whose own key is a function of its name
     /// cannot be renamed.
     ///
-    /// A nested archive travels through a rebuild as **opaque payload bytes**:
-    /// its holder copies it across and re-keys nothing inside it. An NG
-    /// archive's own table of contents and names blob are keyed by the name it
-    /// is filed under — `(hash(name) + length + 61) % 101` — so an entry
-    /// renamed from `dlc.rpf` to anything else holds an archive that parses,
-    /// verifies and no longer opens, with nothing refused and nothing reported.
-    /// That is the failure this variant exists to make loud. DR-064.
-    ///
-    /// The holder's own tag is irrelevant: an NG archive nested inside an AES
-    /// one breaks the same way. And a **move** is not a rename here — the key
-    /// takes the entry's name and not its path, so an entry that keeps its name
-    /// is carried anywhere without this.
-    ///
-    /// [`Category::Unsupported`]: no material closes the gap, because the
-    /// missing part is here — re-keying the payload means holding and rewriting
-    /// the whole of a nested archive, which is the streaming cost R3.9 exists
-    /// to avoid.
+    /// A nested archive is copied through a rebuild as opaque bytes and an NG
+    /// one is keyed by its filed name, `(hash(name) + length + 61) % 101`, so a
+    /// rename would leave one that parses and silently no longer opens. A move
+    /// is not a rename: the key takes the entry's name, not its path.
     #[error(
         "{path}: renaming to {to} would leave the {scheme} archive nested there \
          (tag {tag:#010x}) keyed by the name it no longer has"
@@ -205,22 +133,12 @@ pub enum Error {
         to: String,
         /// The nested archive's encryption tag.
         tag: u32,
-        /// What that tag's transform is called. Never a key: DR-020.
+        /// What that tag's transform is called. Never a key.
         scheme: &'static str,
     },
 
     /// A game executable does not carry the key material this build knows how
     /// to find.
-    ///
-    /// Extraction anchors each value on the SHA-1 of its own bytes rather than
-    /// on an offset, so a match is its own proof and a miss means the value is
-    /// not present in that exact form — a different build of the game, a
-    /// patched executable, or the wrong file entirely. It carries the counts
-    /// because "1 of 2" and "0 of 2" are different situations to be in, and it
-    /// names the values it did not find because "1 of 2" does not say which.
-    ///
-    /// [`Category::Unsupported`] for the reason [`Error::UnsupportedVersion`]
-    /// is: the file is intact and the part that is missing is here.
     #[error(
         "{what}: {found} of {wanted} values are in this executable; missing {}",
         .missing.join(" and ")
@@ -228,13 +146,8 @@ pub enum Error {
     UnrecognisedExecutable {
         /// Which material was looked for.
         what: &'static str,
-        /// The values that were not found, by name, and never empty — a search
-        /// that found everything is not this failure.
-        ///
-        /// A kind rather than each value: the NG survey looks for 373 of them
-        /// and 373 names are not something a caller acts on, while `found` and
-        /// `wanted` already say how many. Names only, so nothing here can carry
-        /// a byte of what was looked for (DR-006).
+        /// The values not found, by name and never empty; names only, so no
+        /// byte of the material itself is carried.
         missing: &'static [&'static str],
         /// How many of its values were found.
         found: u32,
@@ -259,7 +172,7 @@ pub enum Error {
     /// names blob.
     ///
     /// Reading past `namesLength` is how stale names from a previous pack get
-    /// mistaken for live ones. `docs/rpf-format.md`, Slack.
+    /// mistaken for live ones.
     #[error(
         "entry {entry}: name offset {name_offset} is not a terminated string in {names_len} bytes"
     )]
@@ -289,16 +202,10 @@ pub enum Error {
     /// table — itself, or an entry above it — so the entries do not form a
     /// tree.
     ///
-    /// The entry table is laid out breadth-first, each directory's children in
-    /// one run after it (`docs/rpf-format.md`, Table order), so a child index
-    /// greater than its parent's is what makes the parent map well founded: a
-    /// walk up it strictly decreases and therefore ends. A claim that goes the
-    /// other way is what a cycle is made of.
-    ///
-    /// Distinct from [`Error::BadChildRange`], and worse: every index involved
-    /// is inside the entry table, so walking the parent map does not run off
-    /// the end — it runs for ever. Refused at parse, because a caller cannot
-    /// act on a value it never gets back.
+    /// The table is breadth-first, so a child index greater than its parent's
+    /// is what makes a walk up the parent map terminate. Worse than
+    /// [`Error::BadChildRange`]: every index is in range, so the walk does not
+    /// run off the end, it runs for ever.
     #[error("entry {entry}: child {child} does not come after it in the entry table")]
     CyclicTree {
         /// Index of the directory that claimed the child.
@@ -310,10 +217,8 @@ pub enum Error {
     /// Two directories claim the same entry as a child, so the entries are not
     /// a forest.
     ///
-    /// Nothing here is out of range and nothing is a cycle, which is why it
-    /// needs saying separately: the children relation can still be a lattice,
-    /// and the number of root-to-leaf paths through one doubles per row. A
-    /// 512-byte archive of 26 such rows made `ls -R` produce 33,554,431 rows.
+    /// Nothing is out of range and nothing is a cycle, but the children
+    /// relation can be a lattice, whose root-to-leaf path count doubles per row.
     #[error("entry {child} is claimed as a child by both entry {first} and entry {second}")]
     ClaimedTwice {
         /// The entry claimed more than once.
@@ -326,11 +231,8 @@ pub enum Error {
 
     /// A recursive structure is deeper than this container will walk.
     ///
-    /// Both directory trees and archives nested inside archives are walked
-    /// recursively, by this crate and by everything built on it, and both
-    /// depths are the archive's to choose. Nothing about a deep one is
-    /// self-contradictory — which is exactly why it is refused at a stated
-    /// depth rather than discovered as a stack overflow (§6).
+    /// Both depths are the archive's to choose, so a deep one is refused at a
+    /// stated limit rather than discovered as a stack overflow.
     #[error("{what} is {depth} deep, over the limit of {limit}")]
     TooDeep {
         /// Which structure: `"directory tree"` or `"archive nesting"`.
@@ -344,10 +246,8 @@ pub enum Error {
     /// An entry's payload begins inside the archive's own header, entry table
     /// or names blob rather than after them.
     ///
-    /// Distinct from [`Error::OutOfBounds`]: the region fits inside the
-    /// archive, and that is what makes it dangerous. Reading it hands back the
-    /// archive's own structure as file contents, and the room reported for
-    /// patching it in place covers the header.
+    /// The region fits inside the archive, so reading it hands back the
+    /// archive's own structure as file contents.
     #[error("entry {entry}: payload begins at {offset}, before the first payload offset {floor}")]
     PayloadUnderflow {
         /// Index of the offending entry.
@@ -368,9 +268,6 @@ pub enum Error {
     },
 
     /// The payload did not inflate.
-    ///
-    /// A fact about the archive's bytes, not about the source they came from:
-    /// every byte asked for arrived, and then did not decode. DR-010.
     #[error("entry {entry}: payload did not inflate")]
     Inflate {
         /// Index of the offending entry.
@@ -381,9 +278,6 @@ pub enum Error {
     },
 
     /// The payload inflated, but not to the length the archive promised.
-    ///
-    /// Worth its own variant: it means the archive is internally inconsistent
-    /// rather than unreadable, and that is a different thing to report.
     #[error("entry {entry}: inflated to {actual} bytes, archive declares {expected}")]
     LengthMismatch {
         /// Index of the offending entry.
@@ -397,16 +291,8 @@ pub enum Error {
     /// The payload's deflate stream ended before the payload did, so the entry
     /// declares bytes that are not part of anything it holds.
     ///
-    /// A deflate stream carries its own end, so the bytes after it inflate to
-    /// nothing and are silently ignored: the contents come back exactly as the
-    /// archive promises them while the payload is longer than what produced
-    /// them. That is the archive contradicting itself, which is why it is
-    /// `Corrupt` and not a refusal — but it is reported by `verify` rather
-    /// than refused by a read, because one producer's archives are not enough
-    /// evidence to reject another's. `docs/backlog.md`, R6.10.
-    ///
-    /// Carries both lengths because both are what a caller acts on: where the
-    /// stream ends, and how much the entry claims after it.
+    /// The trailing bytes inflate to nothing, so the contents still come back
+    /// as promised; reported by `verify` rather than refused by a read.
     #[error(
         "entry {entry}: the deflate stream ends after {used} bytes, \
          but the payload declares {declared}"
@@ -414,9 +300,8 @@ pub enum Error {
     TrailingBytes {
         /// Index of the offending entry.
         entry: u32,
-        /// How many bytes of payload the entry table declares. For a resource
-        /// this is its compressed size with the 16-byte `RSC7` header taken
-        /// off, which is the extent of the stream itself.
+        /// Payload bytes declared; for a resource, its compressed size less
+        /// the 16-byte `RSC7` header.
         declared: u64,
         /// How many of them the deflate stream consumed.
         used: u64,
@@ -424,25 +309,9 @@ pub enum Error {
 
     /// An entry's contents are not the contents recorded for it.
     ///
-    /// The one failure here that the archive cannot state on its own. A
-    /// deflated entry declares its inflated length and its stream carries its
-    /// own end, so bytes changed inside one surface as [`Error::Inflate`],
-    /// [`Error::LengthMismatch`] or [`Error::TrailingBytes`]; a **stored**
-    /// entry declares neither, so a byte changed inside it reads back
-    /// perfectly and is the wrong byte. Only a checksum recorded elsewhere —
-    /// the sidecar manifest's, DR-004's territory, since nothing in an RPF
-    /// archive carries one — can see it. DR-023.
-    ///
-    /// [`Category::Corrupt`], not [`Category::Refused`]: the caller asked a
-    /// reasonable question and the answer is that the archive's bytes are not
-    /// the bytes they were. DR-010.
-    ///
-    /// Identifies the entry by index, as every failure about the archive's own
-    /// bytes does. The path is `crate::Problem`'s to carry, and repeating it
-    /// here would be the same string twice in one sentence.
-    /// [`Error::WrongKind`] names a path instead, and the reason it differs is
-    /// stated there: it is a fact about the request rather than about the
-    /// bytes.
+    /// A stored entry declares neither an inflated length nor a stream end, so
+    /// a byte changed inside it reads back perfectly; only a checksum recorded
+    /// in the sidecar manifest can see it.
     #[error("entry {entry}: contents digest {found}, not the recorded {recorded}")]
     ChecksumMismatch {
         /// Index of the offending entry.
@@ -463,9 +332,6 @@ pub enum Error {
     },
 
     /// No entry at the given path.
-    ///
-    /// `segment` is the component that failed, which is more useful than the
-    /// whole path when addressing through several nested archives.
     #[error("no entry at {path:?}: {segment:?} not found")]
     NotFound {
         /// The path that was asked for.
@@ -476,9 +342,8 @@ pub enum Error {
 
     /// A value does not fit the field the format stores it in.
     ///
-    /// The container's fields are narrow — a compressed size is 24 bits, a
-    /// block offset 23, a file's name offset 16 — and exceeding one is a limit
-    /// of the format, not a bug in the caller's input.
+    /// The fields are narrow: a compressed size is 24 bits, a block offset 23,
+    /// a file's name offset 16.
     #[error("{path:?}: {what} is {len}, over the format's limit of {limit}")]
     FieldOverflow {
         /// The entry being written.
@@ -493,16 +358,9 @@ pub enum Error {
 
     /// The layout ran past the largest payload offset the version can address.
     ///
-    /// A version stores a payload's offset in a narrow field, so it has a size
-    /// ceiling: RPF7 counts 512-byte blocks in 23 bits, which is 4,294,966,784
-    /// bytes. `docs/rpf-format.md`, Entry table.
-    ///
-    /// Not a [`Error::FieldOverflow`], although it is noticed in the same
-    /// place. Every other narrow field is a fact about the entry that
-    /// overflowed it and is fixed by changing that entry; this is a fact about
-    /// the **archive**, and the entry named is only where the layout first ran
-    /// past the end — which is not the entry the caller added, and is nothing
-    /// the caller chose.
+    /// RPF7 counts 512-byte payload block offsets in 23 bits, a ceiling of
+    /// 4,294,966,784 bytes. Not a [`Error::FieldOverflow`]: the entry named is
+    /// only where the layout first ran past the end, not one the caller chose.
     #[error(
         "the archive is too large: this version addresses {limit} bytes \
          and the layout reached {reached} (at {path:?})"
@@ -518,10 +376,8 @@ pub enum Error {
 
     /// A payload cannot be written into a resource entry.
     ///
-    /// **Never because it does not begin with `RSC7`.** `docs/backlog.md` Q7
-    /// measured that no Rockstar resource payload does, so that test refused
-    /// the archives it was meant to serve; what is refused now is a write whose
-    /// row could not be filled in. DR-046.
+    /// Never because it does not begin with `RSC7` — no shipped resource
+    /// payload does — but because its entry row could not be filled in.
     #[error("{path:?}: cannot be written into a resource entry: {reason}")]
     NotAResource {
         /// The entry being written.
@@ -532,9 +388,6 @@ pub enum Error {
 
     /// A payload cannot be written into an entry that holds a tokenised
     /// metadata encoding.
-    ///
-    /// Both encodings are carried rather than a sentence, so a caller acts on
-    /// the pair rather than on English (§10). DR-050.
     #[error(
         "{path:?}: an entry holding {} cannot take a payload of {}",
         held.name(),
@@ -550,12 +403,6 @@ pub enum Error {
     },
 
     /// An entry was asked for as XML and has no XML view.
-    ///
-    /// What it holds is carried rather than a sentence (§10), and `None` is
-    /// both "its payload announces nothing" and "it is a resource, whose
-    /// payload is not read" — `docs/backlog.md` Q7. An entry that gains a view
-    /// later stops answering this, which is what makes it the right refusal to
-    /// leave R5.8 room in. DR-053.
     #[error(
         "{path:?}: an entry holding {} has no XML view",
         held.map_or("no encoding this tool converts", crate::metadata::Encoding::name)
@@ -570,34 +417,11 @@ pub enum Error {
     /// Two children of one directory are one name here, so one of them cannot
     /// be addressed by any spelling of its own path.
     ///
-    /// Path components resolve case-insensitively in this container
+    /// Path components resolve case-insensitively
     /// ([`crate::format::same_name`]), so `A.txt` and `a.txt` in one directory
-    /// are one name and the second is unreachable. Reported by the writer,
-    /// which will not produce such an archive, and by the reader, which will
-    /// not turn one into a tree, rather than "2 files" now and a failure one
-    /// command later. R10.4.
-    ///
-    /// **Two names one reader cannot tell apart is three conditions, not one,
-    /// and this variant is the first of them.** The other two are
-    /// [`Error::BadPath`]: `"is named twice in one directory"` for one name
-    /// carried twice, and `"a file and a directory share one name"` for a
-    /// clash of kinds. The writer has always answered all three separately;
-    /// the reader answered every one of them with this variant, which rendered
-    /// `"aa.txt" and "aa.txt" are one name here` for an exact duplicate — one
-    /// string named twice, telling a caller nothing. Both variants are
-    /// [`Category::Refused`] and exit 6, so nothing branching on the number
-    /// moves; what changes is that the sentence is now the same one either
-    /// way.
-    ///
-    /// **Both are paths from the archive's root, and they are the two names
-    /// that collide** — not the request that ran into the collision. For a
-    /// directory component that is not the same thing: adding
-    /// `X64/alpha.txt` to a tree that already holds `x64` used to render
-    /// `"X64/alpha.txt" and its sibling "x64" are one name here`, which is
-    /// untrue twice over — those two are neither siblings nor one name. What
-    /// the caller has to act on is the pair of directories, and §10 says a
-    /// variant carries that rather than what was being attempted when it
-    /// surfaced.
+    /// are one name. An exact duplicate and a file clashing with a directory
+    /// are [`Error::BadPath`] instead. Both fields are the colliding names,
+    /// not the request that ran into them.
     #[error("{path:?} and {other:?} are one name here, so one of them cannot be addressed")]
     NameCollision {
         /// One of the two, by path from the archive's root.
@@ -608,15 +432,8 @@ pub enum Error {
 
     /// A path a change would create is already in the archive.
     ///
-    /// The counterpart of [`Error::NotFound`], and a refusal rather than a
-    /// corruption: nothing about the archive is wrong, and what the caller has
-    /// to do is pick another name or remove what is there. It exists as its own
-    /// variant because a client mapping this onto an editor's filesystem has a
-    /// distinct answer for it, which "invalid path" would not reach.
-    ///
-    /// A rename onto an occupied path and a directory created twice are the two
-    /// that raise it. A **write** does not: replacing what is at a path is what
-    /// a write has always meant here, and DR-026 keeps it that way.
+    /// Raised by a rename onto an occupied path and by a directory created
+    /// twice, never by a write, which means replacement here.
     #[error("{path:?} is already in the archive")]
     AlreadyExists {
         /// The path that is taken, from the archive's root.
@@ -626,16 +443,8 @@ pub enum Error {
     /// A change set already holds a change at this path, and the one offered
     /// would replace it rather than join it.
     ///
-    /// A set holds one change per path ([`crate::Change`]), so a second change
-    /// at a path silently drops the first. Measured over the wire on
-    /// 2026-08-29: a buffered rename followed by a write of the same entry was
-    /// answered `pending: 1`, and the commit renamed nothing. Two **writes** are
-    /// not this — saving one file twice is what an editor does, and the later
-    /// contents are what it means — and neither is the same change offered
-    /// again.
-    ///
-    /// A refusal rather than a corruption: what the caller has to do is take
-    /// the change it no longer wants back out of the set. DR-032.
+    /// A set holds one change per path ([`crate::Change`]), so a second would
+    /// silently drop the first; two writes at a path are not this.
     #[error("{path:?} already has {held} in this change set, which holds one change per path")]
     Claimed {
         /// The path both changes are at.
@@ -655,10 +464,6 @@ pub enum Error {
     },
 
     /// Two edits in one plan claim the same bytes.
-    ///
-    /// A nested archive and a file inside it, or two spellings of one path.
-    /// Nothing about the archive is wrong, so this is a refusal rather than a
-    /// corrupt archive: the caller has to drop one of the two or rebuild.
     #[error("{path:?} and {other:?} cannot be patched together: they claim the same bytes")]
     Overlapping {
         /// The edit that collided.
@@ -667,10 +472,7 @@ pub enum Error {
         other: String,
     },
 
-    /// A watcher stopped the write. DR-008.
-    ///
-    /// Not a failure of the archive or of the caller's input — the caller asked
-    /// for this — which is why it carries how far it got rather than a reason.
+    /// A watcher stopped the write.
     #[error("cancelled after {done} of {total} entries")]
     Cancelled {
         /// How many entries had been written when it stopped.
@@ -680,20 +482,6 @@ pub enum Error {
     },
 
     /// Entries are not as they are recorded.
-    ///
-    /// What a failing `verify` returns. It is one failure about a set of
-    /// entries rather than about any one of them, so it carries the two counts
-    /// a caller acts on — how many were read, and how many of those were not
-    /// as recorded — and leaves the per-entry detail to the report beside it.
-    /// R6.9. Borrowing [`Error::LengthMismatch`] for this rendered
-    /// "entry 0: inflated to 25 bytes, archive declares 26", a sentence about
-    /// inflation with nothing to do with what happened.
-    ///
-    /// "as they are recorded" rather than "as the archive describes them",
-    /// which was true until a manifest could be given: a checksum mismatch is
-    /// an entry that read back *perfectly* and disagrees with what the sidecar
-    /// recorded for it, so the archive is not the only thing doing the
-    /// describing any more. DR-023, DR-025.
     #[error("{failed} of {checked} entries are not as they are recorded")]
     VerifyFailed {
         /// How many file entries were read, the failing ones included.
@@ -703,22 +491,6 @@ pub enum Error {
     },
 
     /// The entry exists but is not the kind the operation needs.
-    ///
-    /// **Named by path, not by index**, unlike the per-entry failures above it.
-    /// Those are all facts about the archive's own bytes, which a caller reads
-    /// alongside an entry table; this one is a fact about the *request* — the
-    /// caller named something, and it was the wrong kind of thing — and what it
-    /// named was a path. `rpf info a.rpf data` reported `entry 1 is a
-    /// directory, expected a file`, which says nothing a caller can act on
-    /// without first working out what entry 1 is.
-    ///
-    /// The path is spelled as the caller spelled it wherever there is a caller
-    /// to ask: [`crate::Summary::of`] refills it with the path it was given, so
-    /// an entry inside a nested archive names the whole path rather than its
-    /// path within that archive. Where there is no caller — a walk that reached
-    /// the entry on its own — it is `Archive::path`, falling back to the
-    /// index when the tree does not resolve, which is the one case where
-    /// nothing better exists.
     #[error("{path:?} is a {found}, expected a {wanted}")]
     WrongKind {
         /// The entry, by path from the archive that holds it.
@@ -730,12 +502,6 @@ pub enum Error {
     },
 
     /// An `RBF` payload's token stream is not well formed.
-    ///
-    /// The metadata layer's failures are variants of this enum rather than of
-    /// one of their own, because §10 counts **crate** boundaries and there is
-    /// one of those. What is not flattened is the cause: it is the metadata
-    /// layer's own typed enum, so that the layer keeps its vocabulary and this
-    /// enum does not grow a variant per token.
     #[error("malformed RBF at offset {offset}")]
     BadRbf {
         /// Where in the payload the stream stopped making sense.
@@ -745,11 +511,6 @@ pub enum Error {
     },
 
     /// An `RBF` payload is well formed and says something XML cannot carry.
-    ///
-    /// Distinct from [`Error::BadRbf`] because the caller's position is
-    /// different: those bytes are wrong, these are right and this build has no
-    /// way to render them. Every one of them is measured never to occur in a
-    /// shipped file — `docs/metadata-encodings.md` gives the count for each.
     #[error("the RBF payload cannot be written as XML")]
     UnrepresentableRbf {
         /// Which thing it says.
@@ -757,11 +518,6 @@ pub enum Error {
     },
 
     /// A `PSO` payload contradicts itself.
-    ///
-    /// The same shape as [`Error::BadRbf`] and for the same reason: §10 counts
-    /// **crate** boundaries and there is one, so the metadata layer keeps its
-    /// own vocabulary inside `cause` rather than this enum growing a variant
-    /// per section.
     #[error("malformed PSO at offset {offset}")]
     BadPso {
         /// Where in the payload the file stopped making sense.
@@ -771,11 +527,6 @@ pub enum Error {
     },
 
     /// A resource `Meta` payload contradicts itself.
-    ///
-    /// The same shape as [`Error::BadPso`] and for the same reason: §10 counts
-    /// **crate** boundaries and there is one, so the metadata layer keeps its
-    /// own vocabulary inside `cause` rather than this enum growing a variant
-    /// per table.
     #[error("malformed Meta at offset {offset}")]
     BadMeta {
         /// Where in the payload the file stopped making sense.
@@ -786,11 +537,6 @@ pub enum Error {
 
     /// A `PSO` payload is well formed and carries something this build does not
     /// decode.
-    ///
-    /// `docs/metadata-encodings.md` measured 37 `(type, subtype)` pairs over
-    /// 580,044 members, and a decoder that handles those handles every metadata
-    /// file both games ship — so reaching this means a file neither shipped
-    /// build contains.
     #[error("the PSO payload carries something this build does not decode")]
     UnsupportedPso {
         /// Which thing.
@@ -799,12 +545,6 @@ pub enum Error {
 
     /// A resource `Meta` payload is well formed and carries something this
     /// build does not decode.
-    ///
-    /// The same shape as [`Error::UnsupportedPso`] and for the same reason, with
-    /// one difference worth stating: `docs/metadata-encodings.md` counted 23
-    /// distinct `Meta` type codes and does **not** enumerate them, so the table
-    /// this refusal is the complement of is `secondary` rather than measured.
-    /// `crate::metadata::meta`'s own documentation says what bounds that.
     #[error("the Meta payload carries something this build does not decode")]
     UnsupportedMeta {
         /// Which thing.
@@ -813,10 +553,6 @@ pub enum Error {
 
     /// The XML handed to the metadata layer does not describe the resource
     /// `Meta` payload it was given beside.
-    ///
-    /// The `Meta` write direction is an edit of the file the document came from
-    /// — DR-049 — so this says the two disagree rather than that either is
-    /// malformed on its own.
     #[error("the XML at position {position} does not describe this Meta payload")]
     NotMetaXml {
         /// Where in the XML the reader was, so an editor can put the cursor on
@@ -830,8 +566,8 @@ pub enum Error {
     /// document.
     #[error("the XML at position {position} does not describe an RBF document")]
     NotRbfXml {
-        /// Where in the XML the reader was. What a caller acts on: it is what
-        /// puts an editor's cursor on the line that has to change.
+        /// Where in the XML the reader was, so an editor can put the cursor on
+        /// the line that has to change.
         position: u64,
         /// What was wrong with it.
         cause: crate::metadata::rbf::NotRbf,
@@ -839,10 +575,6 @@ pub enum Error {
 
     /// The XML handed to the metadata layer does not describe the `PSO`
     /// payload it was given beside.
-    ///
-    /// The `PSO` write direction is an edit of the file the document came from
-    /// — DR-049 — so this says the two disagree rather than that either is
-    /// malformed on its own.
     #[error("the XML at position {position} does not describe this PSO payload")]
     NotPsoXml {
         /// Where in the XML the reader was, so an editor can put the cursor on
@@ -855,14 +587,9 @@ pub enum Error {
 
 /// The class of a failure, which is what an exit code is derived from.
 ///
-/// R6.3 wants exit codes that distinguish these, so the mapping lives here
-/// rather than in the binary: the variant set is the public contract (§10), and
-/// a new variant that forgets to classify itself would otherwise become an
-/// exit code silently.
-/// A category names what the caller has to do about the failure rather than
-/// what the code was doing when it noticed. DR-010.
-/// Deliberately **not** `#[non_exhaustive]`, unlike [`Error`]: a new category
-/// must break every mapping of it at compile time, which is the whole point.
+/// A category names what the caller has to do rather than what the code was
+/// doing when it noticed. Deliberately not `#[non_exhaustive]`, unlike
+/// [`Error`]: a new category must break every mapping of it at compile time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
     /// The thing asked for is not in the archive.
@@ -871,34 +598,25 @@ pub enum Category {
     Corrupt,
     /// The archive is intact but needs key material we do not have.
     NeedsKey,
-    /// The archive is intact and this build cannot read it. Nobody who is
-    /// holding it can act: the missing part is here. DR-010's amendment.
+    /// The archive is intact and this build cannot read it; the missing part
+    /// is here, so whoever holds the archive cannot act.
     Unsupported,
-    /// The container declines to carry out the request. Either it is not well
-    /// formed, or it is and the container will not do it. DR-010.
+    /// The container declines to carry out the request.
     Refused,
     /// The caller stopped it part-way.
     Cancelled,
-    /// The source or sink failed. Nobody's input is in question: this is the
-    /// disk, the pipe or the handle. DR-010.
+    /// The source or sink failed: the disk, the pipe or the handle.
     Io,
 }
 
-/// Whether four bytes at an archive's base claim to be a container at all.
-///
-/// Composed from the two things `format` already names, rather than spelling
-/// the magic again (§3): the version this build reads, and the versions it
-/// only recognises. Either claim is enough — what matters is that something
-/// asserted an archive was there.
+/// Whether four bytes at an archive's base claim to be a container at all,
+/// whether or not this build reads that version.
 fn claims_a_container(magic: [u8; 4]) -> bool {
     magic == Version::Rpf7.magic() || unsupported_version(magic).is_some()
 }
 
 impl Error {
     /// What kind of failure this is.
-    ///
-    /// Not `const`, because [`Error::NotAnArchive`] is classified from the
-    /// bytes it carries and that reads a `format` function. DR-019.
     #[must_use]
     pub fn category(&self) -> Category {
         match *self {
@@ -927,8 +645,8 @@ impl Error {
             | Self::NotPsoXml { .. }
             | Self::NotMetaXml { .. } => Category::Refused,
             Self::Cancelled { .. } => Category::Cancelled,
-            // DR-019: the bytes decide. A payload that never claimed to be an
-            // archive was named one by the caller's own path.
+            // The bytes decide: a payload that never claimed to be an archive
+            // was named one by the caller's own path.
             Self::NotAnArchive { found, .. } => {
                 if claims_a_container(found) {
                     Category::Corrupt
@@ -957,20 +675,9 @@ impl Error {
 
     /// This variant's own name, as a stable symbol.
     ///
-    /// The category ([`Error::category`]) says who has to act and is what the
-    /// exit code is derived from; this says **which** failure it was, for a
-    /// caller that has a distinct answer for one of them. An editor's
-    /// filesystem has `FileExists` for [`Error::AlreadyExists`] and nothing for
-    /// the rest of [`Category::Refused`], and picking it out by reading the
-    /// rendered sentence is what §10 forbids — so the name goes on the wire
-    /// beside the number rather than the client parsing English. DR-030 asked
-    /// for it; DR-032 is where it was decided and where what it commits to is
-    /// written down.
-    ///
-    /// **These names are part of the contract.** Renaming a variant changes
-    /// them, so it is a breaking change to the daemon's wire in the same way
-    /// remapping an exit code is. Adding a variant is not: a caller that does
-    /// not know a name has the number, which is what it had before.
+    /// [`Error::category`] says who has to act; this says which failure it was.
+    /// These names are part of the wire contract: renaming a variant is a
+    /// breaking change, adding one is not.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match *self {
@@ -1024,16 +731,9 @@ impl Error {
 
     /// The container failure an [`io::Error`] is carrying, if it is one.
     ///
-    /// A streaming read can only fail as an [`io::Error`] — that is what
-    /// [`std::io::Read`] returns — so [`crate::archive::Extracted`] packs the
-    /// failure it really had inside one, and this is where it comes back out.
-    ///
     /// # Errors
     ///
-    /// The [`io::Error`] itself, unchanged, when it is not carrying one. A
-    /// caller copying an entry into a sink of its own gets a container failure
-    /// back for a failure of the **read** and its own error for a failure of
-    /// the **write**, which is what lets it name the file it could not write.
+    /// The [`io::Error`] itself, unchanged, when it is not carrying one.
     pub fn carried(source: io::Error) -> std::result::Result<Self, io::Error> {
         source.downcast::<Self>()
     }
@@ -1043,8 +743,8 @@ impl Error {
         io::Error::other(self)
     }
 
-    /// [`Error::carried`], for a caller whose sink cannot fail on its own: a
-    /// failure carrying nothing is the source's, at `offset`.
+    /// [`Error::carried`] for a caller whose sink cannot fail: a failure
+    /// carrying nothing is the source's, at `offset`.
     pub(crate) fn recovered(offset: u64, source: io::Error) -> Self {
         Self::carried(source).unwrap_or_else(|source| Self::Io { offset, source })
     }
@@ -1060,16 +760,9 @@ mod tests {
     use super::{Category, Error, NoWrite};
 
     /// How many variants [`Error`] has, which is what [`Error::name`] counts.
-    ///
-    /// That match is exhaustive, so a variant added later stops the crate
-    /// compiling until it is named there — and then this number and the tables
-    /// below have to be brought up to date, which is the point.
     const VARIANTS: usize = 45;
 
     /// The variant's own name, for a test that has to say which one it means.
-    ///
-    /// [`Error::name`] itself, so that what the tables below enumerate is the
-    /// contract rather than a copy of it.
     fn name(error: &Error) -> &'static str {
         error.name()
     }
@@ -1080,13 +773,9 @@ mod tests {
     }
 
     /// Every failure that means the archive's own bytes are wrong.
-    ///
-    /// `Inflate` belongs here and was `Io`: every byte asked for arrived and
-    /// then failed to decode. DR-010.
     fn corrupt() -> Vec<Error> {
         vec![
-            // The bytes name a container and then do not hold one. The other
-            // spelling of this variant is in `refused()`.
+            // The other spelling of this variant is in `refused()`.
             Error::NotAnArchive {
                 base: 0,
                 found: crate::format::Version::Rpf7.magic(),
@@ -1142,8 +831,6 @@ mod tests {
                 declared: 200_044,
                 used: 44,
             },
-            // The archive's bytes are not the bytes recorded for them, which is
-            // a fact about the archive and not about the request. DR-023.
             Error::ChecksumMismatch {
                 entry: 0,
                 recorded: crate::manifest::Checksum::of(b"as extracted"),
@@ -1153,22 +840,14 @@ mod tests {
                 checked: 27,
                 failed: 1,
             },
-            // A metadata payload's own bytes are wrong, which is the same
-            // fact one layer up: the container handed over exactly what it
-            // held and the tokens in it do not parse.
             Error::BadRbf {
                 offset: 7,
                 cause: crate::metadata::rbf::Malformed::Truncated,
             },
-            // The same fact for the other binary encoding. Added when
-            // `the_variant_count_is_the_one_the_enum_declares` caught the enum
-            // growing past the tables — which is what it is for.
             Error::BadPso {
                 offset: 7,
                 cause: crate::metadata::pso::Malformed::NotPso,
             },
-            // And for the third encoding, whose bytes are a resource's paged
-            // payload rather than a file with a magic at the front.
             Error::BadMeta {
                 offset: 0x10,
                 cause: crate::metadata::meta::Malformed::NotMeta,
@@ -1177,13 +856,9 @@ mod tests {
     }
 
     /// Every failure that means the request, or the input it carried, was
-    /// wrong. All but `Overlapping` were `Corrupt`, and so blamed the archive
-    /// for what the caller passed. DR-010.
+    /// wrong.
     fn refused() -> Vec<Error> {
         vec![
-            // Bytes that never claimed to be a container. Nothing about them
-            // is malformed; the request that called them an archive was wrong.
-            // DR-019.
             Error::NotAnArchive {
                 base: 512,
                 found: *b"hell",
@@ -1216,14 +891,9 @@ mod tests {
                 path: "../escape".to_owned(),
                 reason: "leaves the archive",
             },
-            // A path a change would create and something is already at. The
-            // archive is intact; what the caller asked for cannot be done.
-            // DR-026.
             Error::AlreadyExists {
                 path: "data/notes.txt".to_owned(),
             },
-            // A second change at one path of a set that holds one per path.
-            // DR-032.
             Error::Claimed {
                 path: "data/notes.txt".to_owned(),
                 held: "a rename",
@@ -1241,19 +911,14 @@ mod tests {
                 found: "directory",
                 wanted: "file",
             },
-            // The XML is the caller's, so the caller is who acts on it.
             Error::NotRbfXml {
                 position: 12,
                 cause: crate::metadata::rbf::NotRbf::Empty,
             },
-            // And the `PSO` document is the caller's twice over: it says the
-            // payload it was given beside is not the one it describes.
             Error::NotPsoXml {
                 position: 12,
                 cause: crate::metadata::pso::NotPsoXml::Empty,
             },
-            // And a `Meta` document says the same thing about the resource
-            // payload it was written from. DR-049.
             Error::NotMetaXml {
                 position: 12,
                 cause: crate::metadata::meta::NotMetaXml::Empty,
@@ -1335,18 +1000,12 @@ mod tests {
                 Category::NotFound,
             ),
             (Error::Cancelled { done: 1, total: 24 }, Category::Cancelled),
-            // Nothing is wrong with the payload; this build has no way to
-            // render it. The same shape as `UnsupportedVersion`: whoever holds
-            // it cannot act, because the missing part is here.
             (
                 Error::UnrepresentableRbf {
                     cause: crate::metadata::rbf::Unrepresentable::EmptyBlob,
                 },
                 Category::Unsupported,
             ),
-            // A `(type, subtype)` pair outside the 37 the corpus carries: the
-            // payload is fine and this build cannot render it, which is
-            // `UnsupportedVersion`'s shape once more.
             (
                 Error::UnsupportedPso {
                     cause: crate::metadata::pso::Unsupported::DataType {
@@ -1356,9 +1015,6 @@ mod tests {
                 },
                 Category::Unsupported,
             ),
-            // A `Meta` type code outside the 23 this build names: the same
-            // shape again, and the table it is the complement of is
-            // `secondary` rather than measured.
             (
                 Error::UnsupportedMeta {
                     cause: crate::metadata::meta::Unsupported::DataType { code: 0xFF },
@@ -1384,8 +1040,7 @@ mod tests {
 
     #[test]
     fn every_variant_carries_the_category_it_is_contracted_to() {
-        // §10 makes the variant set the public contract and R6.3 derives the
-        // exit code from it, so a category that moves is a contract that moved.
+        // A category that moves is a contract that moved.
         for (error, expected) in taxonomy() {
             assert_eq!(
                 error.category(),
@@ -1399,11 +1054,7 @@ mod tests {
 
     #[test]
     fn what_the_bytes_claim_decides_who_has_to_act_on_them() {
-        // DR-019. The four bytes are the only thing that ever says an archive
-        // is here — nothing in an entry row marks a payload as one, which is
-        // why every walk sniffs. So bytes that name a container and then fail
-        // to hold one are a malformed archive, and bytes that name nothing are
-        // a request that called an ordinary file an archive.
+        // The four bytes are the only thing that ever says an archive is here.
         for (found, expected) in [
             (crate::format::Version::Rpf7.magic(), Category::Corrupt),
             (*b"RPF2", Category::Corrupt),
@@ -1418,8 +1069,8 @@ mod tests {
 
     #[test]
     fn the_taxonomy_covers_every_variant() {
-        // `NotAnArchive` is listed twice, once per category, because its
-        // category is decided by the bytes it carries. DR-019.
+        // `NotAnArchive` is listed twice because its category is decided by
+        // the bytes it carries.
         let named: BTreeSet<&str> = taxonomy().iter().map(|(error, _)| name(error)).collect();
         assert_eq!(
             named.len(),
@@ -1431,10 +1082,8 @@ mod tests {
 
     /// Every variant [`Error`] declares, read off this file.
     ///
-    /// The enum is `rustfmt`-formatted, so a variant is a line of exactly four
-    /// spaces, an upper-case letter, and an opening brace; a field is
-    /// lower-case, a doc comment begins `///` and an attribute `#[`. Nothing
-    /// else sits at that indentation.
+    /// A variant is the only thing at four spaces of indentation beginning
+    /// with an upper-case letter.
     fn declared_variants() -> Vec<String> {
         let source = include_str!("error.rs");
         let mut found = Vec::new();
@@ -1463,19 +1112,8 @@ mod tests {
 
     #[test]
     fn the_variant_count_is_the_one_the_enum_declares() {
-        // The test above compares two things that are both written by hand:
-        // the taxonomy tables and `VARIANTS`. **Neither is the enum.** Adding a
-        // variant makes `Error::name` fail to compile until it is named there,
-        // and then nothing at all requires the tables or the count to follow —
-        // so both stay as they were, `named.len()` stays equal to `VARIANTS`,
-        // and the taxonomy test passes while covering one variant fewer than
-        // there are. That has now happened twice: `VARIANTS` sat at 29 against
-        // 30 arms, and again at 31 when `WrongKey` arrived against 32.
-        //
-        // This is the third party. It reads the declaration itself, so a new
-        // variant makes the count wrong here whatever anybody remembered to
-        // update — and the only way to make it right again is to add the
-        // variant to the tables, which is what was wanted in the first place.
+        // Neither the tables nor `VARIANTS` is the enum: this reads the
+        // declaration itself, so a new variant makes the count wrong here.
         let declared = declared_variants();
         assert!(
             declared.len() > 20,
@@ -1488,9 +1126,7 @@ mod tests {
             declared.len()
         );
 
-        // And the tables name those variants and no others, so a count that
-        // matches by coincidence — one variant dropped and another added — is
-        // not enough either.
+        // A count that matches by coincidence is not enough.
         let named: BTreeSet<&str> = taxonomy().iter().map(|(error, _)| name(error)).collect();
         let declared: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
         assert_eq!(

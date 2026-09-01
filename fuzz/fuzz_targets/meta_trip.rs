@@ -1,24 +1,10 @@
 //! The `Meta` round trip: read a payload, write its XML, apply that XML back
 //! unmodified, and require the payload to be unchanged.
 //!
-//! **The law `every_shipped_meta_file_round_trips_byte_for_byte` states, over
-//! payloads no corpus holds.** That test is R5.8b's exit criterion and it can
-//! only ever speak about the 49,614 files both installs ship; a mutator reaches
-//! the files a packer would never write, and the write direction is where this
-//! build has already been found wrong — `3374139` fixed `apply` writing past
-//! the value it was editing and silently dropping edits it had accepted.
-//!
-//! Why the round trip and not just "did not panic": `to_xml` and `from_xml` are
-//! two halves of one build, and a payload this build wrote a document for that
-//! this build then refuses — or applies back to different bytes — is DR-039's
-//! shape one layer up from the archive. The document here is `to_xml`'s own
-//! output, **unmodified**, so every difference is the library's: the file
-//! carries page slack, inter-table padding and the 2.48% of itself no walk
-//! reaches (DR-049), none of which the document can carry, so `from_xml` edits
-//! the payload it was given and an unmodified document must edit nothing.
-//!
-//! `meta_apply.rs` attacks the same direction from the other side, with
-//! documents that are *not* what `to_xml` wrote.
+//! `to_xml` and `from_xml` are two halves of one build, so a payload this build
+//! wrote a document for and then refuses is a defect. The document is `to_xml`'s
+//! own output, unmodified, so `from_xml` edits the payload it was given and
+//! must edit nothing.
 
 #![no_main]
 

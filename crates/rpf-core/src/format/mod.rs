@@ -1,30 +1,6 @@
-//! The container version seam.
-//!
-//! One procedure — locate, parse the table of contents, resolve a name, compute
-//! a payload span, decode, fit-or-rebuild, cascade — over one encoder/decoder
-//! per version. That procedure is `archive`, `patch` and `build`; the encodings
-//! underneath it are here, and [`rpf7`] is the only one. DR-012.
-//!
-//! **An enum, not a `dyn` trait.** A row is a fixed-size array whose length is
-//! the version's, and a trait object cannot return one without allocating.
-//! [`Version`] dispatches statically, [`Row`] is an enum over the widths, and a
-//! version nobody handled is a compile error rather than a `None`.
-//!
-//! **What varies, and is therefore here**: the magic and its byte order, the
-//! header's length and layout, the entry row's width and packing, the unit an
-//! offset counts in, the encryption tag that means "not encrypted", and whether
-//! names are strings, hashes or absent. `docs/rpf-format.md`, "What varies
-//! between versions, and what does not" — `secondary` for every version but
-//! this one.
-//!
-//! **What does not vary is not here**: [`same_name`] and [`folded`] are how
-//! *this crate* resolves a path, and [`unsupported_version`] recognises a
-//! version in order to refuse it rather than to decode anything on the strength
-//! of it. `docs/rpf-format.md` marks that magic table `secondary`, which is
-//! enough for a refusal that names the version and for nothing else.
-//!
-//! Nothing here does I/O. These are the measured facts of the format and the
-//! pure functions over them, so that they can be tested without an archive.
+//! The container version seam: what varies between container versions, and the
+//! pure functions over it. [`rpf7`] is the only encoding this build reads;
+//! [`unsupported_version`] recognises the others in order to refuse them.
 
 pub mod crypto;
 pub mod resource;
@@ -37,72 +13,44 @@ use crate::{
     error::{Error, Result},
 };
 
-// `RSC7` is what a resource payload is, not what the container is, and
-// `docs/rpf-format.md` records six other resource magics against versions this
-// build does not read. The module below is where those facts live; these three
-// names are re-exported because `inspect` and the `rpf` binary reach them by
-// this path and neither file is this change's to edit.
+// Re-exported because `inspect` and the `rpf` binary reach them by this path.
 pub use resource::{MAGIC_RSC7, RESOURCE_HEADER_LEN, resource_len};
 
-/// A container version this build reads.
-///
-/// Closed on purpose: an unimplemented version is recognised by
-/// [`unsupported_version`] and refused by its own name, never parsed. Adding a
-/// variant is adding a codec, which DR-012 forbids before an archive of that
-/// version is in the corpus.
+/// A container version this build reads. Closed on purpose: an unimplemented
+/// version is refused by its own name, never parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Version {
     /// GTA V Legacy and Enhanced, and `FiveM`. [`rpf7`].
-    ///
-    /// `docs/rpf-format.md`, Version map — the one row that is `verified`.
     Rpf7,
 }
 
-/// The compressor a version's payloads are written with.
-///
-/// Recorded beside the version rather than derived from it, because it is not
-/// the version's to decide: `docs/rpf-format.md` reads `RPF6` as raw deflate on
-/// the 2010 consoles and zstd on the 2023 ports at one version number,
-/// `secondary`. DR-012.
+/// The compressor a version's payloads are written with, recorded beside the
+/// version rather than derived from it: one version number can carry two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     /// Raw DEFLATE — a zlib stream with the two-byte header removed, inflated
     /// with a window of -15.
-    ///
-    /// `docs/rpf-format.md`, Compression, `verified`.
     Deflate,
 }
 
 /// A length that is an array bound in one place and a byte offset in another.
-///
-/// Widening, not narrowing — §6's rule is about the other direction, and
-/// `usize::try_from` is not `const`, which is what the array bounds behind this
-/// need it to be.
+/// Widening only, and `const`, which `usize::try_from` is not.
 pub(crate) const fn widen(len: usize) -> u64 {
     len as u64
 }
 
-/// The most bytes any version's header occupies.
-///
-/// A reader fills this much before it knows which version it is looking at, and
-/// hands over however much of it there was.
+/// The most bytes any version's header occupies: a reader fills this much
+/// before it knows which version it is looking at.
 pub const MAX_HEADER_LEN: usize = rpf7::HEADER_LEN;
 
-/// The fewest bytes any version's header occupies.
-///
-/// Short of this, the bytes are not an archive of any version: nothing past the
-/// magic can be trusted, so the magic is not worth reading a version out of
-/// either.
+/// The fewest bytes any version's header occupies. Short of this, nothing past
+/// the magic can be trusted, so the magic is not read either.
 const MIN_HEADER_LEN: usize = rpf7::HEADER_LEN;
 
 impl Version {
     /// Every version this build has a codec for.
-    ///
-    /// A test walks it, so a property asserted of `RPF7` is asserted of the
-    /// second codec on the day it is added rather than the day someone
-    /// remembers.
     pub const ALL: &'static [Self] = &[Self::Rpf7];
 
     /// The version whose magic these four bytes are, or `None` for every other
@@ -124,8 +72,7 @@ impl Version {
         }
     }
 
-    /// The version number, as `docs/rpf-format.md` and every error message
-    /// spell it.
+    /// The version number, as every error message spells it.
     #[must_use]
     pub const fn number(self) -> u8 {
         match self {
@@ -158,13 +105,9 @@ impl Version {
         }
     }
 
-    /// Whether a **resource** payload of this length — or a compressed-size
-    /// field carrying this value — leaves the row saying nothing about the
-    /// payload's extent.
-    ///
-    /// The version's spelling of [`rpf7::size_field_saturates`], and the only
-    /// one: the writer asks it of a payload it holds and the reader asks it of
-    /// a field it read, so neither can decide the boundary for itself.
+    /// Whether a resource payload of this length — or a compressed-size field
+    /// carrying this value — leaves the row saying nothing about the payload's
+    /// extent. The only spelling of that boundary, asked by both sides.
     pub(crate) const fn size_field_saturates(self, len: u64) -> bool {
         match self {
             Self::Rpf7 => rpf7::size_field_saturates(len),
@@ -172,12 +115,8 @@ impl Version {
     }
 
     /// The length a resource payload's transform is keyed by, given the
-    /// payload's length on disk.
-    ///
-    /// [`rpf7::resource_key_len`] carries the rule and the reasoning. The two
-    /// sites that key a resource payload — `Archive::resource_cipher` on the
-    /// way in and `view::Resource::seal_from` on the way out — derive it here
-    /// and nowhere else. DR-063.
+    /// payload's length on disk. Both the read and the write side derive it
+    /// here and nowhere else; [`rpf7::resource_key_len`] carries the rule.
     pub(crate) const fn resource_key_len(self, len: u64) -> u64 {
         match self {
             Self::Rpf7 => rpf7::resource_key_len(len),
@@ -207,11 +146,8 @@ impl Version {
     }
 
     /// Whether a binary entry carrying this value in its own encryption field
-    /// is stored in the clear.
-    ///
-    /// Asked of the **entry's** field, not the archive's tag; an entry in an
-    /// unencrypted archive is in the clear whatever this says, which is why
-    /// both questions are asked.
+    /// is stored in the clear. Asked of the entry's field, not the archive's
+    /// tag; both questions have to be asked.
     #[must_use]
     pub const fn entry_is_open(self, encryption: u32) -> bool {
         match self {
@@ -220,12 +156,8 @@ impl Version {
     }
 
     /// Which transform an archive carrying this tag is under, and under which
-    /// key, or `None` when nothing this build holds opens it.
-    ///
-    /// `None` covers two situations a caller must not confuse: a tag that means
-    /// "not encrypted" ([`Version::is_open`] is the question for that), and a
-    /// tag that is encrypted under something this build has no transform for.
-    /// Asking both questions is what tells them apart.
+    /// key, or `None` — which covers both "not encrypted", the question
+    /// [`Version::is_open`] answers, and a tag with no transform here.
     #[must_use]
     pub const fn scheme(self, tag: u32) -> Option<crypto::Scheme> {
         match self {
@@ -234,22 +166,8 @@ impl Version {
     }
 
     /// The lowest offset, relative to an archive's base, that a payload may
-    /// occupy: past the header, the entry table and the names blob, and nothing
-    /// else.
-    ///
-    /// One sum, two readers. `Archive` checks an entry's payload offset against
-    /// it so that no payload addresses the archive's own structure, and `build`
-    /// aligns the first payload up from it. Written twice, the reader and the
-    /// writer would be free to disagree about where an archive's contents
-    /// begin.
-    ///
-    /// Saturating rather than checked, and both callers are why:
-    /// `Archive::parse` has already fitted all three regions inside the
-    /// archive's length before it asks, and `build` has already refused an entry
-    /// count that does not fit a `u32`. There is no second failure left to
-    /// report.
-    ///
-    /// `docs/rpf-format.md`, Layout, `verified`.
+    /// occupy: past the header, the entry table and the names blob. One sum for
+    /// the reader that checks against it and the writer that aligns up from it.
     #[must_use]
     pub const fn payload_floor(self, entry_count: u64, names_len: u64) -> u64 {
         self.header_len()
@@ -257,18 +175,9 @@ impl Version {
             .saturating_add(names_len)
     }
 
-    /// Whether one entry row of this version is **exactly one cipher block**,
-    /// on a block boundary of the transform that covers the entry table.
-    ///
-    /// True for `RPF7`, and it is what lets an in-place patch rewrite one row
-    /// of an encrypted archive without touching the rest of the table: the
-    /// header is 16 bytes, a row is 16, the transform runs from the table's own
-    /// start and neither transform chains between blocks, so row *i* is cipher
-    /// block *i*. `docs/rpf-format.md`, Entry table, `verified`.
-    ///
-    /// Asked rather than assumed, because it is a coincidence of three numbers
-    /// and not a rule the format states: `RPF6`'s row is 20 bytes and `RPF8`'s
-    /// 24 (`secondary`), and neither would divide a block.
+    /// Whether one entry row of this version is exactly one cipher block, on a
+    /// block boundary of the transform that covers the entry table. True for
+    /// `RPF7`, which is what lets an in-place patch rewrite one row.
     #[must_use]
     pub const fn row_is_a_cipher_block(self) -> bool {
         let block = widen(crypto::CIPHER_BLOCK_LEN);
@@ -285,10 +194,7 @@ impl Version {
     }
 
     /// Whether a payload of this length fits the compressed-size field of this
-    /// version's row.
-    ///
-    /// Asked by the writer before it chooses to deflate: a deflated form the
-    /// row cannot describe is not a smaller archive, it is a truncated field.
+    /// version's row. Asked by the writer before it chooses to deflate.
     #[must_use]
     pub const fn holds_compressed_len(self, len: u64) -> bool {
         match self {
@@ -346,23 +252,9 @@ impl Version {
 }
 
 /// The container version named by the four bytes at an archive's base, when it
-/// is a version this build does not read.
-///
-/// A magic this answers `Some` for is by construction one that cannot be
-/// opened, which leaves the caller nothing to finish (§4): every implemented
-/// version is [`Version::of`]'s, and answers `None` here.
-///
-/// **Both byte orders are recognised**, because the convention changes at
-/// version 6. `RPF0` to `RPF4` and console `RPF7` are stored `'R','P','F',n`
-/// and read as `RPFn` on disk; PC `RPF7` and `RPF8` are stored reversed and
-/// read as `7FPR` and `8FPR`. So an archive reading `RPF7` here is the console
-/// spelling of version 7, which is a version this build does not read either.
-///
-/// `docs/rpf-format.md`, "The magic word changes byte order at version 6" —
-/// **`secondary`**, read from reference implementations rather than measured
-/// here. That is enough for this and for nothing else: a version recognised
-/// wrongly costs a less exact refusal, where a version *decoded* wrongly is the
-/// failure `AGENTS.md` records. DR-012.
+/// is a version this build does not read. Both byte orders are recognised: the
+/// convention changes at version 6, and PC `RPF7` and `RPF8` are stored
+/// reversed as `7FPR` and `8FPR`.
 #[must_use]
 pub fn unsupported_version(magic: [u8; 4]) -> Option<u8> {
     if Version::of(magic).is_some() {
@@ -377,11 +269,8 @@ pub fn unsupported_version(magic: [u8; 4]) -> Option<u8> {
     digit.checked_sub(b'0')
 }
 
-/// What an archive's header says about it.
-///
-/// The magic is not a field: a [`Header`] cannot exist without it having
-/// matched, and which version it matched is [`Header::version`]. The archive's
-/// length is not in the header at all.
+/// What an archive's header says about it. The magic is not a field: a
+/// [`Header`] cannot exist without it having matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     /// The version that wrote it.
@@ -395,11 +284,9 @@ pub struct Header {
 }
 
 impl Header {
-    /// The header these bytes are, or why they are not one.
-    ///
-    /// `bytes` is however much of the archive's first [`MAX_HEADER_LEN`] bytes
-    /// there turned out to be, and `base` is where they came from — a nested
-    /// archive's header is at its own base, not at zero.
+    /// The header these bytes are, or why they are not one. `bytes` is however
+    /// much of the first [`MAX_HEADER_LEN`] there was; `base` is where they
+    /// came from, which for a nested archive is its own base.
     ///
     /// # Errors
     ///
@@ -411,16 +298,14 @@ impl Header {
             .get(0..4)
             .and_then(|start| start.try_into().ok())
             .unwrap_or_default();
-        // Too short to hold the shortest header there is: nothing past the
-        // magic can be trusted, so the magic is not worth reading a version out
-        // of either.
+        // Nothing past the magic can be trusted, so the magic is not worth
+        // reading a version out of either.
         if bytes.len() < MIN_HEADER_LEN {
             return Err(Error::NotAnArchive { base, found: magic });
         }
         let Some(version) = Version::of(magic) else {
-            // The version is in the first four bytes, and discarding it
-            // reported a sound archive of another version as a malformed one.
-            // DR-012.
+            // Discarding the version would report a sound archive of another
+            // version as a malformed one.
             return Err(match unsupported_version(magic) {
                 Some(version) => Error::UnsupportedVersion {
                     base,
@@ -445,12 +330,8 @@ impl Header {
     }
 }
 
-/// One row of the entry table, in the width its version gives it.
-///
-/// An enum over fixed-size arrays rather than a `Vec` or a trait object: the
-/// row is 16 bytes at `RPF7`, 20 at `RPF6` and 24 at `RPF8`
-/// (`docs/rpf-format.md`, `secondary` for both of the latter), and a writer
-/// that had to allocate one per entry would allocate one per entry.
+/// One row of the entry table, in the width its version gives it: an enum over
+/// fixed-size arrays, so a writer allocates nothing per entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row(RowBytes);
 
@@ -470,13 +351,8 @@ impl Row {
         }
     }
 
-    /// The same row under `seal`, for an archive whose entry table is
-    /// encrypted.
-    ///
-    /// Sound for one row on its own only where [`Version::row_is_a_cipher_block`]
-    /// holds, which is the caller's to ask: the transform covers the entry
-    /// table from the table's own start, so a row that is not a whole aligned
-    /// block cannot be sealed without the rows around it.
+    /// The same row under `seal`. Sound for one row on its own only where
+    /// [`Version::row_is_a_cipher_block`] holds, which is the caller's to ask.
     #[must_use]
     pub fn sealed(self, seal: &crypto::Seal) -> Self {
         match self.0 {
@@ -489,12 +365,8 @@ impl Row {
 }
 
 /// The fields of one file's entry row, in the widths the version has yet to
-/// narrow them to.
-///
-/// Wide on purpose: a value the version's field cannot hold arrives here to be
-/// refused by [`Version::file_row`] rather than being quietly cut down on the
-/// way. A compressed size written as the low three bytes of a wider value
-/// describes a fraction of its own payload and reads back without complaint.
+/// narrow them to. Wide on purpose, so [`Version::file_row`] can refuse a
+/// value rather than quietly cut it down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileFields {
     /// Offset of the entry's name within the names blob.
@@ -507,12 +379,9 @@ pub struct FileFields {
     pub content: Content,
 }
 
-/// What a file's payload is.
-///
-/// Two variants rather than two words whose meaning depends on a flag (§5):
-/// offsets 8 and 12 of an `RPF7` row are an uncompressed size and an encryption
-/// word on a binary entry and two page-flag words on a resource, and a single
-/// struct carrying both readings is a bug waiting for its first resource.
+/// What a file's payload is. Offsets 8 and 12 of an `RPF7` row are an
+/// uncompressed size and an encryption word on a binary entry, and two
+/// page-flag words on a resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Content {
     /// Plain bytes.
@@ -542,16 +411,9 @@ pub struct NamesPlan {
     pub offsets: Vec<u32>,
 }
 
-/// Where one entry's name lies in the names blob.
-///
-/// A span rather than an owned `String`, because nothing stops an archive
-/// pointing every entry at one long name: materialising each copy makes the
-/// cost of *opening* the archive `entry_count × names_len`. Measured before
-/// this was a span — 40,000 entries over a 40,000-byte blob, a 680,016-byte
-/// file — 1,980,317,696 bytes of resident memory in 4.2 seconds, and ~7 MB of
-/// input would have asked for ~200 GB. `Archive::open` is on the path of every
-/// command and every daemon session, so that is a small file away from every
-/// caller.
+/// Where one entry's name lies in the names blob. A span rather than an owned
+/// `String`: nothing stops an archive pointing every entry at one long name,
+/// which would make opening it cost `entry_count × names_len`.
 #[derive(Debug, Clone, Copy)]
 struct Span {
     /// Offset into the names blob.
@@ -560,12 +422,9 @@ struct Span {
     len: u32,
 }
 
-/// Every entry's name, in the form its version stores them.
-///
-/// Names do not universalise: `docs/rpf-format.md` reads strings at versions 0,
-/// 2, 4 and 7 and **hashes** at 3, 6 and 8, all `secondary` but for this one. A
-/// reader that assumes a names blob exists gets three versions wrong, so the
-/// shape is behind the seam and `Archive` asks this type rather than the bytes.
+/// Every entry's name, in the form its version stores them. Names do not
+/// universalise — some versions store hashes rather than strings — so the
+/// shape stays behind the seam and `Archive` asks this type.
 #[derive(Debug, Clone)]
 pub struct Names(Stored);
 
@@ -584,10 +443,8 @@ enum Stored {
 
 impl Names {
     /// Locates every entry's name, refusing anything the version's encoding
-    /// cannot account for.
-    ///
-    /// Done once, at parse, so that [`Names::at`] has nothing left to find
-    /// (§5).
+    /// cannot account for. Done once, so [`Names::at`] has nothing left to
+    /// find.
     ///
     /// # Errors
     ///
@@ -607,9 +464,7 @@ impl Names {
     ///
     /// [`Error::NoSuchEntry`] if the index is past the end, and
     /// [`Error::BadName`] if the bytes at the entry's name offset are not
-    /// UTF-8. Every name in the sample is ASCII; refusing the rest is §6's
-    /// answer for third-party bytes, and it is a name the caller can be shown
-    /// rather than a repair it cannot check.
+    /// UTF-8.
     pub fn at(&self, index: u32) -> Result<&str> {
         let Stored::Blob { blob, spans } = &self.0;
         let span = usize::try_from(index)
@@ -641,14 +496,8 @@ impl Names {
 }
 
 /// The little-endian `u16` at `at`, or `None` if `bytes` is too short to hold
-/// one there.
-///
-/// Every fixed-width field of every version read here is little-endian —
-/// `docs/rpf-format.md` records `RPF6` as big-endian throughout, `secondary`,
-/// and there is no codec for it — so every reader of one comes through here or
-/// its two siblings. They return an `Option` rather than defaulting, because
-/// the caller is the only one that knows whether a short buffer is impossible
-/// or is the malformed input §6 is about.
+/// one there. Every fixed-width field this build reads is little-endian, and
+/// only the caller knows whether a short buffer is possible.
 #[must_use]
 pub fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
     let end = at.checked_add(2)?;
@@ -657,10 +506,8 @@ pub fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
 }
 
 /// The little-endian 24-bit field at `at`, widened, or `None` if `bytes` is too
-/// short to hold one there.
-///
-/// Three bytes, not four: an `RPF7` entry's compressed size and its block
-/// offset are both this width. `docs/rpf-format.md`, Entry table, `verified`.
+/// short to hold one there: an `RPF7` entry's compressed size and its block
+/// offset are both three bytes wide.
 #[must_use]
 pub fn u24_at(bytes: &[u8], at: usize) -> Option<u32> {
     let end = at.checked_add(3)?;
@@ -678,32 +525,16 @@ pub fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(raw))
 }
 
-/// Whether two names address the same entry.
-///
-/// Path components resolve case-insensitively here — `Archive::child_named`
-/// folds, and `find`, `locate` and `split_at_file` all go through it — so two
-/// children of one directory differing only in case are one name, and the
-/// second is unreachable by any spelling of its own path.
-///
-/// That archives *are* stored in ascending name order is `verified`
-/// (`docs/rpf-format.md`, Entry ordering); that the runtime *requires*
-/// case-folded resolution is `docs/backlog.md` Q1 and is not measured. What is
-/// settled is that this crate resolves that way, which is the whole reason
-/// `build` has to refuse a collision it could not address afterwards.
+/// Whether two names address the same entry. Path components resolve
+/// case-insensitively, so two children of one directory differing only in case
+/// are one name and the second is unreachable.
 #[must_use]
 pub fn same_name(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-/// The key a name is unique under among its siblings.
-///
-/// Exactly the equivalence [`same_name`] tests — `folded(a) == folded(b)` if
-/// and only if `same_name(a, b)`, and a test below says so — as a value that
-/// can go in a map, which is what a writer needs to catch a collision before it
-/// writes one. Two spellings of one rule in one place, rather than one spelling
-/// in the reader and another in the writer: they were in two places, and the
-/// writer packed `X64` and `x64` as separate directories that no reader could
-/// tell apart.
+/// The key a name is unique under among its siblings: exactly the equivalence
+/// [`same_name`] tests, as a value a writer can put in a map.
 #[must_use]
 pub fn folded(name: &str) -> String {
     name.to_ascii_lowercase()
@@ -715,16 +546,8 @@ mod tests {
 
     #[test]
     fn the_row_is_a_cipher_block_only_because_three_numbers_agree() {
-        // `Version::row_is_a_cipher_block` reads as a property of the format
-        // and is a coincidence of three constants, which is what its doc
-        // comment says and what nothing checked. A mutation sweep of `93c5006`
-        // found both of its operands unkillable — `Version` has one variant, so
-        // `-> true` and `&& -> ||` are indistinguishable for every input that
-        // exists — and an equivalent mutant is not a missing test for the
-        // function. It is a missing test for the coincidence: an in-place patch
-        // of one row of an encrypted table is sound only while these three
-        // agree, so a change to any of them fails here rather than in an
-        // archive the game refuses to load.
+        // An in-place patch of one row of an encrypted table is sound only
+        // while these three constants agree.
         assert_eq!(rpf7::ROW_LEN, crypto::CIPHER_BLOCK_LEN);
         assert_eq!(rpf7::HEADER_LEN % crypto::CIPHER_BLOCK_LEN, 0);
         assert!(Version::Rpf7.row_is_a_cipher_block());
@@ -732,8 +555,8 @@ mod tests {
 
     #[test]
     fn a_field_read_past_the_end_is_none_rather_than_a_panic() {
-        // §6: the buffer is an archive's bytes, and an entry table can end
-        // mid-row. Every one of these is a slice index in disguise.
+        // An entry table can end mid-row, and every one of these is a slice
+        // index in disguise.
         let row = [0x01_u8, 0x02, 0x03];
         assert_eq!(u16_at(&row, 0), Some(0x0201));
         assert_eq!(u24_at(&row, 0), Some(0x0003_0201));
@@ -745,12 +568,8 @@ mod tests {
 
     #[test]
     fn a_binary_entry_is_in_the_clear_only_when_its_own_field_is_zero() {
-        // `docs/rpf-format.md`, Entry table, `verified`: the per-entry
-        // encryption field takes exactly two values across both installs, 0 on
-        // 27,276 binary entries and 1 on 64,300, and 1 means the payload is
-        // under the archive's transform. Neither `ENTRY_OPEN` nor
-        // `entry_is_open` had a test at all, and this one decides whether a
-        // payload is decrypted.
+        // The per-entry encryption field takes two values: 0 in the clear, 1
+        // under the archive's transform.
         let version = Version::Rpf7;
         assert_eq!(rpf7::ENTRY_OPEN, 0);
         assert!(version.entry_is_open(rpf7::ENTRY_OPEN));
@@ -762,30 +581,21 @@ mod tests {
             );
         }
         // The archive's tag and the entry's field are different questions over
-        // different numbers, which is easy to lose: `ENCRYPTION_OPEN` is not a
-        // value this field ever carries.
+        // different numbers.
         assert!(!version.entry_is_open(version.open()));
     }
 
     #[test]
     fn the_payload_floor_is_the_three_regions_before_it() {
-        // The sample: 11 entries and a 144-byte names blob.
+        // Eleven entries and a 144-byte names blob.
         let version = Version::Rpf7;
         assert_eq!(version.payload_floor(11, 144), 16 + 11 * 16 + 144);
         assert_eq!(version.payload_floor(0, 0), version.header_len());
     }
 
     /// The writer's guard against choosing a deflated form the row cannot
-    /// describe, tested on the side where it says no as well as the side where
-    /// it says yes.
-    ///
-    /// Only the yes was ever asked, so a predicate that agreed to everything
-    /// left the suite green: the fallback to stored storage that keeps a
-    /// 24-bit field from being handed a 25-bit length is the decision this
-    /// makes, and §3's own example is the entry that described a fraction of
-    /// its own payload.
-    ///
-    /// `docs/rpf-format.md`, Entry table: the compressed size is three bytes.
+    /// describe, on the side where it says no as well as the side where it
+    /// says yes. The compressed size is three bytes.
     #[test]
     fn the_compressed_size_field_is_three_bytes_wide_in_both_directions() {
         let version = Version::Rpf7;
@@ -806,14 +616,14 @@ mod tests {
         let version = Version::Rpf7;
         assert_eq!(version.row_at(0), Some(version.header_len()));
         assert_eq!(version.row_at(10), Some(16 + 10 * 16));
-        // The one arithmetic that can fail: an index whose row is past `u64`.
+        // The one arithmetic that could fail: a row past `u64`.
         assert!(version.row_at(u32::MAX).is_some());
     }
 
     #[test]
     fn folding_a_name_and_comparing_two_are_the_same_rule() {
-        // The two spellings exist because one has to go in a map and the other
-        // is on the path of every lookup. They must not be able to disagree.
+        // One spelling goes in a map and the other is on the path of every
+        // lookup; they must not be able to disagree.
         const NAMES: &[&str] = &[
             "x64",
             "X64",
@@ -838,10 +648,8 @@ mod tests {
 
     #[test]
     fn every_other_version_is_recognised_in_both_byte_orders() {
-        // The convention changes at version 6: `RPF0`-`RPF4` and console `RPF7`
-        // read as `RPFn` on disk, PC `RPF7` and `RPF8` read reversed. A reader
-        // that sniffs one order reports half of them as "not an archive".
-        // `docs/rpf-format.md`, the magic table, `secondary`.
+        // The convention changes at version 6, so a reader that sniffs one
+        // order reports half of these as "not an archive".
         for (magic, version) in [
             (*b"RPF0", 0_u8),
             (*b"RPF2", 2),
@@ -858,19 +666,15 @@ mod tests {
 
     #[test]
     fn the_console_spelling_of_rpf7_is_a_version_this_build_does_not_read() {
-        // `RPF7` on disk is version 7 stored the other way round, and this
-        // build reads the `7FPR` spelling. Answering `None` for it would report
-        // a sound archive as malformed, which is the whole defect.
+        // `RPF7` on disk is version 7 the other way round; this build reads
+        // the `7FPR` spelling.
         assert_eq!(unsupported_version(*b"RPF7"), Some(7));
     }
 
     #[test]
     fn a_versions_number_is_the_digit_its_own_magic_carries() {
-        // The two are one fact spelt twice — the magic is `'R','P','F',n` or
-        // its reverse — and they must not be able to drift, because the number
-        // is what a refusal names and the magic is what it was recognised by.
-        // Found by mutation: changing `rpf7::NUMBER` alone left the suite
-        // green.
+        // One fact spelt twice: the number is what a refusal names and the
+        // magic is what it was recognised by, so they must not drift.
         for &version in Version::ALL {
             let magic = version.magic();
             let digit = magic
@@ -888,8 +692,8 @@ mod tests {
 
     #[test]
     fn the_version_this_build_reads_is_never_named_as_one_it_does_not() {
-        // §4: the caller has nothing left to decide. A magic this answers
-        // `Some` for is by construction one that cannot be opened.
+        // A magic this answers `Some` for is by construction one that cannot
+        // be opened.
         assert_eq!(unsupported_version(Version::Rpf7.magic()), None);
         assert_eq!(Version::of(Version::Rpf7.magic()), Some(Version::Rpf7));
     }
@@ -904,7 +708,7 @@ mod tests {
 
     #[test]
     fn a_header_of_another_version_is_refused_by_its_own_name() {
-        // Not `Corrupt`: nothing is malformed. DR-010's amendment, DR-012.
+        // Not `Corrupt`: nothing is malformed.
         let mut bytes = vec![0_u8; MAX_HEADER_LEN];
         bytes.splice(0..4, *b"RPF2");
         assert!(matches!(
@@ -919,8 +723,6 @@ mod tests {
 
     #[test]
     fn a_file_too_short_to_hold_a_header_is_not_an_archive_of_any_version() {
-        // Nothing past the magic can be trusted, so the magic is not worth
-        // reading a version out of either.
         let bytes = *b"RPF2";
         assert!(matches!(
             Header::read(&bytes, 0),

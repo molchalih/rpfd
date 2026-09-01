@@ -1,24 +1,13 @@
 //! `rbf::from_xml` over documents an `Arbitrary` script writes.
 //!
-//! **A mutator handed bytes reaches almost none of this parser.** `rbf_xml.rs`
-//! solves that by seeding with real documents; this solves the other half of
-//! it, which seeds cannot: everything a shipped file is *not*. The 391 files
-//! in the corpus are 391 documents one writer produced, all of them balanced,
-//! all of their names legal, none of them 256 deep, none carrying an attribute
-//! twice or a name that begins `rbf:` or an escape that is not one. Those are
-//! the inputs the refusals exist for, and no amount of mutating a valid
-//! document reliably lands on them.
+//! `rbf_xml.rs` seeds with real documents; this covers what seeds cannot,
+//! everything a shipped file is not — unbalanced, illegally named, too deep,
+//! carrying a duplicate attribute or an escape that is not one.
 //!
-//! The document is generated **flat**, as a script of steps over an element
-//! stack, rather than as a recursive tree. Two reasons, both about the mutator
-//! rather than about `RBF`: a recursive `Arbitrary` spends input on depth in a
-//! way no byte-level mutation maps onto, so flipping one byte in the middle of
-//! a tree rewrites everything after it; and an unbalanced script is exactly
-//! how the depth cap and the unclosed-element refusals are reached, which a
-//! well-formed tree can never produce.
-//!
-//! What is asserted is [`rbf_law`], stated once there because `rbf_xml.rs`
-//! makes the same claim from the other side.
+//! The document is generated flat, as a script of steps over an element stack,
+//! rather than as a recursive tree: byte-level mutation maps onto a flat script,
+//! and an unbalanced one is how the depth cap and the unclosed-element refusals
+//! are reached at all. Asserts [`rbf_law`].
 
 #![no_main]
 
@@ -31,8 +20,8 @@ use rpf_fuzz::{MAX_INPUT, rbf_law, watched};
 
 /// The reserved name prefix the mapping uses, which is not a namespace.
 ///
-/// `rbf/mod.rs`, and DR-043 for why it is a prefix: a real descriptor name in
-/// the corpus is `CriminalCareerDefs::ShoppingCartItemCategoryLimits`, which no
+/// A prefix rather than a namespace: a real descriptor name in the corpus is
+/// `CriminalCareerDefs::ShoppingCartItemCategoryLimits`, which no
 /// namespace-well-formed document can carry.
 const RESERVED: &str = "rbf:";
 
@@ -42,12 +31,9 @@ const UNKNOWN: &str = "unknown";
 /// Names and values that occur in the corpus, or that the mapping's own
 /// documentation uses as its examples.
 ///
-/// **A vocabulary, not a whitelist.** Every one of these is reachable through
-/// the arbitrary arm too; having them under one byte is what lets the mutator
-/// build a document whose names agree across a rename or a duplicate, which is
-/// where the descriptor table's rules live. Two are deliberately not names —
-/// the empty string, and the one carrying a dot, which the attribute spelling
-/// splits at.
+/// A vocabulary, not a whitelist: each is reachable through the arbitrary arm
+/// too, and having them under one byte lets the mutator build a document whose
+/// names agree across a rename or a duplicate. Two are deliberately not names.
 const VOCABULARY: &[&str] = &[
     "Item",
     "CTimeArchetypeDef",
@@ -74,7 +60,7 @@ const KINDS: [&str; 5] = ["uint", "float", "bool", "float3", "string"];
 
 /// Escape sequences a document may carry, including ones that are not.
 ///
-/// `xml::read` resolves predefined entities and refuses the rest as
+/// `xml::read` refuses everything but the predefined entities as
 /// `NotRbf::BadEscape`, and that arm has no other way to be reached: a value
 /// this target escaped itself never carries one.
 const ESCAPES: [&str; 6] = ["&amp;", "&lt;", "&#65;", "&#x41;", "&bogus;", "&#xZZ;"];
@@ -140,15 +126,9 @@ impl Word<'_> {
 const STEP_LIMIT: usize = 4096;
 
 fuzz_target!(|steps: Vec<Step>| {
-    // **The generator's vocabulary is a copy, and a copy can go stale.**
     // `RESERVED`, `UNKNOWN` and `KINDS` are spellings `rbf::xml` owns and does
-    // not export, so nothing but this makes them agree. If they drift, every
-    // document this writes is refused at its first reserved attribute and the
-    // target quietly stops asserting anything — which is `docs/backlog.md`'s
-    // own lesson about a target that tested the function beside the one
-    // clients call, and it cost a campaign. So the vocabulary is checked once
-    // per process against the parser itself, and a drift is a loud failure
-    // here rather than a silent zero.
+    // not export, so a drift would refuse every document this writes and the
+    // target would quietly stop asserting anything. Checked once per process.
     static CHECKED: OnceLock<()> = OnceLock::new();
     CHECKED.get_or_init(canary);
 
@@ -245,10 +225,9 @@ fn canary() {
 
 /// Renders a script into a document.
 ///
-/// Elements still open when the script ends are closed, so an unbalanced
-/// script is a deep document rather than a truncated one — truncation is what
-/// the [`Input::Raw`] arm is for, and a document that never closes its root
-/// tests the syntax check rather than anything about `RBF`.
+/// Elements still open when the script ends are closed, so an unbalanced script
+/// is a deep document rather than a truncated one: a document that never closes
+/// its root tests the syntax check rather than anything about `RBF`.
 fn rendered(steps: &[Step]) -> Vec<u8> {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     let mut open: Vec<String> = Vec::new();
@@ -331,10 +310,9 @@ fn word_of(kind: u8) -> &'static str {
 
 /// Appends `text` with the five characters XML reserves replaced.
 ///
-/// The document has to be readable for anything past the syntax check to be
-/// reached, and an unescaped `"` in an attribute value ends it. What is
-/// deliberately *not* escaped is [`Step::Escape`], which writes its sequence
-/// straight in — including two that are not sequences.
+/// The document has to parse for anything past the syntax check to be reached.
+/// [`Step::Escape`] is deliberately not escaped: it writes its sequence straight
+/// in, including two that are not sequences.
 fn escaped(out: &mut String, text: &str) {
     for character in text.chars() {
         match character {

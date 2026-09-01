@@ -1,10 +1,8 @@
 //! The `RBF` token stream: bytes to [`Document`] and back.
 //!
-//! Every constant here cites its row in `docs/metadata-encodings.md`, `RBF` —
-//! The token stream. The stream is flat and self-terminating: four magic bytes,
-//! then records, and the file ends when the last open element closes. There is
-//! no header, no version, no length, no string table, no alignment and no
-//! padding, and all values are little-endian.
+//! The stream is flat and self-terminating: four magic bytes, then records, and
+//! the file ends when the last open element closes. No header, no version, no
+//! length, no string table, no alignment, no padding; all little-endian.
 
 use std::collections::BTreeMap;
 
@@ -125,22 +123,16 @@ struct Open {
 }
 
 impl Open {
-    /// Whether the next record belongs in the attribute list.
-    ///
-    /// `docs/metadata-encodings.md` measured `attrCount` never to exceed the
-    /// element's leading run of value records, in all 106,193 open elements, so
-    /// "the first `attrCount` records" and "the leading value records" name the
-    /// same thing. This takes the first reading, and anything that opens or
-    /// blobs before the quota is filled is a count that lied.
+    /// Whether the next record belongs in the attribute list: the first
+    /// `attrCount` records are the attributes, and anything that opens or blobs
+    /// before the quota is filled is a count that lied.
     fn wants_attribute(&self) -> bool {
         self.attributes.len() < self.attributes_wanted
     }
 
-    /// Whether a child element or a blob may begin here.
-    ///
-    /// It may not while attributes are still owed — the count lied — and it may
-    /// not once a blob has arrived, because all 48,042 blobs in the corpus are
-    /// the sole content of their element and XML text cannot show otherwise.
+    /// Whether a child element or a blob may begin here: not while attributes
+    /// are still owed, and not once a blob has arrived, since a blob is the
+    /// sole content of its element.
     fn admits_content(&self, tokens: &Tokens<'_>) -> Result<()> {
         if self.blob.is_some() {
             return Err(unrepresentable(Unrepresentable::BlobNotAlone {
@@ -247,9 +239,8 @@ pub(super) fn read(payload: &[u8]) -> Result<Document> {
 }
 
 /// Reads one named record — `descIdx:u8 dataType:u8 [nameLen:u16 name]` and
-/// its payload — and puts it where it belongs.
-///
-/// The name comes **after** the type byte, not before it.
+/// its payload — and puts it where it belongs. The name comes after the type
+/// byte, not before it.
 fn named(
     tokens: &mut Tokens<'_>,
     descriptors: &mut Vec<Name>,
@@ -314,12 +305,8 @@ fn reoffset(error: Error, at: usize) -> Error {
     }
 }
 
-/// The name a record's descriptor index refers to, introducing it if it is new.
-///
-/// An index equal to the current count introduces a name; a lower one reuses
-/// it. There is no case for a higher one, and none for `0xFE`: the index is one
-/// byte with `0xFD` and `0xFF` taken, so the table cannot grow past
-/// [`MAX_NAMES`] and an index past its end has no name to refer to.
+/// The name a record's descriptor index refers to: an index equal to the
+/// current count introduces one, a lower one reuses it, a higher one has none.
 fn descriptor(tokens: &mut Tokens<'_>, descriptors: &mut Vec<Name>, index: usize) -> Result<Name> {
     if index == descriptors.len() {
         let len = usize::from(tokens.u16()?);
@@ -358,12 +345,8 @@ fn scalar(tokens: &mut Tokens<'_>, kind: u8) -> Result<Scalar> {
     }
 }
 
-/// The descriptor table as it is built, keyed **by name alone**.
-///
-/// `docs/metadata-encodings.md`, Descriptor keying: no file has two descriptors
-/// with the same name, a name-keyed table reproduces **391 of 391** shipped
-/// files byte-for-byte, and a name-and-type-keyed one reproduces 205.
-/// `CodeWalker`'s commented-out `Name_DataType` form is actively wrong.
+/// The descriptor table as it is built, keyed by name alone, which is what
+/// reproduces the shipped files byte for byte.
 struct Descriptors<'a>(BTreeMap<&'a str, u8>);
 
 impl<'a> Descriptors<'a> {
@@ -387,8 +370,7 @@ impl<'a> Descriptors<'a> {
 /// # Errors
 ///
 /// [`Unrepresentable::TooManyNames`] if the document uses more distinct names
-/// than the one-byte descriptor index can address. The seam wraps it, because
-/// which refusal that is depends on which side the document came from.
+/// than the one-byte descriptor index can address.
 pub(super) fn write(document: &Document) -> Written<Vec<u8>> {
     let mut out = MAGIC.to_vec();
     let mut descriptors = Descriptors(BTreeMap::new());

@@ -1,25 +1,12 @@
 //! The XML an `RBF` document is written as, and read back from.
 //!
-//! DR-043 argues the mapping and records what was measured to reach it. The
-//! short version is that **nothing here infers a type from how a value is
-//! spelled**, because the corpus refuses that: `x`, `y`, `z`, `w` and `type`
-//! are real attribute names, so a bare `x="1.0"` cannot be reserved for a
-//! vector; and 26 string values are bare digits, so `"3"` cannot be read as a
-//! number. Every record's type is therefore written down.
+//! Nothing here infers a type from how a value is spelled — `x` and `type` are
+//! real attribute names, and real string values are bare digits — so every
+//! record's type is written down.
 //!
-//! - An element becomes an element of the same name.
-//! - A string attribute record becomes a plain XML attribute — 50,589 of the
-//!   52,397 attribute records in the corpus.
-//! - Any other attribute record becomes `rbf:<type>.<name>`.
-//! - A value record becomes an empty child element carrying one reserved
-//!   attribute, `rbf:<type>`, which is what marks it as a value rather than an
-//!   element.
-//! - A blob becomes the element's text, escaped by [`super::text`].
-//!
-//! The dot is what separates the two reserved forms, and it separates them
-//! totally: `rbf:float3` has none and is a value record, `rbf:float.x` has one
-//! and is an attribute. A name containing a dot splits at the first, so an
-//! attribute called `a.b` is `rbf:float.a.b` and reads back whole.
+//! The dot separates the two reserved forms totally: `rbf:float3` has none and
+//! is a value record, `rbf:float.x` has one and is an attribute. A name
+//! containing a dot splits at the first, so `a.b` is `rbf:float.a.b`.
 
 use quick_xml::{
     Reader, XmlVersion,
@@ -36,11 +23,8 @@ use crate::{
     metadata::text::{self, float, unfloat},
 };
 
-/// The reserved attribute that carries an open element's two meaningless words.
-///
-/// `docs/metadata-encodings.md`: both are 0 in all 106,193 open elements, so
-/// this is never written for a shipped file. It exists so that the round trip
-/// is a property of the code rather than of the corpus.
+/// The reserved attribute that carries an open element's two meaningless words,
+/// which are always 0 and so never written for a shipped file.
 const UNKNOWN: &str = "unknown";
 
 /// How far each level of nesting is indented.
@@ -477,9 +461,7 @@ mod tests {
 
     #[test]
     fn whitespace_outside_the_root_is_tolerated_and_anything_else_is_not() {
-        // `push_text`'s only `None` arm — nothing is open to receive the
-        // text — and the one place indentation around the root is told apart
-        // from a stray word there.
+        // `push_text`'s only `None` arm: nothing is open to receive the text.
         read(b"<root></root>\n").expect("trailing whitespace is not text");
         assert_eq!(
             refused(b"<root></root>stray"),
@@ -490,10 +472,8 @@ mod tests {
 
     #[test]
     fn a_value_element_carrying_stray_text_is_refused_rather_than_read_alone() {
-        // A value record is a name, a type and a value and nothing more
-        // (`NotRbf::ValueNotAlone`'s own doc). `finish` is where children and
-        // body are checked together — either alone is not the empty pair the
-        // record promises.
+        // `finish` is where a value record's children and body are checked
+        // together — either alone is not the empty pair the record promises.
         assert_eq!(
             refused(b"<root><field rbf:uint=\"42\">stray</field></root>"),
             NotRbf::ValueNotAlone {

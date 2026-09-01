@@ -1,18 +1,10 @@
 //! What an entry holding one metadata encoding will take as a replacement.
+//! `RBF` and `PSO` are tokenised and the runtime reads an entry as whatever it
+//! was, so XML or text written into one parses and does not load;
+//! `--allow-encoding-change` is the way through.
 //!
-//! `RBF` and `PSO` are tokenised, and the runtime reads an entry as whatever
-//! the entry was — so XML or plain text written into one produces an archive
-//! that parses and does not load, which `docs/backlog.md` names as the standing
-//! top risk. R6.6 refuses that write, `--allow-encoding-change` is the way
-//! through, and DR-050 is why the way through is a switch of its own.
-//!
-//! **Every write path is asked, every time.** A patch, a rebuild and the
-//! cascading `rewrite` both frontends actually commit through reach one rule in
-//! `crate::edit`, and a caller that falls back from one to the other must not
-//! get a different answer (§3), so every case here is run through all three.
-//!
-//! Corpus-free. Every archive here is built by this crate's own writer, so the
-//! facts are pinned on a machine with no game installed.
+//! Every case runs through all three write paths, which must not disagree.
+//! Corpus-free: every archive here is built by this crate's own writer.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -37,13 +29,10 @@ use rpf_core::{
     Unlock, Unwatched, Verified,
 };
 
-/// The path every archive here holds its one metadata entry at.
 const AT: &str = "data/thing.ymt";
 
-/// A payload announcing each encoding, and one announcing none.
-///
-/// The magics are `docs/rpf-format.md`'s, Metadata encodings, `verified`. The
-/// unknown one is a byte that is neither text nor a signature.
+/// A payload announcing each encoding, and one announcing none — a byte that is
+/// neither text nor a signature.
 fn payload(named: Option<Encoding>) -> Vec<u8> {
     match named {
         Some(Encoding::Rbf) => b"RBF0\x01\x02\x03\x04tokens here".to_vec(),
@@ -54,10 +43,8 @@ fn payload(named: Option<Encoding>) -> Vec<u8> {
     }
 }
 
-/// An archive holding one stored entry at [`AT`], with `contents` in it.
-///
-/// Stored rather than deflated so the entry's allocation is what its length
-/// says, which is what keeps every patch below a patch rather than a rebuild.
+/// An archive holding one stored entry at [`AT`], with `contents` in it. Stored
+/// so the entry's allocation is its length, keeping every patch below a patch.
 fn archive_holding(contents: &[u8]) -> Vec<u8> {
     let owned = contents.to_vec();
     let mut out = Cursor::new(Vec::new());
@@ -79,7 +66,6 @@ fn archive_holding(contents: &[u8]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// The change one write is.
 fn writing(contents: &[u8], allow_encoding_change: bool) -> Changes {
     Changes::one(
         AT,
@@ -91,29 +77,19 @@ fn writing(contents: &[u8], allow_encoding_change: bool) -> Changes {
     )
 }
 
-/// Which write path a case is run through.
 #[derive(Debug, Clone, Copy)]
 enum Path {
     /// `rpf_core::plan` — the entry is rewritten where it sits.
     Patch,
     /// `rpf_core::rebuild` — the whole archive is written again.
     Rebuild,
-    /// `rpf_core::rewrite` — the same, cascading through nesting. **This is
-    /// the one that ships**: both frontends commit through it, and `rebuild`
-    /// answers a different question for every path that addresses through a
-    /// nested archive. `docs/backlog.md` records a fuzz target that tested the
-    /// function beside the one clients call.
+    /// `rpf_core::rewrite` — the same, cascading through nesting; the one both
+    /// frontends commit through.
     Rewrite,
 }
 
-/// All of them, so a case that names none is run through each.
 const ALL: [Path; 3] = [Path::Patch, Path::Rebuild, Path::Rewrite];
 
-/// Writes `contents` into an archive holding `held`, by `path`, and answers
-/// the archive that came out.
-///
-/// A patch and a rebuild produce the same archive from the same change, which
-/// is what lets one assertion cover both.
 fn written(
     held: &[u8],
     contents: &[u8],
@@ -159,7 +135,6 @@ fn written(
     }
 }
 
-/// The contents of [`AT`] in an archive.
 fn contents_of(bytes: &[u8]) -> Vec<u8> {
     let mut file = Cursor::new(bytes.to_vec());
     let archive = Archive::open(&mut file, &Unlock::unkeyed()).expect("re-parses");
@@ -167,12 +142,8 @@ fn contents_of(bytes: &[u8]) -> Vec<u8> {
     archive.extract(&mut file, index).expect("reads back")
 }
 
-/// The four pairs R6.6 names, on every write path: an entry holding a
-/// tokenised encoding refuses a textual payload.
-///
-/// Two targets and two payloads, because a rule written for one of them is a
-/// rule that lets the other through — which is how a guard covering `RBF` and
-/// not `PSO` would pass a suite that only ever asked about `RBF`.
+/// Two targets and two payloads: a guard covering `RBF` and not `PSO` would
+/// pass a suite that only ever asked about `RBF`.
 #[test]
 fn a_tokenised_entry_refuses_a_textual_payload() {
     for held in [Encoding::Rbf, Encoding::Pso] {
@@ -199,9 +170,6 @@ fn a_tokenised_entry_refuses_a_textual_payload() {
     }
 }
 
-/// The refusal is [`rpf_core::Category::Refused`], which is exit 6 — the
-/// number DR-010 already gives "the caller asked for something the entry
-/// cannot take".
 #[test]
 fn the_refusal_is_a_refusal_rather_than_a_claim_about_the_archive() {
     let error = written(
@@ -215,11 +183,6 @@ fn the_refusal_is_a_refusal_rather_than_a_claim_about_the_archive() {
     assert_eq!(error.name(), "WrongEncoding");
 }
 
-/// The escape hatch: with it, the write is taken and the payload is what came
-/// out.
-///
-/// Both paths, because an override honoured by one of them and not the other
-/// is the same layering bug as a refusal honoured by one of them.
 #[test]
 fn an_allowed_encoding_change_writes_the_payload() {
     for held in [Encoding::Rbf, Encoding::Pso] {
@@ -237,13 +200,9 @@ fn an_allowed_encoding_change_writes_the_payload() {
     }
 }
 
-/// The negative, and the reason the rule is four cells rather than a mood:
-/// every write that was allowed before is allowed still.
-///
-/// A guard that refused more than R6.6 asks for would pass every test above.
-/// This is what fails when it does — including the two cases a careless rule
-/// would catch by symmetry: a tokenised payload into a textual entry, and a
-/// tokenised payload into a tokenised entry of the other kind.
+/// Every write that was allowed before is allowed still, including the two a
+/// careless rule catches by symmetry: a tokenised payload into a textual entry,
+/// and into a tokenised entry of the other kind.
 #[test]
 fn every_other_pair_is_taken() {
     let all = [
@@ -275,16 +234,9 @@ fn every_other_pair_is_taken() {
     }
 }
 
-/// The loosening, pinned as a loosening: an overridden write is taken, reads
-/// back, and a bare `verify` has **nothing to say about it**.
-///
-/// This is the half of DR-050 that is worth a test rather than a sentence. A
-/// resource entry keeps its own flag words when a payload is written into it,
-/// so DR-046's loosening is caught by a later `verify`; a metadata entry keeps
-/// no record of what it used to hold, so once the write is taken the archive
-/// is a perfectly sound archive holding XML. Anything claiming otherwise is
-/// claiming a safety net that is not there, and this is what fails when it
-/// does.
+/// A metadata entry keeps no record of what it used to hold, so once an
+/// overridden write is taken the archive is a sound archive holding XML and a
+/// bare `verify` has nothing to say about it.
 #[test]
 fn an_overridden_write_is_sound_afterwards_and_verify_cannot_see_it() {
     let after = written(
@@ -308,13 +260,8 @@ fn an_overridden_write_is_sound_afterwards_and_verify_cannot_see_it() {
     assert!(walked.outcome().is_ok());
 }
 
-/// What `verify` **can** say about it, which is the whole of what R6.6's
-/// override is checked by afterwards: the per-entry contents checksum a
-/// manifest records. DR-023.
-///
-/// The manifest is written from the archive as it was, so the entry's `RBF`
-/// contents are what its checksum is over; the overridden write replaces them,
-/// and `verify --against` names that entry and no other.
+/// The per-entry contents checksum a manifest records is the only thing that
+/// catches an overridden write afterwards.
 #[test]
 fn a_recorded_checksum_is_what_catches_an_overridden_write() {
     let before = archive_holding(&payload(Some(Encoding::Rbf)));
@@ -347,11 +294,8 @@ fn a_recorded_checksum_is_what_catches_an_overridden_write() {
     }
 }
 
-/// A payload that announces nothing is taken, whatever the entry holds.
-///
-/// `Encoding::of` answers `None` for it, and `None` contradicts no entry. A
-/// rule that refused everything it did not recognise would refuse the commonest
-/// payload in a real archive.
+/// A payload that announces nothing is taken, whatever the entry holds:
+/// `Encoding::of` answers `None`, and `None` contradicts no entry.
 #[test]
 fn a_payload_announcing_nothing_is_taken() {
     for held in [Encoding::Rbf, Encoding::Pso] {
@@ -361,8 +305,6 @@ fn a_payload_announcing_nothing_is_taken() {
     }
 }
 
-/// A path the archive does not hold has no entry to contradict, so the rule
-/// has nothing to say and a created entry takes whatever it is given.
 #[test]
 fn a_created_entry_is_not_judged_against_an_entry_that_is_not_there() {
     let mut file = Cursor::new(archive_holding(&payload(Some(Encoding::Rbf))));
@@ -398,13 +340,8 @@ fn a_created_entry_is_not_judged_against_an_entry_that_is_not_there() {
     assert_eq!(bytes, payload(Some(Encoding::Xml)));
 }
 
-/// The daemon's early check runs the same rule: `allows` refuses what a commit
-/// would refuse.
-///
-/// `allows` is what a client is told at the moment it can still act (R7.1), and
-/// it is the resolution a commit performs run early and thrown away. A rule the
-/// commit applies and `allows` does not is a refusal arriving at the save
-/// rather than at the edit.
+/// `allows` is the commit's own resolution run early and thrown away, so a rule
+/// it does not apply is a refusal arriving at the save rather than the edit.
 #[test]
 fn allows_refuses_what_a_commit_would_refuse() {
     let mut file = Cursor::new(archive_holding(&payload(Some(Encoding::Pso))));
@@ -438,7 +375,6 @@ fn allows_refuses_what_a_commit_would_refuse() {
         .expect("and taken when the caller says it meant it");
 }
 
-/// An archive holding one deflated entry at [`AT`], with `contents` in it.
 fn deflated_holding(contents: &[u8]) -> Vec<u8> {
     let owned = contents.to_vec();
     let mut out = Cursor::new(Vec::new());
@@ -460,12 +396,9 @@ fn deflated_holding(contents: &[u8]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// The entry is judged by what it holds, not by what is stored in it.
-///
 /// A deflated `RBF` payload begins with a deflate stream and not with `RBF0`,
 /// so a rule reading the stored bytes would find no encoding and take every
-/// write. Every fixture above is `Storage::Stored`, which is exactly the shape
-/// that cannot notice.
+/// write.
 #[test]
 fn a_deflated_entry_is_judged_by_what_it_inflates_to() {
     let mut file = Cursor::new(deflated_holding(&payload(Some(Encoding::Rbf))));
@@ -503,7 +436,6 @@ fn a_deflated_entry_is_judged_by_what_it_inflates_to() {
     );
 }
 
-/// An archive holding `inner.rpf`, which holds [`AT`] with `contents` in it.
 fn nesting(contents: &[u8]) -> Vec<u8> {
     let inner = archive_holding(contents);
     let mut out = Cursor::new(Vec::new());
@@ -525,17 +457,11 @@ fn nesting(contents: &[u8]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// The path a nested archive's entry is addressed by, from the outside.
 const THROUGH: &str = "inner.rpf/data/thing.ymt";
 
-/// The rule reaches an entry inside a nested archive, and the refusal names the
-/// path the caller used.
-///
-/// `rewrite` is where a cascade happens and `plan` is the path a caller falls
-/// back from, so the two are asked the same question here. They answered
-/// **different paths** until 2026-08-31: `split` re-keys a nested change to the
-/// path within the archive it lands in, and the rebuild path reported that,
-/// which does not resolve in the archive the caller named. DR-050 §2.
+/// The refusal must name the path the caller spelled: `split` re-keys a nested
+/// change to the path within the archive it lands in, which does not resolve in
+/// the archive the caller named.
 #[test]
 fn a_nested_entry_is_refused_under_the_path_the_caller_spelled() {
     for allowed in [false, true] {
@@ -571,15 +497,12 @@ fn a_nested_entry_is_refused_under_the_path_the_caller_spelled() {
             other => panic!("got {other:?}"),
         }
 
-        // And the patch path, which is what a frontend tries first: the same
-        // refusal, under the same path.
         file.rewind().expect("rewinds");
         match rpf_core::plan(&mut file, &archive, &changes).expect_err("refused there too") {
             Error::WrongEncoding { path, .. } => assert_eq!(path, THROUGH),
             other => panic!("got {other:?}"),
         }
 
-        // The early check a client gets is the same answer under the same path.
         file.rewind().expect("rewinds");
         let change = changes.at(THROUGH).expect("holds it").clone();
         match rpf_core::allows(&mut file, &archive, &Changes::new(), THROUGH, &change)

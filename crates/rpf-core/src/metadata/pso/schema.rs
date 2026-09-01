@@ -1,20 +1,12 @@
 //! The block table and the embedded schema, as types that carry their own
 //! guarantees.
 //!
-//! `docs/metadata-encodings.md`, `PSO` — `PMAP` and `PSCH`. The whole of R5.3
-//! rests on one measurement: a walk of all 9,753 files from `PMAP.rootId`,
-//! using only each file's own `PSCH`, reached **0** references the file did not
-//! define. So nothing here consults a builtin table, and there is none to
-//! consult.
-//!
-//! What is checked at construction (`docs/conventions.md` §5) is everything a
-//! later read would otherwise have to re-check: a block lies inside the data
-//! section, the root names a block, a structure's length is not negative, an
-//! array's element index names an `ARRAYINFO` member of its own structure, and
-//! a wrapped `dataOffset` has been recovered. What is *not* checked here is
-//! whether a referenced structure exists, because a `PSCH` legitimately
-//! describes structures the data never instantiates — 36 such hashes across the
-//! corpus, none ever reached.
+//! Checked at construction: a block lies inside the data section, the root
+//! names a block, a structure's length is not negative, an array's element
+//! index names an `ARRAYINFO` member of its own structure, and a wrapped
+//! `dataOffset` has been recovered. Not checked: whether a referenced structure
+//! exists, because a `PSCH` legitimately describes structures the data never
+//! instantiates.
 
 use std::collections::BTreeMap;
 
@@ -25,36 +17,23 @@ use super::{
 };
 use crate::error::Result;
 
-/// How long an `ATBINARYMAP` member is.
-///
-/// Measured 2026-08-30 over the corpus: the map members of one structure are 24
-/// bytes apart, and the layout is two `u32`s — `0x01000000` and `0`, in 17,560
-/// of 17,560 instances — followed by the same 16-byte counted pointer an
-/// `ATARRAY` uses.
+/// How long an `ATBINARYMAP` member is: two `u32`s followed by the same
+/// 16-byte counted pointer an `ATARRAY` uses.
 pub(super) const MAP_LEN: u32 = 24;
 
 /// Where an `ATBINARYMAP`'s counted pointer sits inside it.
 pub(super) const MAP_POINTER_AT: u32 = 8;
 
-/// How long the 16-byte counted forms are: `Array_Structure` and `CharPointer`.
-///
-/// `docs/metadata-encodings.md`, Pointers: the pointer, then `count1:u16be`,
+/// How long the 16-byte counted forms are: the pointer, then `count1:u16be`,
 /// `count2:u16be`, `unk:u32be`.
 pub(super) const COUNTED_LEN: u32 = 16;
 
-/// Where the first of a counted form's two counts sits inside it.
-///
-/// `count1` is the length and `count2` the capacity. They are equal for every
-/// one of the 591,472 `ATARRAY`s in the corpus and differ for 35% of the
-/// 112,515 `ATSTRING`s, so this reads the one that is the length.
+/// Where the first of a counted form's two counts sits inside it: `count1` is
+/// the length, and it differs from the capacity for many strings.
 pub(super) const COUNT_AT: u32 = 8;
 
-/// Where the second of a counted form's two counts sits inside it.
-///
-/// `count2` is the capacity, and it is what bounds a write rather than what a
-/// read answers: over all 39,469 counted strings the corpus reaches, the
-/// characters number `min(count1, count2)` and the terminator is the byte
-/// after. DR-052.
+/// Where the second of a counted form's two counts sits inside it: `count2` is
+/// the capacity, which bounds a write rather than what a read answers.
 pub(super) const CAPACITY_AT: u32 = 10;
 
 /// How long one `PMAP` entry is: `nameHash`, `offset`, `unknown_8h`, `length`.
@@ -86,35 +65,25 @@ const BLOCKS_AT: usize = 16;
 
 /// How long a pointer is: 32 bits of block and offset, and a second word that
 /// carries nothing.
-///
-/// `docs/metadata-encodings.md`, Pointers: read as one big-endian `u64` with
-/// the block id in the low bits — the shape the reference implementation's
-/// field layout suggests — **every** pointer in the corpus reads as null.
 pub(super) const POINTER_LEN: u32 = 8;
 
 /// How long a hashed string is: the `u32` hash and nothing else.
 pub(super) const HASH_LEN: u32 = 4;
 
-/// How deep [`Schema::extent`] follows an inline array of an inline array.
-///
-/// An element descriptor is an index into the same member list, so a hostile
-/// schema can point one at itself. The corpus reaches 2.
+/// How deep [`Schema::extent`] follows an inline array of an inline array: an
+/// element descriptor indexes the same member list and can point at itself.
 const MAX_ELEMENT_NESTING: usize = 8;
 
 /// How far one wrap moves a `dataOffset`: the width of the `u16` field it is.
-///
-/// `docs/metadata-encodings.md`, `ARRAY` subtype `0x81`.
 const WRAP: u32 = 0x1_0000;
 
 /// One `PMAP` entry: a run of the data section with a type tag.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Block {
-    /// Its `nameHash`: a structure name, or one of the eight plain-data type
-    /// tags `docs/metadata-encodings.md` lists.
+    /// Its `nameHash`: a structure name, or a plain-data type tag.
     pub(super) name: u32,
     /// Where it starts, from the start of the `PSIN` section, header included.
     pub(super) offset: u32,
-    /// How long it is.
     pub(super) length: u32,
 }
 
@@ -127,11 +96,7 @@ pub(super) struct Blocks {
 
 impl Blocks {
     /// Reads the block table, checking every block against the data section.
-    ///
-    /// `docs/metadata-encodings.md`, `PMAP`: the 16-byte header variant is the
-    /// only one that occurs — 9,753 of 9,753 — so `CodeWalker`'s second layout,
-    /// detected by `entriesCount <= 0` under `//any other way to know which
-    /// version?`, is not implemented and an empty table is an empty table.
+    /// Only the 16-byte header variant occurs, so an empty table is empty.
     ///
     /// # Errors
     ///
@@ -225,10 +190,6 @@ impl Width {
 }
 
 /// Which of the six `STRING` subtypes a member is.
-///
-/// `docs/metadata-encodings.md`: exactly these six occur, over 77,431 string
-/// members, and 0 fall through. Subtype 9 `ATHASHVALUE` — the one predicted to
-/// be the commonest string kind — does not occur at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Text {
     /// Subtype 0, a fixed inline character array of this many bytes.
@@ -273,7 +234,7 @@ pub(super) enum Nested {
 /// Which of the six `ARRAY` subtypes a member is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Layout {
-    /// Subtype 0, a 16-byte counted pointer. 59,811 of 64,906.
+    /// Subtype 0, a 16-byte counted pointer.
     AtArray,
     /// Subtype 1, elements inline at the member's own offset.
     AtFixedArray,
@@ -281,15 +242,8 @@ pub(super) enum Layout {
     AtRangeArray,
     /// Subtype 4, the same again.
     Member,
-    /// Subtype 6, an 8-byte pointer with the count in the schema.
-    ///
-    /// **`secondary`, and the only thing here that is.** The two members that
-    /// carry it sit at byte 40 of a 64-byte structure whose next member is at
-    /// 48, so the member is eight bytes and cannot hold the 16-byte counted
-    /// form; the count is `referenceKey >> 16`. But the data walk never reaches
-    /// either of them — 0 occurrences across all 9,753 rendered documents,
-    /// measured 2026-08-30 — so this is read from the layout rather than
-    /// confirmed against a value.
+    /// Subtype 6, an 8-byte pointer with the count in `referenceKey >> 16`,
+    /// read from the layout rather than confirmed against a value.
     PointerWithCount,
     /// Subtype `0x81`: inline, at a `dataOffset` that has wrapped past 16 bits.
     Wrapped,
@@ -339,11 +293,8 @@ pub(super) enum Scalar {
 }
 
 impl Scalar {
-    /// How many bytes it occupies.
-    ///
-    /// `docs/metadata-encodings.md`'s census, and the sizes the corpus walk
-    /// used: a `VECTOR3` is **sixteen** bytes carrying three floats, not
-    /// twelve.
+    /// How many bytes it occupies; a `VECTOR3` is sixteen carrying three
+    /// floats, not twelve.
     pub(super) const fn bytes(self) -> u32 {
         match self {
             Self::Bool | Self::Char | Self::UChar => 1,
@@ -403,15 +354,9 @@ pub(super) enum Kind {
         /// Which enum table names it.
         table: u32,
     },
-    /// A bitset, whose bits an enum names.
-    ///
-    /// `docs/metadata-encodings.md`: a `BITSET`'s `referenceKey` is **never** an
-    /// enum hash — 0 of 1,526 — it is `(bitCount << 16) | memberIndex` through
-    /// the `ARRAYINFO` indirection, and index `0xFFF` is a "no enum" sentinel
-    /// rather than an index.
-    /// The high half of the reference is a bit count, and it is not needed to
-    /// render one: every set bit is written, named or numbered, so the value
-    /// survives whatever the count says.
+    /// A bitset, whose bits an enum names. Its `referenceKey` is
+    /// `(bitCount << 16) | memberIndex` through the `ARRAYINFO` indirection,
+    /// never an enum hash.
     Bits {
         /// How wide the stored value is.
         width: Width,
@@ -431,7 +376,6 @@ pub(super) struct Member {
     pub(super) name: u32,
     /// Its byte offset within the structure, wrapping already recovered.
     pub(super) offset: u32,
-    /// What it holds.
     pub(super) kind: Kind,
 }
 
@@ -451,13 +395,9 @@ pub(super) struct Structure {
     pub(super) members: Vec<Member>,
 }
 
-/// A file's whole embedded schema: its structures and its enums.
-///
-/// A name hash indexes what the entry at a `PSCH` offset holds rather than
-/// owning a copy of it, because several index entries may carry different name
-/// hashes and name the **same** entry offset. Measured 2026-08-30: a file that
-/// does that buys a whole member list per 8 bytes of index, which is how 64,520
-/// bytes of schema came to hold 160 MB and return `Ok`.
+/// A file's whole embedded schema: its structures and its enums. A name hash
+/// indexes what the entry at a `PSCH` offset holds rather than owning a copy,
+/// because several entries may name the same offset.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Schema {
     defined: Vec<Structure>,
@@ -466,10 +406,8 @@ pub(super) struct Schema {
     enums: BTreeMap<u32, usize>,
 }
 
-/// The entries already read, by the offset they were read from.
-///
-/// What makes an index entry naming an offset already read cost one map entry
-/// rather than another copy of everything at that offset.
+/// The entries already read, by the offset they were read from, so a repeated
+/// offset costs one map entry rather than another copy.
 #[derive(Debug, Default)]
 struct Shared {
     structures: BTreeMap<usize, usize>,
@@ -485,13 +423,8 @@ impl Schema {
         self.defined.get(*self.structures.get(&name)?)
     }
 
-    /// Every value an enum table names, in key order.
-    ///
-    /// The inverse [`super::apply`] needs: rendering goes value to name and a
-    /// document carries the name, so the write direction has to search. Handed
-    /// out whole rather than searched here, because deciding which of two keys
-    /// a rendered name belongs to needs the dictionary, and the schema does not
-    /// have one.
+    /// Every value an enum table names, in key order; handed out whole because
+    /// resolving a rendered name back to a key needs the dictionary.
     pub(super) fn enum_table(&self, table: u32) -> Option<&BTreeMap<i32, u32>> {
         self.tables.get(*self.enums.get(&table)?)
     }
@@ -510,8 +443,8 @@ impl Schema {
     ///
     /// [`Malformed::SchemaEntry`] for an entry that does not resolve,
     /// [`Malformed::Wrapped`] for a wrapped `dataOffset` the structure does not
-    /// settle, and [`Unsupported::DataType`] for a member outside the 37 pairs
-    /// the corpus carries.
+    /// settle, and [`Unsupported::DataType`] for a member type this build does
+    /// not decode.
     pub(super) fn read(section: &[u8]) -> Result<Self> {
         let count = section::u32(section, 8).ok_or_else(|| bad(8, Malformed::SectionTruncated))?;
         let count = usize::try_from(count).unwrap_or(0);
@@ -579,23 +512,12 @@ impl Schema {
 
     /// Puts every wrapped `dataOffset` back where it belongs.
     ///
-    /// `docs/metadata-encodings.md`, `ARRAY` subtype `0x81`: bit 7 of the
-    /// subtype marks a `dataOffset` that has wrapped past the 16 bits the field
-    /// has, and one flag bit cannot say how many times. Measured 2026-08-30:
-    /// the multiple is recovered **uniquely** by the two constraints the
-    /// structure itself imposes — the member begins at or after the end of the
-    /// member before it, and its own extent fits inside the structure. On the
-    /// one real case, a member of `junctions.pso` whose field holds `0x99B0` in
-    /// a structure 170,688 bytes long, exactly one multiple satisfies both, and
-    /// it is the 2 that puts the elements at 170,416, which is where they are.
-    ///
-    /// Needs the whole schema, because the preceding member's extent may be an
-    /// inline array of a structure defined later in the index. A member the two
-    /// constraints do not settle is [`Malformed::Wrapped`] rather than left as
-    /// it lies: the raw `u16` is a real offset inside the structure, so leaving
-    /// it renders whatever happens to be there — the `0x99B0` that reads
-    /// `0.0, 0.0, 0.0` where coordinates are — and nothing about that is
-    /// visible in the output.
+    /// Bit 7 of the subtype marks a `dataOffset` wrapped past the 16 bits the
+    /// field has, without saying how many times; the multiple is recovered
+    /// uniquely by two constraints — the member begins at or after the end of
+    /// the one before it, and its own extent fits inside the structure. Needs
+    /// the whole schema, because a preceding member's extent may be an inline
+    /// array of a structure defined later in the index.
     fn recover_wrapped_offsets(&mut self, origins: &[u64]) -> Result<()> {
         for slot in 0..self.defined.len() {
             let Some(structure) = self.defined.get(slot) else {
@@ -626,19 +548,13 @@ impl Schema {
         Ok(())
     }
 
-    /// The offset a wrapped member really has.
-    ///
-    /// Both constraints are monotone in the multiple, so the first and the last
-    /// that fit are arithmetic rather than a search over all [`MAX_WRAPS`] of
-    /// them: a member no multiple fits used to cost 65,536 iterations, which is
-    /// how 8 KB of schema came to cost 6.8 seconds.
+    /// The offset a wrapped member really has. Both constraints are monotone
+    /// in the multiple, so the first and last that fit are arithmetic.
     ///
     /// # Errors
     ///
     /// [`Malformed::Wrapped`] when no multiple fits, and when more than one
-    /// does. `docs/metadata-encodings.md`'s argument that this recovery is
-    /// correct is that the two constraints settle the multiple **uniquely**, so
-    /// a structure in which they do not is one that argument does not cover.
+    /// does — the recovery is only correct while the multiple is unique.
     fn unwrapped(&self, structure: &Structure, index: usize, at: u64) -> Result<u32> {
         let refuse = || bad(at, Malformed::Wrapped);
         let step = u64::from(WRAP);
@@ -662,14 +578,9 @@ impl Schema {
         u32::try_from(recovered).map_err(|_| refuse())
     }
 
-    /// Where the member before `index` ends, which is the lowest offset the
-    /// member at `index` may have.
-    ///
-    /// A preceding member whose extent the schema does not settle contributes
-    /// its own offset rather than nothing: it is where that member starts, so
-    /// the member after it cannot begin earlier, and it is the strongest bound
-    /// available. Falling back to 0 instead would make multiple 0 satisfy the
-    /// constraint always, which is the constraint not being applied.
+    /// Where the member before `index` ends, the lowest offset the member at
+    /// `index` may have. One whose extent the schema does not settle
+    /// contributes its own offset, since 0 would satisfy any constraint.
     fn member_ends_at(&self, structure: &Structure, index: usize) -> u32 {
         structure
             .members
@@ -685,11 +596,8 @@ impl Schema {
             })
     }
 
-    /// How many bytes one instance of `member` occupies inside `owner`.
-    ///
-    /// `None` when the schema does not settle it: a structure it does not
-    /// define, or element descriptors nested past
-    /// [`MAX_ELEMENT_NESTING`].
+    /// How many bytes one instance of `member` occupies inside `owner`; `None`
+    /// when the schema does not settle it.
     pub(super) fn extent(&self, owner: &Structure, member: &Member, depth: usize) -> Option<u32> {
         if depth > MAX_ELEMENT_NESTING {
             return None;
@@ -764,12 +672,7 @@ struct Raw {
     reference: u32,
 }
 
-/// Reads the twelve bytes of one member.
-///
-/// `referenceKey` is at offset **8**, not 10. `docs/metadata-encodings.md`:
-/// getting this wrong shifts every reference by two bytes and leaves member
-/// types and offsets looking plausible while every hash is garbage, which is
-/// how it was found.
+/// Reads the twelve bytes of one member. `referenceKey` is at offset 8, not 10.
 fn read_member(section: &[u8], base: usize) -> Result<Raw> {
     let at = u64::try_from(base).unwrap_or(u64::MAX);
     let truncated = || bad(at, Malformed::SectionTruncated);
@@ -782,11 +685,8 @@ fn read_member(section: &[u8], base: usize) -> Result<Raw> {
     })
 }
 
-/// Turns the raw members of one structure into checked ones.
-///
-/// Two passes, because an element index points at another member of the same
-/// list: the kinds are worked out first and the indices checked against the
-/// finished list second.
+/// Turns the raw members of one structure into checked ones, in two passes
+/// because an element index points at another member of the same list.
 fn resolve(raw: &[Raw], at: u64) -> Result<Vec<Member>> {
     let mut members = Vec::with_capacity(raw.len());
     for entry in raw {
@@ -809,10 +709,6 @@ fn resolve(raw: &[Raw], at: u64) -> Result<Vec<Member>> {
 }
 
 /// What a member's twelve bytes describe.
-///
-/// `docs/metadata-encodings.md`'s census is the whole list: 37 `(type,
-/// subtype)` pairs over 580,044 members, and a decoder that handles those
-/// handles every metadata file both games ship.
 fn kind_of(entry: &Raw, raw: &[Raw]) -> Result<Kind> {
     let refuse = || {
         unsupported(Unsupported::DataType {
@@ -870,10 +766,6 @@ fn text_of(subtype: u8, reference: u32) -> Option<Kind> {
 }
 
 /// The array form a subtype names, with its element index and its count.
-///
-/// `docs/metadata-encodings.md`: the `0xFFFF` mask alone gives a valid
-/// `ARRAYINFO` index in 64,906 of 64,906, so `CodeWalker`'s `0xFFF` re-mask
-/// fallback is not here.
 fn array_of(subtype: u8, reference: u32) -> Option<Kind> {
     let layout = match subtype {
         0 => Layout::AtArray,
@@ -976,9 +868,7 @@ mod tests {
         out
     }
 
-    /// The three members a wrapped `dataOffset` needs around it: a long inline
-    /// array, the wrapped member itself, and the `ARRAYINFO` both resolve
-    /// through.
+    /// The three members a wrapped `dataOffset` needs around it.
     fn wrapped_members() -> [[u8; 12]; 3] {
         [
             // 16,384 `UINT`s inline at 0, so the member after it starts at
@@ -999,11 +889,6 @@ mod tests {
 
     #[test]
     fn many_index_entries_naming_one_offset_store_one_structure() {
-        // The measured defect: `Schema::read` inserted a whole `Structure` per
-        // index entry, and several entries may carry different name hashes and
-        // point at the same offset. 8 bytes of index bought a whole member
-        // list, which is how 64,520 bytes of schema came to hold 160 MB and
-        // return `Ok`.
         let members: Vec<[u8; 12]> = (0..500)
             .map(|index| member(index, 0x06, 0x00, 0, 0))
             .collect();
@@ -1024,8 +909,6 @@ mod tests {
 
     #[test]
     fn many_index_entries_naming_one_enum_store_one_table() {
-        // The same shape one entry kind over: an enum entry is 8 bytes and a
-        // duplicate index entry re-read the whole table.
         let mut section = Vec::from(*b"PSCH");
         let entries: u32 = 4_000;
         let count = usize::try_from(entries).expect("fits");
@@ -1056,10 +939,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_exactly_one_multiple_fits_is_recovered() {
-        // `docs/metadata-encodings.md`, `ARRAY` subtype `0x81`. The member
-        // before it ends at 65,536 and its own four bytes must fit inside a
-        // structure 70,000 bytes long, so multiple 1 is the only one and the
-        // raw 0 is really 65,536.
+        // The member before it ends at 65,536 and its own four bytes must fit
+        // inside a structure 70,000 bytes long, so multiple 1 is the only one.
         let section = psch(1, &wrapped_members(), 70_000);
         let schema = Schema::read(&section).expect("the multiple is unique");
         let structure = schema.structure(1).expect("the structure is defined");
@@ -1068,10 +949,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_no_multiple_fits_is_refused_rather_than_left_as_it_lies() {
-        // Leaving the raw `u16` is what the reference implementation does, and
-        // it is silent: the field holds a real offset inside the structure, so
-        // the read succeeds and renders whatever is there. 65,000 bytes is too
-        // short for any multiple to clear the member before it.
+        // 65,000 bytes is too short for any multiple to clear the member
+        // before it.
         assert_eq!(
             cause(&psch(1, &wrapped_members(), 65_000)),
             Malformed::Wrapped
@@ -1080,10 +959,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_more_than_one_multiple_fits_is_refused_rather_than_guessed() {
-        // The whole of `docs/metadata-encodings.md`'s argument that this
-        // recovery is correct is that the two constraints settle the multiple
-        // **uniquely**. At 140,000 bytes both 1 and 2 fit, so this structure is
-        // not one that argument covers and taking the first would be a guess.
+        // At 140,000 bytes both multiple 1 and 2 fit, so the recovery is not
+        // unique and taking the first would be a guess.
         assert_eq!(
             cause(&psch(1, &wrapped_members(), 140_000)),
             Malformed::Wrapped
@@ -1092,15 +969,8 @@ mod tests {
 
     #[test]
     fn a_schema_of_nothing_but_duplicates_costs_its_own_size_and_not_more() {
-        // The measured defect at the size it was measured at: 4,000 index
-        // entries and one 2,750-member structure is 64,024 bytes, and copying
-        // the structure per entry made that 11,000,000 members — +160 MB of
-        // resident memory, and `Ok`. `fuzz/src/lib.rs` holds a 64 KiB input to
-        // 64 MiB, so this shape was 2.5 times past this project's own standard.
-        //
-        // The bound is wall-clock and generous on purpose: it is a regression
-        // detector rather than a benchmark, and what it detects is a copy that
-        // is quadratic in the input rather than linear.
+        // The bound is wall-clock and generous on purpose: it detects a copy
+        // that is quadratic in the input rather than linear.
         let members: Vec<[u8; 12]> = (0..2_750)
             .map(|index| member(index, 0x06, 0x00, 0, 0))
             .collect();
@@ -1134,9 +1004,6 @@ mod tests {
 
     #[test]
     fn each_layout_writes_its_own_word() {
-        // `render` writes this as the `ARRAY` member's XML type attribute and
-        // `apply` reads it back to check a document against the schema, so the
-        // word is real output, not a debug label.
         for (layout, word) in [
             (Layout::AtArray, "atarray"),
             (Layout::AtFixedArray, "atfixedarray"),
@@ -1151,9 +1018,8 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_at_the_maximum_recoverable_multiple_is_accepted() {
-        // `MAX_WRAPS` is where `unwrapped` stops, not where it refuses: the
-        // last multiple that fits may equal it, and only a multiple past it
-        // is a refusal.
+        // `MAX_WRAPS` is where `unwrapped` stops, not where it refuses: only a
+        // multiple past it is a refusal.
         let step = u64::from(WRAP);
         let after = step * u64::from(MAX_WRAPS);
         let length = u32::try_from(after).expect("fits a u32");
@@ -1267,10 +1133,8 @@ mod tests {
 
     #[test]
     fn bits_of_needs_both_the_arrayinfo_name_and_its_code() {
-        // `referenceKey`'s low half indexes another member of the same
-        // structure, and that member is only a real `ARRAYINFO` description
-        // when both its name hash and its own type code say so — either alone
-        // is a coincidence, not a description.
+        // A member is only a real `ARRAYINFO` description when both its name
+        // hash and its own type code say so.
         let described = Raw {
             name: ARRAYINFO,
             code: 0x00,

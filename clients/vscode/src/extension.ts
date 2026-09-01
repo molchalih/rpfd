@@ -1,9 +1,8 @@
 /**
- * The extension's editor surface. R7.1, R7.2, R7.3, R7.5, R7.6, R7.7.
+ * The extension's editor surface.
  *
- * Everything decided here is decided in `src/core`, which imports no editor and
- * is tested against a live `rpf serve --stdio`. What is left in this file is
- * the part that can only be exercised by a running editor: commands, a status
+ * Everything decided here is decided in `src/core`, which imports no editor.
+ * What is left is the part only a running editor exercises: commands, a status
  * bar, a progress dialog, and the workspace-folder call that mounts an archive.
  */
 
@@ -62,11 +61,8 @@ export function deactivate(): void {
 /**
  * One command, with whatever it throws turned into something to act on.
  *
- * The report is not awaited: it ends in an error notification carrying a
- * button, and a notification with a button is on screen until the user answers
- * it. Awaiting one here would make the command finish when the user
- * acknowledged the failure rather than when the failure happened — and a
- * command invoked by another command would wait just as long.
+ * The report is not awaited: a notification with a button is on screen until
+ * the user answers it, and the command would not finish until they had.
  */
 function register(
     context: vscode.ExtensionContext,
@@ -99,12 +95,11 @@ async function remount(archives: Archives): Promise<void> {
 }
 
 /**
- * R7.2 — an archive as a folder in the explorer.
+ * An archive as a folder in the explorer.
  *
- * The archive is the one the command was given: the explorer context menu
- * passes the file that was right-clicked, and a command that asked again would
- * be ignoring what the user had already said. Only an invocation with nothing
- * to go on — the command palette — opens a dialog.
+ * The archive is the one the command was given — the explorer context menu
+ * passes the file that was right-clicked. Only an invocation with nothing to go
+ * on opens a dialog.
  */
 async function mount(
     archives: Archives,
@@ -181,7 +176,7 @@ async function unmount(archives: Archives): Promise<void> {
     }
 }
 
-/** R7.3 — the one act that writes the archive. */
+/** The one act that writes the archive. */
 async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
     const mount = await choose(archives, 'Save which archive?');
     if (!mount) {
@@ -225,7 +220,7 @@ async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
     );
 }
 
-/** R6.7 — what a save would do, without doing any of it. */
+/** What a save would do, without doing any of it. */
 async function preview(archives: Archives): Promise<void> {
     const mount = await choose(archives, 'Preview a save of which archive?');
     if (!mount) {
@@ -247,9 +242,8 @@ async function preview(archives: Archives): Promise<void> {
         log().appendLine(`  ${entry.path} ${entry.structural}, which no patch can express`);
     }
     log().show(true);
-    // A structural change is a rebuild whatever else is in the set, and saying
-    // so first is the difference between a report about the set and a report
-    // about one entry that did not fit. DR-026.
+    // A structural change is a rebuild whatever else is in the set, so it is
+    // what the report names first.
     const why =
         planned.structural.length > 0
             ? `${planned.structural.length} change(s) alter what the archive holds`
@@ -311,7 +305,7 @@ async function verify(archives: Archives): Promise<void> {
     );
 }
 
-/** R7.5 — put an out-of-scope asset on disk and watch it. */
+/** Puts an out-of-scope asset on disk and watches it. */
 async function handOff(archives: Archives, uri?: vscode.Uri): Promise<void> {
     const chosen = uri ?? vscode.window.activeTextEditor?.document.uri;
     if (!chosen || chosen.scheme !== SCHEME) {

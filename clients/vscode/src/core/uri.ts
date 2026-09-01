@@ -1,23 +1,15 @@
 /**
- * How an entry inside an archive is addressed as a URI. R7.1.
+ * How an entry inside an archive is addressed as a URI.
  *
  * `rpf://<token>/<path inside the archive>?<the archive's own path>`
  *
- * Two things have to be in one URI — which archive, and which entry inside it —
- * and the entry has to be the *tail* of the path, because that is what an
- * editor joins a child name onto and splits a parent off. So the archive goes
- * in the query, where it is one opaque string with no separator to be confused
- * with the path's.
- *
- * The authority is a digest of the query rather than the archive's path spelt
- * out: an authority is compared case-insensitively by convention, and archive
- * paths are not. It carries no information of its own — it is checked against
- * the query, and a URI whose two halves disagree is refused rather than
- * resolved to one of them.
+ * The archive goes in the query because the entry has to be the *tail* of the
+ * path, which is what an editor joins a child name onto. The authority is a
+ * digest of that query: an authority is compared case-insensitively and archive
+ * paths are not, and a URI whose two halves disagree is refused.
  *
  * `/` is the only separator inside an archive, on every platform, and `\` is an
- * ordinary character in an entry name — DR-016. So nothing here treats a
- * backslash as a separator, and a name holding one survives the round trip.
+ * ordinary character in an entry name that survives the round trip.
  */
 
 import { createHash } from 'node:crypto';
@@ -38,7 +30,7 @@ export interface UriParts {
 
 /** Which archive, and which entry inside it. */
 export interface Address {
-    /** The archive's path on the daemon's filesystem. DR-014. */
+    /** The archive's path on the daemon's filesystem. */
     archive: string;
     /** The path inside the archive; empty for its root. */
     inside: string;
@@ -100,9 +92,9 @@ export function addressOf(uri: UriParts): Address {
  * A path inside an archive, as the daemon takes one: no leading separator, no
  * empty component, and nothing that climbs.
  *
- * The climbing rules are DR-013's tree rules, asked here so a URI that cannot
- * name an entry is refused where the user can still see which one they meant.
- * The daemon asks them again, and it is the daemon's answer that decides.
+ * Asked here so a URI that cannot name an entry is refused where the user can
+ * still see which one they meant. The daemon asks again, and its answer
+ * decides.
  *
  * @throws {BadUri} for a component that is empty, `.` or `..`.
  */

@@ -1,9 +1,8 @@
 /**
- * Showing a failure as something to act on. R7.6.
+ * Showing a failure as something to act on.
  *
- * The classification is in `core/errors.ts`, which has no editor in it and is
- * tested against a live daemon. This file is the adapter: it puts the same
- * three lines into whichever of the editor's surfaces the failure reached.
+ * The classification is in `core/errors.ts`, which has no editor in it. This
+ * file puts it into whichever of the editor's surfaces the failure reached.
  */
 
 import * as vscode from 'vscode';
@@ -29,7 +28,7 @@ export function note(line: string): void {
  *
  * The headline is what fits in a notification; the reason and the instruction
  * go to the log, which is what "Show Details" opens. A stack trace is never
- * what is shown, which is R7.6 in one sentence.
+ * shown.
  */
 export async function report(failure: unknown, doing: string): Promise<Advice> {
     const advice = advise(failure);
@@ -47,14 +46,9 @@ export async function report(failure: unknown, doing: string): Promise<Advice> {
 /**
  * The same failure as one the editor's filesystem layer understands.
  *
- * The editor has its own small vocabulary for filesystem failures and shows it
- * in places a notification cannot reach — a failed save, a hover in the
- * explorer — so the categories that have a counterpart are given one, and the
- * message is the actionable text either way.
- *
- * Which word a failure is is decided by `core/errors.ts`, where it can be
- * checked without an editor; this function is the one place those words become
- * the editor's own type.
+ * The editor shows these in places a notification cannot reach — a failed save,
+ * a hover in the explorer — so a category with a counterpart is given one.
+ * Which word a failure is is decided by `core/errors.ts`.
  */
 export function asFileSystemError(failure: unknown, uri: vscode.Uri): vscode.FileSystemError {
     const advice = advise(failure);

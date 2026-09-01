@@ -1,37 +1,13 @@
 /**
  * What a session has buffered, and what the archive holds once it is committed.
  *
- * **A listing is the archive on disk.** DR-028: `list` answers what is there
- * now, and `read` is the one method that prefers a buffered write. So a client
- * that forwarded `list` would show a created entry as absent, a deleted one as
- * present and a renamed one under its old name, until the save. This file is
- * the client's answer: the same change set the daemon holds, kept here as well,
- * and applied to the listing in **the daemon's own order**, so the two cannot
- * come to disagree about what the commit will produce.
- *
- * That order is DR-026's, stated by `rpf_core::edit::tree_of` and repeated in
- * {@link Pending.rowsOver}: **removals, then renames, then writes, then
- * directories.** It is part of the contract rather than an implementation
- * detail, because it is what lets one set rename over a path it also removes.
- *
- * **A change is keyed by the path the archive holds it at**, exactly as
- * `rpf_core::edit::Changes` is, and never by the path the change puts it at. A
- * buffered rename of `data` to `info` leaves the entry beneath it addressed as
- * `data/greeting.txt` for as long as it is buffered, and {@link Pending.address}
- * is what turns the path a user sees back into the one the daemon takes.
- *
- * **A set holds one change per path, and a second change of another kind is
- * refused rather than applied.** `Changes::admits` is where the daemon says so
- * — `Error::Claimed`, exit 6 — and {@link Pending.admits} is the same rule
- * here, because a model that quietly replaced where the daemon refuses would
- * be a model of a set the daemon does not hold. DR-032. What composes two
- * gestures into one set is {@link Pending.plan}, which withdraws before it
- * offers.
- *
- * Nothing here folds case. Two paths differing only in case are one name to the
- * container and two strings here, and the daemon refuses that collision when
- * the change is offered — so this file compares paths exactly and leaves the
- * answer to the side that knows the format. `docs/conventions.md` §1.
+ * A listing is the archive on disk and `read` is the one method that prefers a
+ * buffered write, so the set is applied to the listing in the daemon's own
+ * order — removals, then renames, then writes, then directories — which is what
+ * lets one set rename over a path it also removes. A change is keyed by the
+ * path the archive holds it at, never the path the change puts it at. A set
+ * holds one change per path; a second change of another kind is refused rather
+ * than applied. Nothing here folds case.
  */
 
 import { Refused } from './errors.js';
@@ -42,8 +18,7 @@ import { normalise } from './uri.js';
  * One buffered change, as `rpf_core::edit::Change` spells it.
  *
  * A rename carries only its destination, because the source is the key. A write
- * carries its contents because a gesture can move the key it is buffered at —
- * renaming an entry this session created re-keys the change that created it —
+ * carries its contents because a gesture can move the key it is buffered at,
  * and because a plan that failed part-way puts back what it withdrew.
  */
 export type Change =
@@ -60,9 +35,7 @@ export type Offer = readonly [path: string, change: Change];
  *
  * A gesture is not always one change: deleting a file this session created
  * takes a change **out** of the set, and renaming a directory this session made
- * moves the changes inside it to other keys. `forget` is what expresses both —
- * one request each, where a buffer with no way to take a change back left only
- * `discard` and a replay of everything else. DR-032 §4.
+ * re-keys the changes inside it. `forget` is what expresses both.
  *
  * Withdrawals come first, because the daemon refuses a second change at a path
  * its set already holds.
@@ -74,7 +47,7 @@ export interface Plan {
     readonly offer: readonly Offer[];
 }
 
-/** The order a commit applies a set's changes in. DR-026, `edit::tree_of`. */
+/** The order a commit applies a set's changes in. `edit::tree_of`. */
 const ORDER: Change['kind'][] = ['remove', 'rename', 'write', 'mkdir'];
 
 /** Whether `path` is `under`, or is `under` itself. Component-wise. */
@@ -160,11 +133,9 @@ export class Pending {
      * Why a second change cannot be recorded at a path beside the one already
      * there, or `undefined` when it can.
      *
-     * `rpf_core::edit::Changes::admits`, in the same two exceptions: two
-     * **writes** replace, because saving one file twice is what an editor does
-     * and the later contents are what it means; and the same change offered
-     * again is not a second change. Anything else is `Error::Claimed` on the
-     * wire, so anything else is a refusal here.
+     * `rpf_core::edit::Changes::admits`, with its two exceptions: two
+     * **writes** replace, and the same change offered again is not a second
+     * change. Anything else is `Error::Claimed` on the wire, so a refusal here.
      */
     admits(path: string, change: Change): string | undefined {
         const held = this.changes.get(path);
@@ -185,10 +156,9 @@ export class Pending {
      * `undefined` when it can.
      *
      * `rpf_core::edit::tree_of` applies a set's renames in path order, so a
-     * directory's rename runs before that of an entry inside it and leaves the
-     * inner one addressing a path the tree no longer holds — the commit answers
-     * `NotFound` for a set both halves of which were accepted when they were
-     * offered. Refusing the second here is what keeps that out of the save.
+     * directory's rename runs first and leaves an inner one addressing a path
+     * the tree no longer holds. Refusing the second here keeps that `NotFound`
+     * out of the save.
      */
     blocksRename(held: string): string | undefined {
         for (const [key, change] of this.changes) {
@@ -210,17 +180,14 @@ export class Pending {
      * ones already there.
      *
      * Composition rather than replacement: a gesture that withdraws a change
-     * withdraws it on both sides, and one that re-keys a change forgets it and
-     * offers it at the key it moves to. Nothing here changes this set — the
-     * daemon is asked first, and {@link Pending.apply} is what records the
-     * answer.
+     * withdraws it on both sides. Nothing here changes this set — the daemon is
+     * asked first, and {@link Pending.apply} is what records the answer.
      *
      * @param held the path the archive holds the entry at, which is the key.
      * @param visible the path the user sees it at, which is the key a change
      * this session created is buffered under.
      * @throws Refused when one set cannot hold both changes, naming the one in
-     * the way. The daemon says the same thing — `Error::Claimed` — and this
-     * says it before the request rather than after. DR-032 §3.
+     * the way, before the request rather than after.
      */
     plan(held: string, visible: string, change: Change): Plan {
         if (change.kind === 'remove') {
@@ -229,11 +196,8 @@ export class Pending {
         if (change.kind === 'rename') {
             return this.planRename(held, visible, change.to);
         }
-        // Putting a path back that a buffered removal takes out is not two
-        // changes: "gone, and then these contents" is those contents, which is
-        // the one change a set holds at that key. Only a write can say it — a
-        // directory over a removed file, or a file over a removed directory,
-        // needs two sets and the caller is told so by the refusal below.
+        // "Gone, and then these contents" is those contents, which is the one
+        // change a set holds at that key. Only a write can say it.
         if (change.kind === 'write' && this.changes.get(held)?.kind === 'remove') {
             return { forget: [held], offer: [[held, change]] };
         }
@@ -262,8 +226,8 @@ export class Pending {
     /**
      * The rows a listing would answer once this set is committed.
      *
-     * DR-026's order, which is what makes this the same tree the rebuild
-     * reaches: removals, then renames, then writes, then directories.
+     * In the order that makes this the same tree the rebuild reaches: removals,
+     * then renames, then writes, then directories.
      */
     rowsOver(disk: readonly Listed[]): Listed[] {
         // Each row remembers the path the archive holds it at, because that is
@@ -310,9 +274,7 @@ export class Pending {
      * of recording anything.
      *
      * Whatever was buffered at the path itself goes too: the entry is leaving,
-     * so an edit or a rename of it is void, and a set holding both would be
-     * refused. Both are `forget` now, where each used to be the whole set
-     * discarded and offered again. DR-030 §3, DR-032 §4.
+     * so an edit or a rename of it is void and a set holding both is refused.
      */
     private planRemoval(held: string, change: Change): Plan {
         const there = this.changes.get(held);
@@ -357,9 +319,8 @@ export class Pending {
         if (there !== undefined) {
             forget.push(held);
         }
-        // A rename back to where the entry started is the withdrawal of the one
-        // that moved it: recording `a → a` would be refused, since a rename's
-        // destination may not be inside the entry being renamed.
+        // A rename back to where the entry started withdraws the one that moved
+        // it: recording `a → a` would be refused.
         if (to !== held) {
             offer.push([held, { kind: 'rename', to }]);
         }

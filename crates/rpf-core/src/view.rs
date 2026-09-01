@@ -1,77 +1,6 @@
 //! Which form of an entry a caller reads and writes: its own bytes, or the XML
-//! view of them.
-//!
-//! This is where the container and the metadata layer meet, and it is on this
-//! side of the boundary for the reason `edit::check_encoding` is: an entry's
-//! encoding comes from [`Archive::classify`], the conversion comes from
-//! [`crate::metadata::view`], and neither of the two layers may know about the
-//! other (`docs/conventions.md` §2). Nothing here holds a signature, a schema
-//! or a token, and nothing here knows what XML *is* — it knows only that an
-//! encoding may have a view and that a converter answers it.
-//!
-//! Both frontends read and write through this one module, so `rpf cat --as xml`
-//! and the daemon's `read {"as": "xml"}` are the same bytes by construction
-//! (§1). DR-053 argues the shape, and what a client may and may not conclude
-//! from it.
-//!
-//! **What has a view is not a fact this module holds.** It asks
-//! [`crate::metadata::view::to_xml`], which answers `None` for an encoding with
-//! none, so the set is written down exactly once and one layer down (§3). R5.8
-//! is that door being used: a resource carrying `Meta` gained its view there,
-//! and what this module gained with it is [`Held`] — because a `Meta` is the
-//! one view whose conversion needs a fact from the **entry row** rather than
-//! from the payload.
-//!
-//! # What a resource's view costs, and why it is here rather than one layer
-//! down
-//!
-//! A `Meta` lives inside a resource's *inflated* payload, and every pointer in
-//! it is resolved against the boundary between the system and the graphics
-//! pages. That boundary is `size_from_flags` of the entry's own system flags:
-//! it is nowhere in the payload, so a caller that hands the metadata layer a
-//! payload without the flags that belong to it is handing over half an entry.
-//! [`Held::Resource`] is that half carried, and it is what the two payload-form
-//! entry points take instead of an [`Encoding`] a resource does not have.
-//!
-//! The two framings meet here as well. A resource's payload is framed and
-//! deflated; a `Meta` is what it inflates to. So a converted **read** takes
-//! [`Archive::read`]'s contents rather than [`Archive::extract`]'s payload, and
-//! a converted **write** frames what it produced back up — the payload's own
-//! opaque prefix, then the deflated contents, then the archive's transform
-//! where the entry was read under one. A converted write is the one write that
-//! is not passthrough, and it cannot be: it is a payload this build decoded,
-//! edited and encoded again.
-//!
-//! **What a converted write does and does not preserve** is DR-060, and it is
-//! three properties and not four. The document survives the round trip, the row
-//! is unchanged apart from `compressed_len`, and the write is idempotent from
-//! the second time on. What does **not** hold, and cannot with this design, is
-//! archive-level byte identity for an unedited write: the contents are deflated
-//! again at [`Compression::default`] rather than at whatever level the producer
-//! used, so the payload's length moves even when not one byte of the contents
-//! does. Passthrough — `rpf cat` into `rpf put` with no `--as` — is still byte
-//! for byte, and that is the property `docs/approach.md` commits to.
-//!
-//! **A payload in hand is taken apart under the same transform**, and that is
-//! DR-061. Because a converted write buffers the payload in the form the entry
-//! sits in on disk, the seams that read a payload rather than an archive —
-//! [`of`] and [`applied`], which are what the daemon asks of its own buffered
-//! write — have to be able to un-seal what [`apply`] sealed. So [`Held`]
-//! carries the entry's transform as well as its flag words ([`Resource`]), and
-//! [`held_in_hand`] is where a caller with an archive fills it in. What has no
-//! transform to give still works exactly as it did: the clear boundary, found
-//! rather than declared.
-//!
-//! The other half of DR-061 is a refusal: **a resource entry does not take a
-//! document**. Whether its payload could not be taken apart at all — a corrupt
-//! stream, or a keyed one with no key — or came apart and is not a `Meta`,
-//! which is 694,470 of the corpus's 696,578 resources, there is nothing for a
-//! document to be applied *to*, and [`View::Auto`]'s "hand the bytes back" is
-//! the wrong answer for it: it wrote the XML document into the entry as the
-//! resource's payload, silently, because a resource carries no encoding for
-//! `edit::check_encoding` to see a change in. A resource takes a document only
-//! by converting it; its own bytes still go in under [`View::Raw`], and under
-//! `auto` for anything that is not a document.
+//! view of them. The container and the metadata layer meet here; neither layer
+//! knows about the other.
 
 use std::{
     borrow::Cow,
@@ -95,28 +24,16 @@ use crate::{
     metadata::{Encoding, hash::Dictionary, view as convert},
 };
 
-/// Which form of an entry a caller is asking for.
-///
-/// The three are a wire contract as well as a type: `"raw"`, `"xml"` and
-/// `"auto"` are what `--as` takes and what `read` and `write` carry, and
-/// [`View::name`] is the one place they are spelled (§3). DR-053.
+/// Which form of an entry a caller is asking for, and the wire spelling of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum View {
     /// The entry's own bytes, whatever they are.
-    ///
-    /// The default everywhere, and deliberately: `rpf cat > f` followed by
-    /// `rpf put … f` is a round trip through the filesystem that must stay
-    /// byte for byte, and a caller that asked for nothing asked for that.
     #[default]
     Raw,
     /// The XML view. An entry that has none is refused.
     Xml,
     /// The XML view where the entry has one, and the entry's own bytes where it
     /// has not.
-    ///
-    /// What an editor asks for: it presents whatever it is given and must not
-    /// guess from an extension which of the two it will be. The answer says
-    /// which it got.
     Auto,
 }
 
@@ -143,13 +60,6 @@ impl View {
 
 /// What a caller wants of an entry: which form, and how the hashes in it are
 /// spelled while it is in that form.
-///
-/// Grouped rather than passed as two more parameters, for the reason
-/// [`crate::Change`]'s options are: a call site reading `apply(src, a, i, p,
-/// view, offered, names)` says nothing about which argument is which. The
-/// dictionary rides with the view because it is only ever consulted in one —
-/// it decides how a `PSO`'s names are rendered and is cosmetic by construction
-/// (R5.5), so [`Dictionary::default`] is a complete answer.
 #[derive(Debug, Clone, Copy)]
 pub struct Wanted<'a> {
     /// Which form of the entry.
@@ -160,18 +70,9 @@ pub struct Wanted<'a> {
 
 /// What the **entry** holds, which is the whole of whether it has a view.
 ///
-/// Three answers rather than [`Encoding`]'s four-or-none, because a resource is
-/// not an encoding and never becomes one: `docs/backlog.md` Q7 measured that no
-/// payload sniff can name one, so what a resource is comes from its row and
-/// what it carries comes from the contents inside it (DR-044). A caller that
-/// has only an [`Option<Encoding>`] — every caller before R5.8 — converts into
-/// this and loses nothing, because that is exactly what a binary entry answers.
-///
-/// [`Held::Resource`] carries the entry's two flag words rather than a byte
-/// count, and carries them for two reasons: the system half is the boundary
-/// `meta` resolves every pointer against, and the pair together is the length
-/// the payload must inflate to, which is how a payload in hand is unframed
-/// without an archive to ask.
+/// A resource is not an encoding: what it is comes from its row, whose flag
+/// words are both the boundary `meta` resolves pointers against and the length
+/// the payload must inflate to.
 #[derive(Debug, Clone)]
 pub enum Held {
     /// Nothing recognised — unknown binary — or there is no entry at all.
@@ -183,57 +84,27 @@ pub enum Held {
     Resource(Resource),
 }
 
-/// A **resource** entry as a seam holding its payload needs it.
-///
-/// The row's two flag words, and the archive's own transform in both
-/// directions. The transform is here because of what a converted write leaves
-/// behind: it produces a payload in the form the entry sits in on disk, which
-/// for the 3,022 of 696,578 resources DR-051 measured is ciphertext (DR-054 §3,
-/// DR-060 §2). A caller that then reads that payload back — the daemon reading
-/// its own buffer — has to be able to take it apart again, and nothing in the
-/// bytes says how. DR-061.
-///
-/// [`Resource::in_the_clear`] is the answer for a caller with no archive to
-/// ask, which is every caller that has only flag words to give: a payload under
-/// a transform then has no view here, exactly as before.
+/// A **resource** entry as a seam holding its payload needs it: the row's two
+/// flag words, and the archive's own transform in both directions.
 #[derive(Debug, Clone)]
 pub struct Resource {
     /// The entry row's two flag words.
     flags: ResourceFlags,
-    /// The archive's transform keyed for this entry, where one was to hand.
-    ///
-    /// The decrypting direction, which is what takes a payload in hand apart.
+    /// The archive's decrypting transform, where one was to hand.
     cipher: Option<Cipher>,
-    /// What mints its inverse, where this build can run the transform
-    /// forwards.
+    /// What mints its inverse, where this build can run the transform forwards.
     ///
-    /// **A [`Sealer`] and not a [`crate::format::crypto::Seal`]**, and that is the whole of DR-063: an
-    /// NG key is chosen by the name *and the length* of what is being written,
-    /// and what a converted write writes is a payload it has just produced. A
-    /// seal minted when this value was made would be keyed by the length the
-    /// entry had **before** the edit, and an archive sealed under it parses and
-    /// does not load. So the key is chosen in [`Resource::seal_from`], from the
-    /// bytes actually being sealed, and there is no seal here to be reused.
-    ///
-    /// `None` for an archive under a transform this build cannot run forwards,
-    /// which is a refusal at the write and not at the read: what is readable
-    /// stays readable, and only putting it back is impossible.
-    ///
-    /// Shared rather than owned because a [`Held`] is cloned across the
-    /// daemon's session and deriving the NG forward transform is seventeen
-    /// rounds.
+    /// A [`Sealer`] and not a seal: an NG key is chosen by the name and length
+    /// of what is being written, so a converted write's key can be chosen only
+    /// in [`Resource::seal_from`], once the payload exists.
     sealer: Option<Arc<Sealer>>,
     /// The entry's own name, which is the other half of what a key is chosen
-    /// by.
-    ///
-    /// Empty where there is no transform to key, which is every caller holding
-    /// only flag words.
+    /// by, and empty where there is no transform to key.
     name: String,
     /// The archive's encryption tag, which that refusal names.
     tag: u32,
-    /// The archive's version, which is what says how a payload's keying length
-    /// is derived from its own — [`crate::format::Version::resource_key_len`],
-    /// the rule this seals under and the reader reads under.
+    /// The archive's version, which says how a payload's keying length is
+    /// derived from its own.
     version: Version,
 }
 
@@ -247,9 +118,7 @@ impl Resource {
             sealer: None,
             name: String::new(),
             tag: rpf7::ENCRYPTION_OPEN,
-            // Nothing is keyed under it: this is the answer for a caller with
-            // no archive to ask, and `seal_from` returns before it looks at a
-            // length for a payload that was not sealed.
+            // Nothing is keyed under it, so this version is never consulted.
             version: Version::Rpf7,
         }
     }
@@ -264,44 +133,16 @@ impl Resource {
     /// `from` onwards, where `sealed` says the payload it was made from was
     /// found under it.
     ///
-    /// **The one place a resource payload this build produced is sealed**, and
-    /// the mirror of the probe that took it apart: `build::is_sealed` answers
-    /// `false` for every resource because the writer is handed payloads as they
-    /// sit on disk, so a payload this build *produced* has to arrive there
-    /// already in that form or it arrives in the clear (DR-054 §3, DR-060 §2).
-    ///
     /// `from` is where the stream begins inside the payload, which is where the
-    /// reader's own `archive::Decrypting` counts its blocks from: a resource is
-    /// decrypted from its stream's start and not from the payload's, and the
-    /// two differ for the 24-byte headers of [`RESOURCE_HEADER_LENS`]. The tail
-    /// shorter than a block goes through as it stands, which is
-    /// [`crate::format::crypto::Seal::apply`]'s
-    /// rule and the reader's alike.
-    ///
-    /// **The key is chosen here, from the payload in hand**, because an NG key
-    /// index is `(hash(name) + length + 61) % 101` (Q2) and `payload` is a
-    /// payload this build has just produced: deflated again from edited
-    /// contents, and its own length. The length is the whole payload's — the
-    /// opaque prefix included — because that is what the row will declare and
-    /// what `Archive::resource_cipher` hands the reader off that row.
-    ///
-    /// **The length is put through
-    /// [`crate::format::Version::resource_key_len`] rather than used as it
-    /// stands**, and that is DR-063's correction. Once the payload has outgrown
-    /// the row's 24-bit compressed-size field the row states no extent at all,
-    /// and the reader recovers one as the block-aligned room to the next
-    /// payload — so for every payload past that field whose length is not a
-    /// whole number of blocks, the length in hand here is not the length the
-    /// reader will key by, and the two pick different keys of the 101. The
-    /// rebuilt archive then parses, verifies, and does not load. The one
-    /// number both sides can compute is the room, and both sides derive it
-    /// through that one function.
+    /// reader counts its blocks from. The key is chosen here from the whole
+    /// payload in hand, its length put through
+    /// [`crate::format::Version::resource_key_len`] because past the row's
+    /// 24-bit size field the reader keys by the block-aligned room instead.
     ///
     /// # Errors
     ///
     /// [`Error::CannotWriteEncrypted`] for an archive under a transform this
-    /// build cannot run forwards, which is how a converted write into an
-    /// archive this build cannot seal refuses rather than lands in the clear.
+    /// build cannot run forwards.
     fn seal_from(&self, payload: &mut [u8], from: usize, sealed: bool) -> Result<()> {
         if !sealed {
             return Ok(());
@@ -357,56 +198,31 @@ impl Held {
 }
 
 /// How many of a resource's inflated bytes are system pages.
-///
-/// `docs/rpf-format.md`, Resource page flags. Saturating rather than fallible:
-/// a length no `usize` holds is a payload no machine read, and the conversion
-/// it is handed to bounds every access by the payload it was given.
 fn system_len(flags: ResourceFlags) -> usize {
     usize::try_from(size_from_flags(flags.system)).unwrap_or(usize::MAX)
 }
 
 /// A resource payload a caller already holds, taken apart at the boundary its
 /// stream begins at.
-///
-/// [`crate::archive::Unframed`] over a payload rather than over an archive, and
-/// the two agree by construction: both carry the bytes in front of the stream,
-/// because both feed [`exported`], which puts them back.
 struct InHand<'a> {
     /// The opaque bytes in front of the stream.
     prefix: &'a [u8],
     /// What the stream inflates to.
     contents: Vec<u8>,
     /// Whether the stream was found under the archive's own transform, which
-    /// is how what is written back goes back the way it came. DR-051, DR-060.
+    /// is how what is written back goes back the way it came.
     sealed: bool,
 }
 
 /// The inflated contents of a resource payload a caller already holds, or
 /// `None` when these bytes are not one.
 ///
-/// **The boundary is found rather than declared** — DR-045's rule, applied to a
-/// payload with no archive behind it. A Rockstar resource's payload carries no
-/// header (Q7), so what is in front of its stream is 16 or 24 opaque bytes
-/// ([`RESOURCE_HEADER_LENS`]) and the entry's own flag words are what judge a
-/// candidate: the stream has to inflate to exactly the length they declare.
-///
-/// **The transform is tried as well as the boundary**, in the clear first and
-/// under the archive's own second, which is `Archive::resource_stream`'s own
-/// order over an entry rather than over a payload. It is here because a
-/// converted write leaves a payload in the form the entry sits in on disk, and
-/// for a keyed resource that is ciphertext: a seam that could not take it apart
-/// answered "no view" for the daemon's own buffer, and `auto` then wrote the
-/// document into the archive in its place (DR-061). A [`Resource`] with no
-/// cipher tries the clear boundary alone, which is what a caller holding only
-/// flag words can honestly answer.
-///
-/// **A payload that does carry an `RSC7` header is judged by it.** Its words at
-/// offsets 8 and 12 are the same two facts the row carries, and
-/// `build::store_resource` takes the payload's over the row's when it has them
-/// — so a header that contradicts the row describes a different entry, and
-/// unframing it against the row's boundary would answer a document read at
-/// addresses that are not its own. Two elements over one address have to agree
-/// (DR-059); where they do not, there is no view rather than a guess.
+/// The boundary is found rather than declared: a Rockstar payload carries no
+/// header, so in front of its stream are 16 or 24 opaque bytes
+/// ([`RESOURCE_HEADER_LENS`]) and the row's flag words judge a candidate — the
+/// stream has to inflate to exactly the length they declare, in the clear or
+/// under the archive's own transform. A payload that does carry an `RSC7`
+/// header must agree with the row at offsets 8 and 12 or it is another entry's.
 fn contents_of<'a>(payload: &'a [u8], resource: &Resource) -> Option<InHand<'a>> {
     let flags = resource.flags;
     if payload.get(..MAGIC_RSC7.len()) == Some(&MAGIC_RSC7[..])
@@ -449,25 +265,13 @@ fn contents_of<'a>(payload: &'a [u8], resource: &Resource) -> Option<InHand<'a>>
 /// The payload edited contents become: the payload's **own** opaque prefix,
 /// then the contents deflated.
 ///
-/// **The prefix is carried across rather than replaced with a header of this
-/// build's own**, and that is DR-060 rather than a shortcut. `docs/rpf-format.md`
-/// records that no Rockstar resource payload begins with `RSC7` and that
-/// nothing decrypts those 16 or 24 bytes into one — nobody knows what they are
-/// — and `docs/approach.md` commits that what this build cannot interpret still
-/// round-trips byte for byte. Writing a header instead moved the stream by 8
-/// bytes for the 22 of 7,072 resources whose stream begins at 24 and discarded
-/// the original bytes for all of them.
-///
-/// What the row declares is unaffected: `build::store_resource` reads flag words
-/// out of an `RSC7` header when the payload carries one and takes the entry's
-/// `declared` words when it does not (DR-046), and a payload keeping a
-/// Rockstar prefix is the second case — which is the case every resource in the
-/// corpus is in already.
+/// The prefix is carried across rather than replaced with a header of this
+/// build's own: nobody knows what those 16 or 24 bytes are, and what this build
+/// cannot interpret still round-trips byte for byte.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] from the encoder, which for a payload in memory is
-/// unreachable.
+/// [`Error::Io`] from the encoder, unreachable for a payload in memory.
 fn exported(prefix: &[u8], contents: &[u8]) -> Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(contents.len());
     payload.extend_from_slice(prefix);
@@ -480,24 +284,12 @@ fn exported(prefix: &[u8], contents: &[u8]) -> Result<Vec<u8>> {
         .map_err(|source| Error::Io { offset: 0, source })
 }
 
-/// Whether these offered bytes announce themselves as an XML document, which is
-/// the whole of what [`View::Auto`] converts.
+/// Whether these offered bytes announce themselves as an XML document.
 fn announces_xml(offered: &[u8]) -> bool {
     Encoding::of(offered.get(..Encoding::HEAD_LEN).unwrap_or(offered)) == Some(Encoding::Xml)
 }
 
 /// What the entry at `index` holds, refusing a directory.
-///
-/// A resource's answer carries the archive's transform, which a
-/// [`View::Raw`] read never uses — and it is derived anyway rather than
-/// deferred, because deferring it costs more than it saves. An archive that is
-/// not encrypted derives nothing at all ([`Archive::resource_transform`] over
-/// no scheme is two `None`s), and an archive that is encrypted pays one key
-/// derivation per **call**: both callers, [`read`] and [`apply`], are one entry
-/// each and neither frontend loops over a table here. A lazily-held transform
-/// would put an `Archive` borrow, or a cell, inside a [`Held`] that is cloned
-/// and handed across the daemon's session — which is a great deal of shape for
-/// a cost the archive's own opening already paid.
 ///
 /// # Errors
 ///
@@ -519,21 +311,8 @@ fn held_by<R: Read + Seek>(src: &mut R, archive: &Archive, index: u32, path: &st
 /// archive's transform for a payload of `in_hand` bytes — `None` for the one
 /// the entry itself carries.
 ///
-/// The length matters because the NG key index is a function of the payload's
-/// length on disk (DR-051), and a payload a caller holds is not always the one
-/// the entry carries: what a converted write buffers is deflated again and is
-/// its own length. It keys the **read** direction, which is the direction a
-/// length can be known in advance for: the bytes to be taken apart are the ones
-/// the caller is holding.
-///
-/// The write direction takes no length here at all, and that is DR-063. What
-/// goes back is a payload this build has not produced yet — `exported` deflates
-/// edited contents and the result is neither the entry's length nor the
-/// buffer's — so the key for it is chosen when the bytes exist, in
-/// [`Resource::seal_from`], and what is carried here is the [`Sealer`] that
-/// mints it. Carrying a [`crate::format::crypto::Seal`] instead sealed every
-/// converted write into an
-/// NG archive under the *old* payload's key.
+/// The length keys the read direction alone; the write direction's key is
+/// chosen when the bytes exist, in [`Resource::seal_from`].
 fn resource_at(archive: &Archive, index: u32, in_hand: Option<u64>) -> Result<Held> {
     let EntryKind::Resource {
         system_flags,
@@ -541,9 +320,7 @@ fn resource_at(archive: &Archive, index: u32, in_hand: Option<u64>) -> Result<He
         ..
     } = archive.entry(index)?.kind
     else {
-        // `Classification::Resource` comes from this same row, so the two
-        // cannot disagree; an entry that is not a resource holds no flags and
-        // has no resource view.
+        // An entry that is not a resource holds no flags and has no view.
         return Ok(Held::Nothing);
     };
     let (cipher, sealer) = archive.resource_transform(index, in_hand)?;
@@ -562,21 +339,6 @@ fn resource_at(archive: &Archive, index: u32, in_hand: Option<u64>) -> Result<He
 
 /// What the entry at `index` holds, for a payload the caller has **in hand**
 /// rather than the one the archive carries.
-///
-/// [`of`] and [`applied`] over a buffered write, which is the daemon's whole
-/// read-back path. It differs from what a read of the entry answers in exactly
-/// two ways, and both are about the buffer rather than about the entry:
-///
-/// - **An encoding is the buffer's**, because a client may have written bytes
-///   of another one over the entry, and what is converted is what is there.
-/// - **A resource's transform is keyed for the buffer's own length**, which is
-///   what `resource_at` documents.
-///
-/// What does *not* differ is the rule that decides whether there is a view at
-/// all: a resource is what its row says it is, and its payload is never
-/// sniffed for an encoding (Q7, DR-044). A directory holds nothing rather than
-/// refusing, because a payload buffered over one is a refusal its caller has
-/// already made.
 ///
 /// # Errors
 ///
@@ -601,12 +363,6 @@ pub fn held_in_hand<R: Read + Seek>(
 }
 
 /// A resource entry's inflated contents, or `None` when they do not read back.
-///
-/// [`Archive::classify`]'s rule, applied one layer up: a payload that cannot be
-/// read is not an error here but an entry with no view. A resource whose
-/// deflate stream does not inflate is a resource all the same — `verify` is
-/// where that is reported, one problem per path — and `--as auto` over an
-/// archive holding one must still hand back the bytes rather than fail.
 fn contents_at<R: Read + Seek>(src: &mut R, archive: &Archive, index: u32) -> Option<Vec<u8>> {
     archive.read(src, index).ok()
 }
@@ -617,34 +373,19 @@ pub struct Viewed {
     /// The bytes.
     pub bytes: Vec<u8>,
     /// Whether they are the XML view rather than the entry's own payload.
-    ///
-    /// A `bool` rather than a [`View`], because [`View::Auto`] is a question
-    /// and never an answer: what came back is one of the two forms, and a type
-    /// that could say "auto" here would be saying nothing (§5).
     pub xml: bool,
     /// What the entry's payload announces itself to be, or `None` when it
     /// announces nothing, is a resource, or is a directory.
-    ///
-    /// A resource's `None` means its payload was not read, exactly as a
-    /// listing row's does. `docs/backlog.md` Q7, DR-044.
     pub encoding: Option<Encoding>,
 }
 
-/// Reads one entry in the form `view` asks for.
-///
-/// `path` is how the caller spelled the entry, and is what a refusal names.
-///
-/// **A resource is never sniffed.** The entry's kind decides first, through
-/// [`Archive::classify`], so what a resource's bytes look like never makes it
-/// something else — Q7's trap, and DR-044's answer to it. What a resource's
-/// *contents* carry is a second question, asked only of an entry the row
-/// already called a resource, and its answer is a `Meta` or nothing (R5.8).
+/// Reads one entry in the form `view` asks for, naming `path` in a refusal.
 ///
 /// # Errors
 ///
 /// [`Error::NoXmlView`] when [`View::Xml`] is asked of an entry that has none,
-/// [`Error::WrongKind`] for a directory, and whatever reading the entry or
-/// converting it answers.
+/// [`Error::WrongKind`] for a directory, and whatever reading or converting
+/// answers.
 pub fn read<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -653,10 +394,8 @@ pub fn read<R: Read + Seek>(
     wanted: Wanted<'_>,
 ) -> Result<Viewed> {
     let held = held_by(src, archive, index, path)?;
-    // A resource is read in the framing its view lives in. `Archive::extract`
-    // is the file outside the archive — framed and deflated — and a `Meta` is
-    // what that inflates to, so the converted read asks `Archive::read` for the
-    // contents and only falls back to the payload when there is no view. R5.8.
+    // A `Meta` lives in the inflated contents, so a converted read asks
+    // `Archive::read` and falls back to the framed payload where there is none.
     if wanted.view != View::Raw
         && let Held::Resource(ref resource) = held
     {
@@ -692,18 +431,8 @@ pub fn read<R: Read + Seek>(
 /// The same decision over a payload a caller already holds, which is what the
 /// daemon asks of a write it has buffered.
 ///
-/// `held` is what the entry holds, and [`Held::Nothing`] is "nothing
-/// recognised", "not read" and "there is no entry yet" alike. An
-/// `Option<Encoding>` converts into it, so a caller with no resource to
-/// describe writes what it always wrote. A caller with no entry to ask — a
-/// payload on its own — puts the payload's own [`Encoding::of`] here, which is
-/// what the conversion would have derived anyway.
-///
-/// **A resource in hand is the exported form or it is nothing** — an `RSC7`
-/// header and a stream that inflates to the length its flag words declare —
-/// because the boundary a Rockstar payload's stream begins at is recovered by
-/// reading the archive. A caller holding one should ask [`read`], which unframes
-/// through it.
+/// [`Held::Nothing`] is "nothing recognised", "not read" and "there is no entry
+/// yet" alike. A resource in hand is the exported form or it is nothing.
 ///
 /// # Errors
 ///
@@ -724,9 +453,8 @@ pub fn of(
     if wanted.view == View::Raw {
         return Ok(raw(payload));
     }
-    // A resource's payload is never *sniffed* — what it holds came from its
-    // row, and the bytes decide only what is inside the framing that row
-    // describes.
+    // A resource's payload is never sniffed: the bytes decide only what is
+    // inside the framing its row describes.
     let converted = match held {
         Held::Nothing => None,
         Held::Encoded(_) => convert::to_xml(&payload, wanted.names)?,
@@ -755,37 +483,14 @@ pub fn of(
 /// says they are.
 ///
 /// [`View::Raw`] hands them back untouched. [`View::Xml`] reads them as a
-/// document and applies it to the payload the entry holds — DR-049, for `PSO`
-/// — and refuses an entry with no view. [`View::Auto`] does that only when the
-/// offered bytes announce themselves as XML **and** the entry has a view, and
-/// hands them back untouched otherwise: an editor hands back what it was given,
-/// and a payload that is not a document is not one.
+/// document and applies it to the payload the entry holds, refusing an entry
+/// with no view. [`View::Auto`] does that only when the offered bytes announce
+/// themselves as XML **and** the entry has a view.
 ///
-/// **A resource entry is the one entry that does not take a document**,
-/// whichever view asked. `auto`'s fallback is "these bytes are not a document
-/// for this entry", and for a resource that answer wrote the XML document into
-/// the archive as the resource's payload — silently, because a resource carries
-/// no encoding for `edit::check_encoding` to see a change in. A resource takes
-/// a document only by converting it, and where it cannot convert one it refuses.
-/// DR-061. Bytes that are genuinely a resource's own still go in as they always
-/// did, under [`View::Raw`] and under `auto` for anything that is not a
-/// document.
-///
-/// `held` is what the **entry** holds, on the same terms as [`of`]'s: it is the
-/// caller's [`Archive::classify`] answer, and [`Held::Nothing`] is "nothing
-/// recognised" or "there is no entry yet". It is the whole of whether there is
-/// a view, and `payload` is never consulted to decide that — the write side of
-/// **a resource is never sniffed** (Q7, DR-044). Without it a resource whose
-/// payload happens to begin `RBF0` would be handed to the tokeniser and a
-/// tokenised payload written into a resource entry, which is the one thing
-/// [`Classification::Resource`] carries no encoding to prevent. A resource
-/// carrying `Meta` is not that case reversed: it has a view because its **row**
-/// says it is a resource and its inflated contents carry the `Meta` magic, and
-/// never because a payload looked like one.
-///
-/// What comes back is a payload of the entry's own encoding, which is why a
-/// converted write needs no `allow_encoding_change`: there is no encoding
-/// change in it. DR-050's rule judges the result, unchanged and unweakened.
+/// A resource entry is the one entry that does not take a document, whichever
+/// view asked: handing one back wrote it into the archive as the payload,
+/// silently, because a resource carries no encoding for a change to be seen in.
+/// `held` is the whole of whether there is a view; `payload` never decides it.
 ///
 /// # Errors
 ///
@@ -816,15 +521,11 @@ pub fn applied(
             }
             match converted(payload, &held, wanted, &offered)? {
                 Applied::Payload(payload) => Ok(payload),
-                // The entry has no view and is not a resource, so the document
-                // is bytes like any other and `auto` hands back what it was
-                // given. A binary entry written full of XML is an encoding
-                // change, which `edit::check_encoding` sees and DR-050 judges.
+                // No view and not a resource: the document is bytes like any
+                // other, and `edit::check_encoding` judges the write.
                 Applied::NoView => Ok(offered),
-                // The entry is a resource and the document did not become its
-                // payload, so handing it back would write the document into the
-                // entry as the payload — with nothing to see it, because a
-                // resource carries no encoding. DR-061.
+                // A resource: handing the document back would write it into
+                // the entry as the payload, with nothing to see it.
                 Applied::Resource => Err(no_view()),
             }
         }
@@ -833,25 +534,15 @@ pub fn applied(
 
 /// What a document became against what the entry holds.
 ///
-/// Three answers rather than an `Option`, because the two ways of not becoming
-/// a payload are not one: a **binary** entry with no view holds bytes a
-/// document is no worse than, and DR-050 judges the write that lands them; a
-/// **resource** entry holds a payload whose framing, flag words and transform a
-/// document is not, and there is nothing there for `edit::check_encoding` to
-/// judge it by. [`View::Auto`] hands the document back for the first and
-/// refuses for the second, which is DR-061; an `Option` collapsed them, and the
-/// collapse wrote XML documents into resource entries as their payloads.
+/// Three answers rather than an `Option`: [`View::Auto`] hands a document back
+/// for a binary entry with no view, and refuses it for a resource.
 enum Applied {
     /// The payload the document becomes.
     Payload(Vec<u8>),
     /// The entry is not a resource and has no XML view.
     NoView,
     /// The entry is a **resource** and the document did not become a payload
-    /// for it — its own payload would not come apart, or what came apart is not
-    /// something a document describes.
-    ///
-    /// Both are refusals and neither is a fallback: a resource entry does not
-    /// take a document.
+    /// for it, which is a refusal and never a fallback.
     Resource,
 }
 
@@ -859,10 +550,7 @@ enum Applied {
 /// the entry has no view.
 ///
 /// The whole of the write-side dispatch, in one place so that [`applied`]'s two
-/// converting arms cannot come to disagree. An entry with no view has nothing
-/// for a document to be applied to, and that is the **entry's** answer rather
-/// than the payload's: `payload` is not reached at all in that case, so it
-/// cannot overturn it (Q7, DR-044).
+/// converting arms cannot come to disagree.
 ///
 /// # Errors
 ///
@@ -883,17 +571,14 @@ fn converted(payload: &[u8], held: &Held, wanted: Wanted<'_>, offered: &[u8]) ->
                 offered,
                 wanted.names,
             )? {
-                // Framed back up with the prefix it was unframed at and put
-                // back under the transform it was found under, so a payload in
-                // hand goes back the shape it arrived in (DR-060, DR-061).
+                // Framed with the prefix it was unframed at and put back
+                // under the transform it was found under.
                 Some(edited) => {
                     let mut payload = exported(held.prefix, &edited)?;
                     resource.seal_from(&mut payload, held.prefix.len(), held.sealed)?;
                     Applied::Payload(payload)
                 }
-                // The payload came apart and is not a `Meta`: this resource has
-                // no view, and a resource with no view still does not take a
-                // document. DR-061.
+                // It came apart and is not a `Meta`, so there is no view.
                 None => Applied::Resource,
             }
         }
@@ -902,15 +587,8 @@ fn converted(payload: &[u8], held: &Held, wanted: Wanted<'_>, offered: &[u8]) ->
 
 /// The same, reading the payload the entry holds now out of the archive.
 ///
-/// The read is the whole of what makes a `PSO` write possible: DR-049 makes it
-/// an **edit** of the file the document came from, so the file has to be to
-/// hand. It is read here, in the call that converts, from the handle the caller
-/// is already holding open — never asked about first and read later, which is
-/// the shape that once corrupted an 80 MB archive.
-///
-/// **A resource is never sniffed**, exactly as in [`read`]: the entry's kind
-/// decides first, so a resource has no view whatever its bytes look like and
-/// its payload is not fetched at all. Q7, DR-044.
+/// A `PSO` write is an **edit** of the file the document came from, so it is
+/// read here, in the call that converts, from the handle already open.
 ///
 /// # Errors
 ///
@@ -930,34 +608,22 @@ pub fn apply<R: Read + Seek>(
     let held = held_by(src, archive, index, path)?;
     match held {
         // Nothing for a document to be applied to, so the payload is neither
-        // read nor sniffed. The empty slice is what a path with no entry at all
-        // offers, and it is the same answer for the same reason.
+        // read nor sniffed.
         Held::Nothing => applied(&[], held, path, wanted, offered),
         Held::Encoded(_) => {
             let payload = archive.extract(src, index)?;
             applied(&payload, held, path, wanted, offered)
         }
-        // A resource is unframed by the archive rather than by [`contents_of`],
-        // which is the whole reason this pair exists: the boundary its stream
-        // begins at is recovered by reading, and a payload under the archive's
-        // own transform is decrypted on the way. What comes back is framed
-        // again by [`exported`] and **put back under the transform it was read
-        // under** — [`Resource::seal_from`] seals it, because `build::is_sealed`
-        // answers `false` for every resource and is right to (DR-054 §3,
-        // DR-060).
+        // A resource is unframed by the archive, which recovers the boundary
+        // and decrypts on the way; what comes back is framed and sealed again.
         Held::Resource(ref resource) => {
             // `auto` over bytes that are not a document converts nothing, so a
             // resource that is not being edited as XML is not inflated at all.
             if wanted.view == View::Auto && !announces_xml(&offered) {
                 return Ok(offered);
             }
-            // A payload that will not come apart is a refusal in **both**
-            // forms. `auto`'s fallback is "these bytes are not a document for
-            // this entry", and for an entry whose payload nothing here can
-            // interpret that answer wrote the document into the archive as the
-            // resource's payload, with nothing refused and nothing reported:
-            // `edit::check_encoding` sees no encoding change because a resource
-            // carries no encoding. DR-061.
+            // A payload that will not come apart is a refusal in both forms:
+            // `auto`'s fallback would write the document in as the payload.
             let Ok(unframed) = archive.resource_unframed(src, index) else {
                 return Err(Error::NoXmlView {
                     path: path.to_owned(),
@@ -975,16 +641,8 @@ pub fn apply<R: Read + Seek>(
                     resource.seal_from(&mut payload, unframed.prefix.len(), unframed.sealed)?;
                     Ok(payload)
                 }
-                // The payload came apart and is not a `Meta`: this resource has
-                // no view, and `auto` refuses here exactly as it does for one
-                // that would not come apart at all. Handing the document back
-                // wrote it into the entry as the resource's payload, and this
-                // is the branch that covers 694,470 of the corpus's 696,578
-                // resources. DR-061.
-                //
-                // `View::Raw` never reaches this: it hands the offered bytes
-                // back at the top of the call, which is how genuine resource
-                // bytes still go in.
+                // Came apart and is not a `Meta`: no view, and `auto` refuses
+                // here too. `View::Raw` returned at the top of the call.
                 None => Err(Error::NoXmlView {
                     path: path.to_owned(),
                     held: None,
@@ -1063,9 +721,6 @@ mod tests {
 
     #[test]
     fn an_option_of_an_encoding_is_what_it_always_was() {
-        // Every caller before R5.8 hands over an `Option<Encoding>`, and the
-        // conversion has to be the identity on both of its answers or a binary
-        // entry's view would move.
         assert!(matches!(Held::from(None), Held::Nothing));
         assert!(matches!(
             Held::from(Some(Encoding::Rbf)),
@@ -1073,19 +728,14 @@ mod tests {
         ));
         assert_eq!(Held::Nothing.encoding(), None);
         assert_eq!(Held::Encoded(Encoding::Pso).encoding(), Some(Encoding::Pso));
-        // And a resource holds no encoding, which is what a listing row says
-        // about one and what `read` answers for one. Q7, DR-044.
+        // And a resource holds no encoding.
         assert_eq!(Held::from(FLAGS).encoding(), None);
     }
 
     #[test]
     fn a_resource_payload_in_hand_is_unframed_by_its_own_boundary_or_has_no_view() {
-        // What the daemon holds after a converted write is framed by
-        // `exported`, and unframing it again is what lets a buffered read
-        // answer the document. The prefix crosses both ways: `exported` keeps
-        // the one it was given (DR-060) and `contents_of` finds it again by the
-        // boundary the stream begins at, which is DR-045's rule with no archive
-        // behind it.
+        // The prefix crosses both ways: `exported` keeps the one it was given
+        // and `contents_of` finds it again by the boundary it begins at.
         let contents = vec![0x5A_u8; 512];
         let prefix = [0xFF_u8; 24];
         let payload = exported(&prefix, &contents).expect("frames");
@@ -1134,12 +784,8 @@ mod tests {
         assert!(!viewed.xml);
         assert_eq!(viewed.bytes, payload);
         assert_eq!(viewed.encoding, None);
-        // The write side refuses the document in **both** views, rather than
-        // handing it back for the commit to write into the entry as the
-        // resource's payload: a resource entry does not take a document, and
-        // this payload — framed, deflating to the length the row declares, and
-        // not a `Meta` — is the shape 694,470 of the corpus's 696,578 resources
-        // are in. DR-061.
+        // The write side refuses the document in both views rather than handing
+        // it back for the commit to write in as the resource's payload.
         let document = b"<?xml version=\"1.0\"?><a/>".to_vec();
         assert_eq!(
             applied(
@@ -1192,9 +838,8 @@ mod tests {
 
     #[test]
     fn a_resource_is_not_sniffed_even_when_its_bytes_would_name_something() {
-        // `encoding: None` is the classification's answer for a resource, and
-        // it is what decides here: the payload below is plainly XML and still
-        // has no view, because what an entry *is* comes from its row. Q7.
+        // The payload below is plainly XML and still has no view, because what
+        // an entry is comes from its row.
         let names = Dictionary::default();
         let payload = b"<?xml version=\"1.0\"?><a/>".to_vec();
         let refused = of(
@@ -1246,11 +891,6 @@ mod tests {
 
     #[test]
     fn auto_converts_recognised_xml_against_an_entry_that_has_a_view() {
-        // `auto_hands_back_bytes_that_are_not_a_document_untouched` covers the
-        // `!has_view` arm and offers bytes `auto` cannot read as XML either
-        // way, so neither tells the two `View::Auto` arms apart. An entry with
-        // a view, offered a document its encoding actually reads, is the one
-        // input only the real conversion answers right.
         let names = Dictionary::default();
         let offered = b"<root></root>".to_vec();
         let converted = applied(
@@ -1289,12 +929,8 @@ mod tests {
 
     #[test]
     fn a_payload_the_entry_gives_no_encoding_is_not_sniffed_for_one() {
-        // The write side of Q7. An entry that carries no encoding — a resource,
-        // whose kind `Archive::classify` short-circuits on before any read —
-        // has no view whatever its payload begins with, and `RBF0` is what a
-        // high-entropy resource has a 2^-32 chance of beginning with. Sniffing
-        // `held` instead would take the `rbf` arm and write a tokenised payload
-        // into a resource entry. DR-044.
+        // An entry that carries no encoding has no view whatever its payload
+        // begins with; sniffing would write a tokenised payload into it.
         let names = Dictionary::default();
         let document = b"<?xml version=\"1.0\"?><a/>".to_vec();
         let held = b"RBF0\x00\x00\x00\x00";
@@ -1328,12 +964,8 @@ mod tests {
     }
 
     /// A converted write of a resource, from the archive it is read out of to
-    /// the bytes that land on disk.
-    ///
-    /// `keys::Material::over_zeros` and the AES tag are what let this run on a
-    /// machine with no game installed and no corpus, exactly as
-    /// [`crate::build`]'s own tests do (DR-006): the transform is real and the
-    /// key is thirty-two zero bytes, so nothing here is or came from a key.
+    /// the bytes that land on disk, under a real transform whose key is
+    /// thirty-two zero bytes.
     mod converted {
         use std::{io::Cursor, sync::Arc};
 
@@ -1355,9 +987,7 @@ mod tests {
         /// The path the one entry sits at.
         const AT: &str = "data/thing.ymt";
 
-        /// The opaque bytes in front of the fixture's deflate stream: sixteen
-        /// of them, none of which is an `RSC7` header, which is what all
-        /// 696,578 of Rockstar's resource payloads look like (Q7, DR-046).
+        /// The sixteen opaque bytes in front of the fixture's deflate stream.
         const PREFIX: [u8; 16] = [0xFF; 16];
 
         /// The document [`meta_page`] converts to, and the same with its one
@@ -1376,14 +1006,8 @@ mod tests {
             (5_u64 << 28) | u64::from(offset)
         }
 
-        /// The smallest `Meta` that reaches a value: one structure of one
-        /// `UINT`, one data block holding it, in exactly one 512-byte system
-        /// page — which is what [`FLAGS`] declares.
-        ///
-        /// Built by hand from `docs/metadata-encodings.md`, so that a payload
-        /// built by the reader's own model cannot share the reader's bugs. The
-        /// same fixture as `crates/rpf/tests/common`'s, which is where both
-        /// frontends meet it.
+        /// The smallest `Meta` that reaches a value, in one 512-byte system
+        /// page, built by hand so that it cannot share the reader's own bugs.
         fn meta_page() -> Vec<u8> {
             let mut page = vec![0_u8; 512];
             let mut put = |at: usize, bytes: &[u8]| {
@@ -1414,8 +1038,7 @@ mod tests {
             page
         }
 
-        /// `contents` deflated, which is what a resource payload holds past its
-        /// opaque prefix.
+        /// `contents` deflated, which is what a resource payload holds.
         fn deflated(contents: &[u8]) -> Vec<u8> {
             let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(contents).expect("the page deflates");
@@ -1424,9 +1047,6 @@ mod tests {
 
         /// The zero-key AES forward transform, one seal off it, and the
         /// [`Unlock`] that opens what it wrote.
-        ///
-        /// The AES key is the tag's, so the name and length a seal is keyed by
-        /// are ignored on this arm — the NG arm is the one they are for.
         fn zeroed(named: &str) -> (Sealer, Seal, Unlock) {
             let material = Arc::new(Material::over_zeros());
             let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_AES).expect("AES");
@@ -1437,25 +1057,14 @@ mod tests {
 
         /// An AES-sealed archive holding one resource whose payload is under
         /// the archive's own transform, and that payload as it sits on disk.
-        ///
-        /// The 3,022-of-696,578 case DR-051 measured, assembled: the whole
-        /// payload is sealed from its own start, so the stream is found only
-        /// under the key and the sixteen opaque bytes in front of it are
-        /// ciphertext too.
         fn sealed_archive() -> (Vec<u8>, Unlock, Vec<u8>) {
             sealed_archive_behind(&PREFIX, 0)
         }
 
         /// The same behind a prefix of any length, sealed from `from` onwards.
         ///
-        /// The two parameters are one fact each and they are not the same fact.
-        /// A **16**-byte prefix cannot tell them apart: sealing from 0 and from
-        /// 16 leave byte-identical streams, because 16 is the cipher's own
-        /// block. A **24**-byte one can, and it is the only fixture that can:
-        /// the reader decrypts a resource from its *stream's* start, so a
-        /// 24-byte payload sealed from 0 does not read back at all and one
-        /// sealed from 24 does. DR-060 §2, and what
-        /// `RESOURCE_HEADER_LENS`'s 22-in-7,072 case costs.
+        /// The reader decrypts a resource from its stream's start and not the
+        /// payload's, which only a 24-byte prefix can tell apart.
         fn sealed_archive_behind(prefix: &[u8], from: usize) -> (Vec<u8>, Unlock, Vec<u8>) {
             let (sealer, seal, unlock) = zeroed("meta.rpf");
             let mut payload = prefix.to_vec();
@@ -1482,12 +1091,6 @@ mod tests {
 
         /// The synthetic NG forward transform, and the [`Unlock`] that opens
         /// what it wrote.
-        ///
-        /// `synthetic::ng_material` is arithmetic over a seed and no key
-        /// material at all (DR-006), which is what makes the NG write path
-        /// testable on a machine that has never seen a game — and the NG arm is
-        /// the one where a seal's *name and length* decide which of the 101
-        /// keys it is.
         fn ng_zeroed(named: &str) -> (Sealer, Unlock) {
             let material = Arc::new(synthetic::ng_material(0x0DE1_2A55));
             let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_NG).expect("NG");
@@ -1495,13 +1098,8 @@ mod tests {
             (sealer, Unlock::held(material, named))
         }
 
-        /// An NG-sealed archive holding one resource whose payload is under the
-        /// archive's own transform, the material that opens it, and that
-        /// payload as it sits on disk.
-        ///
-        /// The NG twin of [`sealed_archive`]: the payload is sealed under the
-        /// key its **entry name and its own length on disk** choose, which is
-        /// the key `Archive::resource_cipher` will pick to read it back.
+        /// An NG-sealed archive holding one resource under the archive's own
+        /// transform, the material that opens it, and that payload on disk.
         fn ng_sealed_archive() -> (Vec<u8>, Unlock, Vec<u8>) {
             let (sealer, unlock) = ng_zeroed("meta.rpf");
             let mut payload = PREFIX.to_vec();
@@ -1530,9 +1128,8 @@ mod tests {
             (out.into_inner(), unlock, payload)
         }
 
-        /// The same document with a value that **deflates to a different
-        /// length**, which is what moves the payload's own length on disk and
-        /// so the key an NG archive seals it under.
+        /// The same document with a value that deflates to a different length,
+        /// which moves the key an NG archive seals the payload under.
         const WIDENED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                                <hash_D98BB561 meta:struct=\"hash_D98BB561\">\n  \
                                <hash_12345678 meta:uint=\"123456789\"/>\n\
@@ -1548,22 +1145,12 @@ mod tests {
 
         #[test]
         fn a_converted_write_into_an_ng_archive_is_keyed_for_the_bytes_it_seals() {
-            // **The severe one, on the NG arm.** An NG key index is
-            // `(hash(name) + length + 61) % 101`, so it is a function of the
-            // payload being written — and a converted write produces a payload
-            // of its own length, deflated again from edited contents. A seal
-            // minted from the length the entry had *before* the edit picks the
-            // key the old payload had: the archive parses, `verify` finds a
-            // resource, and the entry does not load.
-            //
-            // The assertion is what LANDS: the rebuilt archive is opened again
-            // and the entry read back through it.
+            // An NG key is a function of the payload being written, so a seal
+            // minted from the length before the edit picks the old key.
             let (bytes, unlock, on_disk) = ng_sealed_archive();
             let mut src = Cursor::new(bytes);
             let archive = Archive::open(&mut src, &unlock).expect("the NG archive opens");
             let index = archive.find(AT).expect("the entry is there");
-            // The fixture is the case it claims to be: keyed, and read back
-            // only through the key.
             assert_eq!(
                 archive.read(&mut src, index).expect("reads"),
                 meta_page(),
@@ -1591,10 +1178,6 @@ mod tests {
             )
             .expect("the document applies");
 
-            // The edit moves the payload's length, and the two lengths choose
-            // different keys — asserted rather than assumed, because a fixture
-            // where both chose the same key would pass against a write that
-            // never re-keyed at all.
             let (sealer, _) = ng_zeroed("meta.rpf");
             let key_for = |len: usize| {
                 sealer
@@ -1642,37 +1225,19 @@ mod tests {
         }
 
         /// The largest value a resource's 24-bit compressed-size field holds,
-        /// and — on a resource — the sentinel it writes when the payload has
-        /// outgrown it.
-        ///
-        /// Spelled out rather than imported, for the reason
-        /// `crates/rpf-core/tests/boundaries.rs` spells it out: a test that
-        /// took the limit from the code it checks would agree with whatever
-        /// that code came to believe.
+        /// and the sentinel it writes when the payload has outgrown it.
         const SATURATED: usize = 0x00FF_FFFF;
 
-        /// A payload past the field that is **not** a whole number of blocks.
-        ///
-        /// The ordinary case rather than a corner: `build::write_payloads`
-        /// aligns every payload to 512, so the room the reader recovers for a
-        /// saturated row is longer than the payload for every length but the
-        /// aligned ones — 246 bytes longer here.
+        /// A payload past the field that is **not** a whole number of blocks,
+        /// so the room the reader recovers is longer than the payload.
         const PAST_THE_FIELD: usize = 17_828_618;
 
-        /// Where the saturated fixture's resource sits: the root, so that the
-        /// entry after it in the table is the payload after it on disk, which
-        /// is what a saturated extent is measured by (DR-051 clause 1).
+        /// Where the saturated fixture's resource sits: the root, so the entry
+        /// after it in the table is the payload after it on disk.
         const BIG: &str = "big.ymt";
 
-        /// An NG archive holding one resource payload of `len` bytes sealed
-        /// exactly as a converted write seals one — [`Resource::seal_from`],
-        /// the one place this build seals a resource payload — with a second
-        /// entry after it bounding its room.
-        ///
-        /// The payload is a stream and then slack, which is what a saturated
-        /// resource is on disk: the reader finds the stream at the payload's
-        /// own start and the bytes past it are the alignment the row cannot
-        /// describe.
+        /// An NG archive holding one resource payload of `len` bytes sealed as
+        /// [`Resource::seal_from`] seals one, with a second entry after it.
         fn ng_saturated_archive(len: usize) -> (Vec<u8>, Unlock) {
             let (sealer, unlock) = ng_zeroed("meta.rpf");
             let mut payload = PREFIX.to_vec();
@@ -1757,25 +1322,14 @@ mod tests {
 
         #[test]
         fn a_saturated_resource_is_sealed_under_the_key_the_reader_will_choose() {
-            // **The severe one.** A resource whose payload has outgrown the
-            // 24-bit compressed-size field writes a sentinel there and states
-            // its extent nowhere, so the reader recovers the extent as the
-            // room to the next payload — block-aligned, because the writer
-            // aligns every payload. An NG key is chosen by name and length, so
-            // a seal minted from the payload's own length picks one of the 101
-            // keys and the reader picks another: the archive parses, `verify`
-            // passes, and the entry does not load.
-            //
-            // Asserted on the archive re-opened and the entry read back, not
-            // on any return value.
+            // A payload past the 24-bit field states no extent, so the reader
+            // recovers it as the block-aligned room to the next payload.
             let room = (PAST_THE_FIELD as u64).next_multiple_of(512);
             assert_ne!(
                 room, PAST_THE_FIELD as u64,
                 "an aligned payload would prove nothing"
             );
 
-            // The two lengths choose different keys, so a fixture where they
-            // agreed cannot be what makes this pass.
             let (sealer, _) = ng_zeroed("meta.rpf");
             let key_for = |len: u64| {
                 sealer
@@ -1793,12 +1347,8 @@ mod tests {
 
         #[test]
         fn a_resource_payload_of_exactly_the_field_is_keyed_as_the_sentinel_it_reads_back_as() {
-            // The off-by-one at the boundary: a payload of exactly the field's
-            // largest value writes that value as its **length**, and no reader
-            // can tell it from the sentinel — the same 24 bits either way. So
-            // the field saturates at `>=` and not at `>`, and the key follows
-            // the reader's reading of the row rather than the writer's private
-            // knowledge of the payload.
+            // A payload of exactly the field's largest value is indistinct
+            // from the sentinel, so the field saturates at `>=` and not at `>`.
             let room = (SATURATED as u64).next_multiple_of(512);
             assert_ne!(room, SATURATED as u64, "the field's value is not aligned");
             saturated_reads_back(SATURATED, room);
@@ -1806,10 +1356,8 @@ mod tests {
 
         #[test]
         fn a_resource_payload_one_past_the_field_is_keyed_by_the_room_it_exactly_fills() {
-            // The far side of the same boundary, and the one that must not
-            // move: 16,777,216 is a whole number of blocks, so the room and
-            // the payload are the same length and the same key. A rule that
-            // over-aligned would break this one.
+            // 16,777,216 is a whole number of blocks, so the room and the
+            // payload are the same length and so the same key.
             let room = (SATURATED as u64).saturating_add(1);
             assert_eq!(room % 512, 0, "one past the field is a whole block");
             saturated_reads_back(SATURATED + 1, room);
@@ -1825,8 +1373,7 @@ mod tests {
             contents
         }
 
-        /// The one entry's payload as it sits on disk, out of a written
-        /// archive.
+        /// The one entry's payload as it sits on disk.
         fn payload_of(bytes: Vec<u8>, unlock: &Unlock) -> (Vec<u8>, crate::entry::EntryKind) {
             let mut src = Cursor::new(bytes);
             let archive = Archive::open(&mut src, unlock).expect("opens");
@@ -1838,20 +1385,10 @@ mod tests {
 
         #[test]
         fn a_converted_write_into_a_sealed_archive_lands_as_ciphertext() {
-            // The severe one. A resource under the archive's own transform is
-            // read **decrypted and inflated** — `Archive::resource_stream`
-            // recovers the transform, DR-051 — so what a converted write frames
-            // back up is contents, and `build::is_sealed` answers `false` for
-            // every resource because it is handed payloads as they sit on disk.
-            // Written through unsealed, the plaintext lands inside an encrypted
-            // archive, and `verify` cannot see it: the read side tries the
-            // clear boundary first and finds it. DR-054 §3 is the rule this
-            // asserts — an archive is written back under the transform it was
-            // read under.
+            // `build::is_sealed` answers `false` for every resource, so an
+            // unsealed write lands plaintext inside an encrypted archive.
             let (bytes, unlock, on_disk) = sealed_archive();
 
-            // The fixture is the case it claims to be: the payload reads back
-            // only under the key.
             let mut src = Cursor::new(bytes.clone());
             let archive = Archive::open(&mut src, &unlock).expect("opens");
             let index = archive.find(AT).expect("the entry is there");
@@ -1901,9 +1438,8 @@ mod tests {
             )
             .expect("the archive rebuilds");
 
-            // The assertion is over the bytes on disk and not over what the
-            // reader makes of them, because the reader is what hid this: it
-            // tries the clear boundary first and would find plaintext there.
+            // Over the bytes on disk rather than what the reader makes of
+            // them: it tries the clear boundary first and would hide this.
             let (written, kind) = payload_of(out.into_inner(), &unlock);
             for header in [16_usize, 24] {
                 assert_ne!(
@@ -1928,8 +1464,6 @@ mod tests {
                 EDITED,
                 "the edit did not land"
             );
-            // And the row is the row it was: a converted write moves the
-            // payload and nothing else about the entry.
             match kind {
                 crate::entry::EntryKind::Resource {
                     system_flags,
@@ -1943,26 +1477,17 @@ mod tests {
             }
         }
 
-        /// The 24-byte prefix, which is the only fixture that can see where a
-        /// converted write starts sealing.
+        /// The 24-byte prefix, the only one that can see where sealing starts.
         const WIDE_PREFIX: [u8; 24] = [0xFF; 24];
 
         #[test]
         fn a_converted_write_behind_a_wide_prefix_seals_from_the_streams_own_start() {
-            // `a_converted_write_into_a_sealed_archive_lands_as_ciphertext`
-            // cannot see this and never could: its prefix is 16 bytes, which is
-            // the cipher's own block, so sealing from the payload's start and
-            // from the stream's produce byte-identical bytes. The 22 of 7,072
-            // resources whose stream begins at 24 are the case where the two
-            // differ, and there the reader is the authority: `Decrypting`
-            // counts its blocks from the stream's first byte
-            // (`archive::resource_stream`), so a payload sealed anywhere else
-            // does not read back at all. DR-060 §2.
+            // A 16-byte prefix is the cipher's own block, so the two starts are
+            // identical; at 24 they differ, and the reader counts from the stream.
             let (bytes, unlock, on_disk) = sealed_archive_behind(&WIDE_PREFIX, WIDE_PREFIX.len());
             let mut src = Cursor::new(bytes);
             let archive = Archive::open(&mut src, &unlock).expect("opens");
             let index = archive.find(AT).expect("the entry is there");
-            // The fixture is the case it claims to be: keyed, and found at 24.
             assert_eq!(
                 archive.read(&mut src, index).expect("reads"),
                 meta_page(),
@@ -2009,8 +1534,7 @@ mod tests {
             .expect("the archive rebuilds");
             let written = out.into_inner();
 
-            // Over the raw bytes, and both directions of the one fact. Sealed
-            // from the stream: what is at 24 onwards decrypts and inflates.
+            // Sealed from the stream: what is at 24 onwards decrypts and inflates.
             let (payload, _) = payload_of(written.clone(), &unlock);
             assert_eq!(
                 payload.get(..WIDE_PREFIX.len()),
@@ -2027,9 +1551,8 @@ mod tests {
                 512,
                 "the written payload does not decrypt from the stream's own start"
             );
-            // And not from the payload's: decrypting the whole and then taking
-            // the stream is what a write sealed from 0 would answer, and it is
-            // a different arrangement of the same 16-byte blocks.
+            // And not from the payload's, which is a different arrangement of
+            // the same 16-byte blocks.
             let mut from_payload = payload.clone();
             Cipher::over_zeros().apply(&mut from_payload);
             assert_ne!(
@@ -2038,8 +1561,6 @@ mod tests {
                 "the written payload was sealed from the payload's start"
             );
 
-            // And it reads back through the archive as the document that was
-            // written, which is the whole round trip the two above bound.
             let mut back = Cursor::new(written);
             let archive = Archive::open(&mut back, &unlock).expect("reopens");
             let index = archive.find(AT).expect("the entry is there");
@@ -2059,13 +1580,8 @@ mod tests {
 
         #[test]
         fn a_keyed_payload_in_hand_comes_apart_and_goes_back_sealed() {
-            // The daemon's own buffer, without the daemon. What `apply`
-            // produces for a keyed resource is the payload as it will sit on
-            // disk — ciphertext — and the two seams that read a payload in hand
-            // have no archive to decrypt it with, so until they were given the
-            // entry's own transform this answered `NoXmlView` for a read of the
-            // buffer and, worse, let `auto` write the **document** into the
-            // entry in place of the payload. DR-061.
+            // What `apply` produces for a keyed resource is ciphertext, so the
+            // seams reading a payload in hand need the entry's own transform.
             for (prefix, from) in [(&PREFIX[..], 0), (&WIDE_PREFIX[..], 24)] {
                 let (bytes, unlock, _) = sealed_archive_behind(prefix, from);
                 let mut src = Cursor::new(bytes);
@@ -2089,15 +1605,12 @@ mod tests {
                 let held = held_in_hand(&mut src, &archive, index, &buffered)
                     .expect("the entry classifies");
 
-                // Read back: the buffer answers the document that made it.
                 let viewed = of(buffered.clone(), held.clone(), AT, wanted(View::Xml))
                     .expect("a keyed buffer has a view");
                 assert!(viewed.xml);
                 assert_eq!(String::from_utf8_lossy(&viewed.bytes), EDITED);
 
-                // Written over again, as `auto` — the flow that wrote the
-                // document into the archive. What comes back is a payload and
-                // not the 133 bytes of the document.
+                // Written over again as `auto`: a payload, not the document.
                 let again = applied(
                     &buffered,
                     held.clone(),
@@ -2112,8 +1625,6 @@ mod tests {
                     buffered.get(..prefix.len()),
                     "the opaque prefix was rewritten"
                 );
-                // Sealed as it was found: the stream decrypts from where the
-                // entry's own does, and reads back as what was written.
                 let mut stream = again.get(prefix.len()..).unwrap_or_default().to_vec();
                 Cipher::over_zeros().apply(&mut stream);
                 assert_eq!(
@@ -2129,11 +1640,8 @@ mod tests {
 
         #[test]
         fn a_converted_write_keeps_the_payloads_opaque_prefix_byte_for_byte() {
-            // DR-060. The bytes in front of a resource's deflate stream are
-            // nobody's — no Rockstar payload begins with `RSC7` and nothing
-            // decrypts those bytes into one (`docs/rpf-format.md`) — so a
-            // converted write carries them across rather than replacing them
-            // with a header of this build's own devising.
+            // The bytes in front of a resource's deflate stream are nobody's, so
+            // a converted write carries them across rather than replacing them.
             let (bytes, unlock, on_disk) = sealed_archive();
             let mut src = Cursor::new(bytes);
             let archive = Archive::open(&mut src, &unlock).expect("opens");
@@ -2160,13 +1668,8 @@ mod tests {
 
         #[test]
         fn a_payload_whose_header_contradicts_the_row_has_no_view() {
-            // Two elements over one address have to agree (DR-059). An `RSC7`
-            // header's words at offsets 8 and 12 are the same two facts the row
-            // carries, and `build::store_resource` takes the payload's when it
-            // has them — so a payload in hand whose header declares the
-            // boundary somewhere else is not this entry's, and unframing it
-            // against the row's flags would answer a document read at an
-            // address that is not its own.
+            // An `RSC7` header's words at 8 and 12 are the row's own two facts,
+            // so one declaring the boundary elsewhere is not this entry's.
             let names = Dictionary::default();
             let mut payload = Vec::new();
             payload.extend_from_slice(&MAGIC_RSC7);
@@ -2194,8 +1697,7 @@ mod tests {
             )
             .expect_err("the header contradicts the row");
             assert_eq!(refused.name(), "NoXmlView");
-            // And the write side answers the same, rather than re-framing what
-            // the client wrote with the row's flags and losing it.
+            // And the write side answers the same rather than re-framing it.
             let viewed = of(
                 payload.clone(),
                 Held::from(FLAGS),
@@ -2210,13 +1712,8 @@ mod tests {
             assert_eq!(viewed.bytes, payload);
         }
 
-        /// A resource payload whose `RSC7` header declares `header` as its two
-        /// flag words, in front of [`meta_page`]'s deflated stream.
-        ///
-        /// The header is sixteen bytes, which is one of
-        /// [`RESOURCE_HEADER_LENS`], so the stream begins exactly where an
-        /// unheaded payload's does and the words at offsets 8 and 12 are the
-        /// only thing that tells one of these payloads from another.
+        /// A resource payload whose sixteen-byte `RSC7` header declares
+        /// `header` as its flag words, in front of [`meta_page`]'s stream.
         fn headed_payload(header: ResourceFlags) -> Vec<u8> {
             let mut payload = Vec::new();
             payload.extend_from_slice(&MAGIC_RSC7);
@@ -2232,15 +1729,8 @@ mod tests {
 
         #[test]
         fn a_header_that_agrees_with_the_row_is_unframed_and_one_word_apart_is_not() {
-            // DR-059 word by word. The refusal is over two facts and not one:
-            // a header that disagrees on the **system** word alone describes
-            // another entry exactly as one that disagrees on the graphics word
-            // alone does, and a header that agrees on both is the ordinary read
-            // every `RSC7`-headed payload takes. A suite that only ever built a
-            // header wrong in both words cannot tell this refusal from one that
-            // fires on agreement, nor from one that waits for both words to be
-            // wrong before it fires — and a refusal that fired on agreement
-            // would leave every headed payload with no view at all.
+            // The refusal is over two facts: a header wrong in either word
+            // alone describes another entry, and one right in both reads.
             let names = Dictionary::default();
             let viewed = of(
                 headed_payload(FLAGS),
@@ -2281,13 +1771,8 @@ mod tests {
 
         #[test]
         fn a_resource_entry_read_through_the_archive_tells_the_three_views_apart() {
-            // R5.8's conversion path is a resource's, and which views take it
-            // is the whole of it. `raw` is the entry's own framed payload, byte
-            // for byte, because `rpf cat > f` followed by `rpf put … f` is a
-            // round trip through the filesystem; `xml` and `auto` are both the
-            // document, because a resource carrying `Meta` has a view and
-            // `auto` is asked to find one rather than to hand back the bytes
-            // (DR-061, DR-063). One entry, three reads, three answers.
+            // `raw` is the entry's own framed payload byte for byte; `xml` and
+            // `auto` are both the document, a resource with `Meta` having a view.
             let (bytes, unlock, on_disk) = sealed_archive();
             let mut src = Cursor::new(bytes);
             let archive = Archive::open(&mut src, &unlock).expect("opens");
@@ -2328,12 +1813,8 @@ mod tests {
 
         #[test]
         fn the_tag_a_refusal_to_seal_a_resource_names_is_the_archives_own() {
-            // `Archive::encryption_tag` exists so that a refusal to write an
-            // encrypted archive names the tag it could not write, and a number
-            // nothing ever reads back is a number that can be anything. The tag
-            // travels from the header into the `Resource` a read classifies and
-            // out again in `CannotWriteEncrypted`, so both ends of that journey
-            // are asserted here over one archive.
+            // The tag travels from the header into the `Resource` a read
+            // classifies and out again in `CannotWriteEncrypted`.
             let (bytes, unlock, _) = sealed_archive();
             let mut src = Cursor::new(bytes);
             let archive = Archive::open(&mut src, &unlock).expect("opens");
@@ -2349,9 +1830,6 @@ mod tests {
                 rpf7::ENCRYPTION_AES,
                 "the entry carries another archive's tag"
             );
-            // The fixture seals, so the refusal is reached by taking the
-            // forward transform away and leaving the tag: what a converted
-            // write into an archive this build cannot seal answers.
             let stranded = Resource {
                 sealer: None,
                 ..resource
@@ -2381,11 +1859,8 @@ mod tests {
 
         #[test]
         fn a_resource_payload_in_hand_is_unframed_at_the_boundary_it_begins_at() {
-            // The daemon's case: a client buffers a resource's own bytes over
-            // its entry and asks for XML. The boundary is *found* rather than
-            // declared (DR-045) — the stream inflates to exactly the length the
-            // row's flag words give, at 16 or at 24 — and a payload that
-            // answers at neither has no view rather than a guessed one.
+            // The boundary is found rather than declared: the stream inflates
+            // to exactly the length the row's flag words give, at 16 or at 24.
             let names = Dictionary::default();
             for prefix in [16_usize, 24] {
                 let mut payload = vec![0xFF_u8; prefix];

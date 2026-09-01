@@ -1,17 +1,8 @@
 //! `rbf::from_xml` over arbitrary bytes offered as a document.
 //!
-//! Bare bytes rather than a shaped type, so the corpus can be **seeded with
-//! the XML `to_xml` writes for every shipped `RBF` file** — 388 documents that
-//! this build produced and that `from_xml` is claimed to read back exactly.
-//! Starting there is what puts the mutator inside the parser: from nothing it
-//! spends its whole budget before the first `<`, and everything `xml::read`
-//! decides is past it — which tag is a value record and which an element, what
-//! `rbf:float.x` splits into, whether a name is a name, whether an attribute is
-//! still owed. `rbf_built.rs` reaches the same parser from the other side,
-//! with documents an `Arbitrary` script writes.
-//!
-//! What is asserted is [`rbf_law`], which is stated once there because both
-//! targets make the same claim.
+//! Bare bytes rather than a shaped type, so the corpus can be seeded with the
+//! XML `to_xml` writes for the shipped `RBF` files: from nothing a mutator
+//! spends its whole budget before the first `<`. Asserts [`rbf_law`].
 
 #![no_main]
 

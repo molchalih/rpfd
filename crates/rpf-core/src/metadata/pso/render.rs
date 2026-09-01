@@ -1,15 +1,10 @@
 //! The walk from the root block, and the XML it writes.
 //!
-//! Driven by the file's own `PSCH` and by nothing else — R5.3, and DR-047 is
-//! the mapping. Every read is bounds-checked against the `PSIN` section and
-//! every pointer against its own block's length, and the walk carries both a
-//! depth ceiling and a budget, because the block graph is attacker-chosen and
-//! can name a cycle or a diamond.
-//!
-//! Both are charged in [`Writer::empty`] and [`Writer::open`], which are the
-//! only two places an element is written. Charging at the structure instead
-//! left the array path free of both, and an array's size is a number the schema
-//! declares rather than something it has to nest to reach.
+//! Driven by the file's own `PSCH` and by nothing else. Every read is
+//! bounds-checked against the `PSIN` section and every pointer against its own
+//! block's length, and the walk carries a depth ceiling and a budget, both
+//! charged in [`Writer::empty`] and [`Writer::open`] — the only two places an
+//! element is written, and so the only charge an array path cannot escape.
 
 use quick_xml::escape::escape;
 
@@ -31,21 +26,17 @@ use crate::{
     },
 };
 
-/// The word an array item or a map entry is written under.
-///
-/// Reserved, like every name this mapping invents, by the `pso:` prefix
-/// [`Dictionary::load`] refuses a dictionary name to begin with. A prefix and
-/// deliberately **not** a namespace, for the reason DR-043 gives for `RBF`.
+/// The word an array item or a map entry is written under, reserved by the
+/// `pso:` prefix [`Dictionary::load`] refuses a dictionary name to begin with.
 pub(super) const ITEM: &str = "item";
 
 /// The word a null pointer is written under. Its value is the type word the
 /// value would have had.
 pub(super) const NULL: &str = "null";
 
-/// The word a structure is written under, in both of the places one is named:
-/// as the attribute on the element of a structure, whose value is that
-/// structure's own name — the only place a pointer's concrete type is written
-/// down — and as the value of `pso:null` for a structure pointer that is null.
+/// The word a structure is written under: as the attribute naming a
+/// structure's own type — the only place a pointer's concrete type is written
+/// down — and as the value of `pso:null` for a null structure pointer.
 pub(super) const STRUCT: &str = "struct";
 
 /// The word an array is written under; its value is which of the six `ARRAY`
@@ -73,7 +64,7 @@ const INDENT: &str = "  ";
 ///
 /// [`crate::Error::BadPso`] when the file contradicts itself, and
 /// [`crate::Error::UnsupportedPso`] when it is well formed and carries a member
-/// type outside the 37 pairs the corpus has.
+/// type this build does not decode.
 pub(super) fn write(payload: &[u8], names: &Dictionary) -> Result<Vec<u8>> {
     let sections = section::chain(payload).map_err(|(at, cause)| bad(at, cause))?;
     let find = |tag: [u8; 4]| {
@@ -105,10 +96,8 @@ pub(super) fn write(payload: &[u8], names: &Dictionary) -> Result<Vec<u8>> {
     let tag = names.render(root.name);
     writer.structure(root.name, root.offset, &tag, Place::root())?;
     // The per-element check is asked before the element is written, so the
-    // document may overshoot by the last one. Asking again at the end is what
-    // makes `document_budget` a bound the answer obeys rather than one the walk
-    // merely aims at — and what lets `apply` refuse a longer document on sight
-    // without refusing anything this ever wrote.
+    // document may overshoot by the last one; asking again here makes
+    // `document_budget` a bound the answer obeys.
     if writer.out.len() > writer.budget {
         return Err(bad(0, Malformed::TooLarge));
     }
@@ -124,18 +113,13 @@ struct Writer<'a> {
     names: &'a Dictionary,
     out: String,
     nodes: usize,
-    /// The most bytes of document this payload is allowed to write.
-    ///
-    /// `MAX_OUTPUT_RATIO` of the payload, and never less than `MIN_OUTPUT`.
-    /// Held rather than recomputed because it is a fact about the payload and
-    /// the payload does not change.
+    /// The most bytes of document this payload is allowed to write:
+    /// `MAX_OUTPUT_RATIO` of it, and never less than `MIN_OUTPUT`.
     budget: usize,
 }
 
-/// How deep the walk is, and how far the line is indented.
-///
-/// The two move together everywhere except inside an array, where an item is
-/// one level of both.
+/// How deep the walk is, and how far the line is indented; the two move
+/// together everywhere except inside an array.
 #[derive(Debug, Clone, Copy)]
 struct Place {
     depth: usize,
@@ -180,11 +164,8 @@ struct Items {
     word: &'static str,
     /// The member that describes one item.
     described: Member,
-    /// Where the first item is.
     base: u32,
-    /// How far apart they are.
     stride: u32,
-    /// How many there are.
     count: u16,
 }
 
@@ -273,12 +254,8 @@ impl<'a> Writer<'a> {
         self.leaf(tag, &reserved(word), &value, at.place)
     }
 
-    /// Writes a nested structure, inline or through a pointer.
-    ///
-    /// `docs/metadata-encodings.md`: a `STRUCT` member with subtype 3 or 4
-    /// carries `referenceKey == 0` in 43,225 of 43,225, so its type is not in
-    /// the member at all — it is the `nameHash` of the block the pointer lands
-    /// in, which is `PMAP` doing the work rather than an external schema.
+    /// Writes a nested structure, inline or through a pointer; subtypes 3 and
+    /// 4 carry no type of their own, it is the target block's `nameHash`.
     fn nested(&mut self, form: Nested, tag: &str, at: At<'a>) -> Result<()> {
         let (name, address) = match form {
             Nested::Structure(name) => (name, at.address),
@@ -302,11 +279,8 @@ impl<'a> Writer<'a> {
         self.leaf(tag, &reserved(ENUM), &rendered, at.place)
     }
 
-    /// Writes a bitset as the set of bits it holds.
-    ///
-    /// A bit the enum names is written as that name; one it does not is written
-    /// as its index. A dictionary name can never be a decimal number — it must
-    /// begin with a letter, `_` or `:` — so the two cannot be confused.
+    /// Writes a bitset as the set of bits it holds: a bit the enum names by
+    /// that name, one it does not by its index.
     fn bits(&mut self, width: Width, table: Option<u32>, tag: &str, at: At<'a>) -> Result<()> {
         let value = self.unsigned(width, at.address)?;
         let mut set = Vec::new();
@@ -342,10 +316,8 @@ impl<'a> Writer<'a> {
             _ => (at.address, count),
         };
         if count == 0 {
-            // An empty array's element type is never asked for. A `PSCH`
-            // legitimately describes structures the data never instantiates —
-            // 36 such hashes across the corpus — and an array of none of them
-            // is one of the ways they go unreached.
+            // An empty array's element type is never asked for: a `PSCH`
+            // legitimately describes structures the data never instantiates.
             return self.empty(tag, &attribute(&reserved(ARRAY), layout.word()), at.place);
         }
         let described = *at
@@ -371,11 +343,8 @@ impl<'a> Writer<'a> {
         )
     }
 
-    /// Where an out-of-line array's items are, and how many there are.
-    ///
-    /// A null pointer with a non-zero count is refused rather than read as
-    /// empty: it is a file contradicting itself, and 0 of 1,362,769 pointers in
-    /// the corpus do it.
+    /// Where an out-of-line array's items are, and how many; a null pointer
+    /// with a non-zero count is the file contradicting itself.
     fn counted(&self, address: u32, count: u16) -> Result<(u32, u16)> {
         match self.data.block_pointer(address)? {
             Some((_, base)) => Ok((base, count)),
@@ -384,13 +353,9 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Writes an `ATBINARYMAP` and its entries.
-    ///
-    /// Measured 2026-08-30: the counted pointer at byte 8 of the member lands
-    /// on an array of structures whose type is the target block's `nameHash`,
-    /// and that structure carries both a `Key` and an `Item` member in 17,560
-    /// of 17,560 instances. So a map is an array of key/value structures and
-    /// needs no vocabulary of its own beyond saying that it is one.
+    /// Writes an `ATBINARYMAP` and its entries: the counted pointer at byte 8
+    /// lands on an array of key/value structures typed by the block's
+    /// `nameHash`, so a map needs no vocabulary of its own.
     fn map(&mut self, tag: &str, at: At<'a>) -> Result<()> {
         let header = at.address.saturating_add(MAP_POINTER_AT);
         let count = self.data.half(header.saturating_add(COUNT_AT))?;
@@ -452,14 +417,9 @@ fn attribute(name: &str, value: &str) -> String {
 }
 
 impl Writer<'_> {
-    /// Charges one element against the ceilings.
-    ///
-    /// Called from [`Writer::empty`] and [`Writer::open`], which is every
-    /// element this mapping writes and the only way to write one. Charging at
-    /// the structure instead left the whole array path free: an inline array of
-    /// an inline array of an inline array declares its own lengths, so 176
-    /// bytes of schema asked for 2.8*10^14 items and neither ceiling was ever
-    /// consulted.
+    /// Charges one element against the ceilings, from [`Writer::empty`] and
+    /// [`Writer::open`] — every element this mapping writes, and so the only
+    /// charge a nest of inline arrays cannot escape.
     fn spend(&mut self, place: Place) -> Result<()> {
         if place.depth > MAX_DEPTH {
             return Err(bad(0, Malformed::TooDeep));
@@ -469,13 +429,9 @@ impl Writer<'_> {
             return Err(bad(0, Malformed::TooManyNodes));
         }
         // Charged in bytes as well as in elements, because an element is not a
-        // fixed number of bytes: it carries two spaces of indent per level, so
-        // a deep million costs several times a shallow million. `MAX_NODES`'s
-        // own doc comment claimed the node count bounded the memory; a
-        // 5,068-byte payload peaking at 81.8 MB is what said otherwise.
-        //
-        // Checked before the element rather than after, so the document
-        // overshoots by at most the one being written.
+        // fixed number of bytes: it carries two spaces of indent per level.
+        // Checked before the element, so the document overshoots by at most
+        // the one being written.
         if self.out.len() > self.budget {
             return Err(bad(0, Malformed::TooLarge));
         }
@@ -545,7 +501,6 @@ impl Writer<'_> {
         }
     }
 
-    /// Writes `depth` levels of indentation.
     fn indent(&mut self, depth: usize) {
         for _ in 0..depth {
             self.out.push_str(INDENT);
@@ -589,13 +544,8 @@ impl Writer<'_> {
     }
 }
 
-/// A word, as the reserved name that carries it.
-///
-/// One spelling of the prefix, in one place, and it is the same constant
-/// [`Dictionary::load`] refuses a dictionary name to begin with — so the guard
-/// and the vocabulary it guards are one fact rather than two. The words are
-/// [`Scalar::word`], [`Text::word`], [`Layout::word`] and the ones this module
-/// names.
+/// A word, as the reserved name that carries it: one spelling of the prefix,
+/// and the same constant [`Dictionary::load`] refuses a name to begin with.
 fn reserved(word: &str) -> String {
     format!("{RESERVED_PREFIX}{word}")
 }
@@ -614,8 +564,7 @@ mod tests {
     const ROOT_NAME: u32 = 0xD98B_B561;
     /// An arbitrary member name, distinct from [`ROOT_NAME`] and [`ARRAYINFO`].
     const MEMBER_NAME: u32 = 0x1234_5678;
-    /// The `ARRAYINFO` sentinel, `crate::metadata::pso::model`'s own copy not
-    /// being imported into this module.
+    /// The `ARRAYINFO` sentinel.
     const ARRAYINFO: u32 = 0x0000_0100;
 
     /// A one-entry `PMAP` block table naming a block of `length` bytes at
@@ -635,12 +584,6 @@ mod tests {
     fn trivial_blocks() -> Blocks {
         Blocks::read(&one_block_pmap(0, 64), 64).expect("a minimal block table reads")
     }
-
-    // -------------------------------------------------------------------
-    // `Writer::counted` — the `None` arm's `count == 0` guard tells a
-    // legitimately empty array from a null pointer that still declares
-    // items.
-    // -------------------------------------------------------------------
 
     #[test]
     fn counted_refuses_a_null_pointer_that_declares_a_nonzero_count() {
@@ -680,10 +623,6 @@ mod tests {
             "{error:?}"
         );
     }
-
-    // -------------------------------------------------------------------
-    // `Writer::spend` — both ceilings, at their exact boundary.
-    // -------------------------------------------------------------------
 
     #[test]
     fn spend_refuses_only_past_the_exact_node_ceiling() {
@@ -778,12 +717,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // The `Layout::PointerWithCount` arm — deleting it falls through to the
-    // inline wildcard, so an item is read from the pointer's own bytes
-    // instead of from the block the pointer names.
-    // -------------------------------------------------------------------
-
     /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`,
     /// the pointer naming a second block that holds the one item.
     fn pointer_with_count_pso() -> Vec<u8> {
@@ -846,28 +779,12 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // `write`'s own final check — the one `Writer::spend`'s per-element
-    // check cannot make, because it asks before the last element is
-    // written and so cannot see the total the last element leaves behind.
-    // -------------------------------------------------------------------
-
-    /// A distinct member name for the fine-tuning field
-    /// [`calibrated_pso`] carries alongside its bulk array.
+    /// A distinct member name for the fine-tuning field.
     const FINE_NAME: u32 = 0x4444_4444;
 
-    /// A payload whose root has two fields: an inline array of `outer`
-    /// inline arrays of `inner` zero-length strings, and a fixed inline
-    /// string of `fine` bytes.
-    ///
-    /// Every array item is zero-stride — the innermost element is a
-    /// zero-length inline string, so every level's stride is zero and no
-    /// item ever moves off the structure's own address — so the payload
-    /// itself stays a few dozen bytes regardless of `outer` and `inner`,
-    /// exactly as `nested_arrays_pso` in `crates/rpf-core/tests/metadata.rs`
-    /// does. `fine` is the one knob that costs real payload bytes, one for
-    /// one, which is what makes it the lever for closing the last few bytes
-    /// of a target exactly.
+    /// A payload whose root has an inline array of `outer` inline arrays of
+    /// `inner` zero-length strings and a fixed inline string of `fine` bytes.
+    /// Items are zero-stride, so only `fine` costs real payload bytes.
     fn calibrated_pso(outer: u16, inner: u16, fine: u16) -> Vec<u8> {
         let fine = usize::from(fine);
         let mut psin = Vec::new();
@@ -931,9 +848,8 @@ mod tests {
 
         let names = Dictionary::default();
 
-        // A cheap probe, two renders apart, gives the exact bytes one more
-        // inner item costs at this outer count — real measurement rather
-        // than a hand count of the XML this walk writes.
+        // Two renders apart give the exact bytes one more inner item costs at
+        // this outer count.
         let probe_low = write(&calibrated_pso(OUTER, PROBE, 0), &names)
             .expect("renders")
             .len();

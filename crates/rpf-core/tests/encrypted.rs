@@ -1,28 +1,9 @@
-//! R3.6: an encrypted archive opens, and says so honestly when it does not.
+//! An encrypted archive opens, and says so honestly when it does not.
 //!
-//! Two halves, and they are different kinds of evidence.
-//!
-//! The **ungated** half runs everywhere and is about the contract: what an
-//! encrypted archive answers when no key material is available, what the seam
-//! offers when there is none, and that none of the new surface can print a key.
-//! None of it needs a key or an archive.
-//!
-//! The **gated** half runs only where `RPF_CORPUS` names a directory holding
-//! the two encrypted archives `docs/corpus.md` lists and `RPF_GAME_IMAGE` names
-//! a memory image carrying the NG material. That is one machine, for DR-006's
-//! reason: key material is extracted from the user's own installation and never
-//! travels, so continuous integration can never run this half. The backlog
-//! plans around that rather than discovering it late.
-//!
-//! **The archives are addressed by a fixed relative path, and their own file
-//! names matter.** An NG archive's key is chosen by its file name and its
-//! length (`docs/rpf-format.md`, Encryption), so a corpus entry that is renamed
-//! stops opening — which is why `gtav_ng/dlc.rpf` is a directory named for the
-//! pack around a file still called `dlc.rpf`.
-//!
-//! `clippy.toml`'s `allow-*-in-tests` settings reach `#[cfg(test)]` modules and
-//! not this directory: an integration test is its own crate with no
-//! `cfg(test)`. `docs/conventions.md` §15's exception is spelled out here.
+//! The gated half needs `RPF_CORPUS` and a source of key material, which is
+//! extracted from the user's own installation and never travels. An NG
+//! archive's key is chosen by its file name and its length, so the corpus
+//! archives are addressed by fixed paths and their own file names matter.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -45,56 +26,34 @@ use rpf_core::{
     keys::Material,
 };
 
-/// The NG-encrypted archive in the corpus, by the relative path that addresses
-/// it. `docs/corpus.md`.
+/// The NG-encrypted archive in the corpus, by the path that addresses it.
 const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 
 /// The AES-encrypted archive in the corpus, likewise.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
-/// The AES-encrypted archive whose resources carry a **24-byte** header rather
-/// than the 16 every other archive here uses. `docs/corpus.md`.
-///
-/// It is in the corpus for one reason: it is the smallest archive on either
-/// install, 4,096 bytes, whose payloads begin their deflate stream anywhere but
-/// 16 bytes in. `docs/backlog.md` Q14, population 1.
+/// The AES-encrypted archive whose resources carry a 24-byte header rather than
+/// the 16 every other archive here uses.
 const AES_24_ARCHIVE: &str = "gtav_aes/des_hosp_ceil2.rpf";
 
-/// The archive whose **resources are under its own transform**, which every
-/// other archive here would have you believe cannot happen. `docs/corpus.md`.
-///
-/// 155,648 bytes and two entries, both of them resources that begin no deflate
-/// stream in the clear at any measured boundary and both of which inflate to
-/// exactly what their flag words declare once decrypted. `docs/backlog.md`
-/// Q14, population 2; DR-051.
+/// The archive whose resources are under its own transform: neither begins a
+/// deflate stream in the clear at any measured boundary.
 const AES_KEYED_ARCHIVE: &str = "gtav_aes/script_release.rpf";
 
 /// The two resources [`AES_KEYED_ARCHIVE`] holds, and what each inflates to.
-///
-/// Measured 2026-08-31, and written down rather than derived so that a read
-/// which stopped decrypting them would fail here instead of agreeing with
-/// itself. DR-051.
 const KEYED_RESOURCES: [(&str, usize); 2] = [
     ("pilot_school.ysc", 458_752),
     ("pilotschool_dlc_startup.ysc", 8_192),
 ];
 
 /// Which of the 101 NG expanded keys `abigail1.ysc` is decrypted with, and
-/// which one the binary-entry rule would have chosen for it.
-///
-/// `docs/rpf-format.md`, Encryption, `verified`: the index is
-/// `(hash(name) + length + 61) % 101`, so the two lengths choose different keys
-/// and only the first decrypts anything. Written down rather than derived, so
-/// that a change to the hash is a failure here rather than a silent agreement.
+/// which one the binary-entry rule would have chosen for it: the index is
+/// `(hash(name) + length + 61) % 101`, so the two lengths choose different keys.
 const ON_DISK_KEY: usize = 85;
 const CONTENTS_KEY: usize = 13;
 
-/// The two builds of the Rockstar Games Launcher's own archive, which are the
-/// only archives here under the launcher key. `docs/corpus.md`.
-///
-/// Each row is the path, the entry count, the directories and the files, all
-/// measured 2026-08-30. The pair is one fixture: it is what established the
-/// block size and the absence of chaining before any key was in hand.
+/// The two builds of the launcher's own archive — the only archives here under
+/// the launcher key — each a path, an entry, directory and file count.
 const LAUNCHER_ARCHIVES: [(&str, usize, usize, usize); 2] = [
     ("rockstar_launcher/Launcher.rpf", 118, 19, 99),
     ("rockstar_launcher/Launcher.updated.rpf", 120, 20, 100),
@@ -103,13 +62,9 @@ const LAUNCHER_ARCHIVES: [(&str, usize, usize, usize); 2] = [
 /// The executable the launcher key comes from, inside `RPF_GAME_EXE`.
 const LAUNCHER_EXE: &str = "Launcher.exe";
 
-/// Reports a skip, naming the test, the gate that was not there, and what it
-/// would have read.
-///
-/// `RPF_REQUIRE_<GATE>` turns **that** gate's absence into a failure and no
-/// other's, which is what stops a green suite from being confused with a suite
-/// that ran (§12). It used to require all three at once, so asking for a corpus
-/// failed a test that only wanted an image and the message named neither.
+/// Reports a skip naming the test, the gate that was not there, and what it
+/// would have read; `RPF_REQUIRE_<GATE>` turns that gate's absence into a
+/// failure and no other's.
 fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -137,14 +92,9 @@ fn archive_path(test: &str, relative: &str) -> Option<PathBuf> {
     }
 }
 
-/// The key material the memory image carries, scanned **once** for the whole
-/// test binary.
-///
-/// One pass over a 65 MB image is about five seconds at `--release` and a good
-/// deal longer unoptimised (DR-040), and every gated test below wants the same
-/// material. An image carries 375 of the 376 values this pass looks for: the
-/// launcher key is in `Launcher.exe` and nowhere else (DR-042). Nothing is written anywhere: the material lives in this process
-/// and dies with it, which is what DR-006 is about.
+/// The key material the memory image carries, scanned once for the whole test
+/// binary: an image carries every value this pass looks for but the launcher
+/// key, which is in `Launcher.exe` alone. Nothing is written anywhere.
 fn scanned() -> Result<Arc<Material>, String> {
     static HELD: std::sync::OnceLock<Result<Arc<Material>, String>> = std::sync::OnceLock::new();
     HELD.get_or_init(|| {
@@ -184,8 +134,7 @@ struct Encrypted {
 }
 
 impl Encrypted {
-    /// The corpus archive at `relative`, with material, or `None` and a loud
-    /// skip.
+    /// The corpus archive at `relative`, with material, or a loud skip.
     fn of(test: &str, relative: &str) -> Option<Self> {
         let path = archive_path(test, relative)?;
         let material = material(test)?;
@@ -200,11 +149,8 @@ impl Encrypted {
         })
     }
 
-    /// The corpus archive at `relative`, with the material a game
-    /// **executable** carries.
-    ///
-    /// The AES key is in every source there is, so an AES archive needs no
-    /// memory image and this gate is `RPF_CORPUS` with `RPF_GAME_EXE`. DR-040.
+    /// The corpus archive at `relative`, with the material a game executable
+    /// carries: the AES key is in every source, so no memory image is needed.
     fn under_aes(test: &str, relative: &str) -> Option<Self> {
         let path = archive_path(test, relative)?;
         let material = executable_material(test)?;
@@ -225,13 +171,10 @@ impl Encrypted {
     }
 }
 
-// ---------------------------------------------------------------- ungated ---
-
 #[test]
 fn an_encrypted_archive_with_no_material_says_it_needs_a_key() {
-    // The state every machine without a game install is in, and the one R2.6
-    // rests on. Nothing past the tag is read: the sixteen bytes below describe
-    // an entry table that is not there, and the refusal happens first.
+    // Nothing past the tag is read: the refusal happens first, over sixteen
+    // bytes that describe an entry table which is not there.
     for tag in [
         rpf7::ENCRYPTION_NG,
         rpf7::ENCRYPTION_AES,
@@ -256,11 +199,8 @@ fn an_encrypted_archive_with_no_material_says_it_needs_a_key() {
 
 #[test]
 fn a_tag_names_a_transform_and_the_key_that_runs_it() {
-    // `0x0FFFFFF9` and `0x0FFFFFF7` are the **same** cipher under two different
-    // 32-byte keys — the tag selects a key, not an algorithm
-    // (`docs/rpf-format.md`, Encryption, `verified`; DR-042). Both are the AES
-    // scheme, and they are not the same scheme, which is the whole of the
-    // routing this build does.
+    // `0x0FFFFFF9` and `0x0FFFFFF7` are the same cipher under two different
+    // 32-byte keys: the tag selects a key, not an algorithm.
     assert_eq!(
         Version::Rpf7.scheme(rpf7::ENCRYPTION_AES),
         Some(crypto::Scheme::Aes(crypto::AesKey::Rage))
@@ -275,14 +215,11 @@ fn a_tag_names_a_transform_and_the_key_that_runs_it() {
     );
     assert!(!Version::Rpf7.is_open(rpf7::ENCRYPTION_AES_LAUNCHER));
 
-    // A tag that means nothing here still has no transform, and an unencrypted
-    // one has none either — two situations `None` covers and `is_open` tells
-    // apart.
+    // An unknown tag has no transform and neither has an open one: two
+    // situations `None` covers and `is_open` tells apart.
     assert_eq!(Version::Rpf7.scheme(0x0FFF_FFF0), None);
     assert_eq!(Version::Rpf7.scheme(Version::Rpf7.open()), None);
 
-    // Named apart, because a caller told the key it has is the wrong one has
-    // two different things to do about it.
     assert_ne!(
         crypto::Scheme::Aes(crypto::AesKey::Rage).named(),
         crypto::Scheme::Aes(crypto::AesKey::Launcher).named()
@@ -301,15 +238,10 @@ fn an_unkeyed_seam_names_no_archive_and_offers_nothing() {
 
 #[test]
 fn nothing_the_seam_renders_is_a_key() {
-    // DR-020, at the surface this change added. `Unlock` is the only new public
-    // type that can hold material, and the only thing it will say about itself
-    // is which archive it is for.
     let rendered = format!("{:?}", Unlock::unkeyed().renamed("dlc.rpf"));
     assert!(rendered.contains("dlc.rpf"), "{rendered}");
     assert!(rendered.contains("Unkeyed"), "{rendered}");
 }
-
-// ------------------------------------------------------------------ gated ---
 
 #[test]
 #[cfg_attr(
@@ -327,12 +259,10 @@ fn the_ng_archive_opens_and_every_entry_reads_back() {
 
     assert_eq!(archive.encryption(), rpf7::ENCRYPTION_NG);
     assert_eq!(archive.scheme(), Some("NG"));
-    // Measured 2026-08-30 on `update/x64/dlcpacks/patchday28g9ecng/dlc.rpf`,
-    // 6,144 bytes: seven entries, four of them directories.
+    // Seven entries, four of them directories.
     assert_eq!(archive.entries().len(), 7);
 
-    // The decrypted names are names, and the decrypted payload is XML — which
-    // is the whole claim. A wrong key gives neither.
+    // A wrong key gives neither a name that resolves nor XML.
     let index = archive.find("content.xml").expect("resolves");
     let contents = archive.read(&mut source, index).expect("reads");
     assert!(
@@ -367,17 +297,12 @@ fn a_nested_ng_archive_opens_under_its_own_name() {
         .locate(&mut source, "x64/levels/gta5/vehicles.rpf/cyclone2.ytd")
         .expect("descends into the nested archive");
     assert_eq!(inner.encryption(), rpf7::ENCRYPTION_NG);
-    // A resource: 16,384 bytes of texture dictionary, whose deflate stream sits
-    // in the clear sixteen bytes into the payload.
+    // A resource whose deflate stream sits in the clear sixteen bytes in.
     let contents = inner.read(&mut source, index).expect("reads");
     assert_eq!(contents.len(), 16_384);
 }
 
 #[test]
-// The AES key is in every source there is, executables included (DR-040), so
-// what an AES archive needs is `RPF_GAME_EXE` and not the memory image. Both of
-// these were gated on the image, which meant the Q3 measurement below never ran
-// on a machine that had everything it needed to check it.
 #[cfg_attr(
     any(no_corpus, no_executables),
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
@@ -393,7 +318,7 @@ fn the_aes_archive_opens_and_every_entry_reads_back() {
 
     assert_eq!(archive.encryption(), rpf7::ENCRYPTION_AES);
     assert_eq!(archive.scheme(), Some("AES-256"));
-    // Measured 2026-08-30: ten file entries, one binary and nine resources.
+    // Ten file entries, one binary and nine resources.
     assert_eq!(archive.entries().len(), 11);
 
     let index = archive.find("_manifest.ymf").expect("resolves");
@@ -430,13 +355,8 @@ fn resource_rows(bytes: &[u8], unlock: &Unlock) -> BTreeMap<String, (u32, u32)> 
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_aes_archives_nine_resources_extract_and_pack_back_with_their_flag_words() {
-    // R4.17, on the archive it was measured failing on. Its nine resources
-    // carry no `RSC7` header of their own — `docs/backlog.md` Q7, 696,578 of
-    // 696,578 — so before DR-058 the manifest recorded that they were resources
-    // and not what their rows declared, and packing the tree back was refused
-    // at the first of them. What makes this the whole round trip rather than
-    // half of it is DR-057: the tag names a transform this build can run
-    // forwards, so the tree packs back sealed under the archive's own key.
+    // The nine resources carry no `RSC7` header of their own, so the manifest
+    // has to record what their rows declared.
     let test = "the_aes_archives_nine_resources_extract_and_pack_back_with_their_flag_words";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
@@ -515,14 +435,8 @@ fn the_aes_archives_nine_resources_extract_and_pack_back_with_their_flag_words()
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_resource_whose_header_is_twenty_four_bytes_reads_back() {
-    // `docs/backlog.md` Q14, population 1, and the reason
-    // `format::resource::RESOURCE_HEADER_LENS` is a set rather than a constant.
-    // Both resources here begin their deflate stream 24 bytes into the payload,
-    // and neither begins one at 16: a reader that assumed the `RSC7` header's
-    // own length read nothing out of this archive at all.
-    //
-    // The synthetic half of this is `crates/rpf-core/tests/resource.rs`, which
-    // runs with no corpus. This is the archive the measurement came from.
+    // Both resources begin their deflate stream 24 bytes in and neither at 16,
+    // which is why the header length is a set rather than a constant.
     let test = "a_resource_whose_header_is_twenty_four_bytes_reads_back";
     let Some(held) = Encrypted::under_aes(test, AES_24_ARCHIVE) else {
         return;
@@ -531,7 +445,7 @@ fn a_resource_whose_header_is_twenty_four_bytes_reads_back() {
     let mut source = Cursor::new(held.bytes.clone());
     let archive = Archive::open(&mut source, &unlock).expect("the archive opens");
 
-    // Measured 2026-08-30: a root, one binary `.ytyp` and two resources.
+    // A root, one binary `.ytyp` and two resources.
     assert_eq!(archive.entries().len(), 4);
     for (name, len) in [
         ("des_hosp_ceil2.ydr", 16_384),
@@ -543,8 +457,7 @@ fn a_resource_whose_header_is_twenty_four_bytes_reads_back() {
             .unwrap_or_else(|error| panic!("{name} did not read back: {error}"));
         assert_eq!(read.len(), len, "{name} inflated to the wrong length");
 
-        // The stream begins 24 bytes in and nowhere else: the payload as the
-        // archive holds it does not inflate from 16.
+        // The stream begins 24 bytes in and nowhere else.
         let payload = archive.extract(&mut source, index).expect("extracts");
         let mut short = flate2::bufread::DeflateDecoder::new(&payload[16..]);
         let mut sunk = Vec::new();
@@ -566,12 +479,8 @@ fn a_resource_whose_header_is_twenty_four_bytes_reads_back() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_resource_under_the_archives_own_transform_reads_back() {
-    // `docs/backlog.md` Q14, population 2, and the reason
+    // Both resources here are under the archive's AES transform, so
     // `Archive::resource_stream` recovers a transform as well as a boundary.
-    // Both resources here are under the archive's AES transform: neither
-    // begins a deflate stream in the clear at either measured boundary, and
-    // both inflate to exactly what their flag words declare once decrypted.
-    // Under the build before DR-051 this archive failed 2 of 2.
     let test = "a_resource_under_the_archives_own_transform_reads_back";
     let Some(held) = Encrypted::under_aes(test, AES_KEYED_ARCHIVE) else {
         return;
@@ -580,7 +489,7 @@ fn a_resource_under_the_archives_own_transform_reads_back() {
     let mut source = Cursor::new(held.bytes.clone());
     let archive = Archive::open(&mut source, &unlock).expect("the archive opens");
 
-    // Measured 2026-08-31: a root and two resources, and no binary entry.
+    // A root and two resources, and no binary entry.
     assert_eq!(archive.entries().len(), 3);
     for (name, len) in KEYED_RESOURCES {
         let index = archive.find(name).expect("resolves");
@@ -589,9 +498,8 @@ fn a_resource_under_the_archives_own_transform_reads_back() {
             .unwrap_or_else(|error| panic!("{name} did not read back: {error}"));
         assert_eq!(read.len(), len, "{name} inflated to the wrong length");
 
-        // The half that says it is the transform and not a boundary: the same
-        // bytes with no key applied, at either measured boundary, inflate to
-        // nothing like what the flag words declare.
+        // With no key applied, neither boundary inflates to the declared
+        // length, so it is the transform and not a boundary that settles it.
         let payload = archive.extract(&mut source, index).expect("extracts");
         for header in [16_usize, 24] {
             let stream = payload.get(header..).expect("inside the payload");
@@ -613,14 +521,8 @@ fn a_resource_under_the_archives_own_transform_reads_back() {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
 fn a_resources_ng_key_is_chosen_by_its_length_on_disk() {
-    // The one part of DR-051 no archive in `assets/` can pin: the NG script
-    // archives are tens of megabytes each and stay out of the corpus, so what
-    // is pinned here is the field the key is chosen by rather than a payload
-    // that comes back. `docs/rpf-format.md`, Encryption, `verified` —
-    // `script_rel.rpf/abigail1.ysc` is 90,775 bytes on disk and inflates to the
-    // 229,376 its flag words declare, and only the on-disk length chooses the
-    // key that decrypts it. A **binary** entry keys by the other one, which is
-    // why this can regress into that rule without anything else noticing.
+    // The NG script archives stay out of the corpus, so what is pinned is the
+    // field the key is chosen by: a binary entry keys by the other length.
     let test = "a_resources_ng_key_is_chosen_by_its_length_on_disk";
     let Some(material) = material(test) else {
         return;
@@ -645,13 +547,9 @@ fn a_resources_ng_key_is_chosen_by_its_length_on_disk() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn one_pass_of_aes_opens_it_and_a_second_pass_does_not() {
-    // `docs/backlog.md` Q3, enforced rather than stated. Sixteen successive
-    // passes is the reading four implementations attest for RPF2 through RPF6;
-    // RPF7 is **one**, measured on all 43 archives here that carry the tag.
-    //
-    // The experiment: decrypt this archive's table of contents in the buffer,
-    // so that opening it decrypts a second time. If two passes were right, the
-    // doubly-decrypted form would be the one that opens. It is not.
+    // Four implementations attest sixteen successive passes for RPF2 through
+    // RPF6; RPF7 is one. Decrypting the table of contents in the buffer here
+    // makes opening the archive decrypt it a second time.
     let test = "one_pass_of_aes_opens_it_and_a_second_pass_does_not";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
@@ -688,10 +586,7 @@ fn one_pass_of_aes_opens_it_and_a_second_pass_does_not() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_renamed_ng_archive_says_the_material_does_not_open_it() {
-    // The failure DR-041 exists to separate from `NeedsKey`. The material is
-    // real and complete; the name it is keyed by is wrong, which is exactly
-    // what renaming an NG archive does. Nothing here is malformed, so reporting
-    // it as corrupt would name the wrong person (DR-010).
+    // The material is real and complete; the name it is keyed by is wrong.
     let test = "a_renamed_ng_archive_says_the_material_does_not_open_it";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -709,12 +604,6 @@ fn a_renamed_ng_archive_says_the_material_does_not_open_it() {
 }
 
 /// The material one named executable inside `RPF_GAME_EXE` carries.
-///
-/// `Launcher.exe` is an executable in a directory of executables, read by the
-/// same scan for the same kind of value as `GTA5.exe`, so it is gated on the
-/// same variable rather than on a fourth one. What tells the two apart is the
-/// per-file skip below, which names the file that was not there — a machine
-/// with a game and no launcher skips loudly and passes. DR-042.
 fn material_of(test: &str, named: &str) -> Option<Arc<Material>> {
     let Some(root) = env::var_os("RPF_GAME_EXE") else {
         return skip(test, "RPF_GAME_EXE", "RPF_GAME_EXE is not set");
@@ -739,9 +628,7 @@ fn material_of(test: &str, named: &str) -> Option<Arc<Material>> {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_launcher_archives_open_and_every_entry_reads_back() {
-    // R3.6 for the tag that was unidentified until 2026-08-30. Both builds,
-    // because the key holding across a repack is the claim that makes it a key
-    // rather than a coincidence, and because the pair is the corpus row.
+    // Both builds: a key holding across a repack is what makes it a key.
     let test = "the_launcher_archives_open_and_every_entry_reads_back";
     let Some(material) = material_of(test, LAUNCHER_EXE) else {
         return;
@@ -763,9 +650,8 @@ fn the_launcher_archives_open_and_every_entry_reads_back() {
         assert_eq!(archive.scheme(), Some("AES-256 (launcher)"));
         assert_eq!(archive.entries().len(), entries, "{relative}");
 
-        // Names resolve, which is the names blob having been decrypted from its
-        // own start rather than as part of the entry table — and a payload
-        // reads as itself, which no wrong key produces.
+        // Names resolve only if the names blob was decrypted from its own
+        // start rather than as part of the entry table.
         let index = archive
             .find("metadata/rdr2/title.rgl")
             .expect("a path the tree holds");
@@ -808,12 +694,8 @@ fn the_launcher_archives_open_and_every_entry_reads_back() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_game_install_without_the_launcher_needs_a_key_rather_than_holding_a_wrong_one() {
-    // The answer a machine with a game and no Rockstar Games Launcher gets, and
-    // the one thing about this change that is a decision rather than a
-    // measurement. The RAGE key is right there and it is not this archive's
-    // key, so `WrongKey` would be true of the material and useless as an
-    // instruction: what the holder does is install the launcher or point at its
-    // executable, which is extraction. DR-010, DR-041, DR-042.
+    // The RAGE key is right there and is not this archive's key, so `WrongKey`
+    // would be true and useless: what the holder does is find the launcher.
     let test = "a_game_install_without_the_launcher_needs_a_key_rather_than_holding_a_wrong_one";
     let Some(material) = material_of(test, "GTA5.exe") else {
         return;
@@ -845,12 +727,8 @@ fn a_game_install_without_the_launcher_needs_a_key_rather_than_holding_a_wrong_o
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_tag_chooses_the_key_and_the_rage_key_is_not_it() {
-    // The fact the whole change rests on, checked where nothing else can check
-    // it: `Launcher.exe` carries **both** keys, so the two transforms below
-    // differ in the key alone — same cipher, same mode, same one pass. Only one
-    // of them puts the root directory marker at row 0. A build that quietly
-    // handed back the RAGE key for either tag would pass every other test here
-    // and fail this one.
+    // `Launcher.exe` carries both keys, so the two transforms below differ in
+    // the key alone. Only one of them puts the root directory marker at row 0.
     let test = "the_tag_chooses_the_key_and_the_rage_key_is_not_it";
     let Some(material) = material_of(test, LAUNCHER_EXE) else {
         return;
@@ -887,12 +765,7 @@ fn the_tag_chooses_the_key_and_the_rage_key_is_not_it() {
     );
 }
 
-/// The material a game executable carries, which is the AES key and the hash
-/// lookup table and none of the NG values.
-///
-/// A third gate, because it names a third thing: `RPF_GAME_EXE` is a directory
-/// of executables and `RPF_GAME_IMAGE` is one memory image, and a machine can
-/// have either without the other. DR-040.
+/// The material a game executable carries: no NG values, the rest of it.
 fn executable_scanned() -> Result<Arc<Material>, String> {
     static HELD: std::sync::OnceLock<Result<Arc<Material>, String>> = std::sync::OnceLock::new();
     HELD.get_or_init(|| {
@@ -924,10 +797,8 @@ fn executable_material(test: &str) -> Option<Arc<Material>> {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn material_without_the_ng_half_is_no_candidate_for_an_ng_archive() {
-    // An executable's material carries the AES key and none of the NG values
-    // (DR-040), so pointing it at an NG archive is "no material available"
-    // rather than "the wrong material" — there is nothing to try. `NeedsKey` is
-    // the honest answer, and it is the one that says what to go and do.
+    // An executable carries none of the NG values, so an NG archive is "no
+    // material available" rather than "the wrong material".
     let test = "material_without_the_ng_half_is_no_candidate_for_an_ng_archive";
     let Some(path) = archive_path(test, NG_ARCHIVE) else {
         return;
@@ -955,9 +826,7 @@ fn material_without_the_ng_half_is_no_candidate_for_an_ng_archive() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_truncated_encrypted_table_of_contents_is_refused_rather_than_decoded() {
-    // §12: the malformed case on a parsing surface reached before every check
-    // that already existed. The header still claims seven entries and a names
-    // blob; the bytes that would hold them are gone.
+    // The header still claims seven entries and a names blob; the bytes are gone.
     let test = "a_truncated_encrypted_table_of_contents_is_refused_rather_than_decoded";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -979,10 +848,8 @@ fn a_truncated_encrypted_table_of_contents_is_refused_rather_than_decoded() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_tag_that_claims_encryption_over_a_body_that_is_not_says_the_key_is_wrong() {
-    // §12 again, from the other side: an unencrypted table of contents behind
-    // an encrypted tag. The material is real and it decrypts plaintext into
-    // nonsense, which the root directory row catches — so this is `WrongKey`
-    // and not a tree walked out of garbage.
+    // The material is real and it decrypts plaintext into nonsense, which the
+    // root directory row catches — so this is `WrongKey`, not a walked tree.
     let test = "a_tag_that_claims_encryption_over_a_body_that_is_not_says_the_key_is_wrong";
     let Some(material) = material(test) else {
         return;
@@ -1011,9 +878,7 @@ fn a_tag_that_claims_encryption_over_a_body_that_is_not_says_the_key_is_wrong() 
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn an_encrypted_payload_streams_and_seeks_the_same_bytes_it_reads_whole() {
-    // §7 and R3.9: the decrypting layer holds one block, so the streaming form
-    // and the whole-buffer form have to agree byte for byte, and a seek into
-    // the middle has to land where the whole read says it does.
+    // The decrypting layer holds one block, so the two forms have to agree.
     let test = "an_encrypted_payload_streams_and_seeks_the_same_bytes_it_reads_whole";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1049,13 +914,9 @@ fn an_encrypted_payload_streams_and_seeks_the_same_bytes_it_reads_whole() {
 }
 
 #[test]
-// Only the unencrypted sample, so only `RPF_CORPUS`: the whole claim is that a
-// cache is *not* read, and material would prove nothing about that.
 #[cfg_attr(no_corpus, ignore = "RPF_CORPUS is not set")]
 fn a_cache_is_read_only_when_an_archive_turns_out_to_need_it() {
-    // The property `Unlock::cached` exists for, and the one that keeps R2.6
-    // true now that the library can consult a cache at all: an unencrypted
-    // archive opens without the cache directory being so much as looked in.
+    // An unencrypted archive opens without the cache directory being looked in.
     let test = "a_cache_is_read_only_when_an_archive_turns_out_to_need_it";
     let Some(sample) = archive_path(test, "rmrp_bp16_meringls63amg24/dlc.rpf") else {
         return;
@@ -1079,8 +940,7 @@ fn a_cache_is_read_only_when_an_archive_turns_out_to_need_it() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_cache_holding_the_material_opens_the_archive_with_no_flag_anywhere() {
-    // §1 and DR-041: the seam a frontend uses. Nothing here names a key — the
-    // caller says which archive and where a cache is, and the archive opens.
+    // Nothing here names a key: only which archive, and where a cache is.
     let test = "a_cache_holding_the_material_opens_the_archive_with_no_flag_anywhere";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1110,9 +970,7 @@ fn a_cache_holding_the_material_opens_the_archive_with_no_flag_anywhere() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn nothing_an_open_encrypted_archive_prints_is_a_key() {
-    // DR-020 re-checked at the one place a key now reaches: an `Archive` holds
-    // the material that opened it, and it is `Debug`. Every value the image
-    // carries is searched for in what it prints, raw and in three encodings.
+    // An `Archive` holds the material that opened it and is `Debug`.
     let test = "nothing_an_open_encrypted_archive_prints_is_a_key";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1152,8 +1010,7 @@ fn nothing_an_open_encrypted_archive_prints_is_a_key() {
     }
 }
 
-/// Lower-case hexadecimal, so a test can say what it looked for without
-/// depending on a crate the library does not.
+/// Lower-case hexadecimal, without depending on a crate the library does not.
 fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1169,9 +1026,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn an_encrypted_archive_extracts_the_bytes_a_second_read_agrees_with() {
-    // §8's rule applied to the new path: what comes out has to be stable, and
-    // the two framings have to agree about a binary entry — for which the file
-    // outside the archive is what it means.
     let test = "an_encrypted_archive_extracts_the_bytes_a_second_read_agrees_with";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1193,8 +1047,6 @@ fn an_encrypted_archive_extracts_the_bytes_a_second_read_agrees_with() {
     );
 }
 
-// ------------------------------------------------------- the write refusal ---
-
 /// The entry of the NG corpus archive every refusal below is asked about.
 const NG_ENTRY: &str = "content.xml";
 
@@ -1210,9 +1062,7 @@ fn refuses_the_write(what: &str, error: &Error, tag: u32, reason: NoWrite) {
     );
     assert_eq!(error.category(), Category::Unsupported, "{what}");
     assert_eq!(error.name(), "CannotWriteEncrypted", "{what}");
-    // The message names the reason rather than only the tag, which is the whole
-    // point of splitting the two: an automation told "cannot write an encrypted
-    // archive" over an AES archive would stop trying something that works.
+    // The message names the reason and not only the tag.
     assert!(
         error.to_string().contains(&reason.to_string()),
         "{what}: {error} does not name its reason"
@@ -1225,19 +1075,8 @@ fn refuses_the_write(what: &str, error: &Error, tag: u32, reason: NoWrite) {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn the_ng_write_refusal_names_material_that_is_missing() {
-    // **`no_write_path_touches_an_ng_archive`, re-aimed rather than deleted.**
-    // It used to pin that every write path refused an NG archive because the
-    // transform had no forward direction here. It has one since DR-062 — all
-    // seventeen rounds derived from the decrypt tables in milliseconds — so
-    // `NoWrite::NoInverse` no longer means "this is impossible". It means
-    // **this build has nothing to derive the transform from**, and it still
-    // fires, which is what this test now pins.
-    //
-    // The failure it exists for is unchanged and is the reason the refusal was
-    // re-aimed instead of removed: `plan` decided a patch fitted, `apply` wrote
-    // plaintext into a region the format requires to be ciphertext, and the
-    // command exited 0 over an archive that no longer opened. A refusal that
-    // silently stops firing is how that ships. DR-041, DR-054, DR-062.
+    // `NoWrite::NoInverse` means this build has nothing to derive the transform
+    // from, not that the transform has no forward direction.
     let test = "the_ng_write_refusal_names_material_that_is_missing";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1248,10 +1087,7 @@ fn the_ng_write_refusal_names_material_that_is_missing() {
     let tag = archive.encryption();
     assert_eq!(tag, rpf7::ENCRYPTION_NG);
 
-    // With the material in hand the archive is writable and hands out a
-    // forward transform. That is the half that changed, and asserting it here
-    // is what stops this test from passing for the wrong reason: a build where
-    // NG never seals would satisfy the refusal below and nothing else.
+    // With the material the archive is writable and hands out a transform.
     archive
         .writable()
         .expect("an NG archive with its material is writable");
@@ -1260,9 +1096,8 @@ fn the_ng_write_refusal_names_material_that_is_missing() {
         "an NG archive with its material handed out no forward transform"
     );
 
-    // Without it, `pack` is the write path a caller can still reach — it opens
-    // no archive, so a manifest naming the NG tag is packable material-free
-    // input. It refuses, and it names the reason.
+    // `pack` opens no archive, so a manifest naming the NG tag is the write
+    // path a caller can still reach with no material at all.
     let manifest = rpf_core::Manifest::of(&archive).expect("a manifest describes it");
     let mut out = Cursor::new(Vec::new());
     let error = manifest
@@ -1276,16 +1111,11 @@ fn the_ng_write_refusal_names_material_that_is_missing() {
     refuses_the_write("pack", &error, tag, NoWrite::NoInverse);
     assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
 
-    // And it is `NoInverse` rather than `NeedsKey`: the two name different
-    // things to do, and telling an automation to extract a key it cannot
-    // extract — the material is in a memory image of a running game (DR-040) —
-    // is a loop it never leaves.
+    // `NoInverse` rather than `NeedsKey`: telling an automation to extract a
+    // key that is only in a running game's memory is a loop it never leaves.
     assert_ne!(error.category(), Category::NeedsKey);
 
-    // The manifest itself is no longer refused at parse time (DR-057,
-    // revisited): a manifest carries no material, so the tag alone can no
-    // longer answer, and refusing here would refuse a tree that packs on the
-    // machine that holds what packs it.
+    // A manifest carries no material, so the tag alone cannot answer.
     let read_back = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
         .expect("an NG manifest reads back rather than being refused at parse time");
     assert_eq!(read_back, manifest);
@@ -1304,16 +1134,9 @@ fn the_ng_write_refusal_names_material_that_is_missing() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn an_ng_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
-    // **R4.7, against Rockstar's own NG archive.** The payload seal and the row
-    // seal, in the path that writes into the live archive, under a transform
-    // derived from the decrypt tables and nothing else (DR-062).
-    //
-    // The new contents are deliberately a **different length** from the old
-    // ones, which is the case Q2 is about: the NG key index is
+    // The new contents are deliberately a different length: the NG key index is
     // `(hash(name) + length + 61) % 101`, so the payload goes back under a key
-    // the entry did not have before. A writer that reused the old key writes an
-    // archive that parses — the table is right, the row is right — and does not
-    // load.
+    // the entry did not have before.
     let test = "an_ng_archive_patched_in_place_opens_again_and_reads_the_new_bytes";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1324,9 +1147,7 @@ fn an_ng_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
     let index = archive.find(NG_ENTRY).expect("content.xml resolves");
     let was = archive.read(&mut source, index).expect("reads");
 
-    // Not compressible, not a whole number of cipher blocks, and not the length
-    // it had — all three at once, so the tail rule and the re-keying are both
-    // exercised rather than avoided.
+    // Not compressible, not a whole number of cipher blocks, not the old length.
     let wanted: Vec<u8> = (0..401_u32)
         .map(|n| u8::try_from(n % 251).expect("a byte"))
         .collect();
@@ -1371,14 +1192,8 @@ fn an_ng_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn an_ng_archive_rebuilt_opens_again_with_every_entry_intact() {
-    // The other write path, and the one with the second re-keying in it: a
-    // rebuild lays the archive out afresh, so the **archive's own length**
-    // changes — and the table of contents and the names blob are keyed by that
-    // length. A rebuild that sealed them under the length the archive had
-    // before writes a file that does not open at all.
-    //
-    // The claim is per entry contents, never per archive: our deflate is not
-    // the producer's and slack is not reconstructed.
+    // A rebuild changes the archive's own length, which the table of contents
+    // and the names blob are keyed by. The claim is per entry contents.
     let test = "an_ng_archive_rebuilt_opens_again_with_every_entry_intact";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1429,9 +1244,7 @@ fn an_ng_archive_rebuilt_opens_again_with_every_entry_intact() {
     )
     .expect("an NG archive rebuilds");
 
-    // Still encrypted, still under the same tag, and still not readable without
-    // the material: a rebuild that wrote it out in the clear would open under
-    // `Unlock::unkeyed` and every assertion below would pass anyway.
+    // A rebuild that wrote it in the clear would open under `Unlock::unkeyed`.
     let rebuilt = out.into_inner();
     let error = Archive::open(&mut Cursor::new(rebuilt.clone()), &Unlock::unkeyed())
         .expect_err("the rebuilt archive is not in the clear");
@@ -1477,10 +1290,8 @@ fn an_ng_archive_rebuilt_opens_again_with_every_entry_intact() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_tree_extracted_from_an_ng_archive_packs_back_and_opens_again() {
-    // `pack`'s NG half: a manifest naming the NG tag, packed back under the
-    // material `unlock` reaches, and opened again. It is the third region rule
-    // in one claim — the table of contents, the names blob and every payload,
-    // each keyed by its own name and its own new length.
+    // The table of contents, the names blob and every payload, each keyed by
+    // its own name and its own new length.
     let test = "a_tree_extracted_from_an_ng_archive_packs_back_and_opens_again";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -1539,24 +1350,8 @@ fn a_tree_extracted_from_an_ng_archive_packs_back_and_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again() {
-    // `pack` builds from a tree and opens no archive, so until DR-057 it held
-    // no key and refused every encrypted manifest from the tag alone. It now
-    // asks for material the way `open` does and writes the archive back under
-    // the tag's own transform — the same `Under::sealed` a rebuild uses.
-    //
-    // **The archive is the launcher's, and which archive it is carries the
-    // claim.** `docs/corpus.md` records `Launcher.rpf` as the only archive here
-    // with no resource entry at all, and a tree holding a Rockstar resource
-    // does not pack back at all: schema 3 records *that* an entry is a resource
-    // and not its flag words, so `store` refuses a payload that carries no
-    // `RSC7` header of its own — which is every Rockstar resource (Q7). The
-    // test after this one is that limitation, pinned against the corpus archive
-    // that has it. DR-004, DR-046, DR-057.
-    //
-    // The tree here is the archive's own entries, held in memory rather than on
-    // disk: what `pack` is given is a manifest and something to fetch each
-    // path's contents from, and `crates/rpf/tests/cli.rs` is where the same run
-    // goes through a real extracted tree and a real cache.
+    // The launcher's is the only archive here with no resource entry, and a
+    // tree holding a Rockstar resource does not pack back at all.
     let test = "a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again";
     let Some(material) = material_of(test, LAUNCHER_EXE) else {
         return;
@@ -1582,8 +1377,7 @@ fn a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again() {
         tree.push((entry.path.clone(), bytes));
     }
 
-    // Through the JSON, because that is what a tree on disk carries and the
-    // refusal this record narrowed was `from_json`'s.
+    // Through the JSON, because that is what a tree on disk carries.
     let manifest = rpf_core::Manifest::from_json(&manifest.to_json().expect("renders"))
         .expect("an AES manifest is no longer refused at parse time");
 
@@ -1604,9 +1398,7 @@ fn a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again() {
         )
         .expect("the tree packs back");
 
-    // Still encrypted, still under the same tag, and still needing a key: a
-    // pack that wrote it out in the clear would open here under no material at
-    // all and every assertion below would pass anyway.
+    // A pack that wrote it in the clear would open under no material at all.
     let packed = out.into_inner();
     let error = Archive::open(&mut Cursor::new(packed.clone()), &Unlock::unkeyed())
         .expect_err("the packed archive is not in the clear");
@@ -1640,11 +1432,8 @@ fn a_tree_extracted_from_an_aes_archive_packs_back_and_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_tree_extracted_from_an_aes_archive_needs_a_key_to_pack_back() {
-    // The one that matters most: with no material available, `pack` must refuse
-    // rather than write a plaintext archive carrying an encrypted tag — which
-    // would exit 0 and open for nobody afterwards. `Error::NeedsKey`, exit 5,
-    // which is what `open` answers for the same archive and the same empty
-    // cache. DR-041, DR-057.
+    // With no material, `pack` must refuse rather than write a plaintext
+    // archive carrying an encrypted tag, which would open for nobody.
     let test = "a_tree_extracted_from_an_aes_archive_needs_a_key_to_pack_back";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
@@ -1670,12 +1459,8 @@ fn a_tree_extracted_from_an_aes_archive_needs_a_key_to_pack_back() {
     assert!(out.into_inner().is_empty(), "a refused pack wrote bytes");
 }
 
-// ------------------------------------------------- the AES write path, R4.7 ---
-
-/// The AES archive, its unlock, and a cursor over a copy of its bytes.
-///
-/// The copy is the point: every test below writes into it, and the corpus file
-/// itself is never opened for writing.
+/// The AES archive, its unlock, and a cursor over a copy of its bytes; the
+/// corpus file itself is never opened for writing.
 fn aes_copy(test: &str) -> Option<(Encrypted, Unlock, Cursor<Vec<u8>>)> {
     let held = Encrypted::under_aes(test, AES_ARCHIVE)?;
     let unlock = held.unlock();
@@ -1689,17 +1474,8 @@ fn aes_copy(test: &str) -> Option<(Encrypted, Unlock, Cursor<Vec<u8>>)> {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_resource_put_back_leaves_an_aes_archive_byte_identical() {
-    // **The strongest evidence available here, and it is independent of our own
-    // decryptor.** A resource is written through untouched and is not under the
-    // archive's transform, so putting one back unchanged writes the same
-    // payload bytes and rebuilds the same entry row — and that row then has to
-    // be *sealed* back to the sixteen bytes Rockstar's packer wrote. If our
-    // forward transform were anything but the exact inverse of the decrypt that
-    // read the row, or the row encoder lost a field, those sixteen bytes would
-    // differ and the whole archive would not compare equal.
-    //
-    // What it does not say: nothing here re-deflates, so it is silent about the
-    // payload seal. The two tests after it are what cover that.
+    // A resource is written through untouched, so its row has to be sealed
+    // back to the exact sixteen bytes the producer wrote. Nothing re-deflates.
     let test = "a_resource_put_back_leaves_an_aes_archive_byte_identical";
     let Some((held, unlock, mut source)) = aes_copy(test) else {
         return;
@@ -1748,11 +1524,8 @@ fn a_resource_put_back_leaves_an_aes_archive_byte_identical() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
-    // The payload seal, in the path that writes into the live archive.
     // `_manifest.ymf` is the one binary entry, it is deflated, and its own
-    // encryption field says it is under the transform — so this covers the row,
-    // the deflate and the payload seal at once, and the archive has to open
-    // again afterwards with no key but the one it already had.
+    // encryption field says it is under the transform.
     let test = "an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes";
     let Some((_, unlock, mut source)) = aes_copy(test) else {
         return;
@@ -1762,8 +1535,7 @@ fn an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
     let was = archive.read(&mut source, index).expect("reads");
     assert_eq!(was.len(), 852);
 
-    // Deliberately not compressible and not a multiple of the cipher block, so
-    // the tail rule is exercised rather than avoided.
+    // Not compressible and not a multiple of the cipher block, so the tail runs.
     let wanted: Vec<u8> = (0..401_u32)
         .map(|n| u8::try_from(n % 251).unwrap())
         .collect();
@@ -1783,9 +1555,8 @@ fn an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
     };
     patches.apply(&mut source).expect("the patch applies");
 
-    // Re-opened from the bytes on disk, under the same unlock: a table of
-    // contents whose row was not resealed does not parse, and a payload that
-    // was not sealed does not inflate.
+    // A table of contents whose row was not resealed does not parse, and a
+    // payload that was not sealed does not inflate.
     let reopened = Archive::open(&mut source, &unlock).expect("the patched archive opens again");
     assert_eq!(reopened.encryption(), rpf7::ENCRYPTION_AES);
     let index = reopened.find("_manifest.ymf").expect("resolves");
@@ -1806,16 +1577,8 @@ fn an_aes_archive_patched_in_place_opens_again_and_reads_the_new_bytes() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn an_aes_archive_rebuilt_opens_again_with_every_entry_intact() {
-    // The other write path. A rebuild lays the whole archive out afresh — a new
-    // entry table, a new names blob, payloads at new offsets — so it is the one
-    // that has to seal three kinds of region rather than two rows. The added
-    // entry makes it structural, which is what forces the rebuild rather than a
-    // patch.
-    //
-    // The claim is per **entry contents**, never per archive: our deflate is
-    // not the producer's and slack is not reconstructed, so the archive's bytes
-    // differ by construction. `docs/backlog.md`, "an archive-level digest is
-    // not a round-trip test".
+    // A rebuild lays the archive out afresh, so it seals three kinds of region.
+    // The claim is per entry contents: the bytes differ by construction.
     let test = "an_aes_archive_rebuilt_opens_again_with_every_entry_intact";
     let Some((_, unlock, mut source)) = aes_copy(test) else {
         return;
@@ -1836,13 +1599,8 @@ fn an_aes_archive_rebuilt_opens_again_with_every_entry_intact() {
         let bytes = archive.extract(&mut source, index).expect("extracts");
         before.push((path, bytes));
     }
-    // The other half of "the writer honours the field verbatim and invents no
-    // third value" (`docs/rpf-format.md`, Entry table). Flipping the *bytes*
-    // fails the reads below, but a writer that zeroed the *field* and wrote its
-    // payload in the clear would round-trip through our own reader with nothing
-    // else here noticing — and the game would then read a plaintext payload as
-    // ciphertext. So the field itself is compared, and the non-zero assertion
-    // is what stops the comparison from being vacuous.
+    // The field itself is compared, not only the bytes: a writer that zeroed it
+    // and wrote in the clear would round-trip through our own reader.
     assert!(
         fields.iter().any(|&(_, encryption)| encryption != 0),
         "no binary entry of the AES archive is under the transform, so this \
@@ -1871,9 +1629,7 @@ fn an_aes_archive_rebuilt_opens_again_with_every_entry_intact() {
     )
     .expect("an AES archive rebuilds");
 
-    // The rebuilt archive is still encrypted, still under the same tag, and
-    // still needs a key: a rebuild that wrote it out in the clear would open
-    // under `Unlock::unkeyed` and every assertion below would pass anyway.
+    // A rebuild that wrote it in the clear would open under `Unlock::unkeyed`.
     let rebuilt = out.into_inner();
     let error = Archive::open(&mut Cursor::new(rebuilt.clone()), &Unlock::unkeyed())
         .expect_err("the rebuilt archive is not in the clear");
@@ -1914,12 +1670,8 @@ fn an_aes_archive_rebuilt_opens_again_with_every_entry_intact() {
         .expect("every entry of the rebuilt archive reads back");
 }
 
-/// [`AES_KEYED_ARCHIVE`], its unlock, and a cursor over a copy of its bytes.
-///
-/// [`aes_copy`]'s counterpart for the one archive here whose resources are
-/// **keyed**, and the reason there are two: every other write test in this file
-/// goes through `des_canister.rpf`, all nine of whose resources are in the
-/// clear.
+/// [`AES_KEYED_ARCHIVE`], its unlock, and a cursor over a copy of its bytes:
+/// [`aes_copy`]'s counterpart for the one archive whose resources are keyed.
 fn keyed_copy(test: &str) -> Option<(Encrypted, Unlock, Cursor<Vec<u8>>)> {
     let held = Encrypted::under_aes(test, AES_KEYED_ARCHIVE)?;
     let unlock = held.unlock();
@@ -1929,10 +1681,6 @@ fn keyed_copy(test: &str) -> Option<(Encrypted, Unlock, Cursor<Vec<u8>>)> {
 
 /// Each of [`KEYED_RESOURCES`] as it sits on disk, and the change set that
 /// writes every one of them back unaltered.
-///
-/// Asserts on the way through what the write half is about to depend on: that
-/// the entry really is a resource, and that its payload read back before
-/// anything was written to the archive.
 fn keyed_resources_put_back(
     archive: &Archive,
     source: &mut Cursor<Vec<u8>>,
@@ -1973,21 +1721,9 @@ fn keyed_resources_put_back(
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk() {
-    // **Q14's read side and R4.7's write side, meeting.** Nothing else does:
-    // `AES_KEYED_ARCHIVE` appeared once in this file and only on the read path,
-    // and every AES write test goes through `des_canister.rpf`, whose nine
-    // resources are all in the clear. A writer that decrypted a resource and
-    // wrote the plaintext back, or one that sealed a payload that was already
-    // sealed, would leave every one of those green — and would be silent
-    // corruption of 3,022 corpus resources, because "read back what we wrote"
-    // reads back exactly what it wrote.
-    //
     // `build::is_sealed` answers `false` for a resource because the writer is
-    // handed the payload **as it sits on disk**, not because the payload is in
-    // the clear. This is the row that tells those two reasons apart: here the
-    // bytes on disk *are* under the archive's transform (DR-051), so both
-    // mistakes are visible — the patch stops being byte-identical, and the
-    // rebuilt resources stop inflating to what their flag words declare.
+    // handed the payload as it sits on disk, not because it is in the clear —
+    // and here those bytes are under the archive's own transform.
     let test = "a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk";
     let Some((held, unlock, mut source)) = keyed_copy(test) else {
         return;
@@ -2000,8 +1736,7 @@ fn a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk() {
         "the corpus archive's shape changed"
     );
 
-    // Put both resources back exactly as they came out. The payload bytes are
-    // the same bytes, so the archive has to be the same archive.
+    // The payload bytes are the same bytes, so the archive is the same archive.
     let (on_disk, changes) = keyed_resources_put_back(&archive, &mut source);
 
     let plan = rpf_core::plan(&mut source, &archive, &changes).expect("a keyed patch is planned");
@@ -2015,8 +1750,7 @@ fn a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk() {
         "putting a keyed resource back changed the archive's bytes"
     );
 
-    // And the other write path, which lays the archive out afresh. The added
-    // entry is what makes it structural.
+    // The other write path: the added entry is what makes it structural.
     let added = b"added by a rebuild of a keyed-resource archive".to_vec();
     let mut changes = Changes::new();
     changes.set(
@@ -2058,9 +1792,7 @@ fn a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk() {
             "{name} was not written back as it sat on disk"
         );
     }
-    // The half the byte comparison alone would not give: the payload still
-    // decrypts and inflates, so what was preserved is a readable resource and
-    // not merely a matching blob.
+    // The payload still decrypts and inflates: a resource, not a matching blob.
     for (name, len) in KEYED_RESOURCES {
         let index = opened.find(name).expect("resolves");
         assert_eq!(
@@ -2078,15 +1810,8 @@ fn a_keyed_resource_crosses_both_write_paths_as_it_sits_on_disk() {
         .expect("every entry of the rebuilt keyed-resource archive reads back");
 }
 
-// -------------------------------------------------- the nested archive gap ---
-
-/// An unencrypted archive holding one encrypted one, which is the shape every
-/// AES archive on this machine is in: all 43 of them are nested, and not one
-/// sits on a disk in its own right (`docs/rpf-format.md`, Encryption).
-///
-/// Built here rather than taken from the corpus, because the corpus has no
-/// unencrypted archive holding an encrypted one and this is the arrangement the
-/// answer depends on.
+/// An unencrypted archive holding one encrypted one — the shape every AES
+/// archive on this machine is in, and one the corpus has no example of.
 fn holding(inner: &[u8], named: &str) -> Vec<u8> {
     let files = vec![rpf_core::FileSpec {
         path: named.to_owned(),
@@ -2115,13 +1840,7 @@ fn holding(inner: &[u8], named: &str) -> Vec<u8> {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn an_encrypted_archive_nested_in_a_plain_one_is_counted_whether_it_opens_or_not() {
-    // The sniff answered `None` for every failure but `TooDeep`, so an
-    // encrypted nested archive was invisible: `info` said `nested 0`, `ls -R`
-    // stopped at it and `verify` reported clean over the largest entry there
-    // was. Before key material could be present that was uniformly true; after
-    // it, the same walk gave two different answers depending on what a cache
-    // held. Now the count is a fact about the archive and `locked` is the fact
-    // about this machine. DR-041.
+    // The count is a fact about the archive, `locked` one about this machine.
     let test = "an_encrypted_archive_nested_in_a_plain_one_is_counted_whether_it_opens_or_not";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
@@ -2170,8 +1889,7 @@ fn an_encrypted_archive_nested_in_a_plain_one_is_counted_whether_it_opens_or_not
         "{:?}",
         problem.error
     );
-    // Exit 5 and not 4: the archive is intact and the person holding it is the
-    // one who can act. DR-010.
+    // Exit 5 and not 4: the archive is intact.
     let outcome = verified
         .outcome()
         .expect_err("a verify that skipped is not clean");
@@ -2179,10 +1897,7 @@ fn an_encrypted_archive_nested_in_a_plain_one_is_counted_whether_it_opens_or_not
     assert_eq!(outcome.name(), "NeedsKey");
 }
 
-// -------------------------------------------------------------- the tail ---
-
-/// Raw DEFLATE, as the format uses it: a zlib stream with the two-byte header
-/// removed, inflated with a window of -15. `docs/rpf-format.md`, Compression.
+/// Raw DEFLATE, as the format uses it: no zlib header, a window of -15.
 fn inflated(stream: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut decoder = flate2::read::DeflateDecoder::new(stream);
@@ -2190,12 +1905,8 @@ fn inflated(stream: &[u8]) -> Vec<u8> {
     out
 }
 
-/// What one entry's sub-block tail is worth, measured two ways.
-///
-/// Answers the entry's on-disk length, what the archive's own read inflates to
-/// — the tail carried through — and what it inflates to if the tail is
-/// decrypted as though it had been padded to a whole block. Two readings of the
-/// same bytes, and only one of them can be the format's.
+/// What one entry's sub-block tail is worth: the on-disk length, what the read
+/// inflates to with it carried through, and with it padded to a whole block.
 fn tail_two_ways(held: &Encrypted, scheme: crypto::Scheme, named: &str) -> (u64, usize, usize) {
     let mut source = Cursor::new(held.bytes.clone());
     let archive = Archive::open(&mut source, &held.unlock()).expect("opens");
@@ -2208,8 +1919,7 @@ fn tail_two_ways(held: &Encrypted, scheme: crypto::Scheme, named: &str) -> (u64,
         .checked_add(usize::try_from(on_disk).expect("fits"))
         .expect("fits");
     let payload = held.bytes.get(start..end).expect("inside the archive");
-    // The key for a payload is the entry's own base name and its uncompressed
-    // length. `docs/rpf-format.md`, Encryption.
+    // The key for a payload is the entry's base name and uncompressed length.
     let cipher = crypto::Cipher::new(
         scheme,
         &held.material,
@@ -2222,9 +1932,7 @@ fn tail_two_ways(held: &Encrypted, scheme: crypto::Scheme, named: &str) -> (u64,
     cipher.apply(&mut carried);
 
     // The other reading: the tail zero-padded to a whole block, decrypted, and
-    // the first `tail` bytes taken back. `Cipher::apply` transforms a whole
-    // block and leaves a tail, so a sixteen-byte buffer is how that reading is
-    // spelled with the same cipher.
+    // the first `tail` bytes taken back.
     let tail = usize::try_from(on_disk % 16).expect("under sixteen");
     let mut padded = carried.clone();
     let mut block = [0_u8; 16];
@@ -2253,15 +1961,8 @@ fn tail_two_ways(held: &Encrypted, scheme: crypto::Scheme, named: &str) -> (u64,
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_sub_block_tail_is_carried_through_rather_than_padded() {
-    // `docs/rpf-format.md`, Encryption, promoted from `secondary` on 2026-08-30
-    // by this test. It was written as unmeasurable — "every `namesLength`
-    // observed here is a multiple of 16" — which is true of the names blob and
-    // says nothing about payloads, and a payload is where the rule is exercised
-    // constantly: two of the three payloads in the NG archive end mid-block.
-    //
-    // The experiment is decisive because the two readings disagree about the
-    // deflate stream: carried through, it inflates to exactly the length the
-    // entry declares; padded, it inflates to a different length entirely.
+    // Two of the three payloads in the NG archive end mid-block, and the two
+    // readings disagree: carried through inflates to the declared length.
     let test = "a_sub_block_tail_is_carried_through_rather_than_padded";
     let Some(ng) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -2291,11 +1992,7 @@ fn a_sub_block_tail_is_carried_through_rather_than_padded() {
     );
 }
 
-// ------------------------------------------------- the root directory row ---
-
-/// Every archive reachable from `archive`, counted, with entry 0 checked.
-///
-/// The walk is the archive itself and every archive nested in it, to any depth.
+/// Every archive reachable from `archive` to any depth, with entry 0 checked.
 fn root_rows<R: std::io::Read + std::io::Seek>(
     src: &mut R,
     archive: &Archive,
@@ -2325,12 +2022,8 @@ fn root_rows<R: std::io::Read + std::io::Seek>(
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn entry_zero_is_the_root_directory_in_every_archive_here() {
-    // The fact `Archive::parse` decides a key by: one 32-bit word no file entry
-    // can produce, at row 0 (DR-041). It was cited in the source and in the
-    // decision record as `verified` while `docs/rpf-format.md` carried it as a
-    // bare sentence under the Layout table with no Status column at all —
-    // which is the citation `AGENTS.md` forbids, on the one check that decides
-    // whether a decryption was right.
+    // `Archive::parse` decides a key by one 32-bit word, at row 0, that no file
+    // entry can produce.
     let test = "entry_zero_is_the_root_directory_in_every_archive_here";
     let Some(material) = material(test) else {
         return;
@@ -2364,12 +2057,8 @@ fn entry_zero_is_the_root_directory_in_every_archive_here() {
                 .unwrap_or_default();
             let mut file = fs::File::open(&path).expect("readable");
             let unlock = Unlock::held(Arc::clone(&material), name);
-            // The Rockstar Games Launcher's `0x0FFFFFF7` is the one tag this
-            // walk does not open, and since 2026-08-30 that is a fact about the
-            // material rather than about the tag: a memory image carries the
-            // RAGE key and the NG values and **not** the launcher key, which is
-            // in `Launcher.exe` alone (DR-042). The archives it cannot open are
-            // counted and named rather than passed over.
+            // The launcher tag is the one this walk does not open: a memory
+            // image carries no launcher key. Those archives are counted.
             let Ok(archive) = Archive::open(&mut file, &unlock) else {
                 unopened += 1;
                 continue;
@@ -2391,8 +2080,6 @@ fn entry_zero_is_the_root_directory_in_every_archive_here() {
     );
 }
 
-// ------------------------------------------------------ the empty archive ---
-
 /// A sixteen-byte RPF7 header and nothing after it, under `tag`.
 fn empty_archive(tag: u32) -> Vec<u8> {
     let mut header = Vec::with_capacity(16);
@@ -2406,12 +2093,8 @@ fn empty_archive(tag: u32) -> Vec<u8> {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn an_encrypted_archive_with_no_entries_answers_what_an_open_one_answers() {
-    // `entryCount == 0` gives an empty entry table, so there is no root
-    // directory row and nothing for a key to be judged by. That left the
-    // candidate loop into `Error::WrongKey` carrying `tried: 1` — a count taken
-    // before any candidate ran — so a caller was told "the material you have is
-    // wrong" about an archive no material has anything to do with, at exit 5,
-    // which is the number that tells an automation to run `keys extract` again.
+    // `entryCount == 0` leaves no root directory row for a key to be judged by,
+    // and a key failure would be reported about an archive no key applies to.
     let test = "an_encrypted_archive_with_no_entries_answers_what_an_open_one_answers";
     let Some(material) = executable_material(test) else {
         return;
@@ -2425,8 +2108,7 @@ fn an_encrypted_archive_with_no_entries_answers_what_an_open_one_answers() {
     assert_eq!(archive.scheme(), Some("AES-256"));
     assert_eq!(archive.entries().len(), 0);
 
-    // The same header under `OPEN`, which is the answer this one has to match:
-    // both are archives with no entries, and neither is a key failure.
+    // The same header under `OPEN`, which is the answer this one has to match.
     let mut open = Cursor::new(empty_archive(Version::Rpf7.open()));
     let plain = Archive::open(&mut open, &Unlock::unkeyed()).expect("opens");
     assert_eq!(plain.entries().len(), 0);
@@ -2448,23 +2130,14 @@ fn an_encrypted_archive_with_no_entries_answers_what_an_open_one_answers() {
     );
 }
 
-// ----------------------------------------------------------- the key index ---
-
 #[test]
 #[cfg_attr(
     any(no_corpus, no_game_image),
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn the_hash_chooses_the_key_a_brute_force_over_all_of_them_finds() {
-    // `docs/rpf-format.md`, Encryption: the index is
-    // `(hash(name) + length + 61) % 101`, and the hash's own five constants are
-    // what compute it. Established the way the row says it was — by brute force
-    // first and arithmetic second — so this is the arithmetic being checked
-    // against an answer that did not come from it.
-    //
-    // Every one of the 101 keys is reachable through the public seam without a
-    // second spelling of the transform: the index is linear in the length, so
-    // `len + delta` for `delta` in `0..101` selects each key exactly once.
+    // The index is `(hash(name) + length + 61) % 101`, checked against a brute
+    // force; it is linear in the length, so `len + delta` selects each key once.
     let test = "the_hash_chooses_the_key_a_brute_force_over_all_of_them_finds";
     let Some(held) = Encrypted::of(test, NG_ARCHIVE) else {
         return;
@@ -2505,9 +2178,7 @@ fn the_hash_chooses_the_key_a_brute_force_over_all_of_them_finds() {
         "exactly one of the 101 keys puts the root directory row at entry 0"
     );
 
-    // And the arithmetic agrees with the brute force, which is the whole claim.
-    // The hash folds case — the lookup table's doing, since nothing in the code
-    // lower-cases anything — so the same name in either spelling chooses it.
+    // The hash folds case — the lookup table's doing — so either spelling works.
     for name in ["dlc.rpf", "DLC.RPF", "Dlc.Rpf"] {
         let cipher = crypto::Cipher::new(crypto::Scheme::Ng, &held.material, name, len)
             .expect("the material carries the NG half");
@@ -2515,33 +2186,14 @@ fn the_hash_chooses_the_key_a_brute_force_over_all_of_them_finds() {
     }
 }
 
-// ------------------------------------------------ the resource in the clear ---
-
 #[test]
 #[cfg_attr(
     any(no_corpus, no_executables),
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn a_resource_in_the_clear_is_not_read_through_the_archives_key() {
-    // The control for `a_resource_under_the_archives_own_transform_reads_back`.
-    // `des_canister.rpf` carries the same tag and the same key as
-    // `script_release.rpf` and every one of its resources is in the clear, so
-    // "it still reads back" would be no evidence at all — it read back before
-    // any of this existed. What is asserted instead is that the bytes the
-    // reader hands over are the bytes inflating the payload **with no key
-    // applied** gives, computed here rather than by asking the reader again,
-    // and that applying the key to those same bytes gives something else.
-    //
-    // What that does and does not catch, measured 2026-08-31: a reader that
-    // decrypted resources unconditionally fails this, and a reader that merely
-    // tried the key *first* does **not**, because no payload is accepted at two
-    // candidates. The try-order is argued in DR-051 and is not pinned by
-    // anything, which is stated there rather than implied away here.
-    //
-    // It was named `a_resource_payload_is_never_under_the_archives_transform`
-    // until 2026-08-31, which is a claim about every resource that the corpus
-    // refutes 3,022 times (DR-051). The archive it actually reads is one, and
-    // what it establishes about that one is unchanged.
+    // The control for the keyed-resource test: every resource here is in the
+    // clear, so the reader's bytes are what it inflates to with no key applied.
     let test = "a_resource_in_the_clear_is_not_read_through_the_archives_key";
     let Some(held) = Encrypted::under_aes(test, AES_ARCHIVE) else {
         return;
@@ -2580,8 +2232,7 @@ fn a_resource_in_the_clear_is_not_read_through_the_archives_key() {
             "entry {index} is not what its payload inflates to in the clear"
         );
 
-        // The same bytes with the transform applied, which is what would happen
-        // if a resource were treated like a keyed binary entry.
+        // The same bytes with the transform applied, as a keyed binary entry.
         let cipher = crypto::Cipher::new(
             crypto::Scheme::Aes(crypto::AesKey::Rage),
             &held.material,

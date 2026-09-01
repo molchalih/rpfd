@@ -2,7 +2,7 @@
 //!
 //! The tool is driven by automation that will do exactly what it is told, and
 //! editing a shipped archive in place breaks the game's own integrity checks.
-//! `AGENTS.md` makes refusing an invariant; this is the detector behind it.
+//! Refusing is an invariant here; this is the detector behind it.
 
 use std::{
     ffi::OsStr,
@@ -27,10 +27,8 @@ const MAX_ASCENT: usize = 8;
 
 /// What the ascent above an archive found.
 ///
-/// Two answers rather than one path, because "this is an installation" and
-/// "this could not be looked at" are different things to tell a caller, and a
-/// refusal that named the second as the first would assert something nothing
-/// measured (§10).
+/// Two answers rather than one path: "this is an installation" and "this could
+/// not be looked at" are different things to tell a caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Detected {
     /// A directory holding a file only a game installation holds.
@@ -44,15 +42,11 @@ pub enum Detected {
 /// The installation above `path`, or the directory that stopped the ascent
 /// from being able to say.
 ///
-/// Deliberately conservative in one direction only: a false positive costs an
-/// explicit override, a false negative costs a broken installation. A
-/// directory that cannot be examined is therefore reported rather than passed
-/// over — the whole guard is a negative answer, and one that came from a
-/// question the filesystem refused is not an answer at all.
-///
+/// Conservative in one direction only: a false positive costs an explicit
+/// override, a false negative costs a broken installation. A directory that
+/// cannot be examined is therefore reported rather than passed over.
 /// [`Detected::Installation`] wins over [`Detected::Unexaminable`] wherever
-/// both are found, because a directory named outright says more than one that
-/// could not be looked at below it.
+/// both are found.
 pub fn detect(path: &Path) -> Option<Detected> {
     let resolved = resolve(path);
     let mut current = resolved.parent()?;
@@ -87,11 +81,9 @@ fn verdict(directory: &Path) -> Held {
 /// climbs the tree the name actually sits in.
 ///
 /// Without this a bare `dlc.rpf` ascends exactly once and stops, because
-/// `Path::new("dlc.rpf").parent()` is the empty path — so the guard never saw
-/// the installation it was standing in. The archive itself may not exist yet,
-/// which is the ordinary case for `pack`, so the directory is resolved rather
-/// than the file, and a path that resolves to nothing is ascended as it was
-/// given rather than abandoned.
+/// `Path::new("dlc.rpf").parent()` is the empty path. The archive itself may
+/// not exist yet — the ordinary case for `pack` — so the directory is resolved
+/// rather than the file.
 fn resolve(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path) {
         return canonical;
@@ -108,19 +100,11 @@ fn resolve(path: &Path) -> PathBuf {
 
 /// Whether a name found on disk is the one being looked for.
 ///
-/// The comparison is ours rather than the filesystem's, and that is the whole
-/// point of it: NTFS and the default macOS volume fold case and ext4 does not,
-/// so `directory.join(name).is_file()` gives three answers to one question. A
-/// Proton or Wine installation sits on a case-sensitive volume and spells its
-/// executable however the copy it came from did, so the exact join misses it —
-/// and this guard then fails open, which `detect` above names as the expensive
-/// direction. R10.10.
-///
-/// Separated from [`holds`] because it is the half a test can pin directly. On
-/// a case-insensitive volume the filesystem answers `true` for either spelling
-/// of an ASCII name, so a test that only asserts `holds(dir, "GTA5.exe")`
-/// against a `gta5.exe` passes whether the fold is here or not — which is what
-/// the test that used to stand here was doing.
+/// The comparison is ours rather than the filesystem's: NTFS and the default
+/// macOS volume fold case and ext4 does not, so `directory.join(name).is_file()`
+/// gives three answers to one question, and a case-sensitive volume would make
+/// this guard fail open. Separated from [`holds`] because it is the half a test
+/// can pin directly.
 fn is_named(found: &OsStr, name: &str) -> bool {
     found
         .to_str()
@@ -129,10 +113,9 @@ fn is_named(found: &OsStr, name: &str) -> bool {
 
 /// What the filesystem will say about a name in a directory.
 ///
-/// Three answers rather than two, because a question the filesystem refuses to
-/// answer is not the answer `false` (§4). Every "no" this guard acts on is a
-/// reason to write into a directory, so a "no" invented out of a permission
-/// error is the one failure direction the module opens with.
+/// Three answers rather than two: a question the filesystem refuses to answer
+/// is not the answer `false`. Every "no" this guard acts on is a reason to
+/// write into a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Held {
     /// The name is there, and is a file.
@@ -172,18 +155,10 @@ impl Held {
 ///
 /// The directory is listed and each entry compared by [`is_named`], rather than
 /// the name being joined on and stat'd, so the answer is the same on all three
-/// platforms.
-///
-/// A directory that cannot be listed is asked the other way — the exact join
-/// this replaced — because the two fail on different permissions and neither
-/// subsumes the other. Measured 2026-08-28 on macOS, one `GTA5.exe` inside:
-/// mode `111` refuses the listing and answers the join, mode `444` answers the
-/// listing and refuses the stat, and mode `000` refuses both. All three used to
-/// answer `false`, and the first two are the case-fold's own trade rather than
-/// a limit of the filesystem.
-///
-/// The entry is stat'd through its own path rather than through
-/// `DirEntry::file_type`, so a symlinked executable still counts as one.
+/// platforms. A directory that cannot be listed is asked the other way — the
+/// exact join — because the two fail on different permissions and neither
+/// subsumes the other. The entry is stat'd through its own path rather than
+/// through `DirEntry::file_type`, so a symlinked executable still counts.
 fn holds(directory: &Path, name: &str) -> Held {
     let Ok(entries) = fs::read_dir(directory) else {
         return of_path(&directory.join(name));
@@ -197,7 +172,7 @@ fn holds(directory: &Path, name: &str) -> Held {
 /// What a path says about itself, when it will say anything.
 ///
 /// Only [`io::ErrorKind::NotFound`] is an answer; every other failure is the
-/// filesystem declining the question, and answering `No` for it is what let a
+/// filesystem declining the question, and answering `No` for it would let a
 /// directory nobody could look into pass for one with no game in it.
 fn of_path(path: &Path) -> Held {
     match path.metadata() {
@@ -227,11 +202,8 @@ mod tests {
 
     #[test]
     fn an_executable_is_matched_whatever_case_it_is_spelled_in() {
-        // The fold itself, not a round trip through the filesystem. The test
-        // this replaces wrote `gta5.exe` and asserted `holds(dir, "GTA5.exe")`,
-        // which on the case-insensitive volume this runs on is `true` for the
-        // exact join it was written to replace: it passed either way and so
-        // pinned nothing. R10.10.
+        // The fold itself, not a round trip through the filesystem: on a
+        // case-insensitive volume a round trip passes either way.
         for spelling in ["gta5.exe", "GTA5.exe", "GTA5.EXE", "gTa5.ExE"] {
             assert!(
                 is_named(OsStr::new(spelling), "GTA5.exe"),
@@ -260,10 +232,9 @@ mod tests {
             "a directory that is not there is an answer, not a refusal to answer",
         );
 
-        // The fold is ours and it is ASCII. A case-insensitive volume folds
-        // more than that — measured on this one, `ÄTA5.exe` opens as
-        // `äta5.exe` — so on the platform where the first assertion above
-        // cannot tell the listing from an exact join, this one can.
+        // The fold is ours and it is ASCII; a case-insensitive volume folds
+        // more than that, so this assertion can tell the listing from an exact
+        // join where the ones above cannot.
         fs::write(dir.path().join("ÄTA5.exe"), b"not really").expect("writable");
         assert_eq!(
             holds(dir.path(), "äta5.exe"),
@@ -312,28 +283,18 @@ mod tests {
 
         use super::super::{Detected, Held, detect, holds};
 
-        /// Measured 2026-08-28 in a tempdir on macOS, one `GTA5.exe` inside:
-        ///
-        /// | mode | `read_dir` | listed names | join stat | was | is |
-        /// |---|---|---|---|---|---|
-        /// | `000` | denied | — | denied | `false` | `Unknown` |
-        /// | `111` | denied | — | file | `false` | `Yes` |
-        /// | `444` | ok | `GTA5.exe` | denied | `false` | `Unknown` |
-        ///
-        /// Only `111` is the trade the case-fold made — the exact join it
-        /// replaced answered `true` there. The other two were never right and
-        /// were never noticed; `444` had the name in its hand and threw it away
-        /// on a stat it was not allowed to make. What the tests below assert is
-        /// the property behind all three: never a confident `No` from a
-        /// question that was refused.
+        /// The three modes that close a directory to one or both of the
+        /// questions [`holds`] asks. What the tests below assert is the
+        /// property behind all three: never a confident `No` from a question
+        /// that was refused.
         const MODES: [u32; 3] = [0o000, 0o111, 0o444];
 
         /// Sets the mode, and says whether it actually closed the directory.
         ///
         /// Asked of the filesystem rather than of the user id: root reads
-        /// every directory whatever its mode says, and so do some mounts, and
-        /// there the test has nothing to reproduce. A directory is closed when
-        /// it refuses at least one of the two questions [`holds`] asks.
+        /// every directory whatever its mode says, and so do some mounts. A
+        /// directory is closed when it refuses at least one of the two
+        /// questions [`holds`] asks.
         fn closes(directory: &Path, mode: u32) -> bool {
             fs::set_permissions(directory, fs::Permissions::from_mode(mode)).is_ok()
                 && (fs::read_dir(directory).is_err()

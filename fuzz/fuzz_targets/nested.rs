@@ -1,17 +1,12 @@
 //! `Archive::open_nested` driven down an arbitrary chain of payloads, as far
 //! as the archive claims it goes.
 //!
-//! Nesting is the one structure an input chooses the *depth* of, and depth is
-//! what turns a bounded walk into a stack overflow. [`MAX_DEPTH`] is the
-//! answer, so this asserts it from the outside: the walk never descends past
-//! it, and the step that would is refused as [`Error::TooDeep`] rather than as
-//! whatever the payload happens to be.
+//! Nesting is the one structure an input chooses the depth of, and depth turns
+//! a bounded walk into a stack overflow: the step past [`MAX_DEPTH`] must be
+//! refused as [`Error::TooDeep`] and not as whatever the payload happens to be.
 //!
-//! The bound is checked against [`nested_to_the_bound`], once per process,
-//! because a generated input cannot reach it: `-max_len` defaults to 4096
-//! bytes with no corpus to raise it, and 4096 bytes cannot carry a chain
-//! deeper than seven. See [`nested_to_the_bound`]. Every input after that
-//! walks its own bytes.
+//! A generated input cannot reach the bound, so it is checked once per process
+//! against [`nested_to_the_bound`]; every input after that walks its own bytes.
 
 #![no_main]
 
@@ -33,27 +28,21 @@ struct Input<'a> {
 
 /// The most entries one level is probed for a nested archive.
 ///
-/// The walk starts where the input points and takes the first entry from
-/// there that nests, because an index chosen at random is a directory or a
-/// payload that is not an archive nearly every time, and a walk that gave up
-/// on the first of those would never reach a second level at all. Bounded
-/// because probing every entry of a four-thousand-entry table, per level,
-/// would be the whole cost of the target.
+/// The walk takes the first entry from where the input points that nests,
+/// since a random index is nearly always a directory or a non-archive payload.
+/// Bounded because probing a whole table per level would be the target's cost.
 const PROBE_LIMIT: u32 = 64;
 
 fuzz_target!(|input: Input| {
     // `steps` is input as much as `data` is, and one `u32` of it is four bytes
-    // the decoder allocated. `MAX_INPUT`.
+    // the decoder allocated.
     if input.steps.len().saturating_mul(size_of::<u32>()) > MAX_INPUT {
         return;
     }
 
-    // Once per process, outside the watched region. The chain exists so the
-    // depth bound is checked without anyone having to pass `-max_len`, and
-    // checking it costs 12 µs — worth paying to settle the question, not worth
-    // paying again on every input to re-settle it. The descent through it is
-    // the same one every time regardless of `steps`, because `probe` finds the
-    // one entry that nests whatever it is pointed at first.
+    // Once per process, outside the watched region: the descent through the
+    // chain is the same every time regardless of `steps`, because `probe` finds
+    // the one entry that nests whatever it is pointed at first.
     static CHECKED: OnceLock<()> = OnceLock::new();
     CHECKED.get_or_init(|| descend(nested_to_the_bound(), &input.steps));
 
@@ -80,8 +69,8 @@ fn descend(data: &[u8], steps: &[u32]) {
         let start = steps.get(depth as usize).copied().unwrap_or(0);
 
         // The bound is on the descent, not on the payload: at the deepest
-        // level the archive is allowed to reach, an entry that has a payload
-        // at all is refused for the depth and for nothing else.
+        // level, an entry with a payload at all is refused for the depth and
+        // for nothing else.
         if depth == MAX_DEPTH {
             let Some(index) = probe(count, start, |at| archive.payload_at(at).is_ok()) else {
                 return;
@@ -109,10 +98,8 @@ fn descend(data: &[u8], steps: &[u32]) {
 /// The first entry from `start` that `wanted` accepts, wrapping.
 ///
 /// Reduced before the offset is added rather than after, and added in `u64`,
-/// so the scan really is the distinct run of indices it reads as: `start`
-/// wrapping first gives `0, 0, 1` for three entries starting at `u32::MAX`,
-/// which never looks at entry 2 — and if entry 2 is the only one that nests,
-/// that input never descends at all.
+/// so the scan really is the distinct run of indices it reads as: wrapping
+/// `start` first gives `0, 0, 1` for three entries starting at `u32::MAX`.
 fn probe(count: u32, start: u32, mut wanted: impl FnMut(u32) -> bool) -> Option<u32> {
     let span = u64::from(count);
     (0..count.min(PROBE_LIMIT))

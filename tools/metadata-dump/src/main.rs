@@ -1,14 +1,6 @@
-//! Writes the metadata dump `RPF_METADATA` names: every `PSO`, `RBF` and
-//! resource `Meta` payload in a corpus, out of its archive and onto disk.
-//!
-//! Run by hand, once per corpus, like `tools/oracle`. What it leaves behind is
-//! the dump; what is committed is a fixture describing it. `README.md` says
-//! how to run it and what the names mean.
-//!
-//! It holds no archive knowledge (`docs/conventions.md` §1): every offset,
-//! every inflate, every decrypt and the resource page arithmetic are
-//! `rpf-core`'s, and what is here is a walk, a recognition test and a file
-//! name.
+//! Writes the metadata dump: every `PSO`, `RBF` and resource `Meta` payload in
+//! a corpus, out of its archive and onto disk. Run by hand, once per corpus;
+//! what is committed is a fixture describing the result. See `README.md`.
 
 use std::{
     collections::BTreeMap,
@@ -28,10 +20,6 @@ use rpf_core::{
 };
 
 /// Why a dump step stopped: the two layers below this one, kept apart.
-///
-/// §10 wants typed variants rather than a rendered sentence, and a frontend is
-/// where the two are converted into one report. Nothing here is matched on —
-/// the walk reports a failure and steps over it — but the source is not lost.
 #[derive(Debug)]
 enum Failure {
     /// The filesystem, which `rpf-core` never touches.
@@ -187,8 +175,8 @@ struct Dump<'a> {
 impl<'a> Dump<'a> {
     /// Opens one archive file and walks it.
     ///
-    /// The archive's own file name chooses its key, and turning a path into a
-    /// name is the frontend's job — §7 keeps paths out of `rpf-core`.
+    /// The archive's own file name chooses its key; turning a path into a name
+    /// is the frontend's job.
     fn archive(&mut self, path: &Path, label: &str) -> Result<(), Failure> {
         let mut file = File::open(path)?;
         let name = path
@@ -227,9 +215,8 @@ impl<'a> Dump<'a> {
     /// Walks one archive's entry table, descending into every archive nested
     /// in it.
     ///
-    /// One entry that will not read back is reported and stepped over rather
-    /// than ending the walk: a corpus this size holds a few, and stopping at
-    /// the first would dump a fraction of it and say it was done.
+    /// An entry that will not read back is reported and stepped over: stopping
+    /// at the first would dump a fraction of the corpus and call it done.
     fn walk<R: Read + Seek>(&mut self, archive: &Archive, src: &mut R, prefix: &str) {
         let count = u32::try_from(archive.entries().len()).unwrap_or(u32::MAX);
         for index in 0..count {
@@ -286,9 +273,8 @@ impl<'a> Dump<'a> {
 
     /// A resource entry: its inflated payload is a `Meta` or it is not.
     ///
-    /// The system length is the entry's, from its system flags —
-    /// `docs/rpf-format.md`, Resource page flags — and is the one thing about a
-    /// dumped `Meta` that its own bytes do not state.
+    /// The system length comes from the entry's system flags, and is the one
+    /// thing about a dumped `Meta` that its own bytes do not state.
     fn resource<R: Read + Seek>(
         &mut self,
         archive: &Archive,
@@ -314,13 +300,9 @@ impl<'a> Dump<'a> {
 
     /// Writes one payload out under the name the dump's layout gives it.
     ///
-    /// Through a temporary name and a rename, and removed if either step fails:
-    /// the index in a dumped name comes from a running count, so a run that
-    /// stopped part-way through a `write_all` and was started again would put a
-    /// *complete* payload under a name a truncated one already holds — and a
-    /// truncated `Meta` is still recognised by `meta::identifies`, so the
-    /// corpus tests would read it as a malformed shipped file. The same rule
-    /// `docs/conventions.md` §8 states for an archive, for the same reason.
+    /// Through a temporary name and a rename, removed if either step fails: an
+    /// interrupted run restarts from the same index, and a truncated `Meta` is
+    /// still recognised, so it would read back as a malformed shipped file.
     fn write(
         &mut self,
         kind: Kind,
@@ -412,8 +394,7 @@ fn run(request: &Request) -> Result<Tally, Failure> {
 /// Every `.rpf` under `root`, recursively, to [`MAX_DEPTH`].
 ///
 /// `Path::is_dir` follows a symlink, so a directory linked to one of its own
-/// ancestors is an unbounded descent — and this walks a game install, which is
-/// somebody else's directory tree. The cap is what makes that a truncated walk
+/// ancestors is an unbounded descent; the cap makes that a truncated walk
 /// rather than a stack overflow.
 fn collect(root: &Path, found: &mut Vec<PathBuf>, depth: usize) -> Result<(), io::Error> {
     if depth >= MAX_DEPTH {

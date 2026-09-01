@@ -1,17 +1,13 @@
 /**
- * Packaging the extension as a `.vsix`. R8.3, the half that is ours.
+ * Packaging the extension as a `.vsix`: an Open Packaging Conventions zip of a
+ * content-type map, a manifest, and the extension under `extension/`.
  *
- * A `.vsix` is an Open Packaging Conventions zip: a content-type map, a
- * manifest, and the extension under `extension/`. Writing it here rather than
- * with the official packer is not asceticism — that tool **requires a publisher
- * id in `package.json`**, and a publisher id is an identity this repository
- * does not have and must not invent. Packaging and publishing are two acts, and
- * only the first one is ours: the id is supplied at packaging time by whoever
- * owns it, and without one this refuses to run rather than making one up.
+ * Written here rather than with the official packer, which **requires a
+ * publisher id in `package.json`** — an identity this repository does not have
+ * and must not invent. The id is supplied at packaging time instead, and
+ * without one this refuses to run.
  *
- * What ships is the explicit list in {@link contents} and nothing else. One
- * owner for "what is in the package" (`docs/conventions.md` §3); there is no
- * ignore file saying the same thing in the negative.
+ * What ships is the explicit list in {@link contents} and nothing else.
  */
 
 import fs from 'node:fs';
@@ -79,8 +75,8 @@ export function contents(root: string, publisher: string): Part[] {
         });
     }
 
-    // A bundled binary, when one has been put there. R7.7: one static binary
-    // per target, and the extension carries whichever the packager put in.
+    // A bundled binary, when one has been put there: one static binary per
+    // target, and the extension carries whichever the packager put in.
     for (const at of walk(path.join(root, 'bin'))) {
         parts.push({
             name: `extension/${path.relative(root, at).split(path.sep).join('/')}`,
@@ -98,9 +94,8 @@ export function contents(root: string, publisher: string): Part[] {
 /**
  * The licence that goes in the package.
  *
- * It is the repository's, not the client directory's, so it is looked for in
- * both: one licence for the whole tree (`MIT OR Apache-2.0`), and a second copy
- * of it beside the extension would be a second owner of it.
+ * The repository's rather than the client directory's, so it is looked for in
+ * both: a second copy beside the extension would be a second owner of it.
  */
 function licenseOf(root: string): { name: string; at: string } | undefined {
     for (const directory of [root, path.resolve(root, '..', '..')]) {

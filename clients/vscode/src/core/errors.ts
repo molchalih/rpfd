@@ -1,17 +1,13 @@
 /**
- * What a failure means, and who has to act on it. R7.6.
+ * What a failure means, and who has to act on it.
  *
- * DR-010: an exit code names what the caller has to do about a failure, not
- * what the code was doing when it noticed. That is a designed contract and a
- * client that renders every failure as a stack trace throws it away — so the
- * number is what decides the sentence here, and nothing else is parsed. The
- * daemon's own message is carried through as the reason, because
- * `docs/conventions.md` §10 puts the rendered sentence in the frontend and the
- * daemon has already rendered one that names the archive, the handle, the
- * respelt path or the entry.
+ * An exit code names what the caller has to do about a failure, so the number
+ * decides the sentence here and nothing else is parsed. The daemon's own
+ * message is carried through as the reason, since it already names the archive,
+ * the handle, the respelt path or the entry.
  *
  * On the wire a negative code is JSON-RPC's own and a positive one is the exit
- * code the command line would use. DR-008.
+ * code the command line would use.
  */
 
 /** Exit codes, as `crates/rpf/src/exit.rs` declares them. */
@@ -64,11 +60,8 @@ export class DaemonError extends Error {
      * The failure's own name, as `error.data.reason` carries it: an
      * `rpf_core::Error` variant, one of the daemon's own, or JSON-RPC's.
      *
-     * Empty for an error object that carried none, which this daemon never
-     * writes — DR-032 §5 puts it on every one — and which an older one would.
-     * A name is a finer classification within {@link code} and never a
-     * replacement for it, so nothing here decides anything the number alone
-     * could not; it decides it more exactly.
+     * Empty only for an older daemon that wrote none. A finer classification
+     * within {@link code} and never a replacement for it.
      */
     readonly failure: string;
 
@@ -85,9 +78,9 @@ export class DaemonError extends Error {
 /**
  * What a caller has to do about a change this client declined to offer.
  *
- * A category rather than a rendered sentence, for `docs/conventions.md` §10's
- * reason: an editor has its own small vocabulary for filesystem failures and
- * picks from it by this, while the message is what a person reads.
+ * A category rather than a rendered sentence: an editor picks from its own
+ * small vocabulary for filesystem failures by this, while the message is what a
+ * person reads.
  */
 export type RefusalKind = 'exists' | 'not-found' | 'is-a-directory' | 'refused';
 
@@ -95,10 +88,9 @@ export type RefusalKind = 'exists' | 'not-found' | 'is-a-directory' | 'refused';
  * A change the client's own view of the archive refuses before the daemon is
  * asked for it.
  *
- * Its own type because the daemon cannot answer it: every buffered change is
- * resolved against the archive **on disk**, so a path a buffered change created
- * is not there to be found and a path a buffered removal freed is still
- * occupied. The client is the only side that holds both. DR-030.
+ * Its own type because the daemon cannot answer it: it resolves every buffered
+ * change against the archive **on disk**, and the client is the only side that
+ * holds both views.
  */
 export class Refused extends Error {
     /** Which answer an editor's filesystem vocabulary has for this. */
@@ -118,9 +110,8 @@ export class Refused extends Error {
  * A failure of the connection rather than of a request: the daemon could not be
  * started, died, or stopped answering.
  *
- * Its own type because nobody's input is in question, which is exactly what
- * exit 7 means, and a client that reported it as a refusal would be telling the
- * user to change a request that was never read.
+ * Its own type because nobody's input is in question: a client reporting it as
+ * a refusal would tell the user to change a request that was never read.
  */
 export class TransportError extends Error {
     /** Whatever the process left on standard error, when there was any. */
@@ -203,7 +194,7 @@ const COUNSEL: Record<Kind, { headline: string; action: string }> = {
     },
     'needs-key': {
         headline: 'This archive is encrypted, and no key material is available.',
-        action: 'rpf never bundles keys — it reads them from your own game install — and this build cannot decrypt archive contents at all. An encrypted archive cannot be opened here; work on an unencrypted one.',
+        action: 'rpf never bundles keys — it reads them from your own game install. Run "rpf keys extract" against that install, which caches what it finds, and mount the archive again. An NG-encrypted archive needs a memory image of the running game rather than the executable.',
     },
     refused: {
         headline: 'rpf declined to carry out the request.',
@@ -235,8 +226,7 @@ const COUNSEL: Record<Kind, { headline: string; action: string }> = {
  * What to tell the user about a failure, and what to tell them to do.
  *
  * Everything that is not a {@link DaemonError} or a {@link TransportError} is
- * an internal fault of this extension, and says so rather than being dressed up
- * as an archive problem.
+ * an internal fault of this extension, and says so.
  */
 export function advise(failure: unknown): Advice {
     if (failure instanceof Refused) {
@@ -284,14 +274,10 @@ export function advise(failure: unknown): Advice {
  * Which of an editor filesystem's own failures a failure is.
  *
  * Here rather than in the editor adapter so it can be checked without an
- * editor: this is the whole of R7.6 for the filesystem surface, and an adapter
- * that decided it would be the one place nothing tests. A {@link Refused} says
- * which word it means, because the client's own view is what decided it; a
- * {@link DaemonError} reaches one through the failure's own name and, failing
- * that, through DR-010's classification. Nothing about its sentence is parsed —
- * that is what {@link DaemonError.failure} is for, and what DR-030 asked the
- * wire for because exit 6 is `AlreadyExists`, "is a directory that is not
- * empty" and every other refusal at once.
+ * editor. A {@link Refused} says which word it means; a {@link DaemonError}
+ * reaches one through {@link DaemonError.failure} and, failing that, through
+ * its code. Nothing about its sentence is parsed — exit 6 is `AlreadyExists`,
+ * "is a directory that is not empty" and every other refusal at once.
  */
 export type FileSystemWord =
     | 'exists'
@@ -304,11 +290,10 @@ export type FileSystemWord =
 /**
  * The failures whose own name says more than their number does.
  *
- * Only those: a name that reaches the same word the code reaches is a second
- * spelling of one fact (`docs/conventions.md` §3), and every failure not named
- * here is classified by DR-010's number exactly as it was. All three of these
- * are exit 6, which an editor can only render as "no permissions" — which is
- * the measurement DR-030 §5 made and DR-032 §5 answered.
+ * Only those: a name that reaches the same word its code reaches is a second
+ * spelling of one fact, and everything not named here is classified by its
+ * number. All three of these are exit 6, which an editor would otherwise render
+ * as "no permissions".
  */
 const WORD_FOR: Record<string, FileSystemWord> = {
     AlreadyExists: 'exists',

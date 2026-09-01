@@ -12,7 +12,6 @@ use std::io::Cursor;
 
 use rpf_core::{FileKind, FileSpec, Flow, Step, Storage, Unwatched, Watch};
 
-/// Records every step, and stops after a given number of them.
 struct Recorder {
     seen: Vec<(String, u32, u32, u64)>,
     stop_after: Option<u32>,
@@ -85,7 +84,6 @@ fn a_build_reports_every_entry_it_writes() {
         assert_eq!(total, 3, "the total should be known up front");
     }
 
-    // Bytes written only ever grow.
     let written: Vec<u64> = watch.seen.iter().map(|&(.., bytes)| bytes).collect();
     assert!(
         written.windows(2).all(|pair| pair[0] < pair[1]),
@@ -115,8 +113,8 @@ fn stopping_a_build_stops_it_and_says_so() {
 
 #[test]
 fn a_cancellation_is_its_own_category() {
-    // R6.3: a caller distinguishes these without parsing a message. A cancel is
-    // the caller's own doing, so it is neither a refusal nor a corrupt archive.
+    // A cancel is the caller's own doing, so it is neither a refusal nor a
+    // corrupt archive.
     let mut watch = Recorder::stopping_after(1);
     let mut out = Cursor::new(Vec::new());
     let stopped = rpf_core::build(
@@ -133,8 +131,6 @@ fn a_cancellation_is_its_own_category() {
 
 #[test]
 fn a_caller_that_does_not_care_says_so() {
-    // Unwatched exists so that "no progress wanted" is written at the call site
-    // rather than left out of it.
     let mut out = Cursor::new(Vec::new());
     let report = rpf_core::build(
         &mut out,
@@ -150,8 +146,8 @@ fn a_caller_that_does_not_care_says_so() {
 
 #[test]
 fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
-    // replace_many rebuilds each ancestor in turn, so the report is one
-    // sequence per archive, innermost first.
+    // Each ancestor is rebuilt in turn, so the report is one sequence per
+    // archive, innermost first.
     let mut inner = Cursor::new(Vec::new());
     rpf_core::build(
         &mut inner,
@@ -211,8 +207,6 @@ fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
 
 #[test]
 fn a_verify_reports_every_entry_it_reads_and_stops_when_told_to() {
-    // Reading every entry back is unbounded work in the same way a rebuild is,
-    // so it takes the same seam and answers a cancel the same way. DR-008.
     let mut out = Cursor::new(Vec::new());
     rpf_core::build(
         &mut out,

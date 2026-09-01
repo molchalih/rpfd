@@ -36,15 +36,13 @@ const STRIDE: usize = 1 << 20;
 
 /// Finds each of `anchors`, returning a slot per anchor in the same order.
 ///
-/// A slot is `None` when nothing in the source hashed to that anchor. Where one
-/// value occurs more than once — measured: the NG hash lookup table occurs
-/// three times in `GTA5_Enhanced.exe` — the lowest offset is the one reported,
-/// and every anchor carrying that digest is filled from it.
+/// A slot is `None` when nothing in the source hashed to that anchor. Where a
+/// value occurs more than once the lowest offset is reported, and every anchor
+/// carrying that digest is filled from it.
 ///
-/// `what` names the material for the watcher; `watch` is told once per block
-/// read, which is DR-008's seam at the boundary this scan already had. A scan
-/// that has found everything stops where it is, so the last step can name fewer
-/// blocks than the total — that is what finishing early looks like.
+/// `what` names the material for the watcher, which is told once per block
+/// read. A scan that has found everything stops where it is, so the last step
+/// can name fewer blocks than the total.
 ///
 /// # Errors
 ///
@@ -180,8 +178,7 @@ mod tests {
     /// What the tests here call the material they plant.
     const SEARCHING: &str = "a planted value";
 
-    /// A search nobody is watching, which is what every test but the last two
-    /// is about.
+    /// A search nobody is watching.
     fn look<S: std::io::Read + std::io::Seek>(
         source: &mut S,
         anchors: &[Anchor],
@@ -258,10 +255,9 @@ mod tests {
 
     #[test]
     fn a_value_off_the_alignment_is_not_found() {
-        // The reference steps eight bytes at a time, so a value not beginning
-        // on an eight-byte boundary is invisible to it. Pinned rather than
-        // fixed: the stride is what makes the scan affordable, and every value
-        // measured so far sits on it.
+        // The scan steps eight bytes at a time, so a value not beginning on an
+        // eight-byte boundary is invisible to it. Pinned rather than fixed:
+        // the stride is what makes the scan affordable.
         let value = planted(5, 32);
         let mut hay = haystack(4096);
         plant(&mut hay, 2044, &value);
@@ -283,9 +279,8 @@ mod tests {
 
     #[test]
     fn a_value_straddling_a_read_boundary_is_found() {
-        // Reads advance by a stride and the buffer is a stride plus the longest
-        // anchor, so consecutive reads overlap. A value beginning near the end
-        // of one read and ending in the next is what that overlap is for.
+        // The buffer is a stride plus the longest anchor, so consecutive reads
+        // overlap and a value can span the boundary.
         let value = planted(11, 1024);
         let at = STRIDE - 512;
         let mut hay = haystack(STRIDE * 2);
@@ -312,8 +307,8 @@ mod tests {
 
     #[test]
     fn two_anchors_of_one_value_are_both_filled() {
-        // 188 of the 272 NG decrypt-table anchors repeat an earlier one, so one
-        // sighting has to fill every slot that asked for it.
+        // Many NG decrypt-table anchors repeat an earlier one, so one sighting
+        // has to fill every slot that asked for it.
         let value = planted(19, 1024);
         let mut hay = haystack(8192);
         plant(&mut hay, 2048, &value);
@@ -332,16 +327,8 @@ mod tests {
 
     #[test]
     fn a_source_that_is_exactly_the_value_finds_it() {
-        // The boundary of the check above, which every test was clear of: a
-        // read shorter than the anchor holds no window and is skipped, and a
-        // read of **exactly** the anchor holds one. Moving it by one — `<` to
-        // `<=` — makes a source that is nothing but the value find nothing,
-        // and the previous sweep reported that survivor as needing "an
-        // executable smaller than one scan stride", which is a `Cursor`.
-        //
-        // `crates/rpf-core/tests/boundaries.rs` is where a limit belongs, and
-        // this one cannot go there: `find` is private to this module. The rule
-        // is the same and the file is the only thing that differs.
+        // A read shorter than the anchor holds no window and is skipped; a read
+        // of exactly the anchor holds one.
         let value = planted(53, 32);
         let found = look(&mut Cursor::new(value.clone()), &[anchor(&value)]).unwrap();
         let sighting = found[0]
@@ -350,7 +337,6 @@ mod tests {
         assert_eq!(sighting.offset, 0);
         assert_eq!(sighting.bytes, value);
 
-        // And one byte short of it holds nothing, which is the far side.
         let mut short = value.clone();
         short.pop();
         assert!(
@@ -361,9 +347,8 @@ mod tests {
 
     #[test]
     fn a_scan_reports_one_step_per_block_and_counts_bytes_read() {
-        // DR-008's seam at the boundary the scan already had. The step is a
-        // block because that is where the reads are, and where a cancellation
-        // can land.
+        // The step is a block because that is where the reads are, and where a
+        // cancellation can land.
         let absent = planted(29, 32);
         let mut watching = Seen::default();
         let end = STRIDE * 3 + 17;
@@ -389,8 +374,8 @@ mod tests {
 
     #[test]
     fn a_scan_that_finds_everything_stops_before_the_end() {
-        // The loop already ended early on a complete search; this pins that the
-        // watcher sees it as fewer steps than the total rather than as a stall.
+        // A complete search ends early, and the watcher sees fewer steps than
+        // the total rather than a stall.
         let value = planted(31, 32);
         let mut hay = haystack(STRIDE * 3);
         plant(&mut hay, 512, &value);
@@ -443,12 +428,6 @@ mod tests {
 
     /// A source that answers `EINTR` before each of its first `left` reads and
     /// its own bytes after that.
-    ///
-    /// `Read::read` is allowed to return [`std::io::ErrorKind::Interrupted`]
-    /// and mean nothing by it, and a caller that treats it as a failure loses
-    /// the rest of the file. Nothing in the repository provoked one, so the
-    /// guard that tolerates it could be deleted or inverted with the whole
-    /// suite staying green.
     struct Interrupting {
         inner: Cursor<Vec<u8>>,
         left: usize,
@@ -471,11 +450,6 @@ mod tests {
     }
 
     /// A source that hands over `head` and then fails once, permanently.
-    ///
-    /// The failure is not `Interrupted`, so it is the case the guard above must
-    /// **not** swallow. It ends rather than failing again, so a scan that did
-    /// swallow it finishes instead of spinning — a hang and a wrong answer are
-    /// told apart by what this test asserts, not by how long it takes.
     struct Failing {
         head: Vec<u8>,
         at: usize,
@@ -524,9 +498,8 @@ mod tests {
 
     #[test]
     fn a_read_that_actually_fails_is_reported_with_how_far_it_got() {
-        // The other half of the guard: an error that is not `Interrupted` ends
-        // the scan and names the offset reached, rather than being retried for
-        // ever or quietly treated as the end of the source.
+        // An error that is not `Interrupted` ends the scan and names the offset
+        // reached, rather than being retried or taken for the end of the source.
         let value = planted(47, 32);
         let head = haystack(512);
         let mut source = Failing {

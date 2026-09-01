@@ -1,15 +1,10 @@
 /**
- * Finding the `rpf` binary, and saying what to do when there is none. R7.7.
+ * Finding the `rpf` binary, and saying what to do when there is none.
  *
  * Three places, in the order a user would expect them to win: what they
  * configured, what shipped with the extension, and what is on `PATH`. Each
  * candidate is proved by running it — a file called `rpf` that is not this tool
- * is a worse failure than no file at all, because it fails later and less
- * clearly.
- *
- * DR-001 is why bundling is possible at all: the output is one static binary
- * with no runtime prerequisite, so an extension can carry one per platform and
- * still be a zip file.
+ * fails later and less clearly than no file at all.
  */
 
 import { execFile } from 'node:child_process';
@@ -51,12 +46,7 @@ export function binaryName(platform: NodeJS.Platform = process.platform): string
     return platform === 'win32' ? 'rpf.exe' : 'rpf';
 }
 
-/**
- * Where a bundled binary would be.
- *
- * One directory per target, because a static binary is per target and an
- * extension that carried only one would work on one machine.
- */
+/** Where a bundled binary would be. One directory per target. */
 export function bundledAt(
     extensionRoot: string,
     platform: NodeJS.Platform = process.platform,
@@ -100,8 +90,7 @@ export function isExecutable(at: string): boolean {
 /**
  * Runs a candidate and reports the version it prints.
  *
- * `undefined` for anything that is not this tool, including a file that is
- * there and executable and something else entirely.
+ * `undefined` for anything that is not this tool, executable or not.
  */
 export function probeVersion(binary: string): Promise<string | undefined> {
     return new Promise((settle) => {

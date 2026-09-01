@@ -1,27 +1,15 @@
 //! The XML read back, and applied to the file it was written from.
 //!
-//! R5.4, and DR-049 is why this takes the original payload rather than the
-//! document alone. The short version is that a `PSO` file carries more than its
-//! data: an opaque `PSIG`, an encrypted `STRE`, a `PSCH` that describes
-//! structures the data never instantiates, and 2.86% of `PSIN` bytes no walk
-//! from the root ever reaches. None of that is in the document, and none of it
-//! can be invented, so the write direction **edits** the file it came from.
+//! This takes the original payload as well as the document, because a `PSO`
+//! file carries bytes the document does not: an opaque `PSIG`, an encrypted
+//! `STRE`, a `PSCH` describing structures the data never instantiates, and
+//! `PSIN` no walk from the root reaches.
 //!
-//! The walk here is [`super::render`]'s walk read backwards: the same schema,
-//! the same block table, the same addresses, in the same order. It is a second
-//! spelling of the traversal and not a second spelling of one operation —
-//! `rbf`'s `token::read` and `token::write` stand in the same relation — and
-//! everything the two genuinely share is [`super::data`].
-//!
-//! Every address it writes at is one [`super::render`] read from, so no
-//! structural fact of the file changes: no block moves, no count changes, no
-//! pointer is rewritten. A value that no longer fits where it was is a refusal
-//! ([`NotPsoXml::TooLong`]), and so is an array of a different length or a
-//! structure of a different member list. DR-052 is why those three are the
-//! permanent boundary of `PSO` editing rather than work not yet done, and why
-//! the room a string has is the store its form gives it less the byte its
-//! terminator needs — never less, though, than the value already there, because
-//! an edit moves nothing it did not change.
+//! The walk is [`super::render`]'s read backwards — the same schema, block
+//! table and addresses in the same order — so no structural fact of the file
+//! changes: no block moves, no count changes, no pointer is rewritten. A value
+//! that no longer fits is a refusal ([`NotPsoXml::TooLong`]), and so is an
+//! array of a different length or a structure of a different member list.
 
 use quick_xml::{
     Reader, XmlVersion,
@@ -74,10 +62,8 @@ pub(super) fn write(payload: &[u8], document: &[u8], names: &Dictionary) -> Resu
         .bytes;
     let data = psin.bytes;
 
-    // Before the document is parsed, because parsing it is what costs: the
-    // whole of it is materialised into a tree before the first comparison
-    // against the payload, and a 68 MB document against a 172-byte payload
-    // reached 652 MB resident on its way to being refused at its first child.
+    // Before the document is parsed: the whole of it is materialised into a
+    // tree before the first comparison against the payload.
     let budget = document_budget(payload.len());
     if document.len() > budget {
         return Err(Error::NotPsoXml {
@@ -116,14 +102,9 @@ pub(super) fn write(payload: &[u8], document: &[u8], names: &Dictionary) -> Resu
     Ok(out)
 }
 
-/// The `CHKS` section, recomputed over whatever the edit left behind.
-///
-/// `docs/metadata-encodings.md`, `CHKS`: a Jenkins one-at-a-time hash seeded
-/// `0x3FAC7125` over the **whole file**, each byte taken as a signed `int8`,
-/// with the `fileSize` and `checksum` fields zeroed first. It reproduces the
-/// stored value in 8,978 of 8,978 files that carry one, so an unedited round
-/// trip through it is a fixed point and an edited one is correct rather than
-/// stale.
+/// The `CHKS` section, recomputed: a Jenkins one-at-a-time hash seeded
+/// `0x3FAC7125` over the whole file, each byte taken as a signed `int8`, with
+/// the `fileSize` and `checksum` fields zeroed first.
 mod checksum {
     use super::{Malformed, bad, section};
     use crate::error::Result;
@@ -141,14 +122,10 @@ mod checksum {
     ///
     /// # Errors
     ///
-    /// [`Malformed::Checksum`] when the section is not the twenty bytes
-    /// `docs/metadata-encodings.md` records it always is, or when a field of it
-    /// would fall outside those twenty bytes. The two writes are bounded by the
-    /// section rather than by the file, because a chain declaring a shorter
-    /// `CHKS` would otherwise have the next section's tag and length written
-    /// over — and a failure is answered rather than swallowed, because the
-    /// alternative is emitting a file whose checksum is stale and whose caller
-    /// was told nothing (`docs/conventions.md` §4).
+    /// [`Malformed::Checksum`] when the section is not the twenty bytes it
+    /// always is, or when a field would fall outside them: the writes are
+    /// bounded by the section rather than by the file, so a chain declaring a
+    /// shorter `CHKS` cannot have the next section's header written over.
     pub(super) fn restamp(file: &mut [u8], chks: Option<section::Section<'_>>) -> Result<()> {
         let Some(chks) = chks else { return Ok(()) };
         let at = chks.at;
@@ -179,10 +156,8 @@ mod checksum {
         Ok(())
     }
 
-    /// The seeded, signed-byte Jenkins one-at-a-time hash.
-    ///
-    /// The signed byte is the part that was under suspicion and is right: the
-    /// unsigned variant matches 0 of 8,978.
+    /// The seeded, signed-byte Jenkins one-at-a-time hash; the unsigned
+    /// variant matches nothing.
     fn jenkins(bytes: &[u8]) -> u32 {
         let mut hash: u32 = SEED;
         for byte in bytes {
@@ -204,9 +179,8 @@ mod checksum {
     mod tests {
         use super::*;
 
-        /// The write is bounded by the section's own twenty bytes, not by the
-        /// file: a field ending exactly on that boundary is the last one a
-        /// `CHKS` section can hold, and it must still be accepted.
+        /// A field ending exactly on the section's boundary is the last one a
+        /// `CHKS` can hold and must still be accepted.
         #[test]
         fn put_accepts_a_field_that_ends_exactly_on_the_sections_boundary() {
             let mut file = vec![0u8; 40];
@@ -220,8 +194,7 @@ mod checksum {
         }
 
         /// One byte past that boundary is refused rather than written into
-        /// whatever follows the section — the defect this bound exists to
-        /// prevent, `docs/metadata-encodings.md`, `CHKS`.
+        /// whatever follows the section.
         #[test]
         fn put_refuses_a_field_that_reaches_one_byte_past_the_boundary() {
             let mut file = vec![0xAAu8; 40];
@@ -235,22 +208,16 @@ mod checksum {
 }
 
 /// One element of the document: its name, its one reserved attribute, and its
-/// children.
-///
-/// Every element [`super::render`] writes carries **exactly one** `pso:`
-/// attribute, which is what makes this shape total rather than a subset: the
-/// type of every record is written down, which is DR-047's central decision and
-/// what R5.4 was promised.
+/// children. Every element carries exactly one `pso:` attribute, so a record's
+/// type is written down rather than inferred.
 #[derive(Debug)]
 struct Node {
     /// Where in the document it opened, so a refusal names a place an editor
     /// can put a cursor on.
     position: u64,
-    /// Its element name.
     tag: String,
     /// Its reserved attribute's word, with [`RESERVED_PREFIX`] removed.
     word: String,
-    /// That attribute's value.
     value: String,
     children: Vec<Node>,
 }
@@ -278,11 +245,8 @@ fn read_tree(document: &[u8]) -> Result<Node> {
                     return Err(at(&reader, NotPsoXml::SecondRoot));
                 }
                 // `>` and not `>=`: `stack.len()` is the depth the element
-                // about to be pushed will sit at, and `Applier::structure` and
-                // `super::render`'s `spend` both accept `MAX_DEPTH` itself. At
-                // `>=` this direction stopped one level short of the other, so
-                // a payload whose walk is exactly this deep rendered and was
-                // then refused — and blamed the document for it.
+                // about to be pushed will sit at, and both directions accept
+                // `MAX_DEPTH` itself.
                 if stack.len() > MAX_DEPTH {
                     return Err(at(&reader, NotPsoXml::TooDeep));
                 }
@@ -381,7 +345,6 @@ struct Applier<'a> {
     /// The original `PSIN` section. Every address, count and pointer the walk
     /// follows is read from here, so an edit cannot move the walk.
     data: Data<'a>,
-    /// The copy the values go into.
     edited: Vec<u8>,
     schema: &'a Schema,
     names: &'a Dictionary,
@@ -406,7 +369,6 @@ struct At<'a> {
     owner: &'a Structure,
     /// Where the value starts, from the start of the `PSIN` section.
     address: u32,
-    /// How deep the walk is.
     depth: usize,
 }
 
@@ -504,11 +466,9 @@ impl<'a> Applier<'a> {
             Text::Member(len) => {
                 expect(node, tag, word)?;
                 let len = u32::from(len);
-                // A fixed inline string is `len` bytes and its terminator is one
-                // of them: `docs/metadata-encodings.md`, Pointers — 116,507 of
-                // 116,507 shipped member strings end inside their own member,
-                // so filling all `len` is a shape no shipped file has and a
-                // string the next member continues.
+                // A fixed inline string is `len` bytes and its terminator is
+                // one of them, so a string filling all `len` would run on into
+                // the next member.
                 let was = until_nul(self.data.bytes(at.address, len)?).len();
                 self.put_string(at.address, room(len.saturating_sub(1), was), node)?;
                 Ok(())
@@ -525,34 +485,19 @@ impl<'a> Applier<'a> {
             },
             Text::AtString => {
                 let count = self.data.half(at.address.saturating_add(COUNT_AT))?;
-                // The bytes a counted string owns are its characters and the
-                // NUL after them, and `count1` and `count2` disagree about
-                // which of the two they measure: `docs/metadata-encodings.md`,
-                // Pointers. Over all 39,469 counted strings the corpus reaches,
-                // the characters number `min(count1, count2)` — the 38,683
-                // whose capacity is the larger store `count1` and terminate at
-                // `count1`, and the 786 whose capacity is the smaller store
-                // `count2` and terminate at `count2`. So the store is the
-                // smaller of the two, and a write bounded by `count1` alone
-                // puts a character over the terminator of those 786.
+                // A counted string's characters number `min(count1, count2)`
+                // and its terminator is the byte after, so the store is the
+                // smaller of the two counts, not `count1`.
                 let capacity = self.data.half(at.address.saturating_add(CAPACITY_AT))?;
                 let store = u32::from(count.min(capacity));
                 match self.data.pointer(at.address)? {
                     None => expect_null(node, tag, word),
                     Some(address) => {
                         expect(node, tag, word)?;
-                        // `count1` is the length — `schema::COUNT_AT` — so a
-                        // string that changed length has to take it with it.
-                        // The reader answers `until_nul` of the bytes it
-                        // covers and so cannot see it left behind.
-                        //
-                        // Rewritten only when the length actually changed,
-                        // and never merely because the stored count disagrees
-                        // with what the bytes read back as. Whether `count1`
-                        // counts the terminator is the file's own business —
-                        // a payload carrying `count1 = 1` over a lone NUL is
-                        // a payload this reads as the empty string — and
-                        // DR-049 moves nothing the edit did not.
+                        // `count1` is the length, so a string that changed
+                        // length has to take it with it — but only then, never
+                        // merely because the stored count disagrees with what
+                        // the bytes read back as.
                         let was = until_nul(self.data.bytes(address, u32::from(count))?).len();
                         let len = self.put_string(address, room(store, was), node)?;
                         if usize::try_from(len).is_ok_and(|written| written == was) {
@@ -581,12 +526,8 @@ impl<'a> Applier<'a> {
         self.structure(name, address, tag, node, at.depth)
     }
 
-    /// The value an enum element names.
-    ///
-    /// The inverse of [`super::render`]'s rendering, in the same order: a name
-    /// the file's own table carries, and otherwise the decimal the renderer
-    /// falls back to. The two cannot be confused — a dictionary name must begin
-    /// with a letter, `_` or `:`, and a placeholder begins `hash_`.
+    /// The value an enum element names: a name the file's own table carries,
+    /// and otherwise the decimal the renderer falls back to.
     fn enumerated(&self, table: u32, node: &Node) -> Result<i32> {
         if let Some(key) = self.keyed(table, &node.value, node)? {
             return Ok(key);
@@ -594,11 +535,8 @@ impl<'a> Applier<'a> {
         node.value.parse().map_err(|_| unreadable(node))
     }
 
-    /// The key an enum table gives a rendered name, when exactly one does.
-    ///
-    /// More than one is [`NotPsoXml::Ambiguous`] rather than a choice: two keys
-    /// whose names render the same are indistinguishable in the document, and
-    /// picking one would write a value the reader never wrote.
+    /// The key an enum table gives a rendered name, when exactly one does;
+    /// more than one is [`NotPsoXml::Ambiguous`] rather than a choice.
     fn keyed(&self, table: u32, wanted: &str, node: &Node) -> Result<Option<i32>> {
         let Some(entries) = self.schema.enum_table(table) else {
             return Ok(None);
@@ -742,7 +680,6 @@ impl<'a> Applier<'a> {
 /// The writes. Every one is bounds-checked against the section, and every one
 /// is at an address [`super::render`] read the same value from.
 impl Applier<'_> {
-    /// Writes `bytes` at `address`.
     fn put(&mut self, address: u32, bytes: &[u8]) -> Result<()> {
         let gone = || bad(u64::from(address), Malformed::DataRange);
         let at = usize::try_from(address).map_err(|_| gone())?;
@@ -753,16 +690,8 @@ impl Applier<'_> {
     }
 
     /// Writes a string into the `room` bytes it has, NUL-terminated when there
-    /// is a byte to spare, and answers how many bytes it wrote.
-    ///
-    /// Nothing past the terminator is touched, which is what makes an unedited
-    /// trip identical rather than merely equivalent: a fixed inline string is
-    /// read up to its first NUL, and what follows is whatever the packer left.
-    ///
-    /// The length is answered rather than discarded because a form that stores
-    /// its own length has to be told it: an `ATSTRING`'s `count1` describes
-    /// these bytes, and a shortened string that left it alone would write a
-    /// file saying five where three were written.
+    /// is a byte to spare, and answers how many bytes it wrote. Nothing past
+    /// the terminator is touched, so an unedited trip is byte-identical.
     fn put_string(&mut self, address: u32, room: u32, node: &Node) -> Result<u32> {
         let bytes = text::decode(&node.value).ok_or(Error::NotPsoXml {
             position: node.position,
@@ -882,14 +811,8 @@ impl Applier<'_> {
 }
 
 /// How many bytes a string may be written into: the `store` its form gives it,
-/// and never less than the `was` bytes already there.
-///
-/// The second half is DR-049's rule that an edit moves nothing it did not
-/// change, applied to a payload whose own string already fills its store and
-/// leaves no terminator. Such a payload is in neither the corpus nor anything
-/// this writes — 0 of 116,507 fixed inline strings and 0 of 39,469 counted ones
-/// — but it is representable, and refusing to write it back unchanged would
-/// break the round trip for a shape the reader accepts. DR-052.
+/// and never less than the `was` bytes already there — a payload whose string
+/// already fills its store must still write back unchanged.
 fn room(store: u32, was: usize) -> u32 {
     store.max(u32::try_from(was).unwrap_or(u32::MAX))
 }
@@ -947,10 +870,9 @@ fn expect_value(node: &Node, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks that a null pointer is still written down as one.
-///
-/// DR-047: `pso:null` carries the type word the value would have had, because
-/// an empty string and an absent one are different things.
+/// Checks that a null pointer is still written down as one; `pso:null` carries
+/// the type word the value would have had, since an empty string and an absent
+/// one differ.
 fn expect_null(node: &Node, tag: &str, word: &str) -> Result<()> {
     expect(node, tag, NULL)?;
     expect_value(node, word)
@@ -971,13 +893,8 @@ fn expect_children(node: &Node, wanted: usize) -> Result<&[Node]> {
     Ok(&node.children)
 }
 
-/// The half-float `f32` narrows to, or `None` when it does not narrow exactly.
-///
-/// The inverse of `section::f16`, and it refuses rather than rounds: a value
-/// that is not a half is a value the file cannot hold, and silently storing the
-/// nearest one would make the document and the payload disagree.
-/// `docs/metadata-encodings.md`, the census: `FLOAT16` is 60 of 580,044
-/// members, and the pinned toolchain has no `f16`.
+/// The half-float `f32` narrows to, or `None` when it does not narrow exactly:
+/// storing the nearest half would make document and payload disagree.
 fn narrow(number: f32) -> Option<u16> {
     let bits = number.to_bits();
     let sign = u16::try_from(bits >> 31).ok()? << 15;
@@ -1006,11 +923,8 @@ fn narrow(number: f32) -> Option<u16> {
         let exponent = u16::try_from(shifted).ok()? << 10;
         return Some(sign | exponent | u16::try_from(mantissa >> 13).ok()?);
     }
-    // A half subnormal: the implicit one comes back and the whole thing shifts
-    // down by however far the exponent is below the half's smallest. A half
-    // subnormal is `m * 2^-24` and the `f32` is `full * 2^(exponent-150)`, so
-    // `m` is `full >> (14 - shifted)`; 13 is off by a factor of two and every
-    // subnormal half is wrong by it.
+    // A half subnormal is `m * 2^-24` and the `f32` is `full * 2^(exponent-150)`,
+    // so `m` is `full >> (14 - shifted)`.
     let drop = u32::try_from(14i32.checked_sub(shifted)?).ok()?;
     if drop >= 32 {
         return None;
@@ -1036,8 +950,7 @@ mod tests {
     const ROOT_NAME: u32 = 0xD98B_B561;
     /// An arbitrary member name, distinct from [`ROOT_NAME`] and [`ARRAYINFO`].
     const MEMBER_NAME: u32 = 0x1234_5678;
-    /// The `ARRAYINFO` sentinel, `crate::metadata::pso::model`'s own copy not
-    /// being imported into this module.
+    /// The `ARRAYINFO` sentinel.
     const ARRAYINFO: u32 = 0x0000_0100;
 
     /// A one-entry `PMAP` block table naming a block of `length` bytes at
@@ -1071,11 +984,6 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
-    // `is_space` — a mutant that always answers `true` would trim a stray
-    // word down to nothing and never see it.
-    // -------------------------------------------------------------------
-
     #[test]
     fn text_between_elements_that_is_not_whitespace_is_refused() {
         let error = read_tree(b"<a pso:x=\"y\">not-blank</a>").expect_err("stray text is refused");
@@ -1095,12 +1003,6 @@ mod tests {
     fn text_between_elements_that_is_only_whitespace_is_accepted() {
         read_tree(b"<a pso:x=\"y\">  \n\t\r  </a>").expect("pure whitespace is not content");
     }
-
-    // -------------------------------------------------------------------
-    // `Applier::counted` — the `None` arm's `count == 0` guard tells an
-    // array that is legitimately empty from a null pointer with items
-    // nowhere to be, which is the file contradicting itself.
-    // -------------------------------------------------------------------
 
     #[test]
     fn counted_refuses_a_null_pointer_that_declares_a_nonzero_count() {
@@ -1139,11 +1041,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // `Applier::structure` — the depth ceiling accepts a structure exactly
-    // `MAX_DEPTH` deep and refuses only past it.
-    // -------------------------------------------------------------------
-
     #[test]
     fn structure_refuses_only_past_the_exact_depth_ceiling() {
         let section = vec![0u8; 8];
@@ -1161,9 +1058,8 @@ mod tests {
         };
         let leaf = node("tag", STRUCT, "whatever");
 
-        // At the ceiling itself, the depth check must not be what refuses:
-        // the schema defines nothing, so what should surface once the depth
-        // check is passed is `UndefinedStructure`, not `TooDeep`.
+        // At the ceiling itself the depth check must not be what refuses:
+        // `UndefinedStructure` should surface instead.
         let at_ceiling = applier.structure(0xDEAD_BEEF, 0, "tag", &leaf, MAX_DEPTH);
         assert!(
             matches!(
@@ -1189,16 +1085,7 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // `expect_value` and `expect_null` — a refusal that never fires is a
-    // refusal that does not exist.
-    // -------------------------------------------------------------------
-
     /// A minimal valid `PSO`: one block, one structure, one `UINT` member.
-    ///
-    /// The same shape `crates/rpf-core/tests/metadata.rs`'s `minimal_pso`
-    /// builds, kept local because a test crate and a unit test module share
-    /// no code.
     fn one_uint_pso() -> Vec<u8> {
         let mut psin = Vec::new();
         psin.extend_from_slice(&section::PSIN);
@@ -1325,12 +1212,6 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------
-    // The `Layout::PointerWithCount` arm — deleting it falls through to the
-    // inline wildcard, so an edit lands on the pointer's own bytes instead
-    // of on the block the pointer names.
-    // -------------------------------------------------------------------
-
     /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`,
     /// the pointer naming a second block that holds the one item.
     fn pointer_with_count_pso() -> Vec<u8> {
@@ -1403,13 +1284,6 @@ mod tests {
             "and the pointer itself is untouched"
         );
     }
-
-    // -------------------------------------------------------------------
-    // `narrow` — the `||` at the top of the infinity/NaN arm. Its second
-    // half is dead in isolation (see the report), but the disjunction as a
-    // whole is not: a payload with a low bit that would be dropped and a
-    // nonzero high half must still be refused.
-    // -------------------------------------------------------------------
 
     #[test]
     fn a_nan_whose_low_payload_bits_would_be_lost_is_refused() {

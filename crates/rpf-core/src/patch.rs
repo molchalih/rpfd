@@ -1,26 +1,9 @@
 //! Rewriting entries without rewriting the archive.
 //!
-//! `docs/approach.md`: "Writes prefer in-place patching. Rewriting an entry
-//! whose new payload fits its existing block allocation must not rewrite the
-//! archive." This is that. It matters most where it is hardest to do without:
-//! a 5 KB edit to a 2.7 GB archive should cost 5 KB of writes, not 2.7 GB.
-//!
-//! Real archives leave room for it. The sample is 82.7% unreferenced bytes, so
-//! an entry's allocation almost always exceeds what it holds.
-//!
-//! **Deciding and writing are separate.** [`plan`] resolves every edit, applies
-//! each entry's own storage rule, and checks that all of them fit, without
-//! touching the archive; [`Patches::apply`] then writes what was decided. That
-//! split is what lets a caller commit several edits at once: patching them one
-//! at a time can apply two and then discover the third does not fit, which is
-//! not what a commit promises. R4.14.
-//!
-//! **What the split does not buy is crash atomicity.** A rebuild writes a
-//! temporary file and renames it, so an interruption leaves the original
-//! intact. A patch writes into the live archive: the payload first, then the
-//! entry row, with a flush between. An interruption between the two leaves an
-//! archive whose entry describes bytes that are no longer there. That is the
-//! price of not rewriting gigabytes, and it is why `verify` exists.
+//! [`plan`] decides everything without touching the archive and
+//! [`Patches::apply`] writes what was decided, into the live archive — so
+//! unlike a rebuild, an interruption can leave an entry describing bytes that
+//! are no longer there.
 
 use std::{
     fmt,
@@ -36,9 +19,6 @@ use crate::{
 };
 
 /// What a plan will do to one entry.
-///
-/// Carries no payload: this is the description a caller reports, and R6.7's
-/// dry-run is exactly this without the [`Patches::apply`] that would follow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
     /// The path, as it was given.
@@ -70,18 +50,14 @@ struct Ready {
     row: Row,
 }
 
-/// A set of edits that all fit, ready to be written.
-///
-/// A value of this type exists only when every edit in it has been resolved,
-/// prepared and checked against the room its entry has, so [`Patches::apply`]
-/// has nothing left to decide (§4).
+/// A set of edits that all fit, ready to be written: this type exists only when
+/// every edit in it has been checked against the room its entry has.
 pub struct Patches {
     ready: Vec<Ready>,
 }
 
 impl fmt::Debug for Patches {
-    /// Shows what would be written, never the bytes: a payload is megabytes,
-    /// and this type appears in test failures.
+    /// Shows what would be written, never the bytes.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_list()
@@ -96,16 +72,11 @@ impl Patches {
         self.ready.iter().map(|ready| &ready.planned)
     }
 
-    /// Writes every planned edit.
-    ///
-    /// Each is written payload first, then its entry row, with a flush between
-    /// — see the module documentation for the window that leaves open, and for
-    /// why it is accepted here.
+    /// Writes every planned edit, payload first and then its entry row.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] from the archive. Whatever was written before the failure
-    /// stays written; nothing here can undo it, which is what `verify` is for.
+    /// [`Error::Io`]; whatever was written before the failure stays written.
     pub fn apply<F>(&self, file: &mut F) -> Result<()>
     where
         F: Write + Seek,
@@ -145,27 +116,15 @@ impl Patches {
 pub enum Plan {
     /// Every edit fits where its entry already sits.
     Fits(Patches),
-    /// At least one does not. The caller has to rebuild instead; nothing was
-    /// written, and **no** edit in the set was applied, including those that
+    /// At least one does not; nothing was written, including the edits that
     /// would have fitted.
     DoesNotFit(Vec<TooLarge>),
-    /// At least one change alters what the archive **holds** rather than what
-    /// an entry holds, and no patch can express that.
-    ///
-    /// An entry added or removed changes the entry count, which moves the names
-    /// blob and the floor every payload sits above; a rename moves the names
-    /// blob the same way. So it is decided for the whole set here, before
-    /// anything is compressed, rather than found one entry at a time. R4.10,
-    /// DR-026.
+    /// At least one change alters what the archive holds rather than what an
+    /// entry holds, and no patch can express that.
     Structural(Vec<Structural>),
 }
 
 /// The bytes one edit claims: the room its payload sits in, and its entry row.
-///
-/// Claimed rather than written, because the room is what another edit must not
-/// reach into. Two entries in one archive have disjoint allocations by
-/// construction — an allocation ends where the next payload begins — so this
-/// only ever fires for edits that genuinely collide.
 struct Claim {
     at: u64,
     len: u64,
@@ -183,48 +142,26 @@ impl Claim {
 /// Decides what patching every change would do, without writing anything.
 ///
 /// A [`Change::Write`] to a path the archive holds is the one thing a patch can
-/// do: the payload goes where the old one sat, in the storage the entry already
-/// carries. Everything else — a path created, an entry removed, an entry
-/// renamed, a directory added — is [`Plan::Structural`], because each of them
-/// changes the entry count or the names blob and therefore every offset after
-/// it. That verdict is reached for the whole set before any payload is
-/// compressed.
+/// do; everything else is [`Plan::Structural`]. A write's contents are the file
+/// as it exists outside the archive, and a path may address through nested
+/// archives in one string without any ancestor being rebuilt.
 ///
-/// A write's contents are the file as it exists outside the archive: for a
-/// resource, its `RSC7` header and still-deflated body. A path may address
-/// through nested archives in one string. Patching inside one needs **no
-/// rebuild of any ancestor**: the nested archive's own length is unchanged, so
-/// the payload its parent describes is unchanged, so there is nothing above to
-/// update. That is the whole reason this is worth having.
-///
-/// Returns [`Plan::DoesNotFit`] naming every write that is too large, so a
-/// caller reporting a dry run can show all of them rather than the first. Too
-/// large for the *entry's room*, that is: a payload too large for the entry's
-/// fields to describe at all is an error rather than a rejection, and the same
-/// one a rebuild of it would give.
+/// Returns [`Plan::DoesNotFit`] naming every write too large for its entry's
+/// room; one too large for the entry's fields to describe at all is an error.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] for a path that does not resolve and was not asked to be
-/// created, [`Error::WrongKind`] for a directory, [`Error::NotAResource`] for a
-/// resource given a payload that is not one, [`Error::WrongEncoding`] for an
-/// entry given a payload the encoding it holds will not take,
-/// [`Error::FieldOverflow`] for one no entry row can describe,
-/// [`Error::Overlapping`] for two edits that claim the same bytes,
-/// [`Error::CannotWriteEncrypted`] for an archive this build can
-/// read and not write back, and [`Error::Io`] from the archive. Not
-/// [`Error::ArchiveTooLarge`], which the same row builder can raise: the block
-/// this hands it was decoded out of the entry it is patching, so it already
-/// fits the field.
+/// [`Error::NotFound`], [`Error::WrongKind`] for a directory,
+/// [`Error::NotAResource`], [`Error::WrongEncoding`] for a payload the entry's
+/// encoding will not take, [`Error::FieldOverflow`], [`Error::Overlapping`] for
+/// two edits over the same bytes, [`Error::CannotWriteEncrypted`], and
+/// [`Error::Io`].
 pub fn plan<F>(file: &mut F, archive: &Archive, changes: &Changes) -> Result<Plan>
 where
     F: Read + Seek,
 {
-    // Asked before anything is resolved. A `Plan::Structural` is a value the
-    // caller finishes by rebuilding, and an archive that cannot be written back
-    // cannot finish it — so answering one here would be handing over a half
-    // decision (§4). It covers the archive a path never leaves; the holder a
-    // path descends into is asked for itself below.
+    // A `Plan::Structural` is finished by rebuilding, so an archive that cannot
+    // be written back cannot answer one. Nested holders are asked below.
     archive.writable()?;
 
     let structural = structural_in(file, archive, changes)?;
@@ -247,11 +184,8 @@ where
             continue;
         };
         let (holder, index) = archive.locate(file, path)?;
-        // The archive the bytes would land in, asked before a byte of payload
-        // is compressed: a patch writes plaintext where the entry already sits,
-        // and where that region is under a transform it destroys the archive in
-        // place. One answer, `Archive::writable`, shared with the rebuild path.
-        // DR-041.
+        // A patch writes plaintext where the entry already sits, so a region
+        // under a transform this build cannot reproduce must be refused first.
         holder.writable()?;
         edit::check_encoding(
             file,
@@ -261,31 +195,16 @@ where
             &**contents,
             allow_encoding_change,
         )?;
-        // The transform the payload and the row go back under, which is the
-        // holder's and not the outermost archive's: a nested archive carries
-        // its own tag and its own key. A patch writes into the live archive, so
-        // both the region the payload sits in and the sixteen bytes of its row
-        // have to be ciphertext again — an entry row is exactly one aligned
-        // cipher block of the table, which is what makes rewriting one row
-        // without the rest of the table sound and which `Archive::seal` is what
-        // asks.
+        // The holder's transform, not the outermost archive's: a nested archive
+        // carries its own tag and key. An entry row is exactly one aligned
+        // cipher block, which is what makes rewriting one row alone sound.
         let transform = holder.seal()?;
         let tag = holder.encryption_tag();
         let under = transform.as_ref().map(|forward| Sealed::new(forward, tag));
         let entry = *holder.entry(index)?;
 
-        // The storage rule is the entry's, not the caller's: one that was
-        // deflated stays deflated, and one that was stored stays stored.
-        // Changing it would be a different operation than replacing a payload.
-        //
-        // The version is the holder's for the same reason: a patch rewrites one
-        // entry of an archive that already exists, so the fields it has to fit
-        // are that archive's.
-        //
-        // A patch holds the payload it is about to write, because it writes it
-        // as one edit into a live archive rather than streaming it into a new
-        // one. So the sink here is a buffer, and `store` is still the one place
-        // the rule is applied.
+        // The storage rule and the version are the entry's, not the caller's:
+        // deflated stays deflated, stored stays stored.
         let mut buffer = Cursor::new(Vec::new());
         let mut opened = contents.open()?;
         let written = store(
@@ -297,9 +216,8 @@ where
             &mut buffer,
         )?;
         let mut payload = buffer.into_inner();
-        // A deflated form that did not pay for itself leaves the tail of it
-        // zeroed past the plain bytes, which is what a rebuild needs and a
-        // patch does not: the entry describes `len` bytes and no more.
+        // A deflated form that did not pay for itself leaves a zeroed tail past
+        // the plain bytes; the entry describes `len` bytes and no more.
         payload.truncate(usize::try_from(written.len).unwrap_or(usize::MAX));
 
         let allocation = holder.allocation(index)?;
@@ -307,9 +225,8 @@ where
         let (at, _) = holder.payload_at(index)?;
         let row_at = holder.row_at(index)?;
 
-        // Built before the fit is considered, so that a payload the entry could
-        // never describe is refused outright rather than reported as merely too
-        // large for where it sits — which is the verdict a build gives it.
+        // Built before the fit is considered, so a payload the entry could never
+        // describe is refused outright rather than reported as too large.
         let block = at
             .checked_sub(holder.base())
             .and_then(|relative| relative.checked_div(holder.version().block_len()))
@@ -320,19 +237,16 @@ where
                 archive_len: holder.len_bytes(),
             })?;
         let row = file_row(holder.version(), path, entry.name_offset, block, &written)?;
-        // The row goes back under the **table of contents'** key, which is the
-        // archive's own name and its length: a patch does not change either,
-        // so it is the key the row was read under. The payload above is keyed
-        // by this entry's own name and its new uncompressed length instead, and
-        // conflating the two writes a row nothing decodes (Q2, DR-062).
+        // The row is keyed by the archive's own name and length; the payload
+        // above by this entry's name and its new uncompressed length.
+        // Conflating the two writes a row nothing decodes.
         let row = match under {
             None => row,
             Some(under) => row.sealed(&under.of(holder.keyed_name(), holder.len_bytes())?),
         };
 
-        // Claimed whether or not it fits, so that the same set of edits always
-        // reaches the same verdict rather than one that depends on how well
-        // the payloads happened to compress.
+        // Claimed whether or not it fits, so the verdict does not depend on how
+        // well the payloads happened to compress.
         stake(
             &mut claims,
             path,
@@ -379,15 +293,9 @@ where
 
 /// Records what one edit claims, refusing a claim another edit already made.
 ///
-/// Split out of [`plan`] because it is the one part of it that is about the set
-/// rather than about the edit, and because a function that decides something
-/// decides it completely (§4): a caller gets the refusal or a recorded claim,
-/// never a half-staked one.
-///
 /// # Errors
 ///
-/// [`Error::Overlapping`], naming both paths, for two edits over the same
-/// bytes.
+/// [`Error::Overlapping`], naming both paths.
 fn stake<'a>(claims: &mut Vec<(&'a str, Claim)>, path: &'a str, staking: [Claim; 2]) -> Result<()> {
     for claim in staking {
         if let Some((other, _)) = claims
@@ -404,12 +312,8 @@ fn stake<'a>(claims: &mut Vec<(&'a str, Claim)>, path: &'a str, staking: [Claim;
     Ok(())
 }
 
-/// Every change in the set that no patch can express.
-///
-/// A write is the one that depends on the archive rather than on itself, so it
-/// is resolved here: a path the archive holds is a patch, and a path it does
-/// not is either an addition or [`Error::NotFound`], depending on what the
-/// caller asked for. Nothing is compressed on the way.
+/// Every change in the set that no patch can express: a path the archive holds
+/// is a patch, and one it does not is an addition or [`Error::NotFound`].
 fn structural_in<F>(file: &mut F, archive: &Archive, changes: &Changes) -> Result<Vec<Structural>>
 where
     F: Read + Seek,

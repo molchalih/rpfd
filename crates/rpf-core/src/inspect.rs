@@ -1,16 +1,6 @@
 //! What an archive holds, what it adds up to, and whether it reads back as it
-//! describes itself.
-//!
-//! `ls`, `info` and `verify` ask about an archive rather than about one entry,
-//! and both frontends ask them. They live here because anything one frontend
-//! can do the other must be able to do (§1): with this logic in the binary,
-//! `serve --stdio` could not answer any of them at all, and the editor client
-//! reaches the container only through the daemon.
-//!
-//! None of them renders anything. A [`Listed`] is a path and what is at it, a
-//! [`Summary`] is numbers, and a [`Verified`] is a list of failures with the
-//! entry each belongs to, so the command line, `--json` and the editor client
-//! each say it their own way (§10).
+//! describes itself: `ls`, `info` and `verify`, for both frontends. None of
+//! them renders anything.
 
 use std::{
     collections::BTreeMap,
@@ -30,14 +20,8 @@ use crate::{
 /// One entry, as a listing reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listed {
-    /// Where it is: **the whole path**, addressed from the path that was
-    /// listed, in the spelling that path was given in.
-    ///
-    /// Not a name. Listing `x64/inner.rpf` gives rows whose path is
-    /// `x64/inner.rpf/art.yft`, so a row addresses [`Archive::locate`] as it
-    /// stands and a caller that joined it onto what it asked for would build
-    /// the prefix twice. Components resolve case-insensitively, so the
-    /// spelling is the caller's rather than the archive's. DR-028.
+    /// Where it is: **the whole path**, spelled as the listed path was, so a
+    /// row addresses [`Archive::locate`] as it stands.
     pub path: String,
     /// What it is, and the one number that belongs with it.
     pub kind: ListedKind,
@@ -45,15 +29,8 @@ pub struct Listed {
 
 /// What a listed entry is, and the number that means something for that kind.
 ///
-/// Three variants rather than one struct with a nullable field, because the
-/// number is a child count for one of them and a byte count for the others
-/// (§5).
-///
-/// **Only [`ListedKind::Binary`] carries an encoding, and only it can.** A
-/// resource's payload is never read — `docs/backlog.md` Q7 — so a listing
-/// cannot claim one for it even by mistake, which a nullable field beside the
-/// kind would have allowed. [`crate::Classification`] is the same shape one level
-/// down.
+/// Only [`ListedKind::Binary`] can carry an encoding: a resource's payload is
+/// never read, so a listing cannot claim one for it even by mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListedKind {
     /// A directory, and how many children it holds.
@@ -65,16 +42,15 @@ pub enum ListedKind {
     /// announce themselves to be.
     Binary {
         /// The contents' length, which is what the file is outside the
-        /// archive. Either storage choice changes what sits on disk, not what
-        /// the file is.
+        /// archive whichever way it is stored.
         len: u64,
         /// What the first [`Encoding::HEAD_LEN`] bytes name, or `None` for
-        /// R3.7's unknown binary. [`Archive::classify`].
+        /// unknown binary.
         encoding: Option<Encoding>,
     },
     /// A resource, and the length its page flags describe.
     Resource {
-        /// From [`resource_len`], which is where that fact is decoded.
+        /// Decoded from the row's page flags by [`resource_len`].
         len: u64,
     },
 }
@@ -82,18 +58,9 @@ pub enum ListedKind {
 impl Listed {
     /// Every entry at a path, and everything below it when `recursive`.
     ///
-    /// The empty path is the archive's root. A path naming a nested archive
-    /// lists what is inside it, because a nested archive is a directory as far
-    /// as a path is concerned; a path naming an ordinary file is that one
-    /// entry.
-    ///
-    /// **That last case is what makes this a `stat` as well as a listing**, and
-    /// it is the only one there is: a caller tells "this is a file" from "this
-    /// directory holds one child" by comparing the row's [`Listed::path`] with
-    /// the one it asked for. Equal means the path named that entry. The
-    /// comparison is exact — a child's path is its parent's plus a separator
-    /// and a name, so it can never equal its parent's — and an empty answer is
-    /// unambiguous, because a file always gives one row. DR-028.
+    /// The empty path is the root, a nested archive lists what is inside it,
+    /// and an ordinary file is one row — which makes this a `stat` too, told
+    /// apart by comparing that row's path with the one asked for.
     ///
     /// # Errors
     ///
@@ -113,11 +80,7 @@ impl Listed {
     }
 
     /// One row: what an entry is, and where it is from the path that was
-    /// listed.
-    ///
-    /// A binary entry costs [`Encoding::HEAD_LEN`] bytes of its contents here,
-    /// which is what makes a row say `xml` rather than `binary` (R3.7). It is
-    /// sixteen bytes and never the payload: DR-031.
+    /// listed, at the cost of [`Encoding::HEAD_LEN`] bytes for a binary entry.
     fn of<R: Read + Seek>(src: &mut R, archive: &Archive, index: u32, path: &str) -> Result<Self> {
         let kind = match archive.entry(index)?.kind {
             EntryKind::Directory { child_count, .. } => ListedKind::Directory {
@@ -129,9 +92,8 @@ impl Listed {
                 len: u64::from(uncompressed_len),
                 encoding: archive.classify(src, index)?.encoding(),
             },
-            // A resource entry carries no uncompressed size; its length is the
-            // two flag words decoded. `docs/rpf-format.md`, Resource page
-            // flags, `verified`.
+            // A resource entry carries no uncompressed size; its length is
+            // the two flag words decoded.
             EntryKind::Resource {
                 system_flags,
                 graphics_flags,
@@ -156,13 +118,11 @@ fn list_into<R: Read + Seek>(
     recursive: bool,
     rows: &mut Vec<Listed>,
 ) -> Result<()> {
-    // Not a directory? If it is an archive, listing it means listing what is
-    // inside it. Anything else is a single entry.
+    // Not a directory: an archive is listed by what is inside it, and anything
+    // else is a single entry.
     let Ok(children) = archive.children(at) else {
-        // An archive that did not open is listed as the file it also is, which
-        // is the only honest row available: its own entries cannot be read.
-        // `verify` is where that gap is reported, and `info` is where it is
-        // counted.
+        // An archive that did not open is listed as the file it also is, its
+        // own entries being unreadable. `verify` reports that gap.
         if let Nested::Open(nested) = archive.nested_at(src, at)? {
             return list_into(src, &nested, 0, prefix, recursive, rows);
         }
@@ -201,40 +161,20 @@ pub struct Summary {
     pub binary_files: u32,
     /// How many are resources.
     pub resource_files: u32,
-    /// How many entries hold an archive of their own, one level down.
-    ///
-    /// Every one of them, whether this build could open it or not, so the
-    /// number is a fact about the archive rather than about what a key cache
-    /// happens to hold. [`Summary::locked_archives`] is how many of them did
-    /// not open.
+    /// How many entries hold an archive of their own, one level down, whether
+    /// this build could open it or not.
     pub nested_archives: u32,
     /// How many of [`Summary::nested_archives`] this build could not open for
-    /// want of the right key material.
-    ///
-    /// Never larger than that count, and a caller reporting one number without
-    /// the other reports more than was measured. Zero is "everything nested
-    /// here was descended into", which is what a walk needs to know before it
-    /// believes its own totals.
+    /// want of the right key material, and never more than that count.
     pub locked_archives: u32,
-    /// Bytes of the archive that no region claims.
-    ///
-    /// An entry's tail is claimed, so it is not counted here and no other
-    /// field counts it either: a summary is silent about an archive holding a
-    /// payload whose deflate stream ends early, and that is decided rather
-    /// than overlooked. Finding one costs the inflate of every payload, which
-    /// is `verify`'s walk — with the watcher DR-008 gives unbounded work, and
-    /// which reports each one against its own path. R6.10, and the test named
-    /// `a_tail_is_referenced_by_its_entry_and_is_verifys_to_report`.
+    /// Bytes of the archive that no region claims; an entry's tail is claimed,
+    /// so a payload whose stream ends early is `verify`'s to find.
     pub unreferenced_bytes: u64,
 }
 
 impl Summary {
     /// Summarises the archive at `path`, sniffing each payload for a nested
-    /// one.
-    ///
-    /// The empty path is `archive` itself; any other path names an archive
-    /// nested inside it, addressed the way every other command addresses one —
-    /// `x64/vehicles.rpf`, through as much nesting as it takes. R6.11.
+    /// one; the empty path is `archive` itself.
     ///
     /// # Errors
     ///
@@ -247,10 +187,8 @@ impl Summary {
         let holder = archive_at(src, archive, path)?;
         let archive = &holder;
         let entries = count(archive);
-        // The header, the entry table and the names blob are referenced too.
-        // `payload_floor` is the one place that sum lives, so this cannot drift
-        // from where the reader and the writer put the first payload.
-        // `docs/rpf-format.md`, Slack, `verified`.
+        // The header, the entry table and the names blob are referenced too,
+        // and `payload_floor` is the one place that sum lives.
         let mut referenced = archive.version().payload_floor(
             u64::from(entries),
             u64::try_from(archive.names_blob().len()).unwrap_or(u64::MAX),
@@ -274,8 +212,7 @@ impl Summary {
                 } => {
                     binary_files = binary_files.saturating_add(1);
                     // Compressed size zero means stored, and then the other
-                    // field carries what is on disk. `docs/rpf-format.md`,
-                    // Compression.
+                    // field carries what is on disk.
                     let on_disk = if compressed_len == 0 {
                         uncompressed_len
                     } else {
@@ -312,12 +249,8 @@ impl Summary {
     }
 }
 
-/// The same key failure again, where a problem is carrying one.
-///
-/// [`Error`] is not `Clone` — it carries an [`std::io::Error`] in two of its
-/// variants — and these two are the whole of what a locked nested archive
-/// answers, so they are rebuilt from what they carry rather than the enum being
-/// widened to allow copying every variant there is.
+/// The same key failure again, rebuilt from what it carries because [`Error`]
+/// is not `Clone`.
 fn key_failure(error: &Error) -> Option<Error> {
     match *error {
         Error::NeedsKey { tag } => Some(Error::NeedsKey { tag }),
@@ -326,59 +259,46 @@ fn key_failure(error: &Error) -> Option<Error> {
     }
 }
 
-/// One entry that is not as the archive describes it.
-///
-/// It did not read back at all; or it read back and its payload declares bytes
-/// its deflate stream never reached — [`Error::TrailingBytes`], which nothing
-/// but this walk looks for, R6.10; or it read back and its contents are not
-/// the contents a manifest recorded for it — [`Error::ChecksumMismatch`],
-/// DR-023.
+/// One entry that is not as the archive describes it: it did not read back, or
+/// its payload declares bytes its stream never reached, or its contents are not
+/// what a manifest recorded.
 #[derive(Debug)]
 pub struct Problem {
     /// Where it is, addressed from the outermost archive.
     pub path: String,
-    /// What went wrong. The failure itself, not a sentence about it (§10).
+    /// What went wrong: the failure itself, not a sentence about it.
     pub error: Error,
 }
 
 /// The result of reading every entry back.
 ///
-/// **What a clean result proves depends on which walk produced it.** Every
-/// entry is checked against what the archive says about it, and an archive
-/// says nothing at all about a stored entry's bytes: no inflated length, no
-/// stream that ends. So a clean [`Verified::of`] means every entry read back,
-/// which is weaker than every entry being right. [`Verified::contents_checked`]
-/// is how far past that a result reaches, and it is zero unless a manifest was
-/// given. DR-023.
+/// An archive says nothing about a stored entry's bytes, so a clean
+/// [`Verified::of`] means every entry read back and not that every entry is
+/// right.
 #[derive(Debug)]
 pub struct Verified {
     /// How many file entries were read, the failing ones included.
     pub checked: u32,
     /// How many of them had their contents checked against a recorded
-    /// checksum.
-    ///
-    /// Zero for [`Verified::of`], which is given no manifest, and for a
-    /// manifest that recorded none. Never larger than
-    /// [`Verified::checked`], and a caller reporting one number without the
-    /// other reports more than was measured.
+    /// checksum, which is zero without a manifest and never more than
+    /// [`Verified::checked`].
     pub contents_checked: u32,
+    /// How many entries did not read back as the archive describes them, and
+    /// so had no contents to check against a recorded checksum; a checksum
+    /// that was checked and *mismatched* is not one of these.
+    pub unread: u32,
     /// Those that did not come back as the archive promised.
     pub problems: Vec<Problem>,
 }
 
 /// What a [`Verified`] walk carries unchanged from one archive into the ones
-/// nested inside it.
-///
-/// One value rather than five parameters threaded through a recursion: the
-/// source, what a checksum was recorded for, the watcher, and how many bytes
-/// have come back so far — which is the whole nesting's count, not this
-/// archive's.
+/// nested inside it, rather than five parameters through a recursion.
 struct Reading<'a, R, W> {
     /// The source every archive in the nesting is read from.
     src: &'a mut R,
     /// The checksums a manifest recorded, by path. Empty when there is none.
     recorded: &'a BTreeMap<&'a str, Checksum>,
-    /// Where progress goes and where a stop comes from. DR-008.
+    /// Where progress goes and where a stop comes from.
     watch: &'a mut W,
     /// Contents read back so far, across the whole nesting.
     bytes: u64,
@@ -387,22 +307,15 @@ struct Reading<'a, R, W> {
 impl Verified {
     /// Reads every entry of an archive, and of every archive nested in it.
     ///
-    /// A read is unbounded work in the same way a rebuild is — the format
-    /// document names archives of 2.7 GB — so this takes the same [`Watch`]
-    /// seam, reports one step per entry and stops when the watcher says to.
-    /// DR-008. `done` and `total` count the archive being read now rather than
-    /// the whole nesting, for the reason a cascading rebuild does the same.
-    ///
-    /// It is unbounded work and a **bounded** amount of memory: every entry is
-    /// read past rather than into memory, so a walk over an archive costs a
-    /// buffer per entry rather than the largest entry in it. R3.9, DR-033.
+    /// Unbounded work, so it takes a [`Watch`] seam and stops when told to,
+    /// counting the archive being read now rather than the whole nesting.
+    /// Bounded memory: every entry is read past rather than into memory.
     ///
     /// # Errors
     ///
     /// [`Error::Cancelled`] when the watcher stops it, and as
     /// [`Archive::entry`] for an entry table that contradicts itself. An entry
-    /// that does not read back is a [`Problem`], not an error: the point of
-    /// the walk is to find every one of them rather than the first.
+    /// that does not read back is a [`Problem`] rather than an error.
     pub fn of<R: Read + Seek>(
         src: &mut R,
         archive: &Archive,
@@ -414,18 +327,9 @@ impl Verified {
     /// [`Verified::of`], and each entry's contents against the checksum the
     /// manifest recorded for its path.
     ///
-    /// This is the only walk that can see a **stored** entry's bytes change:
-    /// nothing in the archive says what they should be, so nothing in a read
-    /// can notice. DR-023.
-    ///
-    /// Paths are the manifest's own — from the archive's root, as
-    /// [`crate::specs_of`] gives them — so a manifest of this archive matches
-    /// its entries and a manifest of another matches none of them, which
-    /// leaves [`Verified::contents_checked`] at zero rather than reporting
-    /// failures. Entries of a *nested* archive are addressed through the file
-    /// that holds them and are not in the manifest either; the nested archive
-    /// itself is one entry of the outer one, and checking that entry's
-    /// contents covers everything inside it at once.
+    /// The only walk that can see a **stored** entry's bytes change. Paths are
+    /// the manifest's own, so a manifest of another archive matches nothing and
+    /// leaves [`Verified::contents_checked`] at zero rather than failing.
     ///
     /// # Errors
     ///
@@ -449,6 +353,7 @@ impl Verified {
         let mut verified = Self {
             checked: 0,
             contents_checked: 0,
+            unread: 0,
             problems: Vec::new(),
         };
         let mut reading = Reading {
@@ -466,11 +371,8 @@ impl Verified {
     /// # Errors
     ///
     /// [`Error::VerifyFailed`] with both counts when anything did not — except
-    /// when **every** problem is a key one, which is the archive nested here
-    /// that this build could not open. Then the answer is that key failure
-    /// itself. DR-010 classifies by who has to act, and the two answers name
-    /// different people: `VerifyFailed` is `Category::Corrupt` and says the
-    /// bytes are wrong, which they are not.
+    /// when **every** problem is a key one, where the answer is that key
+    /// failure itself, the bytes not being what is wrong.
     pub fn outcome(&self) -> Result<()> {
         let Some(first) = self.problems.first() else {
             return Ok(());
@@ -502,14 +404,12 @@ impl Verified {
             if archive.entry(index)?.is_directory() {
                 continue;
             }
-            // The whole path within this archive, not the entry's own name:
-            // a report naming `greeting.txt` for `data/greeting.txt` names
-            // nothing a caller can pass back to `cat` or `read`.
+            // The whole path within this archive, not the entry's own name,
+            // so that a report names something a caller can pass back.
             let path = joined(prefix, &archive.path(index)?);
 
-            // Counted before the read, not after it: an entry that failed was
-            // still one of the entries checked, and counting only the ones
-            // that passed made "1 of 26 entries failed" out of 27. R6.9.
+            // Counted before the read: an entry that failed was still one of
+            // the entries checked.
             self.checked = self.checked.saturating_add(1);
             done = done.saturating_add(1);
             let outcome = archive.read_back(reading.src, index);
@@ -518,8 +418,7 @@ impl Verified {
             }
 
             // Reported whether or not it read back, so that `done` and the
-            // entries named agree: an entry skipped on the wire while still
-            // counted is a gap the watcher cannot account for.
+            // entries named agree.
             if reading.watch.step(Step {
                 path: &path,
                 done,
@@ -532,28 +431,30 @@ impl Verified {
 
             let payload = match outcome {
                 Err(error) => {
+                    self.unread = self.unread.saturating_add(1);
                     self.problems.push(Problem { path, error });
                     continue;
                 }
                 Ok(payload) => payload,
             };
 
-            // Reported and then walked past: the contents are sound, so an
-            // archive nested in them is still read back. R6.10.
+            // Reported and then walked past: an archive nested in sound
+            // contents is still read back.
             match payload.checked() {
-                Err(error) => self.problems.push(Problem {
-                    path: path.clone(),
-                    error,
-                }),
+                Err(error) => {
+                    self.unread = self.unread.saturating_add(1);
+                    self.problems.push(Problem {
+                        path: path.clone(),
+                        error,
+                    });
+                }
                 Ok(()) => self.check_contents(reading, archive, index, &path)?,
             }
             match archive.nested_at(reading.src, index)? {
                 Nested::None => {}
                 Nested::Open(nested) => self.walk(reading, &nested, &path)?,
-                // Reported rather than walked past. DR-033 says a verify reads
-                // every entry past, and an archive it could not open is a
-                // region it never reached — reporting success over it is the
-                // green suite that tested nothing, one layer down.
+                // Reported rather than walked past: an archive that could not
+                // be opened is a region the walk never reached.
                 Nested::Locked(error) => self.problems.push(Problem { path, error }),
             }
         }
@@ -563,18 +464,10 @@ impl Verified {
     /// One entry's contents against the checksum recorded for its path, when
     /// one was.
     ///
-    /// What is digested is [`Archive::extracted`]'s answer — the entry as the
-    /// file it is outside the archive — which is [`Checksum`]'s own definition
-    /// and what makes the value survive a rebuild and match `sha256sum` over an
-    /// extracted tree. DR-023.
-    ///
-    /// That is a second reading of the payload, and a streaming one: the walk
-    /// holds no contents to digest, and for a **resource** the two forms differ
-    /// anyway — a read inflates it, and the file it is outside the archive
-    /// keeps its `RSC7` header and its deflated body. Asking `extracted` for
-    /// every kind is one statement of what a recorded checksum is over rather
-    /// than two agreeing ones (§3), and it costs the digest rather than the
-    /// entry. DR-033.
+    /// What is digested is [`Archive::extracted`]'s answer, the entry as the
+    /// file it is outside the archive, which is what makes the value match
+    /// `sha256sum` over an extracted tree. That is a second, streaming read,
+    /// and for a resource the two forms differ.
     ///
     /// # Errors
     ///
@@ -608,23 +501,9 @@ impl Verified {
 
 /// The archive a path names, from the archive it is addressed within.
 ///
-/// The empty path is `archive` itself, which is what makes one call answer both
-/// "summarise this archive" and "summarise the archive at `x64/vehicles.rpf`"
-/// (§4). Anything else has to be an archive, so a component that resolves to a
-/// directory or to an ordinary file is an error rather than a summary of
-/// something that is not one.
-///
-/// A path that resolves to something that is **not** an archive is refused with
-/// the path the caller gave, rather than with the entry index the archive
-/// happens to hold it at: `rpf info a.rpf data` reported `entry 1 is a
-/// directory, expected a file`, which a caller cannot act on without first
-/// working out what entry 1 is. It is the same refusal and the same exit code —
-/// one sentence, refilled with the name it was asked by, rather than a second
-/// spelling of "this is not an archive" (§3).
-///
-/// The refill matters most through nesting, where the two differ: an entry
-/// inside `x64/inner.rpf` has a path within that archive and a path within the
-/// one the caller opened, and only the second is what was typed.
+/// The empty path is `archive` itself; anything else has to be an archive. The
+/// refusal is refilled with the path the caller gave rather than the entry
+/// index, which through nesting is the only one that was typed.
 ///
 /// # Errors
 ///
@@ -683,9 +562,6 @@ mod tests {
 
     /// A resource whose page flags describe one 512-byte system page and no
     /// graphics pages, followed by a deflate stream of exactly that.
-    ///
-    /// `docs/rpf-format.md`, Resource page flags, `verified`: the top nibbles
-    /// are the header's version field, and the rest decodes to the length.
     fn resource() -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"RSC7");
@@ -748,8 +624,7 @@ mod tests {
         };
 
         // A directory's number is how many children it holds, and a file's is
-        // its length: two different facts under one field, which is why they
-        // are two variants rather than one nullable number.
+        // its length: two facts, and so two variants.
         assert_eq!(named("data"), ListedKind::Directory { children: 1 });
         assert_eq!(
             named("data/greeting.txt"),
@@ -759,12 +634,8 @@ mod tests {
             }
         );
 
-        // The one that cannot be read off the entry row: a resource carries no
-        // uncompressed size, so its length is the two flag words decoded.
-        // `docs/rpf-format.md`, Resource page flags, `verified`.
-        //
-        // And it carries no encoding, though this payload does begin `RSC7`:
-        // the variant has nowhere to put one. R3.7, DR-044.
+        // A resource carries no uncompressed size, so its length is the two
+        // flag words decoded, and no encoding, the variant having none.
         assert_eq!(named("art.yft"), ListedKind::Resource { len: 512 });
     }
 
@@ -778,8 +649,7 @@ mod tests {
         let paths: Vec<&str> = shallow.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(paths, ["art.yft", "data"], "the root, and no deeper");
 
-        // And a path names what is under it, addressed from the archive's root
-        // rather than from the directory that was asked for.
+        // And a path names what is under it, from the archive's root.
         let inside = Listed::at(&mut src, &parsed, "data", false).expect("lists");
         let paths: Vec<&str> = inside.iter().map(|row| row.path.as_str()).collect();
         assert_eq!(paths, ["data/greeting.txt"]);

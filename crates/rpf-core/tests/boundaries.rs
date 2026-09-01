@@ -1,26 +1,7 @@
 //! Every limit in this crate, at the value it is a limit on.
 //!
-//! A mutation sweep found the same gap in seven places: each limit is compared
-//! with `<` or `>`, every one of them is exercised on values well clear of the
-//! boundary, and **not one of them on the boundary itself**. So moving any of
-//! the seven by exactly one — `>` to `>=`, `<` to `<=` — changed no test's
-//! answer, while the mutations that move a boundary further than that all died.
-//! A path of exactly the longest a path may be, a payload of exactly its own
-//! allocation, a payload starting exactly at the floor, an entry table ending
-//! exactly at the end of the file: none of them appeared anywhere in the suite.
-//!
-//! **A limit added later belongs here, at its own boundary value**, on both
-//! sides where both sides are reachable. The far side of each is tested
-//! wherever it already was; what this file adds is the near one, which is the
-//! case a reader reasons about and gets wrong. One far side was tested nowhere
-//! either, and is here beside its own near side.
-//!
-//! Six of the seven err towards refusal, which is the less dangerous direction
-//! — an off-by-one here declines something legal rather than accepting
-//! something illegal. It is still the direction that turns a patchable edit
-//! into a full rebuild, or refuses a name a real archive holds.
-//!
-//! Corpus-free: every archive here is either built or assembled byte by byte.
+//! A limit added later belongs here, at its own boundary value. Corpus-free:
+//! every archive is either built or assembled byte by byte.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -48,7 +29,6 @@ mod common;
 
 use common::{BLOCK_LEN, ENTRY_LEN, HEADER_LEN, V, archive_bytes, directory_row, stored_row};
 
-/// Builds an archive from specs and hands back its bytes.
 fn built(files: &[FileSpec], contents: &[u8]) -> Vec<u8> {
     let mut out = Cursor::new(Vec::new());
     rpf_core::build(
@@ -63,7 +43,6 @@ fn built(files: &[FileSpec], contents: &[u8]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// A binary file spec at `path`.
 fn spec(path: &str, storage: Storage) -> FileSpec {
     FileSpec {
         path: path.to_owned(),
@@ -74,15 +53,8 @@ fn spec(path: &str, storage: Storage) -> FileSpec {
     }
 }
 
-/// A path of exactly `len` bytes, in five components, every one of them
-/// legal on its own.
-///
-/// Both bounds are asserted rather than assumed. A component past
-/// [`MAX_COMPONENT_LEN`] is refused by a *different* rule, and a path built
-/// that way would still be refused — for the wrong reason, leaving the test
-/// below green and measuring nothing. At `MAX_PATH_LEN` of 1,024 each
-/// component is 204 bytes, and five components carry the limit as far as
-/// 5 × 255 + 4 = 1,279 before that stops being true.
+/// A path of exactly `len` bytes in five legal components; a component past
+/// [`MAX_COMPONENT_LEN`] would be refused by a different rule.
 fn path_of(len: usize) -> String {
     let each = (len - 4) / 5;
     let last = len - 4 - each * 4;
@@ -100,17 +72,12 @@ fn path_of(len: usize) -> String {
     path
 }
 
-/// `name.rs`: a path of exactly [`MAX_PATH_LEN`] bytes is a path.
-///
-/// The limit is what a path may be, not what it must be under, and a real
-/// archive is free to hold a name of exactly that length.
 #[test]
 fn a_path_of_exactly_the_longest_a_path_may_be_is_accepted() {
     check_host(&path_of(MAX_PATH_LEN)).expect("the longest legal path is legal");
 
-    // The reason, not merely a refusal: `check_host` carries several, and a
-    // path one byte too long is only evidence about *this* limit if it is
-    // this limit that turned it away.
+    // `check_host` carries several reasons; only this one is evidence about
+    // this limit.
     let refused = check_host(&path_of(MAX_PATH_LEN + 1)).expect_err("one byte past it is not");
     match refused {
         rpf_core::Error::BadPath { reason, .. } => {
@@ -120,11 +87,7 @@ fn a_path_of_exactly_the_longest_a_path_may_be_is_accepted() {
     }
 }
 
-/// `build.rs`: a tree of exactly [`MAX_DEPTH`] components packs and parses.
-///
-/// §8 pairs this write-path check with `Archive::parse`'s read-path one, and
-/// the two agree only if they refuse at the same depth. A build that stopped
-/// one level early would refuse a tree its own reader opens.
+/// The write and read paths agree only if they refuse at the same depth.
 #[test]
 fn a_tree_of_exactly_the_deepest_a_tree_may_be_is_packed_and_read_back() {
     let deepest = (0..MAX_DEPTH)
@@ -140,16 +103,6 @@ fn a_tree_of_exactly_the_deepest_a_tree_may_be_is_packed_and_read_back() {
     assert_eq!(archive.read(&mut src, index).expect("reads"), b"deep");
 }
 
-/// `build.rs`: one component past [`MAX_DEPTH`] is refused before anything is
-/// written.
-///
-/// The far side of the limit above, and the one far side that was tested
-/// nowhere at all: **nothing in the repository packed a tree deeper than a
-/// reader will walk**, so deleting the guard outright changed no test's
-/// answer. What it guards is §8's pairing — `Archive::parse` refuses a tree
-/// past this depth, so a `build` that did not would write an archive this
-/// build's own reader declines to open, which is the stated top risk with the
-/// failure moved one step later.
 #[test]
 fn a_tree_one_component_deeper_than_a_reader_will_walk_is_refused() {
     let too_deep = (0..=MAX_DEPTH)
@@ -157,8 +110,6 @@ fn a_tree_one_component_deeper_than_a_reader_will_walk_is_refused() {
         .collect::<Vec<_>>()
         .join("/");
 
-    // A cursor is the right sink because nothing should reach it: what is
-    // asserted is the refusal, not what was written.
     let mut out = Cursor::new(Vec::new());
     let refused = rpf_core::build(
         &mut out,
@@ -180,11 +131,7 @@ fn a_tree_one_component_deeper_than_a_reader_will_walk_is_refused() {
     assert!(out.into_inner().is_empty(), "a refused build wrote bytes");
 }
 
-/// `patch.rs`: a payload of exactly its allocation fits.
-///
-/// An allocation is the bytes a caller may write into, ends included. Refusing
-/// the payload that exactly fills one turns a patch into a whole rebuild of a
-/// 2.7 GB archive for the sake of one byte that was never needed.
+/// An allocation is the bytes a caller may write into, ends included.
 #[test]
 fn a_payload_of_exactly_its_allocation_fits_in_place() {
     let source = built(&[spec("raw.bin", Storage::Stored)], &[3_u8; 200]);
@@ -195,8 +142,7 @@ fn a_payload_of_exactly_its_allocation_fits_in_place() {
     let allocation = archive.allocation(index).expect("allocation");
     assert!(allocation > 0, "the entry has no room to fill");
 
-    // Stored, so the payload's on-disk length is exactly its byte count and
-    // the fit is decided by the comparison this test is about.
+    // Stored, so the payload's on-disk length is exactly its byte count.
     let exact: Vec<u8> = (0..allocation as u32).map(|i| (i % 251) as u8).collect();
     let plan = rpf_core::plan(
         &mut file,
@@ -224,15 +170,8 @@ fn a_payload_of_exactly_its_allocation_fits_in_place() {
     assert_eq!(archive.read(&mut file, index).expect("reads"), exact);
 }
 
-/// `archive.rs`: an entry table ending exactly at the end of the file has
-/// itself fitted, and it is the names blob that did not.
-///
-/// The check is deliberately asked before the names blob's, so that a header
-/// claiming more entries than the file can hold names the entry table rather
-/// than the blob that never got a chance to start (§10). Moving it by one
-/// takes the last table that does fit and blames it for the blob's overrun,
-/// which sends a caller looking at the wrong field. Both readings refuse the
-/// archive; only one of them says where to look.
+/// The table's bound is asked before the names blob's, so the overrun names
+/// the field a caller should look at.
 #[test]
 fn an_entry_table_ending_exactly_at_the_end_of_the_file_is_not_what_overran() {
     let rows = [directory_row(0, 0, 0)];
@@ -260,12 +199,8 @@ fn an_entry_table_ending_exactly_at_the_end_of_the_file_is_not_what_overran() {
     );
 }
 
-/// `archive.rs`: a payload beginning exactly at the floor is not underflow.
-///
-/// The floor is the first byte after the names blob, so a payload *at* it is
-/// the tightest legal layout rather than one reaching back into the table of
-/// contents. The names blob is sized here to put the floor on a block
-/// boundary, which is the only way a block offset can land on it exactly.
+/// The floor is the first byte after the names blob, sized here so the floor
+/// lands on a block boundary — the only way a block offset reaches it exactly.
 #[test]
 fn a_payload_beginning_exactly_at_the_floor_is_read_rather_than_refused() {
     let rows = [directory_row(0, 1, 1), stored_row(1, 1, 4)];
@@ -288,13 +223,8 @@ fn a_payload_beginning_exactly_at_the_floor_is_read_rather_than_refused() {
     assert_eq!(archive.read(&mut src, index).expect("reads"), b"here");
 }
 
-/// `archive.rs`: a payload ending exactly where the next one begins claims
-/// none of its bytes.
-///
 /// `allocation` stops at the first byte another payload claims from this one's
-/// start onwards. A neighbour that ends *at* the start claims nothing here, so
-/// the room is real; counting it would report zero room and refuse every patch
-/// to an entry that happens to sit immediately after another.
+/// start onwards.
 #[test]
 fn a_neighbour_ending_exactly_where_a_payload_begins_leaves_it_its_room() {
     let rows = [
@@ -326,14 +256,7 @@ fn a_neighbour_ending_exactly_where_a_payload_begins_leaves_it_its_room() {
     );
 }
 
-/// `build.rs`: a deflated form exactly the size of the plain one is not worth
-/// deflating.
-///
-/// Deflating has to *pay* for itself, and breaking even is not paying: an
-/// entry the same size either way is stored, because stored costs nothing to
-/// read. Which bytes deflate to exactly their own length is the compressor's
-/// business and may change, so the payload is searched for rather than
-/// written down; that such a payload exists is what the boundary needs.
+/// Breaking even is not paying: an entry the same size either way is stored.
 #[test]
 fn a_payload_that_deflates_to_exactly_its_own_length_is_stored() {
     let payload = breaks_even();
@@ -356,19 +279,8 @@ fn a_payload_that_deflates_to_exactly_its_own_length_is_stored() {
     assert_eq!(archive.read(&mut src, index).expect("reads"), payload);
 }
 
-/// Bytes whose raw deflate stream is exactly as long as they are.
-///
-/// Searched rather than written down, because *which* bytes those are is the
-/// compressor's business: `flate2`'s `rust_backend` decides it, and a
-/// semver-compatible `miniz_oxide` release may decide it differently. What the
-/// boundary needs is only that such a payload exists, and the search finds
-/// whichever one the linked compressor agrees with today. It is a fixture, so
-/// its failure is a fixture's failure and says so — a message blaming `build`
-/// would send the next reader after a regression that is not there.
-///
-/// The space is wide enough that the crossing is found many times over: the
-/// first hit today is 16 bytes long, and each length between 16 and 4,096 is
-/// tried against 255 alphabet sizes, which is around a million candidates.
+/// Bytes whose raw deflate stream is exactly as long as they are; which bytes
+/// those are is the linked compressor's business and may change.
 fn breaks_even() -> Vec<u8> {
     for len in 16_u32..4_096 {
         for modulus in 2_u32..=256 {
@@ -392,15 +304,8 @@ fn breaks_even() -> Vec<u8> {
     )
 }
 
-/// `RBF`'s descriptor table, at the last index the one-byte field can carry.
-///
-/// The far side of this limit is the dangerous direction, which is unusual
-/// here — the other seven err towards refusal. `0xFD` is the blob record's
-/// marker, so a 254th name would be written as an index a reader cannot tell
-/// from a blob, and this build would emit metadata it cannot read back.
-/// A mutation sweep found `count < MAX_NAMES` surviving as `<=` at every gate
-/// tier, with the signature that names the gap: `<` to `==` and `<` to `>`
-/// both die, `<` to `<=` lives. `docs/metadata-encodings.md`, The token stream.
+/// `0xFD` is the blob record's marker, so a 254th name would be written as an
+/// index a reader cannot tell from a blob.
 #[test]
 fn a_descriptor_table_of_exactly_its_largest_index_is_written_and_one_more_is_not() {
     fn document(names: usize) -> Vec<u8> {
@@ -428,27 +333,6 @@ fn a_descriptor_table_of_exactly_its_largest_index_is_written_and_one_more_is_no
     assert_eq!(refused.name(), "NotRbfXml", "{refused}");
 }
 
-/// `metadata/mod.rs`: an offered payload is judged by `Encoding::HEAD_LEN`
-/// bytes of it, by however many fewer there are, and by no more.
-///
-/// R6.6's guard reads the payload being written through a sixteen-byte window
-/// and asks [`rpf_core::Encoding::of`] what it announces. Three payloads, one
-/// per mistake, and each is refused or taken according to which:
-///
-/// - **fifteen bytes of text** — refused. The buffer's sixteenth byte is a zero
-///   the payload never had, and judging the buffer rather than what was read
-///   calls plain text unknown binary and takes a write this refuses;
-/// - **sixteen, whose last byte is not text** — taken. Every byte of the head
-///   is judged, so a window one byte short would call it text and refuse it;
-/// - **seventeen, whose last byte is not text** — refused. Nothing past the
-///   head is judged, so a longer window would call it unknown binary and take
-///   it.
-///
-/// The two either side of the limit fail in opposite directions, which is what
-/// makes the pair a boundary rather than one assertion written twice.
-/// `Archive::classify` records the same trap for the entry's side of the
-/// comparison. This is the payload's side, at the value it is a limit on.
-/// DR-050.
 #[test]
 fn a_payload_is_judged_by_the_head_length_and_by_no_more_of_it() {
     let head = rpf_core::Encoding::HEAD_LEN;
@@ -509,38 +393,20 @@ fn a_payload_is_judged_by_the_head_length_and_by_no_more_of_it() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `PSO` — the ceilings both directions of the conversion obey
-// ---------------------------------------------------------------------------
-
-/// The name hash of the one structure [`chained_pso`] defines, and of every
-/// block it lays out.
+/// The name hash of the one structure [`chained_pso`] defines.
 const PSO_ROOT: u32 = 0xD98B_B561;
 
 /// The name hash of its one member.
 const PSO_MEMBER: u32 = 0x1234_5678;
 
-/// How deeply a `PSO` walk nests before it refuses.
-///
-/// `pso::model::MAX_DEPTH`, which is `pub(super)`: the ceiling is the metadata
-/// layer's and is not part of the crate's public contract, so it is pinned here
-/// at the value rather than imported. DR-011 — a stated depth limit rather than
-/// a stack overflow.
+/// How deeply a `PSO` walk nests before it refuses: `pso::model::MAX_DEPTH`.
 const PSO_MAX_DEPTH: usize = 128;
 
-/// The smallest document any payload may be edited by, whatever its size.
-///
-/// `pso::model::MIN_OUTPUT`, the floor under the output ratio, pinned here for
-/// the same reason.
+/// The smallest document any payload may be edited by: `pso::model::MIN_OUTPUT`.
 const PSO_MIN_OUTPUT: usize = 16 * 1024 * 1024;
 
-/// A `PSO` of `levels` structures, each pointing at the next and the last one
-/// null.
-///
-/// Every block carries the same structure — one `STRUCT` subtype 3 member at
-/// offset 0 — so `levels` blocks are a chain `levels` long, and the walk writes
-/// elements at depths 0 through `levels`: one per structure, plus the `pso:null`
-/// leaf the last one's pointer becomes.
+/// A chain of `levels` structures, writing elements at depths 0 through
+/// `levels`: one per structure, plus the `pso:null` leaf the last one becomes.
 fn chained_pso(levels: usize) -> Vec<u8> {
     let count = u32::try_from(levels).expect("a test level count fits");
     let mut psin = Vec::new();
@@ -588,14 +454,8 @@ fn chained_pso(levels: usize) -> Vec<u8> {
     payload
 }
 
-/// `pso`: a walk exactly as deep as a walk may be is written **and read back**.
-///
-/// The two directions were a level apart. `render` refuses at
-/// `depth > MAX_DEPTH` and `Applier::structure` at the same, but `read_tree`
-/// refused at `stack.len() >= MAX_DEPTH` — one level earlier. So a payload
-/// whose walk is exactly this deep was rendered by `to_xml` and then refused by
-/// `from_xml`, breaking R5.7's round-trip law at exactly its boundary and
-/// blaming the document for a property of the payload.
+/// Both directions have to refuse at the same level, or a payload at exactly
+/// the limit renders and is then refused with the document blamed for it.
 #[test]
 fn a_pso_walk_of_exactly_the_deepest_a_walk_may_be_converts_and_applies_back() {
     use rpf_core::metadata::{hash::Dictionary, pso};
@@ -615,7 +475,6 @@ fn a_pso_walk_of_exactly_the_deepest_a_walk_may_be_converts_and_applies_back() {
     );
 }
 
-/// `pso`: one level past it is refused, and refused as a fact about the payload.
 #[test]
 fn a_pso_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
     use rpf_core::metadata::{hash::Dictionary, pso};
@@ -628,9 +487,7 @@ fn a_pso_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
-    // And the document for a payload one level shallower, given one more level
-    // of nesting by hand, is too deep for `read_tree` as well — the far side of
-    // the same limit, on the direction that owns it.
+    // The same limit from the document side: one more level of nesting by hand.
     let shallower = chained_pso(PSO_MAX_DEPTH);
     let xml = String::from_utf8(pso::to_xml(&shallower, &names).expect("converts")).expect("UTF-8");
     let deeper = xml.replace(
@@ -646,17 +503,6 @@ fn a_pso_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
     }
 }
 
-/// `pso`: a document of exactly the bytes a payload allows is applied, and one
-/// byte more is refused before it is parsed.
-///
-/// The write direction materialises the whole document into a tree before its
-/// first comparison against the payload, so an unbounded document is an
-/// unbounded allocation: 4,000,000 elements against a 172-byte payload reached
-/// 652 MB resident and were then refused at the first child. The ceiling is
-/// `render`'s own, in bytes rather than in elements — `docs/backlog.md`'s
-/// recorded lesson that a budget in the wrong unit is not a budget — so a
-/// document `to_xml` wrote always fits and one that describes no payload of
-/// this size never has to be read.
 #[test]
 fn a_pso_document_of_exactly_its_payloads_budget_is_applied_and_one_byte_more_is_not() {
     use rpf_core::metadata::{hash::Dictionary, pso};
@@ -669,8 +515,8 @@ fn a_pso_document_of_exactly_its_payloads_budget_is_applied_and_one_byte_more_is
         "this payload is small enough that the floor is what bounds it"
     );
 
-    // Indentation is whitespace text, which the mapping already skips, so the
-    // document can be padded to any length without describing anything else.
+    // Indentation is whitespace text the mapping skips, so the document can be
+    // padded to any length without describing anything else.
     let mut exact = xml.clone();
     exact.resize(PSO_MIN_OUTPUT, b' ');
     assert_eq!(exact.len(), PSO_MIN_OUTPUT);
@@ -696,13 +542,8 @@ fn a_pso_document_of_exactly_its_payloads_budget_is_applied_and_one_byte_more_is
 /// The second member's name hash, so the two strings are distinct elements.
 const PSO_SECOND: u32 = 0x1111_2222;
 
-/// A `PSO` whose root holds the two string forms an edit has room to argue
-/// about: a fixed inline `char[8]`, and a counted pointer whose two counts are
-/// the caller's to choose.
-///
-/// `docs/metadata-encodings.md`, Pointers: the counted form is the pointer, then
-/// `count1:u16be`, `count2:u16be` and a dead word, and the corpus carries both
-/// orders of the two counts.
+/// A `PSO` whose root holds both string forms: a fixed inline `char[8]`, and
+/// the counted one — a pointer, `count1:u16be`, `count2:u16be` and a dead word.
 fn strings_pso(count1: u16, count2: u16) -> Vec<u8> {
     let mut psin = Vec::new();
     psin.extend_from_slice(&rpf_core::metadata::pso::MAGIC);
@@ -769,15 +610,8 @@ fn with_string(payload: &[u8], was: &str, now: &str) -> Vec<u8> {
     xml.replace(was, now).into_bytes()
 }
 
-/// `pso`: a fixed inline string of exactly its room is written, and one byte
-/// more is refused.
-///
-/// The room is the member's length **less one**, because the terminator is one
-/// of the member's own bytes: `docs/metadata-encodings.md`, Pointers —
-/// 116,507 of 116,507 shipped fixed inline strings end inside their member.
-/// Bounding the write by the member's length instead let a document fill all
-/// eight bytes of a `char[8]`, leaving a string that runs on into whatever
-/// member follows. DR-052.
+/// The room is the member's length less one: the terminator is one of the
+/// member's own bytes.
 #[test]
 fn a_fixed_inline_string_of_exactly_its_room_is_written_and_one_byte_more_is_not() {
     use rpf_core::metadata::{hash::Dictionary, pso};
@@ -810,13 +644,8 @@ fn a_fixed_inline_string_of_exactly_its_room_is_written_and_one_byte_more_is_not
     }
 }
 
-/// `pso`: a counted string of exactly its room is written, and one byte more is
-/// refused — with the room taken from the **smaller** of the two counts.
-///
-/// Measured over all 39,469 counted strings the corpus reaches: the characters
-/// number `min(count1, count2)` in every one, and the terminator is the byte
-/// after. 786 of them carry the smaller count second, and bounding the write by
-/// `count1` alone wrote a character over the terminator of each. DR-052.
+/// The characters number `min(count1, count2)`, and the terminator is the byte
+/// after.
 #[test]
 fn a_counted_string_of_exactly_its_room_is_written_and_one_byte_more_is_not() {
     use rpf_core::metadata::{hash::Dictionary, pso};
@@ -857,27 +686,15 @@ fn a_counted_string_of_exactly_its_room_is_written_and_one_byte_more_is_not() {
 
 /// The value a 24-bit compressed-size field holds at its largest, and — on a
 /// resource — the sentinel it writes when the payload is longer.
-///
-/// Spelled out rather than imported, for the reason
-/// `crates/rpf-core/tests/patch.rs` spells `MAX_SIZE_24` out: a test that took
-/// the limit from the code it checks would agree with whatever that code came
-/// to believe. `docs/rpf-format.md`, Compression, `verified` — 166 of the
-/// corpus's 696,578 resources carry exactly this and none carries more.
 const SATURATED: u32 = 0x00FF_FFFF;
 
-/// Flags describing one 512-byte system page and no graphics pages, as
-/// `crates/rpf-core/tests/resource.rs` uses them. `docs/rpf-format.md`,
-/// Resource page flags.
+/// Flags describing one 512-byte system page and no graphics pages.
 const RESOURCE_SYSTEM_FLAGS: u32 = 0xA800_0000;
 const RESOURCE_GRAPHICS_FLAGS: u32 = 0x2000_0000;
 
 /// An archive of two resources, the first at block 1 declaring
-/// `compressed_len` and the second bounding it at `second_block`.
-///
-/// Both payloads are the same: a 16-byte opaque header and one deflated
-/// 512-byte page, which is far shorter than either declaration. So the only
-/// thing the sentinel tests below differ in is whether the reader believes the
-/// field, and the room the first payload has is `second_block - 1` blocks.
+/// `compressed_len` and the second bounding it at `second_block`; both payloads
+/// are a 16-byte header and one deflated 512-byte page.
 fn saturating_archive(compressed_len: u32, second_block: u32) -> Vec<u8> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -917,13 +734,7 @@ fn saturating_archive(compressed_len: u32, second_block: u32) -> Vec<u8> {
     out
 }
 
-/// `archive.rs`: a compressed-size field at exactly its largest value is a
-/// **sentinel**, and the payload's extent is the room to the next payload.
-///
-/// The near side of the limit, and the one a reader gets wrong: 166 resources
-/// in the corpus declare it, the largest of them a 41 MB payload inside
-/// `x64g.rpf/gtxd.rpf`, and a reader that takes the field literally hands the
-/// inflater a truncated stream and gets about 91% of the output. DR-051.
+/// The extent is then the room to the next payload.
 #[test]
 fn a_resource_size_field_at_exactly_its_largest_value_is_a_sentinel() {
     let mut src = Cursor::new(saturating_archive(SATURATED, 3));
@@ -937,8 +748,7 @@ fn a_resource_size_field_at_exactly_its_largest_value_is_a_sentinel() {
     );
     assert_eq!(archive.read(&mut src, index).expect("reads").len(), 512);
 
-    // The slack past the stream is not a shortfall: the field that would have
-    // bounded it declared nothing, so there is nothing to report against.
+    // The slack past the stream is not a shortfall: the field declared nothing.
     let walked = rpf_core::Verified::of(&mut src, &archive, &mut Unwatched).expect("walks");
     assert!(
         walked.problems.is_empty(),
@@ -947,12 +757,6 @@ fn a_resource_size_field_at_exactly_its_largest_value_is_a_sentinel() {
     );
 }
 
-/// `archive.rs`: one below that value is a length, and is believed.
-///
-/// The far side, and it is reachable only as a refusal here: a payload of
-/// 16,777,214 bytes does not fit this archive, so believing the field is what
-/// puts the entry out of bounds. A reader that treated the sentinel as "at
-/// least this large" would recover a span for this row too and read it back.
 #[test]
 fn a_resource_size_field_one_below_its_largest_value_is_a_length() {
     let mut src = Cursor::new(saturating_archive(SATURATED - 1, 3));
@@ -973,34 +777,20 @@ fn a_resource_size_field_one_below_its_largest_value_is_a_length() {
     );
 }
 
-/// The first payload length past the field, and it is exactly one byte past:
-/// 16,777,216 is [`SATURATED`] + 1, and a whole number of blocks, so the
-/// payload after it begins where it ends with no alignment slack between them.
-/// A saturated entry's recovered extent is then the payload and nothing else,
-/// which is what lets the test below compare bytes rather than a prefix.
+/// The first payload length past the field: [`SATURATED`] + 1, and a whole
+/// number of blocks, so the payload after it leaves no alignment slack.
 const OVER_THE_FIELD: usize = SATURATED as usize + 1;
 
 /// The block a roomy [`saturating_archive`]'s second payload sits at, chosen so
-/// the room the first one has — 16,777,728 bytes — is past the field rather
-/// than the two blocks the sentinel tests above use. A rebuild re-derives every
-/// row from what it wrote, so the room is what arrives at the size field.
+/// the room the first one has — 16,777,728 bytes — is past the field.
 const ROOMY_SECOND_BLOCK: u32 = 32_770;
 
-/// `rpf7.rs`: a resource longer than the 24-bit compressed-size field writes
-/// the sentinel, and the payload comes back byte for byte.
-///
-/// The near side of the same limit from the write direction. `0xFFFFFF` is a
-/// saturation marker on a resource and not a length — 166 corpus resources
-/// carry it, the largest of them 41 MB — so a writer that refused to emit it
-/// could not write an archive its own reader reads. What makes the row correct
-/// is **adjacency**: `write_payloads` lays payloads out in entry-table order,
-/// so the room to the next payload is this payload's own extent. This test is
-/// what fails if that stops being true. DR-056, DR-051 clause 1.
+/// The row is right only because `write_payloads` lays payloads out in
+/// entry-table order, so the room to the next payload is this one's extent.
 #[test]
 fn a_resource_longer_than_its_size_field_writes_the_sentinel_and_reads_back() {
-    // A 16-byte opaque head, as every Rockstar resource payload has (Q7), then
-    // a pattern that is not a run, so a payload assembled out of the wrong
-    // bytes does not compare equal by accident.
+    // A 16-byte opaque head, as every resource payload has, then a pattern
+    // that is not a run.
     let mut payload = vec![0xFF_u8; 16];
     payload.extend((16..OVER_THE_FIELD).map(|at| (at % 251) as u8));
     assert_eq!(payload.len(), OVER_THE_FIELD);
@@ -1063,29 +853,16 @@ fn a_resource_longer_than_its_size_field_writes_the_sentinel_and_reads_back() {
         "the payload did not survive the round trip"
     );
 
-    // And the entry the extent was measured against is itself intact, which is
-    // what a recovered extent reaching into it would have cost.
     let after = archive.find("z.bin").expect("resolves");
     assert_eq!(archive.read(&mut src, after).expect("reads"), b"after");
 }
 
-/// `build.rs`: a saturated resource whose length is **not** a whole number of
-/// blocks reads back with the alignment padding after it, and that is measured
-/// here rather than assumed.
-///
-/// The reader recovers a saturated entry's extent as the room to the next
-/// payload (DR-051 clause 1), and the writer aligns every payload to a block
-/// (`docs/rpf-format.md`, Layout), so for a payload past the field that is not
-/// block-aligned the two differ by up to 511 bytes. It is the same fact DR-051
-/// already records for `extract` of the 166 corpus resources, arriving from the
-/// write direction: nothing in the archive declares a saturated resource's true
-/// length, so the room is the only number there is. `read` and `verify` are
-/// unaffected — a saturated entry's declared length is its used length, and the
-/// deflate stream ends on its own before the padding.
+/// The extent is recovered as the room to the next payload and every payload
+/// is block-aligned, so the two differ by up to 511 bytes.
 #[test]
 fn a_saturated_resource_that_is_not_block_aligned_reads_back_with_its_padding() {
-    // One byte past the aligned case above, so exactly one block of alignment
-    // padding less one byte separates it from the payload after it.
+    // One byte past the aligned case above, so a block of alignment padding
+    // less one byte separates it from the payload after it.
     let len = OVER_THE_FIELD + 1;
     let mut payload = vec![0xFF_u8; 16];
     payload.extend((16..len).map(|at| (at % 251) as u8));
@@ -1124,8 +901,7 @@ fn a_saturated_resource_that_is_not_block_aligned_reads_back_with_its_padding() 
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
     let index = archive.find("big.ydr").expect("resolves");
 
-    // The room to the next payload, which is this payload rounded up to a
-    // block: 511 bytes more than was written.
+    // The room is this payload rounded up to a block: 511 bytes more.
     let slack = usize::try_from(BLOCK_LEN).expect("fits") - 1;
     assert_eq!(
         archive.payload_at(index).expect("span").1,
@@ -1153,20 +929,12 @@ fn a_saturated_resource_that_is_not_block_aligned_reads_back_with_its_padding() 
         "the slack this writer leaves is its own alignment padding"
     );
 
-    // What the padding costs nothing: the entry the extent is measured against
-    // is intact, and the walk reports no problem against the saturated row.
     let after = archive.find("z.bin").expect("resolves");
     assert_eq!(archive.read(&mut src, after).expect("reads"), b"after");
 }
 
-/// `build.rs`: an archive holding a saturated resource rebuilds, for an edit
-/// that has nothing to do with it.
-///
-/// Measured 2026-08-31, before the change: an empty change set over this
-/// archive answered `FieldOverflow { path: "r0.ydr", what: "compressed size",
-/// len: 16777728, limit: 16777215 }`. `rebuild` re-derives **every** row
-/// through `file_row`, so one saturated resource made the whole archive
-/// permanently unrebuildable rather than merely that entry. DR-056.
+/// `rebuild` re-derives every row, so one saturated resource that overflowed
+/// the size field would make the whole archive unrebuildable.
 #[test]
 fn an_archive_holding_a_saturated_resource_rebuilds_for_an_unrelated_edit() {
     let mut src = Cursor::new(saturating_archive(SATURATED, ROOMY_SECOND_BLOCK));
@@ -1207,27 +975,16 @@ fn an_archive_holding_a_saturated_resource_rebuilds_for_an_unrelated_edit() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Resource-embedded `Meta` — the ceilings and the two shape refusals, each at
-// the value it is a limit on. R5.8b, DR-049 and DR-052.
-// ---------------------------------------------------------------------------
-
 /// The name hash of the one structure the `Meta` payloads below define.
 const META_ROOT: u32 = 0xD98B_B561;
 
 /// The name hash of its one member.
 const META_MEMBER: u32 = 0x1234_5678;
 
-/// How deeply a `Meta` walk nests before it refuses.
-///
-/// `meta::kind::MAX_DEPTH`, which is `pub(super)`: the ceiling is the metadata
-/// layer's and is not part of the crate's public contract, so it is pinned here
-/// at the value rather than imported, exactly as `PSO_MAX_DEPTH` is. DR-011.
+/// How deeply a `Meta` walk nests before it refuses: `meta::kind::MAX_DEPTH`.
 const META_MAX_DEPTH: usize = 128;
 
 /// The smallest document any `Meta` payload may be edited by.
-///
-/// `meta::kind::MIN_OUTPUT`, pinned here for the same reason.
 const META_MIN_OUTPUT: usize = 16 * 1024 * 1024;
 
 /// A little-endian `u64` at `at` of `bytes`.
@@ -1242,10 +999,6 @@ fn meta_system(offset: u32) -> u64 {
 
 /// The fixed part every `Meta` payload here opens with: the header, one
 /// structure of one member, and a block table of `blocks` rows.
-///
-/// ```text
-/// 0x050 the structure   0x070 its member   0x100 the block table
-/// ```
 fn meta_frame(len: usize, blocks: u16, length: u32, code: u8) -> Vec<u8> {
     let mut payload = vec![0u8; len];
     meta_put(&mut payload, 0x00, 0xDEAD_BEEF, 4);
@@ -1280,13 +1033,8 @@ fn meta_frame(len: usize, blocks: u16, length: u32, code: u8) -> Vec<u8> {
     payload
 }
 
-/// A `Meta` of `levels` structures, each pointing at the next and the last one
-/// null.
-///
-/// Every block carries the same structure — one structure-pointer member at
-/// offset 0 — so `levels` blocks are a chain `levels` long, and the walk writes
-/// elements at depths 0 through `levels`: one per structure, plus the
-/// `meta:null` leaf the last one's pointer becomes.
+/// A chain of `levels` structures, writing elements at depths 0 through
+/// `levels`: one per structure, plus the `meta:null` leaf the last one becomes.
 fn chained_meta(levels: usize) -> Vec<u8> {
     let data = 0x100 + 16 * levels;
     let mut payload = meta_frame(
@@ -1305,19 +1053,15 @@ fn chained_meta(levels: usize) -> Vec<u8> {
             meta_system(u32::try_from(at).expect("fits")),
             8,
         );
-        // A `Meta` pointer is the block id in the low twelve bits and the item
-        // offset above them; the last block's is null.
+        // A `Meta` pointer is the block id in the low twelve bits and the
+        // item offset above them; the last block's is null.
         let next = if level + 1 < levels { level + 2 } else { 0 };
         meta_put(&mut payload, at, next as u64, 8);
     }
     payload
 }
 
-/// `meta`: a walk exactly as deep as a walk may be is written **and read back**.
-///
-/// The pairing `PSO` needed a repair for: the two directions have to refuse at
-/// the same level, or a payload at exactly the limit renders and is then
-/// refused with the document blamed for it.
+/// Both directions have to refuse at the same level.
 #[test]
 fn a_meta_walk_of_exactly_the_deepest_a_walk_may_be_converts_and_applies_back() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1338,8 +1082,6 @@ fn a_meta_walk_of_exactly_the_deepest_a_walk_may_be_converts_and_applies_back() 
     );
 }
 
-/// `meta`: one level past it is refused, and refused as a fact about the
-/// payload.
 #[test]
 fn a_meta_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1352,8 +1094,7 @@ fn a_meta_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
-    // And the document for a payload one level shallower, given one more level
-    // of nesting by hand, is too deep for the document reader as well.
+    // The same limit from the document side: one more level of nesting by hand.
     let shallower = chained_meta(META_MAX_DEPTH);
     let xml =
         String::from_utf8(meta::to_xml(&shallower, shallower.len(), &names).expect("converts"))
@@ -1371,19 +1112,9 @@ fn a_meta_walk_one_level_deeper_than_the_limit_is_refused_by_both_directions() {
     }
 }
 
-/// A `Meta` of `levels` structures, each pointing at the next and the deepest
-/// one a structure of no members at all.
-///
-/// [`chained_meta`]'s chain ends in the `meta:null` leaf its last pointer
-/// becomes, so its deepest **structure** sits one level above its deepest
-/// element. Here the two are the same element: `levels` blocks write elements
-/// at depths 0 through `levels - 1`, and the deepest of them is the structure
-/// the walk's own depth check is asked about.
-///
-/// ```text
-/// 0x050 the chained structure   0x070 the empty one   0x090 the member
-/// 0x200 the block table
-/// ```
+/// A chain of `levels` structures, the deepest with no members at all: the
+/// elements sit at depths 0 through `levels - 1`, and the deepest of them is a
+/// structure rather than [`chained_meta`]'s null leaf.
 fn capped_meta(levels: usize) -> Vec<u8> {
     let blocks = 0x200;
     let data = blocks + 16 * levels;
@@ -1445,15 +1176,8 @@ fn capped_meta(levels: usize) -> Vec<u8> {
     payload
 }
 
-/// `meta`: a structure at exactly the deepest a structure may sit is written,
-/// read back, and applied.
-///
-/// The near side of `Applier::structure`'s own limit, which [`chained_meta`]
-/// does not reach: that chain's deepest element is the `meta:null` leaf a
-/// pointer becomes, so its deepest *structure* sits at [`META_MAX_DEPTH`] less
-/// one and the comparison is never asked about the boundary value itself.
-/// Moving it by one — `>` to `>=`, or to `==` — refuses this payload, which is
-/// one the read direction writes a document for.
+/// [`chained_meta`] does not reach this: its deepest structure sits at
+/// [`META_MAX_DEPTH`] less one.
 #[test]
 fn a_meta_structure_at_exactly_the_deepest_a_structure_may_sit_is_applied() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1474,8 +1198,6 @@ fn a_meta_structure_at_exactly_the_deepest_a_structure_may_sit_is_applied() {
     );
 }
 
-/// `meta`: a structure one level deeper than that is refused, and refused as a
-/// fact about the payload.
 #[test]
 fn a_meta_structure_one_level_deeper_than_a_structure_may_sit_is_refused() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1489,8 +1211,6 @@ fn a_meta_structure_one_level_deeper_than_a_structure_may_sit_is_refused() {
     }
 }
 
-/// `meta`: a document of exactly the bytes a payload allows is applied, and one
-/// byte more is refused before it is parsed.
 #[test]
 fn a_meta_document_of_exactly_its_payloads_budget_is_applied_and_one_byte_more_is_not() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1527,10 +1247,6 @@ fn a_meta_document_of_exactly_its_payloads_budget_is_applied_and_one_byte_more_i
 
 /// A `Meta` whose root holds one counted string, with both counts the caller's
 /// to choose.
-///
-/// ```text
-/// 0x100 block table   0x140 the root's data   0x160 the string
-/// ```
 fn string_meta(count1: u16, count2: u16) -> Vec<u8> {
     let mut payload = meta_frame(0x200, 2, 16, 0x44);
     meta_put(&mut payload, 0x100, u64::from(META_ROOT), 4);
@@ -1548,14 +1264,8 @@ fn string_meta(count1: u16, count2: u16) -> Vec<u8> {
     payload
 }
 
-/// `meta`: a counted string of exactly its room is written, and one byte more
-/// is refused — with the room the **smaller** of the two counts.
-///
-/// The bound `PSO` arrived at after measuring 39,469 counted strings, applied
-/// to the form this build reads a `Meta` string through. Nothing here moves a
-/// block or re-allocates a page, so a string may be shortened and never
-/// lengthened past its own store, and the terminator is one of the bytes that
-/// store holds. DR-052.
+/// Nothing here moves a block, so a string may be shortened and never
+/// lengthened past its own store, whose last byte is the terminator.
 #[test]
 fn a_meta_counted_string_of_exactly_its_room_is_written_and_one_byte_more_is_not() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1574,11 +1284,8 @@ fn a_meta_counted_string_of_exactly_its_room_is_written_and_one_byte_more_is_not
             "count1 {count1}, count2 {count2}: unedited in, unedited out"
         );
 
-        // The store is the smaller of the two counts and the terminator is one
-        // of the bytes it holds, so the room is `min - 1` — floored, DR-052, at
-        // the five bytes already there. `(6, 5)` is exactly that floor: a store
-        // of five holding a five-byte string and no terminator, which the read
-        // direction accepts and which must therefore be writable back.
+        // The room is `min(count1, count2) - 1`, floored at the five bytes
+        // already there; `(6, 5)` is exactly that floor.
         let room = 5;
         let exact = xml.replace("\"GTA V\"", &format!("\"{}\"", "1".repeat(room)));
         let edited = meta::from_xml(&payload, payload.len(), exact.as_bytes(), &names)
@@ -1629,12 +1336,7 @@ fn array_meta(count: u16) -> Vec<u8> {
     payload
 }
 
-/// `meta`: an array of exactly the items the file declares is applied, and one
-/// item more or fewer is refused.
-///
-/// An array's length is an allocation, and an edit in place moves no
-/// allocation: DR-052. The pin is at the count itself, on both sides, because
-/// a bound compared with `!=` is the one a mutation moves invisibly.
+/// An array's length is an allocation, and an edit in place moves none.
 #[test]
 fn a_meta_array_of_exactly_its_own_length_is_applied_and_one_item_more_is_not() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1674,9 +1376,6 @@ fn a_meta_array_of_exactly_its_own_length_is_applied_and_one_item_more_is_not() 
 }
 
 /// How many elements one byte of `Meta` payload may write.
-///
-/// `meta::kind::MAX_NODES_RATIO`, pinned here at its value for the reason
-/// [`META_MAX_DEPTH`] is.
 const META_MAX_NODES_RATIO: usize = 8;
 
 /// The `ARRAYINFO` sentinel a member carries when it describes another member's
@@ -1699,17 +1398,8 @@ fn meta_elements(document: &str) -> usize {
 /// A `Meta` whose root holds `arrays` counted arrays, every one of them the
 /// same `items` `UINT`s, padded to `len` bytes.
 ///
-/// **One block read many times is the only way to the node ceiling**, which is
-/// eight elements per byte of payload: a walk that reads each byte once writes
-/// well under one element per byte, which is what the corpus does at its
-/// worst. Every array names the same block, so an array costs 32 bytes of
-/// payload — its member record and its counted field — and writes `items + 1`
-/// elements.
-///
-/// The elements are `<meta:item meta:uint="…"/>`, which is the cheapest this
-/// mapping writes: under 32 bytes each, so the document stays under the byte
-/// ceiling all the way to the node one. `len` is the padding after the last
-/// block, which moves the ceiling without moving the walk.
+/// Every array names the same block — the only way to the node ceiling — and
+/// `len` is padding that moves the ceiling without moving the walk.
 fn arrayed_meta(arrays: u16, items: u16, len: usize) -> Vec<u8> {
     let members = 0x70;
     let root_data = members + 16 * (usize::from(arrays) + 1);
@@ -1738,7 +1428,7 @@ fn arrayed_meta(arrays: u16, items: u16, len: usize) -> Vec<u8> {
     meta_put(&mut payload, 0x48, 1, 2);
     meta_put(&mut payload, 0x4C, 2, 2);
     // The root structure: one counted-array member per array, and the
-    // `ARRAYINFO` member all of them read their element type from.
+    // `ARRAYINFO` member they read their element type from.
     meta_put(&mut payload, 0x50, u64::from(META_ROOT), 4);
     meta_put(&mut payload, 0x54, u64::from(META_ROOT), 4);
     meta_put(&mut payload, 0x58, 0x300, 4);
@@ -1784,11 +1474,8 @@ fn arrayed_elements(arrays: u16, items: u16) -> usize {
     1 + usize::from(arrays) * (1 + usize::from(items))
 }
 
-/// `meta`: a walk of exactly as many elements as its payload allows converts.
-///
-/// The ceiling is a ratio — eight elements per byte of payload — so the payload
-/// that sits exactly on it is one whose length is an eighth of the elements it
-/// writes, which the padding after its last block tunes to the byte.
+/// The ceiling is a ratio, so the padding after the last block tunes the
+/// payload to the byte.
 #[test]
 fn a_meta_walk_of_exactly_the_elements_its_payload_allows_converts() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1815,11 +1502,6 @@ fn a_meta_walk_of_exactly_the_elements_its_payload_allows_converts() {
     );
 }
 
-/// `meta`: one byte of payload fewer, and the same walk is refused.
-///
-/// The same file with one byte less of the padding after its last block: the
-/// walk is unchanged and the ceiling it is measured against is eight elements
-/// lower, which is the boundary a mutation of the comparison moves invisibly.
 #[test]
 fn a_meta_walk_past_the_node_ceiling_is_refused() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -1836,9 +1518,6 @@ fn a_meta_walk_past_the_node_ceiling_is_refused() {
 }
 
 /// How many bytes of document one byte of `Meta` payload may write.
-///
-/// `meta::kind::MAX_OUTPUT_RATIO`, pinned here for the reason
-/// [`META_MIN_OUTPUT`] is.
 const META_MAX_OUTPUT_RATIO: usize = 256;
 
 /// The name hash of the structure every pointer below lands on.
@@ -1850,21 +1529,11 @@ fn meta_budget(payload: usize) -> usize {
 }
 
 /// A `Meta` whose root holds a counted string of `text` characters and
-/// `pointers` pointers, every one of them at the same structure of `fields`
-/// `UINT`s.
+/// `pointers` pointers, every one at the same structure of `fields` `UINT`s.
 ///
-/// **One block read many times is the only way to the byte ceiling.** That
-/// ceiling is 256 bytes of document per byte of payload, and a walk that reads
-/// each byte once cannot approach it: a `UINT` costs four bytes of payload and
-/// writes some thirty of document. A file may name one block from many
-/// pointers, and then it does — which is the shape here, and the string is the
-/// knob that tunes the document to the byte, because one character of it is one
-/// byte of each.
-///
-/// The payload's *length* does not depend on `text`: the string's block is
-/// always `store` bytes and only the counts and the terminator move. So the
-/// budget is one number across the whole family and the document is what
-/// varies.
+/// One block read many times is the only way to the byte ceiling. The payload's
+/// length does not depend on `text`, so the budget is one number for the family
+/// and the string tunes the document to the byte.
 fn amplified_meta(pointers: u16, fields: u16, store: u32, text: u32) -> Vec<u8> {
     let leaf_members = 0x200;
     let leaf_data = leaf_members + 16 * usize::from(fields);
@@ -1900,11 +1569,8 @@ fn amplified_meta(pointers: u16, fields: u16, store: u32, text: u32) -> Vec<u8> 
     meta_put(&mut payload, 0x60, system(root_members), 8);
     meta_put(&mut payload, 0x68, u64::from(root_len), 4);
     meta_put(&mut payload, 0x6E, u64::from(pointers) + 1, 2);
-    // The leaf structure: `fields` `Float_XYZW`s, whose four lanes are what
-    // makes an element of this document cost more than a thirty-second of the
-    // payload byte it is charged against. The node ceiling is eight elements
-    // per byte, so a cheaper element would reach that ceiling first and this
-    // payload would never approach the byte one.
+    // The leaf structure: `fields` `Float_XYZW`s, whose four lanes make an
+    // element cost enough that the node ceiling is not reached first.
     meta_put(&mut payload, 0x70, u64::from(META_LEAF), 4);
     meta_put(&mut payload, 0x74, u64::from(META_LEAF), 4);
     meta_put(&mut payload, 0x78, 0x300, 4);
@@ -1957,14 +1623,8 @@ fn amplified_meta(pointers: u16, fields: u16, store: u32, text: u32) -> Vec<u8> 
     payload
 }
 
-/// `meta`: a document of exactly the bytes its payload may write is written,
-/// and one byte more is refused.
-///
-/// The ceiling `apply` reads as [`rpf_core::metadata::meta::NotMetaXml::TooLarge`]
-/// before it parses a document, from the side that writes one. The two are one
-/// number — `meta::kind::document_budget` — so a document this refuses to write
-/// is one the other direction refuses to read, and neither answer depends on
-/// the walk stopping in the same place.
+/// The same number bounds the read direction, so a document this refuses to
+/// write is one the other refuses to read.
 #[test]
 fn a_meta_document_of_exactly_the_bytes_its_payload_may_write_is_the_largest_written() {
     use rpf_core::metadata::{hash::Dictionary, meta};
@@ -2013,10 +1673,8 @@ fn a_meta_document_of_exactly_the_bytes_its_payload_may_write_is_the_largest_wri
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    // And a payload whose document is far past the budget is refused by the
-    // check every element is charged against rather than by the one after the
-    // walk: the walk stops at the ceiling instead of writing twice it and
-    // measuring afterwards.
+    // Far past the budget: refused by the per-element charge rather than by a
+    // check after the walk.
     let far = amplified_meta(pointers * 2, fields, store, 0);
     assert!(meta_budget(far.len()) >= budget);
     match meta::to_xml(&far, far.len(), &names) {

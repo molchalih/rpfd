@@ -1,25 +1,6 @@
-//! R2.6: every unencrypted path works with no key material present at all.
-//!
-//! This is the item that keeps continuous integration possible, and the primary
-//! workflow — a third-party server asset, unencrypted, edited in a loop — never
-//! needs a key either. So it is not enough for the unencrypted paths to happen
-//! to work on a machine that has a game installed. They have to work on one
-//! that does not, and something has to fail when that stops being true.
-//!
-//! What is asserted, in order:
-//!
-//! - the whole cycle runs — build, open, resolve, read, verify, patch in place,
-//!   rebuild, describe as a manifest, and read the result back — with no
-//!   executable anywhere and no cache to read;
-//! - the key cache that would have been consulted is still **not there**
-//!   afterwards, so no unencrypted path quietly created or populated one;
-//! - and an archive that *is* encrypted still answers [`Error::NeedsKey`],
-//!   which is the seam. A reader that tried to find a key would fail here
-//!   rather than silently working on the machine that happens to have one.
-//!
-//! `clippy.toml`'s `allow-*-in-tests` settings reach `#[cfg(test)]` modules and
-//! not this directory: an integration test is its own crate with no
-//! `cfg(test)`. `docs/conventions.md` §15's exception is spelled out here.
+//! Every unencrypted path works with no key material present at all: the whole
+//! cycle runs, no key cache is created on the way, and an archive that is
+//! encrypted answers [`Error::NeedsKey`] rather than opening or failing.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -41,15 +22,10 @@ use rpf_core::{
 };
 
 /// No key material, and no cache named to look for any in.
-///
-/// The state this whole file is about, spelled once so that every open below
-/// says it out loud: the parameter is required precisely so a call site cannot
-/// forget which of the two it is.
 fn unkeyed() -> Unlock {
     Unlock::unkeyed()
 }
 
-/// One stored file.
 fn stored(path: &str) -> FileSpec {
     FileSpec {
         path: path.to_owned(),
@@ -60,7 +36,6 @@ fn stored(path: &str) -> FileSpec {
     }
 }
 
-/// One deflated file.
 fn deflated(path: &str) -> FileSpec {
     FileSpec {
         path: path.to_owned(),
@@ -71,7 +46,6 @@ fn deflated(path: &str) -> FileSpec {
     }
 }
 
-/// Builds an archive into a real file and hands back its bytes.
 fn built(files: &[FileSpec], contents: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     rpf_core::build(
@@ -94,10 +68,8 @@ fn built(files: &[FileSpec], contents: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     fs::read(sink.path()).expect("readable")
 }
 
-/// A header whose encryption tag is not `OPEN`, and nothing else.
-///
-/// Nothing past the tag is read: the refusal happens before any layout is
-/// believed, which is the whole point of it being a refusal.
+/// A header whose encryption tag is not `OPEN`, and nothing else: nothing past
+/// the tag is read before the refusal.
 fn encrypted_header(tag: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(b"7FPR");
@@ -122,14 +94,12 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
         "there is no key material here, and the cache said there was"
     );
 
-    // Build.
     let mut contents = BTreeMap::new();
     contents.insert("data/notes.meta".to_owned(), b"<notes/>".repeat(4));
     contents.insert("x64/raw.bin".to_owned(), vec![0xAB; 600]);
     let files = [deflated("data/notes.meta"), stored("x64/raw.bin")];
     let bytes = built(&files, &contents);
 
-    // Open, resolve, read.
     let mut source = Cursor::new(bytes.clone());
     let archive = Archive::open(&mut source, &unkeyed()).expect("opens with no key material");
     assert!(archive.version().is_open(archive.encryption()));
@@ -139,7 +109,6 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
         assert_eq!(&read, expected, "{path} did not read back");
     }
 
-    // Summarise and verify.
     let summary = Summary::of(&mut source, &archive, "").expect("summarises");
     assert!(summary.entries > 0);
     Verified::of(&mut source, &archive, &mut Unwatched)
@@ -147,7 +116,6 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
         .outcome()
         .expect("every entry reads back");
 
-    // Patch in place.
     let mut edits = BTreeMap::new();
     edits.insert("x64/raw.bin".to_owned(), vec![0xCD; 600]);
     let mut in_place = tempfile::NamedTempFile::new().expect("temp file");
@@ -178,7 +146,6 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
         "the patch did not land"
     );
 
-    // Rebuild.
     let mut grew = BTreeMap::new();
     grew.insert("data/notes.meta".to_owned(), vec![0x5A; 40_000]);
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
@@ -195,16 +162,14 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
     .expect("rebuilds with no key material");
     sink.as_file_mut().flush().expect("flushed");
 
-    // Describe, and read the rebuild back.
     let rebuilt = fs::read(sink.path()).expect("readable");
     let mut rebuilt_source = Cursor::new(rebuilt);
     let rebuilt_archive =
         Archive::open(&mut rebuilt_source, &unkeyed()).expect("the rebuild opens");
     let manifest = Manifest::of(&rebuilt_archive).expect("describes");
     assert_eq!(manifest.specs().len(), files.len());
-    // R11.3: the tree records what it came out of, so it cannot be packed as
-    // another container without saying so. The manifest round-trips through
-    // its own JSON with both fields intact.
+    // The tree records what it came out of, so it cannot be packed as another
+    // container without saying so.
     assert_eq!(manifest.version, rebuilt_archive.version());
     assert_eq!(manifest.codec, rebuilt_archive.version().codec());
     assert_eq!(manifest.schema, rpf_core::manifest::SCHEMA_VERSION);
@@ -230,15 +195,9 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
 
 #[test]
 fn an_encrypted_archive_asks_for_a_key_rather_than_being_opened_or_refused() {
-    // The seam R2.6 protects, from the other side. `0x0FFFFFF9` is the AES tag
-    // and `0x0FEFFFFF` the NG one — both `secondary`, `docs/rpf-format.md` —
-    // and what is asserted is not which tag means what, but that a tag naming
-    // encryption produces a demand for key material rather than a parse.
-    //
-    // Only those two. The same row claims at `secondary` that `0` and `CFXP`
-    // also mean unencrypted, which this build does not implement; pinning what
-    // it currently answers for them would turn implementing it into a failing
-    // test. R1.5 owns that question.
+    // `0x0FFFFFF9` is the AES tag and `0x0FEFFFFF` the NG one. Only those two:
+    // `0` and `CFXP` are unimplemented here, so pinning what they answer would
+    // turn implementing them into a failing test.
     for tag in [0x0FFF_FFF9_u32, 0x0FEF_FFFF] {
         assert!(!Version::Rpf7.is_open(tag));
         let error = Archive::open(&mut Cursor::new(encrypted_header(tag)), &unkeyed())
@@ -253,13 +212,8 @@ fn an_encrypted_archive_asks_for_a_key_rather_than_being_opened_or_refused() {
 
 #[test]
 fn the_key_cache_is_never_consulted_by_opening_an_archive() {
-    // `Archive::open` takes a source and nothing else — no cache, no path, no
-    // key. That is the structural half of R2.6: there is no argument through
-    // which key material could reach the reader, so an unencrypted archive
-    // cannot come to depend on one by accident.
-    //
-    // Asserted the only way a test can assert a negative here: a cache in a
-    // directory that does not exist, untouched by a full open-and-read.
+    // `Archive::open` takes a source and nothing else, so there is no argument
+    // through which key material could reach the reader.
     let scratch = tempfile::tempdir().expect("a temporary directory");
     let absent = scratch.path().join("no-such-cache");
     let cache = Cache::at(&absent);
@@ -279,16 +233,10 @@ fn the_key_cache_is_never_consulted_by_opening_an_archive() {
 
 #[test]
 fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
-    // The third of R2.6's shapes, and the one nothing outside the corpus tests:
-    // an *unencrypted* archive that happens to carry an encrypted one. Every
-    // walk sniffs each payload for a nested archive, so this is a path the
-    // primary workflow reaches on a machine with no key material at all — and
-    // it must be a count and a named refusal rather than a failed walk.
-    //
-    // Until now the only tests of it opened two real archives under real key
-    // material, which needs `RPF_CORPUS` and `RPF_GAME_IMAGE`: a fact this
-    // project could defend on one machine. The payload here is sixteen bytes of
-    // header, because nothing past the encryption tag is read.
+    // Every walk sniffs each payload for a nested archive, so a plain archive
+    // carrying an encrypted one must give a count and a named refusal rather
+    // than a failed walk. Sixteen bytes of header suffice: nothing past the
+    // encryption tag is read.
     const TAG: u32 = 0x0FEF_FFFF;
 
     let mut contents = BTreeMap::new();
@@ -303,14 +251,10 @@ fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
         summary.locked_archives, 1,
         "the nested encrypted archive was not counted as locked"
     );
-    // A locked archive is still an archive that is there, so it is counted in
-    // both: `nested_archives` is how many the sniff found and
-    // `locked_archives` how many of those did not open.
+    // `nested_archives` is how many the sniff found, `locked_archives` how many
+    // of those did not open.
     assert_eq!(summary.nested_archives, 1);
 
-    // And the failure it carries is the one a caller acts on: which tag, so
-    // that "go and extract a key" is answerable. A walk that lost the variant
-    // would report the entry as an ordinary unreadable file.
     let verified = Verified::of(&mut source, &archive, &mut Unwatched).expect("walks");
     let locked: Vec<_> = verified
         .problems
@@ -326,11 +270,8 @@ fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
     );
     assert_eq!(locked[0].error.category(), Category::NeedsKey);
 
-    // And the walk's own verdict is that key failure rather than
-    // `VerifyFailed`. DR-010 classifies by who has to act, and the two name
-    // different people: `VerifyFailed` is `Category::Corrupt` and says the
-    // bytes are wrong, which they are not — the archive is intact and this
-    // machine has no key for part of it.
+    // The walk's verdict is the key failure, not `VerifyFailed`: the bytes are
+    // not wrong, this machine simply has no key for part of them.
     let refused = verified
         .outcome()
         .expect_err("an archive this build cannot open did not read back whole");

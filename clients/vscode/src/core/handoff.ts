@@ -1,21 +1,15 @@
 /**
- * Handing an entry to another tool, and taking it back. R7.5.
+ * Handing an entry to another tool, and taking it back.
  *
- * `docs/approach.md` draws the scope boundary where a format stops describing
- * itself: a `.ytd`, `.ydr`, `.yft`, `.ycd`, `.ynv` or `.awc` is passthrough
- * here and always will be. Passthrough does not have to mean unreachable — the
- * bytes can be put on disk, opened in whatever tool does understand them, and
- * taken back when that tool writes them.
+ * A passthrough entry's bytes are put on disk, opened in whatever tool does
+ * understand them, and taken back when that tool writes them.
  *
  * The re-imported bytes are **buffered like any other edit**, not written
- * through: R7.3's rule is that the archive is written by one explicit act, and
- * a file watcher firing is not one.
+ * through: the archive is written by one explicit act, and a file watcher
+ * firing is not one.
  *
- * The scratch file's name is this client's own invention and not the entry's.
- * That is deliberate: DR-013 and DR-015 decide what an archive's name may be as
- * a file on a host, they decide it in `rpf-core`, and a second copy of that
- * rule here would be two owners of one fact (`docs/conventions.md` §3). A name
- * nobody has to check is cheaper than a rule written twice.
+ * The scratch file's name is this client's own invention and not the entry's,
+ * so no rule about host names is written down twice.
  */
 
 import { createHash } from 'node:crypto';
@@ -47,14 +41,9 @@ const SETTLE_MS = 150;
  * How often the handed-off file is stat-ed, beside the directory watch.
  *
  * Not a preference: on macOS every `fs.watch` in a process shares one FSEvents
- * stream, and arming another one tears that stream down and builds it again.
- * A write during the rebuild is not reported to anybody. **Measured on this
- * machine: with four watchers already armed, a write immediately after arming
- * a fifth was lost 39 times in 150; with none armed, 0 in 150.** The extension
- * arms one per handed-off entry, so that is the ordinary case rather than an
- * edge of it, and a lost event means an asset a converter wrote that never
- * comes back. A stat every half second is what makes the watch an optimisation
- * rather than the mechanism.
+ * stream, arming another tears that stream down and builds it again, and a
+ * write during the rebuild is reported to nobody. The stat is what makes the
+ * watch an optimisation rather than the mechanism.
  */
 const POLL_MS = 500;
 
@@ -95,9 +84,8 @@ export function isPassthrough(
 /**
  * The scratch file one entry is handed off as.
  *
- * The digest is what makes it unique and what makes two entries with the same
- * basename two files; the trailing name is only so the other tool sees an
- * extension it recognises.
+ * The digest is what makes two entries with the same basename two files; the
+ * trailing name is only so the other tool sees an extension it recognises.
  */
 export function scratchFor(directory: string, archive: string, inside: string): string {
     const path_ = normalise(inside);
@@ -142,9 +130,8 @@ export class HandOff {
     /**
      * Writes one entry out and starts watching it.
      *
-     * A resource entry's bytes are what `rpf cat` and `rpf extract` write —
-     * the `RSC7` header included — so what lands on disk is what the other tool
-     * expects, and what comes back is what the daemon will accept.
+     * A resource entry lands with its `RSC7` header, which is what the other
+     * tool expects and what the daemon will accept back.
      */
     async begin(inside: string): Promise<Handed> {
         const path_ = normalise(inside);
@@ -223,15 +210,10 @@ export class HandOff {
      * Watches the *directory* rather than the file, and stats the file beside
      * it.
      *
-     * The directory because editors and converters replace a file by writing
-     * beside it and renaming, which drops a watch held on the file itself and
-     * leaves the entry silently unwatched. The stat because a watch can miss
-     * the event outright — see {@link POLL_MS} for the measurement — so the
-     * watch is what makes a re-import prompt and the stat is what makes it
-     * certain.
-     *
-     * Both feed one settle timer, and a re-import of bytes identical to what
-     * went out does nothing, so noticing twice costs a digest.
+     * The directory because a replace-by-rename drops a watch held on the file
+     * itself; the stat because a watch can miss the event outright — see
+     * {@link POLL_MS}. Both feed one settle timer, and noticing twice costs a
+     * digest.
      */
     private observe(handed: Handed): void {
         const directory = path.dirname(handed.file);

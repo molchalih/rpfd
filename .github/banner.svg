@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 260" width="1200" height="260" role="img" aria-label="rpf — read, edit and rebuild RAGE Package File archives">
+  <rect width="1200" height="260" rx="16" fill="#0f1115"/>
+  <rect x="0.5" y="0.5" width="1199" height="259" rx="15.5" fill="none" stroke="#252a33"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <text x="72" y="140" font-size="76" font-weight="700" fill="#e8eaed" letter-spacing="2">rpf</text>
+    <text x="76" y="182" font-size="18" fill="#8b93a1">read, edit and rebuild RAGE Package File archives</text>
+  </g>
+
+  <g transform="translate(680 62)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+    <rect x="0" y="0" width="448" height="136" rx="8" fill="none" stroke="#2b313b"/>
+    <rect x="16" y="16" width="72" height="104" rx="4" fill="#1b202a" stroke="#2b313b"/>
+    <text x="52" y="73" font-size="12" fill="#8b93a1" text-anchor="middle">header</text>
+    <rect x="104" y="16" width="80" height="104" rx="4" fill="#1b202a" stroke="#2b313b"/>
+    <rect x="200" y="16" width="52" height="104" rx="4" fill="#1b202a" stroke="#2b313b"/>
+    <rect x="268" y="16" width="96" height="104" rx="4" fill="#22160f" stroke="#d98a4b"/>
+    <text x="316" y="73" font-size="12" fill="#d98a4b" text-anchor="middle">patched</text>
+    <rect x="380" y="16" width="52" height="104" rx="4" fill="#1b202a" stroke="#2b313b"/>
+  </g>
+</svg>

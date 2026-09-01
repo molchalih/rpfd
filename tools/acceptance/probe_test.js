@@ -1,10 +1,6 @@
-// What client_index.js must do, checked without a game.
-//
-// The probe cannot be exercised by joining: a join costs a person an elevation
-// prompt and a two-minute game launch, and the failure it exists to prevent —
-// silence — is exactly what a bad probe produces there. So the script is loaded
+// What client_index.js must do, checked without a game: the script is loaded
 // into a stub of the RAGE Multiplayer client API with a clock under test
-// control, and the four paths are driven directly.
+// control, and every path is driven directly.
 //
 //   node tools/acceptance/probe_test.js
 "use strict";
@@ -16,22 +12,19 @@ const vm = require("vm");
 
 const SOURCE = fs.readFileSync(path.join(__dirname, "client_index.js"), "utf8");
 
-// The switch client_index.js documents for the day REQUEST_MODEL is the call
-// that ends the client. Flipping it must reorder the run, not break it.
+// Flipping the switch must reorder the run, not break it.
 const STREAM_FIRST_SOURCE = SOURCE.replace(
     "var NATIVES_FIRST = true;",
     "var NATIVES_FIRST = false;",
 );
 assert.notStrictEqual(STREAM_FIRST_SOURCE, SOURCE, "the NATIVES_FIRST switch moved or was renamed");
 
-// The DLC model must never reach the streamer: requesting it kills this build,
-// on the untouched control as much as on anything this tool wrote.
+// The DLC model must never reach the streamer: requesting it kills this build.
 const DLC_HASH = 3292967587;
 const STOCK_HASH = 2515846680;
 
-// A stub of the client API. `natives` decides what each model-info call does:
-// a value to return, or a function that may throw or end the run the way a
-// process death does.
+// A stub of the client API. `natives` maps each model-info call to a value to
+// return, or a function that may throw or end the run.
 function harness(natives, source) {
     const sent = [];
     const calls = [];
@@ -56,9 +49,8 @@ function harness(natives, source) {
                 handlers[event] = fn;
             },
             callRemote: (event, ...args) => {
-                // A process that has died sends nothing more. The stub cannot
-                // stop the script mid-frame the way an access violation does,
-                // so it drops what a dead client could not have put on the wire.
+                // A dead process sends nothing more; the stub cannot stop the
+                // script mid-frame, so it drops what would not reach the wire.
                 if (state.dead) {
                     return;
                 }
@@ -67,7 +59,7 @@ function harness(natives, source) {
         },
         gui: { chat: { push: () => {} } },
         game: {
-            joaat: (name) => (name === "meringls63amg24" ? 3292967587 : 2515846680),
+            joaat: (name) => (name === "volga5" ? 3292967587 : 2515846680),
             streaming: {
                 requestModel: nativeCall("requestModel"),
                 hasModelLoaded: nativeCall("hasModelLoaded"),
@@ -90,9 +82,8 @@ function harness(natives, source) {
     });
     vm.runInContext(source || SOURCE, context, { filename: "client_index.js" });
 
-    // One frame of the render loop, at 60 fps, for as long as asked. The frame
-    // budget is asserted rather than assumed: a tick that looped would show up
-    // as more than one native call in a single frame.
+    // One frame of the render loop, at 60 fps, for as long as asked. More than
+    // one native call in a frame means the tick is looping.
     const run = (ms) => {
         const until = state.clock + ms;
         while (state.clock < until && !state.dead) {
@@ -107,7 +98,7 @@ function harness(natives, source) {
     };
 
     // The same machine driven by its other clock, with the render tick never
-    // called: a probe with one clock is a probe that can be silent.
+    // called: a probe with one clock can be silent.
     const runTimers = (ms) => {
         const until = state.clock + ms;
         while (state.clock < until && !state.dead) {
@@ -134,6 +125,18 @@ function harness(natives, source) {
 const events = (sent) => sent.map((s) => `${s.event} ${s.args.join(" ")}`);
 const only = (sent, name) => sent.filter((s) => s.event === name);
 
+// One streaming cycle, as the probe reports it: announce, request, announce,
+// poll, report. There are two per run — the stock model, then the pack's own.
+const cycle = (sent, model, index) => {
+    const report = only(sent, "rpf:streamed")[index];
+    return [
+        `rpf:probe stage=pre_request model=${model}`,
+        "rpf:probe stage=post_request",
+        "rpf:probe stage=pre_poll",
+        `rpf:streamed model=${model} ${report.args[1]} ${report.args[2]}`,
+    ];
+};
+
 // --- 1. the whole run, in its shipped order -------------------------------
 {
     let polls = 0;
@@ -146,24 +149,28 @@ const only = (sent, name) => sent.filter((s) => s.event === name);
     h.join();
     h.run(8000);
 
-    const waited = only(h.sent, "rpf:streamed")[0].args[2].split("=")[1];
     assert.deepStrictEqual(events(h.sent), [
-        "rpf:joined model=meringls63amg24 hash=3292967587",
+        "rpf:joined model=volga5 hash=3292967587",
         "rpf:probe stage=pre_natives",
         "rpf:probe stage=post_cdimage in_cdimage=true",
         "rpf:acceptance in_cdimage=true class=1",
-        "rpf:probe stage=pre_request model=adder",
-        "rpf:probe stage=post_request",
-        "rpf:probe stage=pre_poll",
-        "rpf:streamed model=adder model_loaded=true waited_ms=" + waited,
-    ], "the class line comes first, then the streaming control");
-    assert.strictEqual(polls, 3, "the streamer was asked once per poll interval");
+        ...cycle(h.sent, "adder", 0),
+        ...cycle(h.sent, "volga5", 1),
+    ], "the class line comes first, then the stock control, then the pack's model");
+    assert.ok(polls >= 3, "the streamer was asked once per poll interval");
 
-    // The one thing that must never happen: the DLC model reaching the streamer.
+    // The stock model is asked FIRST and the pack's own second: a death on the
+    // second is then attributable, and the first says the probe works.
+    const streamCalls = h.calls.filter(
+        (c) => c.name === "requestModel" || c.name === "hasModelLoaded",
+    );
+    assert.strictEqual(streamCalls[0].hash, STOCK_HASH, "the stock model goes first");
+    assert.strictEqual(
+        streamCalls[streamCalls.length - 1].hash,
+        DLC_HASH,
+        "the pack's own model is asked last",
+    );
     for (const call of h.calls) {
-        if (call.name === "requestModel" || call.name === "hasModelLoaded") {
-            assert.strictEqual(call.hash, STOCK_HASH, call.name + " was given the DLC model");
-        }
         if (call.name === "isModelInCdimage" || call.name === "getVehicleClassFromName") {
             assert.strictEqual(call.hash, DLC_HASH, call.name + " must ask about the DLC model");
         }
@@ -182,14 +189,21 @@ const only = (sent, name) => sent.filter((s) => s.event === name);
     h.run(30000);
 
     const streamed = only(h.sent, "rpf:streamed");
-    assert.strictEqual(streamed.length, 1, "the ceiling reports exactly once");
-    assert.strictEqual(streamed[0].args[1], "model_loaded=false");
-    const waited = Number(streamed[0].args[2].split("=")[1]);
-    assert.ok(waited >= 8000 && waited < 9000, `the ceiling is ~8s, got ${waited}ms`);
+    assert.strictEqual(streamed.length, 2, "each model reports once at the ceiling");
+    for (const s2 of streamed) {
+        assert.strictEqual(s2.args[1], "model_loaded=false");
+        const waited = Number(s2.args[2].split("=")[1]);
+        assert.ok(waited >= 8000 && waited < 9000, `the ceiling is ~8s, got ${waited}ms`);
+    }
+    assert.deepStrictEqual(
+        streamed.map((s2) => s2.args[0]),
+        ["model=adder", "model=volga5"],
+        "the stock model first, the pack's own second",
+    );
     assert.deepStrictEqual(
         events(h.sent).slice(0, 4),
         [
-            "rpf:joined model=meringls63amg24 hash=3292967587",
+            "rpf:joined model=volga5 hash=3292967587",
             "rpf:probe stage=pre_natives",
             "rpf:probe stage=post_cdimage in_cdimage=true",
             "rpf:acceptance in_cdimage=true class=7",
@@ -221,9 +235,8 @@ const only = (sent, name) => sent.filter((s) => s.event === name);
 }
 
 // --- 4. a native ends the process: the breadcrumb is already on the wire ---
-// This is the 2026-09-01 failure. REQUEST_MODEL faulted the client at module
-// offset 0xf4cb31 and nothing after it ever ran; the probe must have said what
-// it was about to do, far enough ahead that the packet left.
+// The probe must announce what it is about to do far enough ahead that the
+// packet leaves before a faulting native ends the client.
 {
     const h = harness({
         requestModel: (_hash, state) => {
@@ -266,15 +279,12 @@ const only = (sent, name) => sent.filter((s) => s.event === name);
     h.runTimers(6000);
 
     assert.deepStrictEqual(events(h.sent), [
-        "rpf:joined model=meringls63amg24 hash=3292967587",
+        "rpf:joined model=volga5 hash=3292967587",
         "rpf:probe stage=pre_natives",
         "rpf:probe stage=post_cdimage in_cdimage=true",
         "rpf:acceptance in_cdimage=true class=1",
-        "rpf:probe stage=pre_request model=adder",
-        "rpf:probe stage=post_request",
-        "rpf:probe stage=pre_poll",
-        "rpf:streamed model=adder model_loaded=true waited_ms="
-            + only(h.sent, "rpf:streamed")[0].args[2].split("=")[1],
+        ...cycle(h.sent, "adder", 0),
+        ...cycle(h.sent, "volga5", 1),
     ], "setTimeout alone drives the whole sequence");
 }
 
@@ -291,12 +301,9 @@ const only = (sent, name) => sent.filter((s) => s.event === name);
     h.run(8000);
 
     assert.deepStrictEqual(events(h.sent), [
-        "rpf:joined model=meringls63amg24 hash=3292967587",
-        "rpf:probe stage=pre_request model=adder",
-        "rpf:probe stage=post_request",
-        "rpf:probe stage=pre_poll",
-        "rpf:streamed model=adder model_loaded=true waited_ms="
-            + only(h.sent, "rpf:streamed")[0].args[2].split("=")[1],
+        "rpf:joined model=volga5 hash=3292967587",
+        ...cycle(h.sent, "adder", 0),
+        ...cycle(h.sent, "volga5", 1),
         "rpf:probe stage=pre_natives",
         "rpf:probe stage=post_cdimage in_cdimage=true",
         "rpf:acceptance in_cdimage=true class=1",
@@ -304,8 +311,7 @@ const only = (sent, name) => sent.filter((s) => s.event === name);
 }
 
 // --- 5. every path says something -----------------------------------------
-// The failure this file exists to make impossible: a join that reports nothing
-// after `joined`. Whatever the natives do, the probe speaks again.
+// Whatever the natives do, the probe speaks again after `joined`.
 for (const [name, natives] of [
     ["loads", { hasModelLoaded: () => true, isModelInCdimage: true, getVehicleClassFromName: 1 }],
     ["never loads", { hasModelLoaded: () => false, isModelInCdimage: true, getVehicleClassFromName: 7 }],

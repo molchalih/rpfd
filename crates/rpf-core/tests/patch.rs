@@ -1,13 +1,7 @@
 //! In-place patching: what it writes, what it leaves alone, and what it
-//! refuses before writing anything.
-//!
-//! The assertion a rebuild cannot make is that **nothing else changed**. These
-//! compare the whole file before and after, byte for byte, and require every
-//! difference to fall inside the payload being replaced or its own entry row.
-//!
-//! The other assertion here is the one planning exists for: a set of edits is
-//! decided in full before any of it is written, so a plan that cannot be
-//! carried out leaves the archive exactly as it was.
+//! refuses before writing anything. The files are compared byte for byte
+//! before and after, and every difference must fall inside the payload being
+//! replaced or its own entry row.
 //!
 //! Corpus-free: each test builds the archive it needs.
 #![allow(
@@ -24,8 +18,6 @@ use std::io::{Cursor, Read as _, Write as _};
 
 use rpf_core::{Archive, FileKind, FileSpec, Plan, Storage, Unwatched};
 
-/// A resource payload: an RSC7 header describing one 512-byte system page,
-/// followed by a deflate stream of exactly that.
 fn resource(fill: u8) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"RSC7");
@@ -39,7 +31,6 @@ fn resource(fill: u8) -> Vec<u8> {
     out
 }
 
-/// An archive with a stored file, a deflated file and a resource.
 fn archive_bytes() -> Vec<u8> {
     let files = vec![
         FileSpec {
@@ -80,7 +71,6 @@ fn archive_bytes() -> Vec<u8> {
     out.into_inner()
 }
 
-/// The edits a plan is asked for, in the shape the daemon holds them.
 fn edits(pairs: &[(&str, Vec<u8>)]) -> rpf_core::Changes {
     rpf_core::Changes::writing(
         pairs
@@ -90,14 +80,12 @@ fn edits(pairs: &[(&str, Vec<u8>)]) -> rpf_core::Changes {
     )
 }
 
-/// Bytes that do not compress, so they cannot be squeezed into a block.
 fn incompressible(len: u32) -> Vec<u8> {
     (0..len)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect()
 }
 
-/// Every byte position at which two buffers differ.
 fn differences(before: &[u8], after: &[u8]) -> Vec<usize> {
     assert_eq!(
         before.len(),
@@ -124,8 +112,6 @@ fn a_patch_writes_only_its_own_payload_and_row() {
         "expected a block of room, got {allocation}"
     );
 
-    // Shorter than the original, so the entry's sizes genuinely change and the
-    // row has to be rewritten.
     let replacement = b"short".to_vec();
     let plan = rpf_core::plan(
         &mut file,
@@ -156,13 +142,11 @@ fn a_patch_writes_only_its_own_payload_and_row() {
         );
     }
 
-    // The row really was rewritten: the new contents read back.
     let mut file = Cursor::new(after);
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("re-parses");
     let index = archive.find("data/notes.txt").expect("resolves");
     assert_eq!(archive.read(&mut file, index).expect("reads"), replacement);
 
-    // And nothing else moved.
     let raw = archive.find("raw.bin").expect("resolves");
     assert_eq!(
         archive.read(&mut file, raw).expect("reads"),
@@ -200,9 +184,8 @@ fn a_patch_that_does_not_fit_writes_nothing_at_all() {
 
 #[test]
 fn one_edit_that_does_not_fit_holds_back_the_ones_that_do() {
-    // The reason planning exists. Patching a set one at a time can apply two
-    // and then discover the third will not fit, which is not what a commit
-    // promises. R4.14.
+    // Patching a set one at a time can apply two and then discover the third
+    // will not fit, which is not what a commit promises.
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -272,8 +255,6 @@ fn several_edits_are_applied_together() {
             "{path} did not take"
         );
     }
-    // `extract` for the resource, which is the form it takes outside the
-    // archive — the same one `cat` writes and `put` accepts.
     let index = archive.find("art.yft").expect("resolves");
     assert_eq!(
         archive.extract(&mut file, index).expect("extracts"),
@@ -284,10 +265,8 @@ fn several_edits_are_applied_together() {
 
 #[test]
 fn two_edits_that_claim_the_same_bytes_are_refused() {
-    // A nested archive and a file inside it. Patching both would write the
-    // inner edit into a nested archive that the outer edit has just replaced
-    // wholesale, and the two writes overlap. Nothing about the bytes on disk
-    // is wrong, so this is a refusal rather than a corrupt archive.
+    // The inner edit would land in a nested archive the outer edit has just
+    // replaced wholesale, so the two writes overlap: a refusal, not corruption.
     let inner = archive_bytes();
     let files = vec![FileSpec {
         path: "x64/inner.rpf".to_owned(),
@@ -355,7 +334,6 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
     let mut file = Cursor::new(before.clone());
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
-    // Where the nested archive sits in the outer file.
     let nested_index = archive.find("x64/inner.rpf").expect("resolves");
     let (nested_at, nested_len) = archive.payload_at(nested_index).expect("span");
     let nested_row = archive.row_at(nested_index).expect("row");
@@ -372,9 +350,8 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
     patches.apply(&mut file).expect("applies");
 
     let after = file.into_inner();
-    // Every change is inside the nested archive's own payload. The outer
-    // archive's header, entry table, names blob and that entry's row are all
-    // untouched — there was nothing above to rebuild.
+    // Every change is inside the nested archive's own payload; the outer
+    // header, entry table, names blob and row are untouched.
     for position in differences(&before, &after) {
         assert!(
             position >= nested_at as usize && position < (nested_at + nested_len) as usize,
@@ -418,39 +395,28 @@ fn a_resource_entry_refuses_a_payload_that_is_not_one() {
         "a refused plan still wrote something"
     );
 
-    // A real resource is accepted, and its flags come from the payload.
     let plan =
         rpf_core::plan(&mut file, &archive, &edits(&[("art.yft", resource(0xBB))])).expect("plans");
     assert!(matches!(plan, Plan::Fits(_)), "got {plan:?}");
 }
 
-/// Largest value the entry table's 24-bit compressed-size field holds.
-/// `docs/rpf-format.md`, Entry table.
-///
-/// Spelled out here rather than imported from the writer on purpose. A test
-/// that took the limit from the code it is checking would agree with whatever
-/// the code came to believe; this one fails if the writer stops refusing at
-/// the width the format actually has.
+/// Largest value the entry table's 24-bit compressed-size field holds. Spelled
+/// out rather than imported: a test that took the limit from the code it checks
+/// would agree with whatever that code came to believe.
 const MAX_SIZE_24: u64 = 0x00FF_FFFF;
 
-/// An `RSC7` payload one byte too large for that field.
-///
-/// Only the first sixteen bytes have to be a header; the size check comes
-/// before anything looks at the deflate stream, and a real one of this length
-/// would make the test cost twenty seconds to prove a comparison.
+/// An `RSC7` payload one byte too large for that field. Only the first sixteen
+/// bytes have to be a header: the size check comes before anything looks at the
+/// deflate stream.
 fn oversized_resource() -> Vec<u8> {
     let mut out = resource(0xAA);
     out.resize(usize::try_from(MAX_SIZE_24).expect("64-bit host") + 1, 0);
     out
 }
 
-/// An archive holding one resource, with room after it for a payload far
-/// larger than the entry can describe.
-///
-/// The room is the point. An oversized payload in a cramped entry is refused
-/// for not fitting, which hides the bug: the sample's `.yft` entries have
-/// megabytes of slack, so the size check is the only thing standing between a
-/// 20 MB payload and an entry row that records 3 MB of it.
+/// An archive holding one resource, with room after it for a payload far larger
+/// than the entry can describe: in a cramped entry the payload would be refused
+/// for not fitting, hiding whether the size check ran at all.
 fn roomy_resource_archive() -> Vec<u8> {
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
@@ -474,9 +440,8 @@ fn roomy_resource_archive() -> Vec<u8> {
     bytes
 }
 
-/// The field a saturated resource's row carries, and what it means: the
-/// payload's extent is the room to the next payload, not this value. DR-056,
-/// DR-051 clause 1.
+/// The field a saturated resource's row carries; the payload's extent is the
+/// room to the next payload, not this value.
 fn saturated_field(archive: &Archive, path: &str) -> Option<u64> {
     let index = archive.find(path).ok()?;
     match archive.entry(index).ok()?.kind {
@@ -487,13 +452,9 @@ fn saturated_field(archive: &Archive, path: &str) -> Option<u64> {
 
 #[test]
 fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_truncating() {
-    // The entry table stores a compressed size in three bytes. A payload over
-    // that limit used to be written whole while its row recorded the low 24
-    // bits of the length, which is an archive that parses, verifies, and hands
-    // the runtime a fraction of a resource. It is now written whole with the
-    // row carrying `MAX_SIZE_24` — the saturation sentinel a resource's row
-    // has for exactly this, and which the low 24 bits of this length are not:
-    // they are zero, which would read back as a stored entry. DR-056.
+    // A payload past the 24-bit field is written whole with the row carrying
+    // `MAX_SIZE_24`, the saturation sentinel; the low 24 bits of this length
+    // are zero, which would read back as a stored entry.
     let payload = oversized_resource();
     let before = roomy_resource_archive();
     let mut file = Cursor::new(before.clone());
@@ -520,8 +481,7 @@ fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_trunc
         MAX_SIZE_24,
         "the row carries the sentinel, not a truncation of the real length"
     );
-    // The extent is the room the entry had, which is where a saturated row
-    // stops meaning anything of its own, and the payload still inflates.
+    // A saturated row means nothing of its own: the extent is the entry's room.
     assert_eq!(
         archive
             .payload_at(archive.find("art.yft").expect("resolves"))
@@ -529,9 +489,8 @@ fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_trunc
             .1,
         allocation
     );
-    // And the payload itself is there, whole. The extent runs past it into the
-    // room the entry keeps, which is what a saturated row costs and what
-    // DR-051 already records `extract` handing back; the payload is its prefix.
+    // The extent runs past the payload into the entry's room, so the payload is
+    // the prefix of what `extract` hands back.
     let index = archive.find("art.yft").expect("resolves");
     let mut back = Vec::new();
     archive
@@ -548,10 +507,8 @@ fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_trunc
 
 #[test]
 fn a_build_and_a_patch_write_the_same_sentinel_for_an_oversized_resource() {
-    // The two write paths apply one rule — the entry's storage rule — to new
-    // contents, and they used to be two implementations of it that disagreed.
-    // They now agree on the sentinel exactly as they agreed on the refusal,
-    // which is the property this test is for and not the verdict itself.
+    // The two write paths apply one rule to new contents; what matters here is
+    // that they agree, not the verdict itself.
     let payload = oversized_resource();
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
@@ -577,26 +534,13 @@ fn a_build_and_a_patch_write_the_same_sentinel_for_an_oversized_resource() {
 }
 
 /// Largest a resource's `RSC7` header is, and the least a resource payload can
-/// be. `docs/rpf-format.md`, Compression.
-///
-/// Spelled out here rather than imported for `MAX_SIZE_24`'s reason: a test
-/// that took the width from the code it checks would agree with whatever the
-/// code came to believe.
+/// be. Spelled out rather than imported, for [`MAX_SIZE_24`]'s reason.
 const RESOURCE_HEADER_LEN: usize = 16;
 
-/// A payload with the right magic and a truncated header is not a resource.
-///
-/// The magic check catches a payload that is not a resource at all; this one
-/// is refused a step earlier, for being shorter than the header whose two flag
-/// words the entry duplicates. The read is a `take(16)`, so its length can
-/// never be *above* sixteen — which means the guard goes inert if the
-/// comparison is turned around, and nothing noticed: no test offered either
-/// write path a resource payload shorter than its own header, and one that
-/// begins `RSC7` walks straight past the magic check behind it.
-///
-/// `docs/rpf-format.md`, Resource entries: the flags at offsets 8 and 12 of
-/// the header are the ones the entry row carries, so a header that is not all
-/// there is an entry whose flags would be invented.
+/// A payload with the right magic and a truncated header is not a resource: the
+/// flags at offsets 8 and 12 are the ones the entry row carries, so a short
+/// header is an entry whose flags would be invented. The read is a `take(16)`,
+/// so the guard goes inert if its comparison is turned around.
 #[test]
 fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
     let mut truncated = b"RSC7".to_vec();
@@ -632,7 +576,6 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
         "nothing may be written for a refused resource"
     );
 
-    // And the patch path, which applies the same rule through `store`.
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -648,22 +591,17 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
     );
 }
 
-/// A plan prints what it will do and never the bytes it will write.
-///
-/// `Patches` carries a hand-written `Debug` for one reason, stated in its own
-/// comment: a payload is megabytes and this type appears in test failures. That
-/// is a contract, and nothing asserted it — the impl could have been replaced
-/// by one that prints nothing, or by the derived one that prints every byte,
-/// and the suite stayed green either way. The second is the expensive
-/// direction: a `--json` payload or a panic message carrying a whole entry.
+/// A plan prints what it will do and never the bytes it will write: `Patches`
+/// has a hand-written `Debug` because a payload is megabytes and the type shows
+/// up in failure messages.
 #[test]
 fn a_plan_prints_what_it_will_do_and_never_the_bytes() {
     let before = archive_bytes();
     let mut file = Cursor::new(before);
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
-    // A payload of one repeated byte, so that finding it in the rendering is
-    // unambiguous: `Debug` for a byte slice writes decimal, and 0xC7 is 199.
+    // One repeated byte: `Debug` for a byte slice writes decimal, and 0xC7 is
+    // 199.
     let replacement = vec![0xC7_u8; 400];
     let plan = rpf_core::plan(
         &mut file,

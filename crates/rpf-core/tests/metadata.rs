@@ -1,20 +1,9 @@
 //! The metadata layer against the metadata both games ship.
 //!
-//! R5.7's harness: unedited in, unedited out, byte-identical. The claim it
-//! makes is not that the round trip holds for made-up documents but that it
-//! holds for **the 391 `RBF` files in the corpus**, which is what
-//! `docs/metadata-encodings.md` measured byte-perfect re-serialisation against.
-//!
-//! No game data is tracked. Payloads are located through `RPF_METADATA`, a
-//! directory of files already extracted from their archives; what is committed
-//! is `fixtures/rbf-metadata.json`, a count and a list of `sha256` digests.
-//! With `RPF_METADATA` unset every test that needs it is `#[ignore]`d by
-//! `build.rs`, so the harness names each one as skipped. R0.2, R8.4.
-//!
-//! `clippy.toml`'s `allow-*-in-tests` settings reach `#[cfg(test)]` modules and
-//! not this directory — an integration test is compiled as its own crate, with
-//! no `cfg(test)`. `docs/conventions.md` §15's exception is therefore spelled
-//! out here: in a test a panic is the reporting mechanism, not a crash.
+//! Unedited in, unedited out, byte-identical, over the shipped corpus rather
+//! than over made-up documents. No game data is tracked: payloads are located
+//! through `RPF_METADATA` and what is committed is a count and a list of
+//! digests. With it unset every test that needs it is `#[ignore]`d.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -44,31 +33,13 @@ const FIXTURE: &str = "../../fixtures/rbf-metadata.json";
 
 /// Refuses, naming the test and what it would have read.
 ///
-/// **There is no third outcome a test can reach for.** `eprintln!` is captured
-/// by default, so a corpus test that reported a skip and returned early was
-/// reported as `ok` in exactly the log a real pass produces: measured
-/// 2026-08-30, with `RPF_METADATA` pointed at a directory holding no payloads
-/// the suite said `48 passed; 0 failed; 0 ignored` in 0.00 s. That is §12's
-/// "most expensive possible bug: a green suite that tested nothing", and it is
-/// the same shape as the `PSIN`-misspelling incident.
-///
-/// The skip §12 asks for is `#[ignore]`, which `build.rs` applies when
-/// `RPF_METADATA` is unset and which the harness names whether or not output is
-/// captured — so the missing-corpus case is a loud skip and never reaches here.
-/// What is left is a variable that **was** set and does not name the corpus,
-/// which is a misconfiguration rather than a missing corpus, and the only
-/// honest thing to do with it is say so.
+/// There is no third outcome: `eprintln!` is captured, so a test that skipped
+/// quietly would read as a pass, and a missing corpus is `#[ignore]`d first.
 fn refuse(test: &str, reason: &str) -> ! {
     panic!("{test} cannot run: {reason}");
 }
 
-/// How many payloads of each kind the corpus holds, from the fixture that
-/// describes it.
-///
-/// §12: a file with the right name is not the same corpus, and neither is one
-/// file of 9,753. Without this the whole-corpus tests passed against a
-/// directory containing a single payload — the counts reached only a captured
-/// `eprintln!`.
+/// How many payloads of each kind the corpus holds, from the fixture.
 fn stated_count(fixture: &str) -> usize {
     let text = fs::read_to_string(fixture).expect("fixture readable");
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
@@ -80,14 +51,8 @@ fn stated_count(fixture: &str) -> usize {
     .expect("a count fits")
 }
 
-/// Every payload under `RPF_METADATA` that opens with `magic`, by file name.
-///
-/// Recognition is from content and never from an extension, which is what
-/// `docs/rpf-format.md` says the container does: 388 of the 391 `RBF` files are
-/// `.ymt` and 3 are `.ymf`, and the same extensions carry `PSO` far more often
-/// — 4,378 `.ymt`, 3,623 `.ymf` and 1,738 `.cut`.
-/// The count is checked against the fixture's, so that a directory holding one
-/// payload cannot satisfy a test whose whole claim is about 9,753 of them.
+/// Every payload under `RPF_METADATA` that opens with `magic`, by file name;
+/// recognition is from content, and the count is checked against the fixture's.
 fn payloads(test: &str, magic: [u8; 4]) -> BTreeMap<String, Vec<u8>> {
     let Some(root) = env::var_os("RPF_METADATA") else {
         refuse(
@@ -143,10 +108,6 @@ fn sha256(bytes: &[u8]) -> String {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_rbf_file_round_trips_byte_for_byte() {
-    // The whole of R5.7. `docs/metadata-encodings.md` measured that a
-    // name-keyed re-serialiser reproduces 391 of 391 shipped files; this is
-    // that measurement, through XML rather than through a tree, and it is what
-    // says a differential rebuild is not needed for `RBF`.
     let files = payloads(
         "every_shipped_rbf_file_round_trips_byte_for_byte",
         rbf::MAGIC,
@@ -183,9 +144,7 @@ fn every_shipped_rbf_file_round_trips_byte_for_byte() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_corpus_is_the_one_the_fixture_describes() {
-    // A file with the right name is not the same file. §12: the fixture records
-    // the `sha256` of every payload it describes, and this confirms that before
-    // the round trip above is allowed to mean anything about *these* 391 files.
+    // The fixture records the `sha256` of every payload it describes.
     let files = payloads("the_corpus_is_the_one_the_fixture_describes", rbf::MAGIC);
     let fixture: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(FIXTURE).expect("fixture readable"))
@@ -217,10 +176,7 @@ fn the_corpus_is_the_one_the_fixture_describes() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_xml_is_readable_and_says_what_the_probe_measured() {
-    // Two of `docs/metadata-encodings.md`'s `RBF` rows, as a test that fails if
-    // they stop being true (§12): every name is literal inline ASCII, so the
-    // XML carries no hash anywhere; and a blob keeps its trailing NUL rather
-    // than having it stripped.
+    // Every name is literal inline ASCII, and a blob keeps its trailing NUL.
     let files = payloads(
         "the_xml_is_readable_and_says_what_the_probe_measured",
         rbf::MAGIC,
@@ -253,8 +209,7 @@ fn the_xml_is_readable_and_says_what_the_probe_measured() {
     );
 }
 
-/// A minimal valid payload: `<Root/>`, built by hand rather than by the writer
-/// under test, so that a bug shared by reader and writer still shows.
+/// A minimal valid payload, built by hand rather than by the writer under test.
 fn minimal() -> Vec<u8> {
     let mut out = rbf::MAGIC.to_vec();
     out.extend_from_slice(&[0x00, 0x00]); // descriptor 0, open element
@@ -291,8 +246,7 @@ fn not_xml(document: &str) -> rbf::NotRbf {
 
 #[test]
 fn the_minimal_payload_is_the_baseline_the_malformed_cases_are_mutations_of() {
-    // Every case below breaks this one payload in one way. If this stopped
-    // being valid, all of them would pass for the wrong reason.
+    // Every malformed case below breaks this one payload in one way.
     let xml = rbf::to_xml(&minimal()).expect("the minimal payload converts");
     assert_eq!(
         str::from_utf8(&xml).expect("UTF-8"),
@@ -305,16 +259,14 @@ fn the_minimal_payload_is_the_baseline_the_malformed_cases_are_mutations_of() {
 fn a_payload_that_is_not_rbf_is_refused_by_its_magic() {
     assert_eq!(malformed(b""), rbf::Malformed::NotRbf);
     assert_eq!(malformed(b"RBF"), rbf::Malformed::NotRbf);
-    // docs/metadata-encodings.md: the fourth byte is 0x30 in all 391 files, so
-    // the strict four-byte test costs nothing. `RBF1` is not an RBF file here.
+    // The fourth byte is 0x30 in all 391 files, so the strict test costs nothing.
     assert_eq!(malformed(b"RBF1\x00\x00"), rbf::Malformed::NotRbf);
     assert_eq!(malformed(b"PSIN\x00\x00"), rbf::Malformed::NotRbf);
 }
 
 #[test]
 fn a_truncated_token_stream_is_refused_at_every_length() {
-    // Not one truncation but all of them: every prefix of a valid payload is
-    // an error, and none of them is a panic. §6.
+    // Every prefix of a valid payload is an error, and none of them is a panic.
     let whole = minimal();
     for len in 4..whole.len() {
         let error = rbf::to_xml(&whole[..len]).expect_err("a prefix is not a document");
@@ -336,8 +288,7 @@ fn a_descriptor_index_past_the_end_of_the_table_is_refused() {
     absurd[4] = 0xFE; // the byte the table can never reach
     assert_eq!(malformed(&absurd), rbf::Malformed::DescriptorIndex);
 
-    // And with a table that is not empty, so that "past the end" is refused
-    // rather than quietly answered with whichever name is nearest.
+    // And with a non-empty table, so the nearest name is not used instead.
     let mut past = minimal();
     past.truncate(past.len() - 2);
     past.extend_from_slice(&[5, 0x10]); // descriptor 5, of a table holding one
@@ -406,8 +357,7 @@ fn a_name_in_the_reserved_prefix_is_refused() {
 
 #[test]
 fn a_data_type_outside_the_seven_is_refused() {
-    // docs/metadata-encodings.md: 281,272 records over 391 files and not one
-    // byte outside the table of seven.
+    // 281,272 records over 391 files, and no byte outside the table of seven.
     let mut payload = minimal();
     payload.truncate(payload.len() - 2);
     payload.extend_from_slice(&[0x01, 0x70]); // descriptor 1, type 0x70
@@ -427,8 +377,7 @@ fn a_close_record_without_its_marker_is_refused() {
 
 #[test]
 fn bytes_after_the_root_closes_are_refused() {
-    // docs/metadata-encodings.md: 0 trailing bytes in all 391 files, so a
-    // reader may insist on it — and this one does.
+    // 0 trailing bytes in all 391 files, so a reader may insist on it.
     let mut payload = minimal();
     payload.push(0x00);
     assert_eq!(malformed(&payload), rbf::Malformed::Trailing);
@@ -444,8 +393,7 @@ fn an_attribute_count_larger_than_the_element_holds_is_refused() {
 
 #[test]
 fn an_empty_blob_is_refused_because_xml_cannot_show_one() {
-    // 0 of the 48,042 blobs in the corpus are empty, and an element whose text
-    // is empty is indistinguishable from one with no text.
+    // 0 of the 48,042 corpus blobs are empty, and empty text is no text at all.
     let mut payload = minimal();
     payload.truncate(payload.len() - 2);
     payload.extend_from_slice(&[0xFD, 0xFF]);
@@ -456,9 +404,7 @@ fn an_empty_blob_is_refused_because_xml_cannot_show_one() {
 
 #[test]
 fn a_blob_sharing_its_element_is_refused() {
-    // All 48,042 blobs in the corpus are the sole content of their element.
-    // Three ways for that to stop being true, and each has to be refused: a
-    // second blob, a blob before a child element, and a blob after one.
+    // All 48,042 corpus blobs are the sole content of their element.
     let blob = |out: &mut Vec<u8>| {
         out.extend_from_slice(&[0xFD, 0xFF]);
         out.extend_from_slice(&1u32.to_le_bytes());
@@ -493,8 +439,7 @@ fn a_blob_sharing_its_element_is_refused() {
 
 #[test]
 fn elements_nested_past_the_walk_limit_are_refused() {
-    // A stack overflow is an abort no `Result` can catch, so the depth is
-    // bounded before the tree is built rather than after.
+    // A stack overflow is an abort no `Result` can catch, so depth is bounded.
     let mut payload = rbf::MAGIC.to_vec();
     payload.extend_from_slice(&[0x00, 0x00]);
     payload.extend_from_slice(&1u16.to_le_bytes());
@@ -547,11 +492,7 @@ fn xml_that_is_well_formed_and_says_the_wrong_thing_is_refused() {
 
 #[test]
 fn the_two_meaningless_words_survive_a_round_trip() {
-    // `docs/metadata-encodings.md`: `unk1` and `unk2` are 0 in all 106,193 open
-    // elements, so a writer emitting zeroes is byte-faithful for every shipped
-    // file. They are carried anyway, so that the round trip is a property of
-    // the code rather than of the corpus — which is the difference between a
-    // law and a coincidence.
+    // The two words are 0 in every shipped element, and are carried anyway.
     let mut payload = minimal();
     payload[12..14].copy_from_slice(&7u16.to_le_bytes());
     payload[14..16].copy_from_slice(&9u16.to_le_bytes());
@@ -566,11 +507,8 @@ fn the_two_meaningless_words_survive_a_round_trip() {
     assert_eq!(rbf::from_xml(&xml).expect("and back"), payload);
 }
 
-/// The minimal payload with one more child, whose descriptor is `new`.
-///
-/// `new` is written as the descriptor index the record names. Passing the
-/// table's length introduces a descriptor and carries its name; naming an
-/// index the table already holds reuses it and carries nothing.
+/// The minimal payload with one more child, whose descriptor is `new`: naming
+/// the index past the table introduces one, naming an index it holds reuses it.
 fn with_second_child(new: bool) -> Vec<u8> {
     let mut out = minimal();
     out.truncate(out.len() - 2); // the close, put back below
@@ -588,24 +526,8 @@ fn with_second_child(new: bool) -> Vec<u8> {
 
 #[test]
 fn a_name_two_descriptors_declare_is_read_and_written_back_once() {
-    // Found by `fuzz/fuzz_targets/rbf.rs` on 2026-08-31, in a mutation of a
-    // shipped file that declared `AnimName` at descriptor 15 and again at 37.
-    //
-    // **The reader accepts it and the writer does not reproduce it**, because
-    // a descriptor is introduced whenever a record names the index one past
-    // the end of the table, while `token::write` rebuilds the table keyed by
-    // name alone — which `docs/metadata-encodings.md` measured as the keying
-    // that reproduces 391 of 391 shipped files where name-and-type reproduces
-    // 205. So the second declaration of a name is dropped, and the payload
-    // comes back shorter than it went in.
-    //
-    // That is a **normalisation and not a loss**: the two descriptors are
-    // interchangeable by construction, so the document is identical and only
-    // the table that spells it is smaller. It is pinned rather than refused
-    // for the reason `docs/backlog.md` gives for orphan entries — refusing a
-    // shape on the strength of a corpus that does not contain it risks
-    // rejecting a real file — and `rbf::to_xml`'s doc comment now states the
-    // law with the condition it actually holds under.
+    // The reader accepts a name declared twice; the writer rebuilds the table
+    // keyed by name alone, so the second declaration is a dropped duplicate.
     let twice = with_second_child(true);
     let once = with_second_child(false);
     assert_eq!(
@@ -618,8 +540,7 @@ fn a_name_two_descriptors_declare_is_read_and_written_back_once() {
     let from_twice = rbf::to_xml(&twice).expect("converts");
     assert_eq!(from_twice, rbf::to_xml(&once).expect("converts"));
 
-    // The payload does. This is the exact claim, and it is what the round trip
-    // gives rather than what a stronger reading of it would.
+    // The payload does, which is what the round trip gives here.
     assert_eq!(rbf::from_xml(&from_twice).expect("and back"), once);
     assert_ne!(rbf::from_xml(&from_twice).expect("and back"), twice);
 
@@ -630,9 +551,7 @@ fn a_name_two_descriptors_declare_is_read_and_written_back_once() {
 
 #[test]
 fn a_blob_that_is_only_whitespace_survives() {
-    // A text node of nothing but spaces is indentation everywhere else in the
-    // document, so a blob made only of spaces has to be written in a way that
-    // cannot be mistaken for it.
+    // Spaces are indentation everywhere else, so such a blob needs telling apart.
     let mut payload = minimal();
     payload.truncate(payload.len() - 2);
     payload.extend_from_slice(&[0xFD, 0xFF]);
@@ -645,9 +564,7 @@ fn a_blob_that_is_only_whitespace_survives() {
 
 #[test]
 fn the_categories_are_the_ones_a_caller_acts_on() {
-    // §10, R6.3: the variant set is the public contract and the exit code comes
-    // from the category. A malformed payload is corrupt data; a payload this
-    // build cannot render is unsupported; XML the caller wrote is refused.
+    // A corrupt payload, an unsupported rendering, and a refused document.
     assert_eq!(
         rbf::to_xml(b"nope").expect_err("not RBF").category(),
         Category::Corrupt
@@ -666,16 +583,9 @@ fn the_categories_are_the_ones_a_caller_acts_on() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// `PSO` — R5.3 and R5.5
-// ---------------------------------------------------------------------------
-
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_pso_file_converts_from_its_own_schema_alone() {
-    // R5.3's claim, and R1.7's measurement reproduced through the layer rather
-    // than through a probe: every one of the 9,753 files converts driven only
-    // by its own `PSCH`, with no dictionary and no builtin table of any kind.
     let files = payloads(
         "every_shipped_pso_file_converts_from_its_own_schema_alone",
         pso::MAGIC,
@@ -687,11 +597,6 @@ fn every_shipped_pso_file_converts_from_its_own_schema_alone() {
             failed.push(format!("{name}: {error:?}"));
         }
     }
-    // The count of `UndefinedStructure` failures is not asserted separately:
-    // every failure is in `failed`, so an assertion that there are none of that
-    // one kind is implied by the assertion that there are none at all. The
-    // claim it stood for — a walk from each file's own `PSCH` reaches 0
-    // references the file does not define — is what this message says.
     assert!(
         failed.is_empty(),
         "{} of {} payloads did not convert, so the walk from each file's own \
@@ -715,18 +620,10 @@ const MEMBER_NAME: u32 = 0x1234_5678;
 
 /// The `ARRAYINFO` sentinel: the name hash a member carries when it describes
 /// another member's element type rather than a field of its own.
-///
-/// `docs/metadata-encodings.md`, The `ARRAYINFO` indirection. The library names
-/// it too, and does not export it — this layer's constants are `pub(super)`.
 const ARRAYINFO: u32 = 0x0000_0100;
 
-/// A minimal valid `PSO`: one block, one structure, one `UINT` member.
-///
-/// Built by hand rather than by a writer — there is no `PSO` writer yet, and a
-/// payload built by the reader's own model could share the reader's bugs. Every
-/// malformed case below is one mutation of this, so
-/// `the_minimal_pso_is_the_baseline_the_malformed_cases_are_mutations_of` has to
-/// keep passing for any of them to mean anything.
+/// A minimal valid `PSO`: one block, one structure, one `UINT` member, built by
+/// hand so it shares no bug with the reader. Every case below mutates it.
 fn minimal_pso() -> Vec<u8> {
     let mut psin = Vec::new();
     psin.extend_from_slice(&pso::MAGIC);
@@ -806,8 +703,7 @@ fn a_payload_that_is_not_pso_is_refused_by_its_first_section_tag() {
 
 #[test]
 fn a_truncated_payload_is_refused_at_every_length() {
-    // Not one truncation but all of them: every prefix of a valid payload is an
-    // error or a refusal, and none of them is a panic. §6.
+    // Every prefix of a valid payload is an error, and none of them is a panic.
     let whole = minimal_pso();
     for len in 0..whole.len() {
         let error = pso::to_xml(&whole[..len], &Dictionary::default())
@@ -828,8 +724,7 @@ fn a_section_length_that_overruns_the_payload_is_refused() {
 
 #[test]
 fn a_section_chain_that_does_not_reach_the_end_is_refused() {
-    // Σ(section lengths) == file length in 9,753 of 9,753, so a trailer is not
-    // something a shipped file has and not something this reads past.
+    // Σ(section lengths) == file length in 9,753 of 9,753, so no file trails.
     let mut trailing = minimal_pso();
     trailing.push(0);
     assert_eq!(pso_malformed(&trailing), pso::Malformed::Section);
@@ -837,8 +732,7 @@ fn a_section_chain_that_does_not_reach_the_end_is_refused() {
 
 #[test]
 fn a_block_that_is_not_inside_the_data_section_is_refused() {
-    // The block table is checked against the data section at construction, so
-    // no later read has to re-check it (§5).
+    // The block table is checked against the data section at construction.
     let mut past = minimal_pso();
     let length_at = 20 + 8 + 4 + 2 + 2 + 12;
     past[length_at..length_at + 4].copy_from_slice(&4096i32.to_be_bytes());
@@ -865,9 +759,7 @@ fn a_root_id_that_names_no_block_is_refused() {
 
 #[test]
 fn a_structure_the_file_does_not_define_is_refused_rather_than_guessed_at() {
-    // R1.7's measurement is that this reaches 0 in 9,753 files, which is what
-    // says no builtin fallback table is needed. Reaching one is therefore an
-    // error and never a reason to consult a table.
+    // A walk from a file's own `PSCH` reaches 0 undefined references in 9,753.
     let mut unknown = minimal_pso();
     unknown[20 + 8 + 4 + 2 + 2..20 + 8 + 4 + 2 + 2 + 4]
         .copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
@@ -876,9 +768,7 @@ fn a_structure_the_file_does_not_define_is_refused_rather_than_guessed_at() {
 
 #[test]
 fn a_member_type_this_build_does_not_decode_is_unsupported_not_corrupt() {
-    // `docs/metadata-encodings.md` measured 37 (type, subtype) pairs over
-    // 580,044 members. A pair outside them is a gap here, not damage there, and
-    // the category is what a caller acts on.
+    // 37 (type, subtype) pairs over 580,044 members: outside them is a gap here.
     let mut alien = minimal_pso();
     let type_at = minimal_pso().len() - 8;
     alien[type_at] = 0x7F;
@@ -897,25 +787,8 @@ fn a_member_type_this_build_does_not_decode_is_unsupported_not_corrupt() {
 
 #[test]
 fn a_document_is_bounded_in_bytes_and_not_only_in_elements() {
-    // Found by `fuzz/fuzz_targets/pso.rs` on 2026-08-31, on the first campaign
-    // that ever reached this parser: a 5,068-byte payload allocated
-    // **81,794,124 bytes** — 16,139 times its input, and past the 64 MiB
-    // `fuzz/`'s counting allocator holds a 64 KiB input to — and then answered
-    // `DataRange`. A refusal, arrived at by way of 81 MB.
-    //
-    // `MAX_NODES` was documented as bounding the memory, on the grounds that
-    // the walk's peak is its output. The second half is true and the first does
-    // not follow: an element is not a fixed number of bytes, because it carries
-    // two spaces of indent per level of `MAX_DEPTH`, so the same million
-    // elements cost several times as much when they are deep.
-    //
-    // **No node budget can be the memory bound, and that is what this pins.**
-    // At the worst element width the ceiling would have to be about 220,000
-    // elements to stay inside 64 MiB; the largest shipped file already writes
-    // 137,120, and `MAX_NODES` is deliberately eight times that. The two
-    // requirements do not both fit in one number, so the bound has to be
-    // charged in the unit it is about. `MAX_OUTPUT_RATIO` and `MIN_OUTPUT` are
-    // that, and this is the case that fails if either stops being charged.
+    // No node budget can be the memory bound: an element is not a fixed number
+    // of bytes, since it carries two spaces of indent per level of depth.
     let payload = nested_arrays_pso(u16::MAX);
     let error =
         pso::to_xml(&payload, &Dictionary::default()).expect_err("a document this size is refused");
@@ -931,31 +804,18 @@ fn a_document_is_bounded_in_bytes_and_not_only_in_elements() {
     );
     assert_eq!(error.category(), Category::Corrupt);
 
-    // And the bound is a bound on the document rather than on the shape: the
-    // same payload one size down converts, and what it writes is inside the
-    // floor. 16 MiB is `MIN_OUTPUT`, restated here because a test that pins a
-    // constant has to name it — if the floor moves, this is what asks whether
-    // it was meant to.
+    // The bound is on the document, not the shape: one size down is inside it.
     let xml = pso_xml(&nested_arrays_pso(64));
     assert!(
         xml.len() <= 16 * 1024 * 1024,
         "a converted document is inside the floor: {} bytes",
         xml.len()
     );
-
-    // **No wall-clock assertion here, deliberately.** The finding had a time
-    // half too — 141 ms spent building the 81 MB before throwing it away, now
-    // 9.5 ms — and a test that measured it would be the load-sensitive kind
-    // `docs/backlog.md` already records one of. It would also assert little
-    // that the refusal above does not: what bounds the time is what bounds the
-    // document, because the walk's cost is the walk's output.
 }
 
 #[test]
 fn a_cyclic_block_graph_is_refused_rather_than_walked_forever() {
-    // The block graph is attacker-chosen. A structure holding a pointer back
-    // into its own block is a cycle, and a depth limit is what stands between
-    // it and a stack overflow no `Result` can catch. DR-011.
+    // A pointer back into its own block is a cycle; the depth limit is the guard.
     let payload = cyclic_pso();
     let error = pso::to_xml(&payload, &Dictionary::default()).expect_err("a cycle is refused");
     assert_eq!(error.category(), Category::Corrupt);
@@ -973,21 +833,8 @@ fn a_cyclic_block_graph_is_refused_rather_than_walked_forever() {
 
 #[test]
 fn an_inline_array_of_inline_arrays_is_refused_by_the_output_budget() {
-    // The depth ceiling does not reach this one: the payload is three levels
-    // deep and declares its size rather than nesting to it. One structure, one
-    // field, and three `ATFIXEDARRAY` descriptors chained through `ARRAYINFO`
-    // — `0xFFFF` items of `0xFFFF` items of `0xFFFF` items — is 2.8*10^14
-    // elements out of 132 bytes, and the element type bottoms out at a
-    // zero-length inline string so every item lands at the same address and no
-    // range check fires either. `Malformed::TooManyNodes` is the only thing
-    // between that and a walk that does not return.
-    //
-    // **Renamed on 2026-08-31, because the budget that catches it changed.**
-    // It was the node budget; it is now the output budget, which is charged in
-    // the same place and fires first here because 1,048,576 elements of this
-    // shape are more than 16 MiB of document. The property the test is for is
-    // unchanged — 2.8*10^14 elements out of 132 bytes is refused rather than
-    // walked — and which ceiling reports it is not what the case is about.
+    // Three levels deep and declaring its size rather than nesting to it:
+    // 2.8*10^14 elements out of 132 bytes, every item at the same address.
     let payload = nested_arrays_pso(u16::MAX);
     assert_eq!(payload.len(), 132);
     let error = pso::to_xml(&payload, &Dictionary::default()).expect_err("a budget refuses it");
@@ -1006,9 +853,7 @@ fn an_inline_array_of_inline_arrays_is_refused_by_the_output_budget() {
 
 #[test]
 fn an_array_charges_its_items_against_the_same_budget_a_structure_charges() {
-    // The budget is spent by every element the walk writes, which is the whole
-    // of the fix above: with the same payload one size smaller the walk
-    // finishes, so the refusal is the ceiling and not the shape.
+    // Every element the walk writes is charged, so one size smaller finishes.
     let ok = nested_arrays_pso(64);
     let xml = pso_xml(&ok);
     assert_eq!(
@@ -1016,9 +861,7 @@ fn an_array_charges_its_items_against_the_same_budget_a_structure_charges() {
         64 + 64 * 64 + 64 * 64 * 64,
         "every item of every level is written, and every one of them is charged"
     );
-    // The same shape one size larger is refused. `TooLarge` rather than
-    // `TooManyNodes` since 2026-08-31: both budgets are charged here and the
-    // one measured in bytes reaches its ceiling first.
+    // Both budgets are charged, and the one in bytes reaches its ceiling first.
     assert!(matches!(
         pso::to_xml(&nested_arrays_pso(200), &Dictionary::default()),
         Err(Error::BadPso {
@@ -1028,12 +871,9 @@ fn an_array_charges_its_items_against_the_same_budget_a_structure_charges() {
     ));
 }
 
-/// A payload whose one field is an inline array of an inline array of an
-/// inline array, each `count` long.
-///
-/// Members 1, 2 and 3 are `ARRAYINFO` descriptors, which is what
-/// [`resolve`](pso) demands of an element index, so the schema is well formed
-/// at construction and the size is entirely in what it declares.
+/// A payload whose one field is an inline array of an inline array of an inline
+/// array, each `count` long; members 1, 2 and 3 are `ARRAYINFO` descriptors, so
+/// the size is entirely in what the schema declares.
 fn nested_arrays_pso(count: u16) -> Vec<u8> {
     let mut psin = Vec::new();
     psin.extend_from_slice(&pso::MAGIC);
@@ -1123,10 +963,7 @@ fn cyclic_pso() -> Vec<u8> {
 
 #[test]
 fn a_pointer_outside_its_own_block_is_refused_rather_than_recovered() {
-    // `CodeWalker`'s `if (offset >= block.Length) { offset = offset >> 8; }
-    // //how to tell when to do this??` is never needed: 0 of 1,362,769 pointers
-    // in the corpus are out of range, so a reader should refuse rather than
-    // guess.
+    // 0 of 1,362,769 corpus pointers are out of range, so one is refused.
     let mut broken = cyclic_pso();
     // Block 1 is eight bytes long; item offset 16 is past its end.
     let pointer = (16u32 << 12) | 1;
@@ -1141,8 +978,7 @@ fn a_pointer_outside_its_own_block_is_refused_rather_than_recovered() {
 
 #[test]
 fn a_member_reaching_past_the_data_section_is_refused() {
-    // A structure that claims a length, a member that claims an offset: both
-    // are attacker-chosen, and the read is bounds-checked rather than trusted.
+    // A structure's length and a member's offset are both attacker-chosen.
     let mut past = minimal_pso();
     let offset_at = minimal_pso().len() - 6;
     past[offset_at..offset_at + 2].copy_from_slice(&40000u16.to_be_bytes());
@@ -1151,31 +987,19 @@ fn a_member_reaching_past_the_data_section_is_refused() {
 
 #[test]
 fn an_array_whose_element_index_is_not_an_arrayinfo_member_is_refused() {
-    // `docs/metadata-encodings.md`: the `0xFFFF` mask alone gives a valid index
-    // in 64,906 of 64,906, so this is checked at construction and
-    // `CodeWalker`'s `0xFFF` re-mask fallback is not implemented.
+    // The `0xFFFF` mask alone gives a valid index in 64,906 of 64,906.
     let mut array = minimal_pso();
     let type_at = minimal_pso().len() - 8;
     array[type_at] = 0x0D; // ARRAY
     array[type_at + 1] = 0x00; // ATARRAY
-    // referenceKey's low half indexes a member; there is only member 0, and it
-    // is this one, whose name is not `ARRAYINFO`.
+    // referenceKey's low half indexes a member, and member 0 is this one.
     assert_eq!(pso_malformed(&array), pso::Malformed::ArrayInfo);
 }
 
 #[test]
 fn a_vector3_is_sixteen_bytes_carrying_three_floats_and_not_twelve() {
-    // `docs/metadata-encodings.md`'s census, `verified`, and §12 wants the fact
-    // to have a test. Nothing about a single `VECTOR3` shows the difference —
-    // three floats are read either way — so this is an inline array of two of
-    // them, where the size is the stride. At twelve the second item would read
-    // the four bytes of padding and the first two floats of the second vector,
-    // and render `0.0, 4.0, 5.0` rather than `4.0, 5.0, 6.0`.
-    //
-    // The mutation matters because it is silent: changed to 12, all 48 tests
-    // stayed green while the rendered XML of 1,483 of the 9,753 shipped files
-    // changed, all four `junctions.pso` among them. The files still convert and
-    // still parse; only the values move.
+    // A single `VECTOR3` shows no difference, so this is an inline array of
+    // two, where the size is the stride: at twelve the second reads padding.
     let xml = pso_xml(&vector3_array_pso());
     let items: Vec<&str> = xml
         .match_indices("pso:float3=\"")
@@ -1235,8 +1059,7 @@ fn vector3_array_pso() -> Vec<u8> {
 
 #[test]
 fn a_payload_missing_a_section_the_walk_needs_is_refused() {
-    // The chain is well formed and lands exactly on the end; what is absent is
-    // the block table and the schema, without which there is nothing to walk.
+    // The chain is well formed; the block table and the schema are absent.
     let payload = minimal_pso();
     let psin_only = &payload[..20];
     assert_eq!(pso_malformed(psin_only), pso::Malformed::MissingSection);
@@ -1244,8 +1067,7 @@ fn a_payload_missing_a_section_the_walk_needs_is_refused() {
 
 #[test]
 fn a_section_too_short_for_its_own_header_is_refused() {
-    // The section chain checks a section against the payload; this is the
-    // check that a section's own header fits inside the length it declared.
+    // A section's own header has to fit inside the length it declared.
     let mut payload = minimal_pso();
     let psch = payload
         .windows(4)
@@ -1259,8 +1081,6 @@ fn a_section_too_short_for_its_own_header_is_refused() {
 #[test]
 fn a_schema_entry_that_is_neither_a_structure_nor_an_enum_is_refused() {
     // The packed word's top byte is 0 for a structure and 1 for an enum.
-    // `docs/metadata-encodings.md` records no third kind, so a file claiming
-    // one is not a file Rockstar's packer wrote.
     let mut payload = minimal_pso();
     let packed = payload.len() - 24;
     payload[packed..packed + 4].copy_from_slice(&0x0200_0001u32.to_be_bytes());
@@ -1269,9 +1089,7 @@ fn a_schema_entry_that_is_neither_a_structure_nor_an_enum_is_refused() {
 
 #[test]
 fn a_structure_whose_declared_length_is_negative_is_refused() {
-    // `structureLength` is an `i32` in the format and a `u32` everywhere here,
-    // so the conversion is where a negative one has to be refused rather than
-    // wrapped into four billion.
+    // `structureLength` is an `i32` in the format and a `u32` everywhere here.
     let mut payload = minimal_pso();
     let length = payload.len() - 20;
     payload[length..length + 4].copy_from_slice(&(-1i32).to_be_bytes());
@@ -1281,9 +1099,7 @@ fn a_structure_whose_declared_length_is_negative_is_refused() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_document_the_corpus_produces_is_well_formed_xml() {
-    // The conversion writes XML by hand rather than through a serialiser, so
-    // that the output is exactly the mapping DR-045 states. This is what says
-    // it is still XML: every one of the 9,753 documents parses.
+    // The conversion writes XML by hand rather than through a serialiser.
     let files = payloads(
         "every_document_the_corpus_produces_is_well_formed_xml",
         pso::MAGIC,
@@ -1307,9 +1123,6 @@ fn every_document_the_corpus_produces_is_well_formed_xml() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn a_dictionary_changes_the_spelling_and_never_the_shape() {
-    // R5.5's claim, as a measurement rather than an assertion: the dictionary
-    // is cosmetic. Two conversions of the same payload, one with names and one
-    // without, differ in what the elements are called and in nothing else.
     let files = payloads(
         "a_dictionary_changes_the_spelling_and_never_the_shape",
         pso::MAGIC,
@@ -1344,12 +1157,7 @@ fn a_dictionary_changes_the_spelling_and_never_the_shape() {
     eprintln!("{resolved} of {} documents changed spelling", files.len());
 }
 
-/// Names measured to occur in the corpus, as a dictionary file.
-///
-/// **Not a shipped dictionary.** DR-006: a 20,300-entry name list derived from
-/// the game is not ours to redistribute. These are the handful the probe of
-/// 2026-08-30 confirmed against real `PSCH` hashes, here so that the test above
-/// resolves something rather than proving nothing.
+/// Names measured to occur in the corpus, and not a shipped dictionary.
 const NAMES_THAT_OCCUR: &str = "\
 CMapTypes
 CBaseArchetypeDef
@@ -1374,10 +1182,7 @@ physicsDictionary
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_name_the_corpus_renders_reads_back_to_the_hash_it_came_from() {
-    // The property R5.5 rests on, over real documents: whatever a name is
-    // spelled as, it names the same `u32` on the way back. A dictionary name
-    // does because `Dictionary::load` checked `joaat(name) == key`; a
-    // `hash_XXXXXXXX` does without the hash function being invoked at all.
+    // Whatever a name is spelled as, it names the same `u32` on the way back.
     let files = payloads(
         "every_name_the_corpus_renders_reads_back_to_the_hash_it_came_from",
         pso::MAGIC,
@@ -1411,15 +1216,8 @@ fn every_name_the_corpus_renders_reads_back_to_the_hash_it_came_from() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_two_cases_the_document_called_undecodable_decode() {
-    // `docs/metadata-encodings.md` recorded 102 `MAP` members and the `ARRAY`
-    // subtype `0x81` as the cases the corpus walk could not decode. Measured
-    // 2026-08-30 while R5.3 was written: both decode, and this is the evidence.
-    //
-    // The wrapped `dataOffset` is the sharper of the two. The document says the
-    // one real member's elements "genuinely begin at byte 170,416", decoding to
-    // plausible world coordinates there and to zeros at the `0x99B0` the field
-    // holds. So the coordinates are what says the multiple was recovered: a
-    // reader that trusted the field would render `0.0, 0.0, 0.0` here.
+    // Two cases the census once called undecodable both decode. A reader that
+    // trusted the wrapped `dataOffset` would render `0.0, 0.0, 0.0` here.
     let files = payloads(
         "the_two_cases_the_document_called_undecodable_decode",
         pso::MAGIC,
@@ -1462,10 +1260,7 @@ const PSO_FIXTURE: &str = "../../fixtures/pso-metadata.json";
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_pso_corpus_is_the_one_the_fixture_describes() {
-    // §12: a file with the right name is not the same file. The fixture holds
-    // one `sha256` of the sorted per-payload digests rather than 9,753 of them
-    // — 391 is a list and 9,753 is a file of its own — and it binds the same
-    // claim: that everything above ran against these bytes.
+    // The fixture holds one `sha256` of the sorted per-payload digests.
     let files = payloads(
         "the_pso_corpus_is_the_one_the_fixture_describes",
         pso::MAGIC,
@@ -1498,9 +1293,7 @@ fn the_pso_corpus_is_the_one_the_fixture_describes() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_section_census_the_document_states_is_what_the_corpus_has() {
-    // `docs/metadata-encodings.md`, Sections, `verified`. §12 wants a test that
-    // fails if a `verified` row stops being true, and this is that row: the
-    // eight tags, their counts, and Σ(section lengths) == file length.
+    // The eight tags, their counts, and Σ(section lengths) == file length.
     let files = payloads(
         "the_section_census_the_document_states_is_what_the_corpus_has",
         pso::MAGIC,
@@ -1563,17 +1356,14 @@ fn only_value(payload: &[u8], names: &Dictionary) -> String {
 
 #[test]
 fn a_fixed_inline_string_stops_at_its_first_nul() {
-    // A `STRING` subtype 0 is a fixed character array — 7,866 members — and the
-    // bytes after its terminator are whatever the packer left there. Reading
-    // the whole field instead would put them in the document.
+    // The bytes after a fixed array's terminator are whatever the packer left.
     let payload = retyped_pso(0x0B, 0, 4 << 16, *b"ab\0Z");
     assert_eq!(only_value(&payload, &Dictionary::default()), "ab");
 }
 
 #[test]
 fn a_null_pointer_is_written_down_rather_than_written_as_empty() {
-    // An absent string and an empty one are different things, and XML gives no
-    // way to tell an empty attribute from a missing value. DR-047.
+    // An absent string and an empty one differ, and XML cannot tell them apart.
     let payload = retyped_pso(0x0B, 1, 0, [0, 0, 0, 0]);
     let xml = String::from_utf8(pso::to_xml(&payload, &Dictionary::default()).expect("converts"))
         .expect("UTF-8");
@@ -1585,9 +1375,7 @@ fn a_null_pointer_is_written_down_rather_than_written_as_empty() {
 
 #[test]
 fn a_hashed_string_is_spelled_by_the_dictionary_and_re_reads_to_its_hash() {
-    // 64,755 `ATNONFINALHASHSTRING` members and 557 `ATFINALHASHSTRING` ones —
-    // 1,120,606 rendered values across the corpus — are `u32`s, so this is
-    // where a dictionary earns its keep and where a wrong one would corrupt.
+    // 1,120,606 rendered values across the corpus are `u32`s.
     let payload = retyped_pso(0x0B, 7, 0, joaat(b"CMapTypes").to_be_bytes());
     assert_eq!(
         only_value(&payload, &Dictionary::default()),
@@ -1598,8 +1386,7 @@ fn a_hashed_string_is_spelled_by_the_dictionary_and_re_reads_to_its_hash() {
     assert_eq!(spelled, "CMapTypes");
     assert_eq!(joaat(spelled.as_bytes()), 0xD98B_B561);
 
-    // And an entry that does not hash to its own key never reaches the
-    // document, so it cannot spell this member as something else. R5.5.
+    // An entry that does not hash to its own key never reaches the document.
     let lying = Dictionary::load("D98BB561 CMapTypes_");
     assert_eq!(lying.rejected.len(), 1);
     assert_eq!(only_value(&payload, &lying.dictionary), "hash_D98BB561");
@@ -1607,9 +1394,8 @@ fn a_hashed_string_is_spelled_by_the_dictionary_and_re_reads_to_its_hash() {
 
 #[test]
 fn a_bitset_names_the_bits_its_own_enum_names_and_numbers_the_rest() {
-    // `docs/metadata-encodings.md`: a `BITSET`'s `referenceKey` is never an
-    // enum hash — 0 of 1,526 — it is `(bitCount << 16) | memberIndex` through
-    // the `ARRAYINFO` indirection, and the enum's entry key is the bit index.
+    // A `BITSET`'s `referenceKey` is `(bitCount << 16) | memberIndex`, and an
+    // entry key is the bit index, never an enum hash.
     let payload = bitset_pso();
     assert_eq!(
         only_value(&payload, &Dictionary::default()),
@@ -1673,17 +1459,9 @@ fn bitset_pso() -> Vec<u8> {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_pso_file_round_trips_byte_for_byte() {
-    // R5.7 for `PSO`, and the exit criterion `docs/backlog.md` states: unedited
-    // in, unedited out, byte-identical, over every `PSO` file in the corpus.
-    //
-    // The trip carries the payload as well as the document, which is DR-049 and
-    // not a weakening of the claim: what is measured here is that the document
-    // describes the payload completely enough for the walk to be replayed
-    // against it — every element in the right place, every type word the one
-    // the schema says, every value readable back to the bytes it came from —
-    // and that the `CHKS` recipe reproduces its own stored value. What the
-    // document cannot carry is `PSIG`, `STRE`, an unreached `PSIN` byte and the
-    // schema itself, and none of those is invented.
+    // The trip carries the payload as well as the document: what the document
+    // cannot carry — `PSIG`, `STRE`, an unreached `PSIN` byte, the schema — is
+    // taken from the payload rather than invented.
     let files = payloads(
         "every_shipped_pso_file_round_trips_byte_for_byte",
         pso::MAGIC,
@@ -1726,10 +1504,6 @@ fn every_shipped_pso_file_round_trips_byte_for_byte() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn a_dictionary_does_not_change_what_a_round_trip_produces() {
-    // R5.5's "cosmetic, not load-bearing" from the write side. The names the
-    // dictionary spells are re-hashed by `from_xml`, so a dictionary that
-    // changes the spelling and changes the bytes would be exactly the silent
-    // corruption `Dictionary::load`'s check exists to prevent.
     let files = payloads(
         "a_dictionary_does_not_change_what_a_round_trip_produces",
         pso::MAGIC,
@@ -1752,16 +1526,9 @@ fn a_dictionary_does_not_change_what_a_round_trip_produces() {
     );
 }
 
-/// The `CHKS` recipe, transcribed here a second time so that agreement with
-/// `rpf-core` is evidence rather than a tautology.
-///
-/// `docs/metadata-encodings.md`, `CHKS`: a Jenkins one-at-a-time hash seeded
-/// `0x3FAC7125` over the **whole file**, each byte taken as a signed `int8`,
-/// with the `fileSize` and `checksum` fields of the trailing `CHKS` zeroed
-/// first. The magic is not reversed and the length field is not overwritten.
-///
-/// Panics if the file carries no `CHKS`, which is a caller's error and not a
-/// checksum of zero.
+/// The `CHKS` recipe, transcribed a second time so agreement with `rpf-core` is
+/// evidence: a Jenkins one-at-a-time hash seeded `0x3FAC7125` over the whole
+/// file, each byte signed, with `fileSize` and `checksum` zeroed first.
 fn chks_of(file: &[u8]) -> u32 {
     let at = chks_at(file).expect("the file carries a CHKS");
     let mut zeroed = file.to_vec();
@@ -1792,17 +1559,8 @@ fn chks_at(payload: &[u8]) -> Option<usize> {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_checksum_recipe_reproduces_every_stored_one() {
-    // `docs/metadata-encodings.md`, `CHKS`: a Jenkins one-at-a-time hash seeded
-    // 0x3FAC7125 over the whole file with each byte signed, the size and the
-    // checksum zeroed first, reproducing the stored value in 8,978 of 8,978
-    // files that carry one. `from_xml` recomputes rather than copies it, so the
-    // recipe being wrong is every file this tool writes being wrong.
-    //
-    // The recipe is computed here, from `docs/metadata-encodings.md` and not
-    // from `rpf-core`. Counting how many files carry a `CHKS` is a census of
-    // the corpus and constrains no code — it is
-    // `the_corpus_carries_a_checksum_in_the_files_the_encodings_say_it_does`,
-    // under the name of what it actually checks.
+    // `from_xml` recomputes the checksum rather than copying it, and the recipe
+    // here is transcribed from the format notes rather than from `rpf-core`.
     let files = payloads(
         "the_checksum_recipe_reproduces_every_stored_one",
         pso::MAGIC,
@@ -1844,9 +1602,7 @@ fn the_checksum_recipe_reproduces_every_stored_one() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_corpus_carries_a_checksum_in_the_files_the_encodings_say_it_does() {
-    // A census of the corpus, and named as one. It constrains nothing in
-    // `rpf-core`; what it is worth is that the number the test above quotes is
-    // the number of files that were actually there to check.
+    // A census: it says the number the test above quotes was there to check.
     let files = payloads(
         "the_corpus_carries_a_checksum_in_the_files_the_encodings_say_it_does",
         pso::MAGIC,
@@ -1880,10 +1636,8 @@ fn sections_of(payload: &[u8]) -> Vec<([u8; 4], u32)> {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn an_edited_value_is_that_value_changed_and_nothing_else() {
-    // The other half of the write path: a round trip that reproduces the file
-    // is only worth something if an edit reaches the bytes. One float is
-    // changed in the first document that has one, and exactly the four bytes
-    // behind it — plus the four the `CHKS` covers — may differ.
+    // A round trip is only worth something if an edit reaches the bytes: one
+    // float, its four bytes and the checksum's four are all that may differ.
     let files = payloads(
         "an_edited_value_is_that_value_changed_and_nothing_else",
         pso::MAGIC,
@@ -1923,10 +1677,6 @@ fn an_edited_value_is_that_value_changed_and_nothing_else() {
     }
     assert!(edited > 0, "no document in the sample carried a float");
 }
-
-// ---------------------------------------------------------------------------
-// `PSO` — R5.4, the write direction
-// ---------------------------------------------------------------------------
 
 /// The `cause` of an [`Error::NotPsoXml`], or a panic naming what was got.
 fn pso_refused(payload: &[u8], document: &str) -> pso::NotPsoXml {
@@ -1972,9 +1722,6 @@ fn the_minimal_pso_round_trips_and_takes_an_edit() {
 
 #[test]
 fn the_schema_comes_from_the_payload_and_the_document_is_checked_against_it() {
-    // R5.4's own wording — "adopting the schema of the file being edited" — as
-    // a test. The document names a member the file's schema does not have there,
-    // and nothing in the document can make that member exist.
     let payload = minimal_pso();
     assert_eq!(
         pso_refused(
@@ -1987,9 +1734,7 @@ fn the_schema_comes_from_the_payload_and_the_document_is_checked_against_it() {
             found: "lodDist".to_owned(),
         }
     );
-    // And a type word that is not the one the schema says. DR-047 writes the
-    // type down on every record precisely so that this is caught here rather
-    // than turning into four bytes of a different shape.
+    // And a type word that is not the one the schema says.
     assert_eq!(
         pso_refused(
             &payload,
@@ -2005,10 +1750,6 @@ fn the_schema_comes_from_the_payload_and_the_document_is_checked_against_it() {
 
 #[test]
 fn a_member_added_or_removed_is_refused_because_the_shape_is_the_payloads() {
-    // A structure's member list and an array's length are facts about the
-    // payload. Changing either needs room the edit cannot make, and DR-052 is
-    // why that is a permanent refusal rather than a missing feature. The
-    // refusal names the element, so a caller is told which one changed.
     let payload = minimal_pso();
     assert_eq!(
         pso_refused(&payload, "<hash_D98BB561 pso:struct=\"hash_D98BB561\"/>"),
@@ -2050,9 +1791,6 @@ fn a_value_that_is_not_of_its_own_declared_type_is_refused() {
 
 #[test]
 fn an_element_with_no_type_word_is_refused_rather_than_inferred() {
-    // DR-047: every record's type is written down. An element without one is
-    // not a document this mapping wrote, and guessing from the spelling is what
-    // DR-043 killed for `RBF` on three measurements.
     let payload = minimal_pso();
     assert_eq!(
         pso_refused(
@@ -2073,8 +1811,6 @@ fn an_element_with_no_type_word_is_refused_rather_than_inferred() {
 
 #[test]
 fn a_string_longer_than_its_room_is_refused_rather_than_made_to_fit() {
-    // A fixed inline string lives in the bytes the structure gave it. Making it
-    // longer moves everything after it, which is a rebuild.
     let payload = string_pso(8);
     let names = Dictionary::default();
     let xml = pso::to_xml(&payload, &names).expect("converts");
@@ -2090,8 +1826,7 @@ fn a_string_longer_than_its_room_is_refused_rather_than_made_to_fit() {
         pso_xml(&edited).contains("pso:string=\"ab\""),
         "a shorter string fits where a longer one was"
     );
-    // Eight bytes of member, seven of room: the terminator is one of the eight,
-    // and 116,507 of 116,507 shipped member strings leave it one. DR-052.
+    // Eight bytes of member, seven of room: the terminator is one of the eight.
     let longer = pso_xml(&payload).replace("pso:string=\"abcdefg\"", "pso:string=\"abcdefgh\"");
     assert_eq!(
         pso_refused(&payload, &longer),
@@ -2148,10 +1883,7 @@ fn string_pso(len: u16) -> Vec<u8> {
 
 #[test]
 fn an_enum_two_keys_render_the_same_name_for_is_refused_rather_than_guessed() {
-    // The one place the inverse of a rendering is not a function. Rendering goes
-    // value to name; two keys carrying one name make the name ambiguous, and
-    // picking one would write a value nobody asked for. 0 shipped files do it,
-    // which is why this is a built case and not a corpus one.
+    // Two keys carrying one name make the name ambiguous on the way back.
     let payload = enum_pso(0x1111_1111, 0x1111_1111);
     let names = Dictionary::default();
     let xml = pso::to_xml(&payload, &names).expect("converts");
@@ -2223,8 +1955,6 @@ fn enum_pso(first: u32, second: u32) -> Vec<u8> {
 
 #[test]
 fn xml_the_write_direction_refuses_is_a_refusal_and_not_corrupt_data() {
-    // §10, R6.3, one encoding over: the payload being wrong is `Corrupt`, the
-    // document being wrong is `Refused`, and the two reach different exit codes.
     let payload = minimal_pso();
     assert_eq!(
         pso::from_xml(&payload, b"<", &Dictionary::default())
@@ -2240,32 +1970,21 @@ fn xml_the_write_direction_refuses_is_a_refusal_and_not_corrupt_data() {
     );
 }
 
-/// Where the counted form sits inside [`counted_string_pso`]'s root, from the
-/// start of the payload.
+/// Where the counted form sits inside [`counted_string_pso`]'s root.
 const COUNTED_AT: usize = 16;
 
-/// Where its `count1` sits, from the start of the payload.
-///
-/// `docs/metadata-encodings.md`, Pointers: the 16-byte counted form is the
-/// pointer, then `count1:u16be`, `count2:u16be`, `unk:u32be`.
+/// Where its `count1` sits: the 16-byte counted form is the pointer, then
+/// `count1:u16be`, `count2:u16be`, `unk:u32be`.
 const COUNT1_AT: usize = COUNTED_AT + 8;
 
-/// The big-endian `u16` at `at`, read straight out of the bytes.
-///
-/// Deliberately not through [`pso::to_xml`]. The reader answers an `ATSTRING`
-/// as `until_nul` of the bytes `count1` covers, so it cannot see a `count1` that
-/// disagrees with what was written — which is exactly the class of error this
-/// pins, and why §8's "every write path has a read path that checks it" needs a
-/// check the read path is not blind to by construction.
+/// The big-endian `u16` at `at`, read straight out rather than through
+/// [`pso::to_xml`], which cannot see a `count1` that disagrees with the text.
 fn half_at(bytes: &[u8], at: usize) -> u16 {
     u16::from_be_bytes(bytes[at..at + 2].try_into().expect("two bytes"))
 }
 
 /// A `PSO` whose one member is an `ATSTRING`: a counted pointer into a second
 /// block holding `GTA V`, its NUL, and filler after it.
-///
-/// The shape `metadata/03698_x64a.rpf_data_levels.ymt` carries at file offset
-/// 984 — `count1 = 5`, `count2 = 6` — reduced to one member.
 fn counted_string_pso() -> Vec<u8> {
     let mut psin = Vec::new();
     psin.extend_from_slice(&pso::MAGIC);
@@ -2319,12 +2038,7 @@ fn counted_string_pso() -> Vec<u8> {
 
 #[test]
 fn a_shortened_counted_string_leaves_no_stale_length_behind() {
-    // `docs/metadata-encodings.md`, Pointers: `count1` is the length. DR-049
-    // blesses shortening, so shortening is the intended edit path — and a
-    // writer that wrote three bytes and left `count1` saying five would ship a
-    // file that contradicts itself. Every assertion here reads the stored
-    // counts out of the bytes rather than through `to_xml`, which answers
-    // `until_nul` of the bytes `count1` covers and therefore cannot see this.
+    // `count1` is the length: three bytes under a count of five contradict.
     let names = Dictionary::default();
     let payload = counted_string_pso();
     assert_eq!(half_at(&payload, COUNT1_AT), 5);
@@ -2364,11 +2078,7 @@ fn a_shortened_counted_string_leaves_no_stale_length_behind() {
 
 #[test]
 fn a_checksum_section_that_is_not_twenty_bytes_is_refused_rather_than_overwritten() {
-    // `docs/metadata-encodings.md`, `CHKS`: twenty bytes in 8,978 of 8,978. The
-    // write direction stamps `fileSize` and `checksum` into it, so a chain
-    // declaring a shorter one would put eight bytes over the tag and length of
-    // whatever follows — and answer a payload whose own section chain no longer
-    // parses.
+    // A `CHKS` is twenty bytes in 8,978 of 8,978, and two fields are stamped in.
     let names = Dictionary::default();
     let mut payload = minimal_pso();
     let plain = payload.len();
@@ -2387,8 +2097,7 @@ fn a_checksum_section_that_is_not_twenty_bytes_is_refused_rather_than_overwritte
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    // The same file with the twenty bytes it always has is stamped, not
-    // refused, and the stamp is the recipe.
+    // The same file with the twenty bytes it always has is stamped.
     let mut good = minimal_pso();
     let at = good.len();
     good.extend_from_slice(b"CHKS");
@@ -2411,11 +2120,7 @@ fn a_checksum_section_that_is_not_twenty_bytes_is_refused_rather_than_overwritte
 
 #[test]
 fn an_array_item_added_or_removed_is_refused_because_the_length_is_the_payloads() {
-    // The second of the three shapes an edit in place cannot change: an array's
-    // length is where its items are, and moving them is a rebuild. DR-052 is
-    // why that is permanent. The refusal names the element the document spells,
-    // which for an array of arrays is the `pso:item` that holds the wrong
-    // number of children.
+    // An array's length is where its items are, and moving them is a rebuild.
     const ITEM: &str = "<pso:item pso:string=\"\"/>";
 
     let payload = nested_arrays_pso(2);
@@ -2446,22 +2151,11 @@ fn an_array_item_added_or_removed_is_refused_because_the_length_is_the_payloads(
 }
 
 /// How many resource `Meta` files both installs ship.
-///
-/// `docs/metadata-encodings.md`, The corpus, corrected — 39,324 `.ymap`, 5,628
-/// `.ytyp` and 4,662 `.ymt`, in 219 archives. §12: a test whose claim is about
-/// this many files is not satisfied by a directory holding one.
 const META_FILES: usize = 49_614;
 
-/// One dumped resource `Meta` payload: its bytes, and the one fact about it
-/// that its bytes do not carry.
-///
-/// A `Meta` is a *paged* payload — system pages, then graphics pages — and
-/// every resource pointer in it resolves against the boundary between the two.
-/// The boundary is the entry's, from `format::resource::size_from_flags` of
-/// its system flags, and nothing in the payload states it. So the dump records
-/// it, in the file's name, and `metadata_dump::system_len_of` is the one place
-/// that convention is read (§3): `tools/metadata-dump` writes it there and
-/// this reads it back.
+/// One dumped resource `Meta` payload: its bytes, and the page boundary they do
+/// not carry. Every resource pointer resolves against the boundary between
+/// system and graphics pages, which the dump records in the file's name.
 #[derive(Debug)]
 struct Dumped {
     /// The inflated payload, exactly as the archive holds it.
@@ -2471,26 +2165,9 @@ struct Dumped {
 }
 
 /// Every resource `Meta` payload under `RPF_METADATA`, one at a time, and how
-/// many there were.
-///
-/// **One payload is held at a time, deliberately.** The dump is 2.85 GB and
-/// both tests below walk it; collecting it into a map held each test's whole
-/// copy for the length of the test, and `cargo test` runs them in parallel, so
-/// the pair peaked at twice the dump. `visit` is handed each payload and the
-/// bytes are dropped before the next file is opened, which makes the walk's
-/// peak one payload rather than the corpus.
-///
-/// Recognition is `meta::identifies` and nothing else: a `Meta` payload has no
-/// magic at its front, so `payloads` above cannot find one.
-///
-/// Two refusals rather than one, and neither can be reached quietly. A dump of
-/// the wrong size is not the corpus this claims something about (§12); and a
-/// `Meta` payload whose name carries no system length is a dump written by
-/// something other than `tools/metadata-dump --kinds meta`, which is a
-/// misconfiguration rather than a missing corpus — `meta::parse` cannot be run
-/// over it at all, and guessing the boundary would be inventing the answer.
-/// Both are raised after the walk, so a caller's own assertion still comes
-/// second: [`refuse`] does not return.
+/// many there were: the dump is 2.85 GB, so one is held at a time. Recognition
+/// is `meta::identifies`, since a `Meta` has no magic at its front; a dump of
+/// the wrong size or without system lengths is refused after the walk.
 fn each_meta_payload(test: &str, mut visit: impl FnMut(&str, &Dumped)) -> usize {
     let Some(root) = env::var_os("RPF_METADATA") else {
         refuse(
@@ -2502,9 +2179,7 @@ fn each_meta_payload(test: &str, mut visit: impl FnMut(&str, &Dumped)) -> usize 
     let Ok(listing) = fs::read_dir(&root) else {
         refuse(test, &format!("{} is not a directory", root.display()));
     };
-    // The names first and sorted, which is what the map this replaced gave for
-    // free: a listing arrives in the filesystem's own order, and a failure
-    // message that changes order between runs is one nobody can diff.
+    // Sorted, because a message whose order changes between runs cannot be diffed.
     let mut paths: Vec<PathBuf> = listing
         .map(|entry| entry.expect("directory entry readable").path())
         .filter(|path| path.is_file())
@@ -2563,22 +2238,9 @@ fn each_meta_payload(test: &str, mut visit: impl FnMut(&str, &Dumped)) -> usize 
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
-    // Five `verified` rows of `docs/metadata-encodings.md`'s resource `Meta`
-    // section, as a test that fails if any of them stops being true: the magic
-    // word at 0x10 in 49,614 of 49,614, the two version words and no third, the
-    // zero at 0x18, the root block a block the table holds, and the three
-    // info-table pointers in the system space.
-    //
-    // The root's *value* is not pinned to 1..8. The probe reported that range
-    // and it is wrong: 237 of the 49,614 carry a root between 9 and 40, every
-    // one of them an interior `.ytyp` with that many data blocks, and every one
-    // of them in range. What is checked is what `parse` checks — that the block
-    // table holds it — and the census of the values is printed rather than
-    // asserted, because nothing about the format bounds it.
-    //
-    // The header alone, deliberately: this is the one claim that holds without
-    // the page boundary, so it fails on a header rather than on a pointer that
-    // could not be resolved. Parsing the whole file is the test below.
+    // Five census rows: the magic word at 0x10, the two version words, the zero
+    // at 0x18, a root the block table holds, and the three info-table pointers
+    // in system space. The root's value is printed rather than pinned.
     let mut failed = Vec::new();
     let mut versions: BTreeMap<u32, usize> = BTreeMap::new();
     let mut roots: BTreeMap<u16, usize> = BTreeMap::new();
@@ -2592,12 +2254,7 @@ fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
                     ("enums", header.enums, header.enum_count),
                     ("blocks", header.blocks, header.block_count),
                 ] {
-                    // A table of nothing points at nothing. Measured on
-                    // `des_canister.ytyp`, a shipped file with six structures,
-                    // eight data blocks and **no enums**, whose enum pointer is
-                    // null: asking a null pointer for its space answers `None`,
-                    // and reading that as "not system-space" failed the file
-                    // for carrying an empty table.
+                    // A null pointer is in no space at all.
                     if count == 0 {
                         assert!(
                             pointer.is_null(),
@@ -2627,13 +2284,8 @@ fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_meta_file_parses_from_the_system_length_its_name_carries() {
-    // What R5.8c is for. `meta::parse` cannot be run over a dumped payload
-    // without the boundary between its system and graphics pages, which is a
-    // fact about the *entry* — `format::resource::size_from_flags` of its
-    // system flags — and appears nowhere in the payload. The dump records it in
-    // each file's name, so the census `docs/metadata-encodings.md` measured by
-    // probe is repeatable here: every file walked from its own tables, with no
-    // builtin table consulted and nothing outside itself referenced.
+    // `meta::parse` needs the page boundary, which is read back out of the
+    // dumped file's name; every file is then walked from its own tables.
     let mut failed = Vec::new();
     let mut structures = 0_usize;
     let mut blocks = 0_usize;
@@ -2658,14 +2310,7 @@ fn every_shipped_meta_file_parses_from_the_system_length_its_name_carries() {
     eprintln!("{count} Meta payloads parsed, {structures} structures and {blocks} data blocks");
 }
 
-// ---------------------------------------------------------------------------
-// Resource-embedded `Meta` — R5.8b, the value walk and the edit that writes it
-// back. Corpus-free: every payload below is assembled byte by byte here, and
-// the one test that needs the dump says so by refusing without it.
-// ---------------------------------------------------------------------------
-
-/// A `Meta` payload under construction, so that a test states the bytes it
-/// means and nothing else.
+/// A `Meta` payload under construction, so a test states the bytes it means.
 struct MetaBytes(Vec<u8>);
 
 impl MetaBytes {
@@ -2734,8 +2379,7 @@ fn meta_header(len: usize) -> MetaBytes {
     payload
 }
 
-/// The smallest file that reaches a value: one structure of one `UINT`, one
-/// data block holding it.
+/// The smallest file that reaches a value: one `UINT` in one data block.
 fn minimal_meta() -> Vec<u8> {
     let mut payload = meta_header(0x100);
     payload
@@ -2762,18 +2406,9 @@ fn minimal_meta() -> Vec<u8> {
     payload.bytes().to_vec()
 }
 
-/// A file whose one member is an inline array of elements **of no width at
-/// all**: a `0x50` whose `arrayInfoIndex` names a `0x05` describing a structure
-/// the file declares zero bytes long.
-///
-/// `referenceKey × 0` is `0` for any count, so the array fits any structure and
-/// every element sits at one address. Nothing in the payload grows with the
-/// count, and the count is a 32-bit field.
-///
-/// ```text
-/// 0x050 the root structure  0x070 the empty one  0x090 the block table
-/// 0x0B0 the root's members  0x0F0 its data
-/// ```
+/// A file whose one member is an inline array of elements of no width at all:
+/// `referenceKey × 0` is `0` for any count, so every element sits at one address
+/// and nothing in the payload grows with the count, which is a 32-bit field.
 fn zero_stride_meta(count: u32) -> Vec<u8> {
     let mut payload = meta_header(0x100);
     payload
@@ -2814,17 +2449,8 @@ fn zero_stride_meta(count: u32) -> Vec<u8> {
 }
 
 /// A file carrying one of every form this build decodes, with `count1` and
-/// `count2` of its counted string chosen by the caller.
-///
-/// The codes are the census's: `0x44` for the counted string and `0x40` for
-/// the inline one, `0x52` for the counted array and `0x50` for the inline one,
-/// `0x59` for a pointer.
-///
-/// ```text
-/// 0x050 structures   0x100 root's members   0x190 the child's member
-/// 0x200 block table  0x300 the root's data  0x380 string  0x390 array
-/// 0x3A0 child
-/// ```
+/// `count2` of its counted string chosen by the caller. The codes are the
+/// census's: `0x44`/`0x40` string, `0x52`/`0x50` array, `0x59` pointer.
 fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
     let mut payload = meta_header(0x400);
     payload
@@ -2863,8 +2489,7 @@ fn rich_meta(count1: u16, count2: u16) -> Vec<u8> {
     // An inline string of eight bytes, whose length is its `referenceKey`.
     member(&mut payload, 0x160, META_INLINE_TEXT, 0x38, 0x40);
     payload.u32(0x16C, 8);
-    // An inline array of two `UINT`, whose count is its `referenceKey` and
-    // whose elements the same `ARRAYINFO` member describes.
+    // An inline array of two `UINT`, whose count is its `referenceKey`.
     member(&mut payload, 0x170, META_INLINE_ARRAY, 0x40, 0x50);
     payload.u16(0x17A, 8).u32(0x17C, 2);
     member(&mut payload, 0x180, META_ARRAYINFO, 0x00, 0x15);
@@ -2962,9 +2587,7 @@ fn every_form_this_build_decodes_is_named_in_the_document() {
 
 #[test]
 fn a_hand_built_meta_round_trips_byte_for_byte() {
-    // DR-049 for `Meta`: the write direction edits the payload the document
-    // came from, so the 2.48% of a payload no walk reaches — the `0xA7` filler
-    // here — survives because nothing looks at it.
+    // The edit is applied to the payload, so bytes no walk reaches survive.
     for payload in [minimal_meta(), rich_meta(6, 6), rich_meta(6, 5)] {
         let xml = meta_xml(&payload);
         assert_eq!(
@@ -2997,8 +2620,7 @@ fn an_edited_value_changes_the_bytes_it_names_and_no_others() {
     assert_eq!(&written[0x304..], &payload[0x304..]);
 }
 
-/// What a payload the document does not fit is refused with, in the write
-/// direction.
+/// What a payload the document does not fit is refused with, when writing.
 fn meta_bad(payload: &[u8], document: &str) -> (u64, meta::Malformed) {
     match meta::from_xml(
         payload,
@@ -3021,14 +2643,8 @@ fn meta_bad_read(payload: &[u8]) -> (u64, meta::Malformed) {
 
 #[test]
 fn a_value_outside_the_block_that_holds_it_is_refused_by_both_directions() {
-    // A structure instance is checked against the length its *block* declares
-    // and not only against the length its structure declares: `fits` is a fact
-    // about the structure, and a block may be shorter than the structure a
-    // pointer says lives in it. The read direction has always bounded every
-    // read by the block; the write direction has to refuse the same payload,
-    // or a document `to_xml` cannot write is one `from_xml` accepts — and the
-    // write runs past the block, over the 7.26% after the last block and the
-    // 2.48% that is unreached and nonzero. DR-049.
+    // A structure instance is checked against its block's declared length as
+    // well: a block may be shorter than the structure a pointer puts in it.
     let document = meta_xml(&minimal_meta());
     let mut payload = minimal_meta();
     payload[0xA4] = 3; // the block's declared length, against a four-byte `UINT`
@@ -3043,9 +2659,7 @@ fn a_value_outside_the_block_that_holds_it_is_refused_by_both_directions() {
 
 #[test]
 fn an_array_item_outside_the_block_that_holds_it_is_refused_by_both_directions() {
-    // The same rule down the array path, where the overrun is a stride at a
-    // time: the file declares two items and a block of one, so the second item
-    // is past the block's end in both directions.
+    // The same rule down the array path: two items declared, a block of one.
     let document = meta_xml(&rich_meta(6, 6));
     let mut payload = rich_meta(6, 6);
     payload[0x224] = 4; // the array block's declared length, against two items
@@ -3059,11 +2673,6 @@ fn an_array_item_outside_the_block_that_holds_it_is_refused_by_both_directions()
 }
 
 /// A `Meta` whose root holds two pointers to one value.
-///
-/// ```text
-/// 0x050 the structure   0x070 its members   0x100 block table
-/// 0x140 the root's data 0x160 the value both pointers name
-/// ```
 fn aliased_meta() -> Vec<u8> {
     let mut payload = meta_header(0x200);
     payload
@@ -3099,10 +2708,7 @@ fn aliased_meta() -> Vec<u8> {
 
 #[test]
 fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() {
-    // DR-059. Two pointers at one value render two elements over one address,
-    // and the last element applied would decide what the file holds — so an
-    // edit of the first is dropped without a word, which is the one outcome
-    // worse than a refusal: the caller is told the write succeeded.
+    // Two pointers at one value would let an edit of one alone be dropped.
     let payload = aliased_meta();
     let document = meta_xml(&payload);
     assert_eq!(
@@ -3115,8 +2721,7 @@ fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() 
         "both pointers render, and both render the same value"
     );
 
-    // Unedited, the two writes agree, so the file is written back byte for
-    // byte: an aliasing payload is still round-tripped.
+    // Unedited, the two writes agree and the file is written back as it was.
     assert_eq!(
         meta::from_xml(
             &payload,
@@ -3157,8 +2762,6 @@ fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() 
 
 #[test]
 fn a_document_that_changes_an_arrays_length_is_refused() {
-    // DR-052: an array's length is a fact about the payload, not about the
-    // document. Nothing here moves a block or re-allocates a page.
     let payload = rich_meta(6, 6);
     let shorter = meta_xml(&payload).replace("    <meta:item meta:uint=\"22\"/>\n", "");
     assert_eq!(
@@ -3228,12 +2831,8 @@ fn a_value_that_does_not_read_back_as_its_own_type_is_refused() {
 
 #[test]
 fn a_reserved_words_value_is_checked_and_not_only_the_word_itself() {
-    // DR-047: the word says what kind of record an element is and its value
-    // says which one — a structure's own type, an array's layout — so a
-    // document naming another type the file declares, or another layout,
-    // describes some other payload and is refused rather than applied to this
-    // one. The value is the half of the attribute a round trip never
-    // disagrees with, and so the half nothing else here asks about.
+    // The reserved word says what kind of record an element is and its value
+    // says which one, so another type or layout describes another payload.
     let payload = rich_meta(6, 6);
     let xml = meta_xml(&payload);
 
@@ -3271,11 +2870,7 @@ fn null_pointer_meta() -> Vec<u8> {
 
 #[test]
 fn a_null_pointer_written_down_as_an_empty_value_of_its_type_is_refused() {
-    // DR-047 from the other side: an absent value and an empty one are
-    // different things, so a null pointer is written down as one — the
-    // reserved word carrying the type the value would have had — and a
-    // document that turns it into an empty structure of that type is not this
-    // file's and is answered rather than applied.
+    // An absent value and an empty one differ, so a null is written down.
     let payload = null_pointer_meta();
     let xml = meta_xml(&payload);
     assert!(
@@ -3306,23 +2901,15 @@ fn a_null_pointer_written_down_as_an_empty_value_of_its_type_is_refused() {
     );
 }
 
-/// A little-endian `u16` at `at` of `bytes`.
-///
-/// Deliberately not through [`meta_xml`], for the reason [`half_at`] is not:
-/// the read direction answers a counted string as `until_nul` of the bytes the
-/// store covers, so it cannot see a count that disagrees with what was
-/// written — which is the class of error the counts below pin.
+/// A little-endian `u16` at `at` of `bytes`, read straight out rather than
+/// through [`meta_xml`], which cannot see a count that disagrees with the text.
 fn meta_half_at(bytes: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(bytes[at..at + 2].try_into().expect("two bytes"))
 }
 
 #[test]
 fn a_shortened_counted_string_is_terminated_where_it_now_ends() {
-    // The store is eight bytes holding a five-byte string, so a three-byte one
-    // has room for a terminator and gets one. A round trip cannot see this:
-    // the value reads back as `GTA` whether the byte after it is a NUL or the
-    // space that was there, and the difference is only found by whatever reads
-    // past the value — which is every reader that is not this one.
+    // An eight-byte store holding five bytes leaves a shorter value its NUL.
     let payload = rich_meta(8, 8);
     let xml = meta_xml(&payload);
     assert!(xml.contains("meta:string=\"GTA V\""), "{xml}");
@@ -3349,12 +2936,8 @@ fn a_shortened_counted_string_is_terminated_where_it_now_ends() {
 
 #[test]
 fn a_counted_string_that_fills_its_room_is_not_terminated_past_that_room() {
-    // The other side of the same guard, and the one that says why it is a
-    // guard rather than an unconditional write: the room is the store less its
-    // terminator, so a value filling it exactly ends at the store's last byte
-    // and there is nowhere left to put a NUL. What terminates it is the count,
-    // which shrinks with it — and the byte past the value belongs to whatever
-    // the packer left there. DR-049.
+    // A value filling the store exactly ends at its last byte, with nowhere for
+    // a NUL: what terminates it is the count, and the byte past it is not ours.
     let payload = rich_meta(8, 8);
     let filled = meta_xml(&payload).replace("meta:string=\"GTA V\"", "meta:string=\"1111111\"");
     let edited = meta::from_xml(
@@ -3378,10 +2961,7 @@ fn a_counted_string_that_fills_its_room_is_not_terminated_past_that_room() {
 
 #[test]
 fn a_shortened_meta_counted_string_leaves_no_stale_length_behind() {
-    // DR-049's amendment, which a shortened `ATSTRING` was found contradicting
-    // in `PSO`: `count1` describes the bytes the edit changed and changes with
-    // them, and `count2` is the capacity of the allocation, which an edit in
-    // place does not touch.
+    // `count1` changes with the bytes; `count2` is the allocation's capacity.
     let payload = rich_meta(8, 8);
     assert_eq!(meta_half_at(&payload, 0x318), 8);
     assert_eq!(meta_half_at(&payload, 0x31A), 8);
@@ -3409,12 +2989,8 @@ fn a_shortened_meta_counted_string_leaves_no_stale_length_behind() {
 
 #[test]
 fn an_inline_array_of_elements_with_no_width_is_refused_rather_than_walked() {
-    // The amplifier a ratio cannot see. An element of width 0 makes an array of
-    // any count occupy no bytes at all, so `fits` passes for every
-    // `referenceKey` there is and the walk writes one element per count — up to
-    // 4,294,967,295 of them — out of a payload that never grows. The node
-    // budget still bounds it, but bounding is not the answer: a stride of zero
-    // describes nothing, and the file is refused where the stride is derived.
+    // An element of width 0 makes an array of any count occupy no bytes, so the
+    // walk writes one element per count out of a payload that never grows.
     let error = meta::to_xml(
         &zero_stride_meta(4_000_000_000),
         zero_stride_meta(0).len(),
@@ -3432,9 +3008,7 @@ fn an_inline_array_of_elements_with_no_width_is_refused_rather_than_walked() {
         "{error:?}"
     );
     assert_eq!(error.category(), Category::Corrupt);
-    // An array of **no elements** is a different thing and is not refused: a
-    // file may describe an element it never instantiates, which is one of the
-    // ways a structure goes unreached.
+    // An array of no elements is not refused: a file may declare and not use.
     let empty = zero_stride_meta(0);
     meta::to_xml(&empty, empty.len(), &Dictionary::default())
         .expect("an empty array asks nothing of its element type");
@@ -3442,9 +3016,7 @@ fn an_inline_array_of_elements_with_no_width_is_refused_rather_than_walked() {
 
 #[test]
 fn a_type_code_outside_the_table_is_refused_rather_than_guessed_at() {
-    // The 23 codes are the census of every member of all 49,614 files, so a
-    // code outside them is one neither shipped build carries and is answered
-    // rather than rendered as whatever width happened to fit.
+    // The 23 codes are the census of every member of all 49,614 files.
     let mut payload = minimal_meta();
     payload[0x78] = 0x7F;
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3463,9 +3035,7 @@ fn a_type_code_outside_the_table_is_refused_rather_than_guessed_at() {
 
 #[test]
 fn a_member_that_does_not_fit_its_own_structure_is_refused() {
-    // The check that catches a width being wrong on a real file: a member's
-    // value has to lie inside the structure whose length the file itself
-    // declares.
+    // A member's value has to lie inside the structure the file declares.
     let mut payload = minimal_meta();
     payload[0x68] = 3; // structLength, against a four-byte `UINT` at offset 0
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3484,9 +3054,7 @@ fn a_member_that_does_not_fit_its_own_structure_is_refused() {
 
 #[test]
 fn an_array_whose_element_member_its_structure_does_not_have_is_refused() {
-    // `docs/metadata-encodings.md`: 925,473 `ARRAYINFO` indices resolved and
-    // **0** unresolvable, so an index that names no member of the owning
-    // structure is a file no packer of Rockstar's wrote.
+    // 925,473 `ARRAYINFO` indices resolved across the corpus, 0 unresolvable.
     let mut payload = rich_meta(6, 6);
     payload[0x14A] = 10; // the array's element index, past the nine members
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3505,10 +3073,7 @@ fn an_array_whose_element_member_its_structure_does_not_have_is_refused() {
 
 #[test]
 fn an_inline_structure_the_file_does_not_define_is_refused() {
-    // The read is driven by the file's own tables and by nothing else — no
-    // builtin table is consulted, because the census found none is needed — so
-    // a member naming a structure the file does not define is answered rather
-    // than looked up somewhere.
+    // The read is driven by the file's own tables and by nothing else.
     let mut payload = minimal_meta();
     payload[0x78] = 0x05; // an inline structure, whose `referenceKey` is 0
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3527,13 +3092,8 @@ fn an_inline_structure_the_file_does_not_define_is_refused() {
 
 #[test]
 fn a_null_pointer_that_still_declares_a_count_is_a_file_contradicting_itself() {
-    // Both counted forms end in the same refusal, and it is about the same
-    // file: a pointer of zero says the value is not there and a count above
-    // zero says how much of it there is. Nothing in the corpus says both, so
-    // the pair is answered rather than resolved in favour of one half — a null
-    // read as an empty run would render a value the file does not hold, and the
-    // count read as a length would read from offset zero of a block the pointer
-    // never named.
+    // A null pointer says the value is not there and a count above zero says
+    // how much of it there is; nothing in the corpus says both.
     let mut string = rich_meta(1, 1);
     string[0x310..0x318].copy_from_slice(&0u64.to_le_bytes());
     assert_eq!(
@@ -3542,8 +3102,7 @@ fn a_null_pointer_that_still_declares_a_count_is_a_file_contradicting_itself() {
         "a counted string of one byte and no pointer"
     );
 
-    // The array shape of it, whose count is `count1` alone: the same
-    // contradiction one member further on.
+    // The array shape of it, whose count is `count1` alone.
     let mut array = rich_meta(6, 6);
     array[0x320..0x328].copy_from_slice(&0u64.to_le_bytes());
     assert_eq!(
@@ -3555,10 +3114,7 @@ fn a_null_pointer_that_still_declares_a_count_is_a_file_contradicting_itself() {
 
 #[test]
 fn a_null_pointer_that_declares_nothing_is_read_rather_than_refused() {
-    // The other half of the same arm, and what says the refusal above is about
-    // the contradiction rather than about the null: a field that is null and
-    // counts nothing is what an absent value looks like, and both forms write
-    // it. A guard that refused every null pointer would refuse this file.
+    // Null and counting nothing is what an absent value looks like.
     let mut empty = rich_meta(0, 0);
     empty[0x310..0x318].copy_from_slice(&0u64.to_le_bytes());
     empty[0x320..0x328].copy_from_slice(&0u64.to_le_bytes());
@@ -3588,20 +3144,10 @@ fn a_null_pointer_that_declares_nothing_is_read_rather_than_refused() {
 const META_TEXT_LEN: usize = 56_000;
 
 /// A file whose one array is `stores.len()` counted strings, each reading the
-/// number of bytes its own row names out of one shared block of text, followed
-/// by a `UINT` at offset 16 of the root's block.
-///
-/// The array is what lets a payload of 60 KB write a document of 16 MB — one
-/// block of text, read once per item — and the stores are what make that
-/// document's length something a test can state to the byte. `root_len` is what
-/// decides whether the `UINT` after the array can be read at all: a block of 16
-/// bytes ends where the array's own field does, so the value at offset 16 is
-/// past it and is refused by a read that charges nothing against the budget.
-///
-/// ```text
-/// 0x050 the root structure  0x0A0 the block table  0x100 its members
-/// 0x200 the root's data     0x300 the array's items, then the text
-/// ```
+/// bytes its own row names out of one shared block of text, then a `UINT` at
+/// offset 16 of the root's block. One block read once per item is what lets a
+/// 60 KB payload write a 16 MB document; at a `root_len` of 16 the block ends
+/// before the `UINT`, which is then unreadable.
 fn counted_strings_meta(stores: &[u16], root_len: u32) -> Vec<u8> {
     const ITEMS_AT: usize = 0x300;
     let items_len = stores.len() * 16;
@@ -3660,38 +3206,19 @@ fn counted_strings_meta(stores: &[u16], root_len: u32) -> Vec<u8> {
 
 #[test]
 fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
-    // The read direction's own half of `document_budget`, ungated and on a
-    // payload built here rather than found: the argument for the bound is
-    // `a_document_is_bounded_in_bytes_and_not_only_in_elements`, and this is
-    // where the `Meta` walk puts it. An element is not a fixed number of bytes,
-    // so no element budget can be the memory bound; this file writes 16 MB of
-    // document out of 60 KB of payload with three hundred elements, which is
-    // three orders of magnitude under the element ceiling and exactly on the
-    // byte one.
-    //
-    // **The boundary is stated as a pair either side of one byte**, which is
-    // what makes it a boundary rather than a direction. The document is charged
-    // before each element is written, so what the last item's charge sees is
-    // everything written before it: at exactly the budget the walk goes on, and
-    // one byte over it stops. What the walk goes on *to* is the `UINT` past the
-    // end of the root's block — a read, refused before it charges anything — so
-    // the two cases answer with different refusals rather than with the same
-    // one at different moments.
+    // 16 MB of document out of 60 KB of payload with three hundred elements:
+    // far under the element ceiling and exactly on the byte one. The charge is
+    // taken before each element, so the two cases answer differently.
     const BUDGET: usize = 16 * 1024 * 1024;
 
-    // What the document costs before its first item, and what an item costs
-    // around its text: measured off the walk's own output rather than counted
-    // out by hand here.
+    // What the document costs before its first item, and an item around its text.
     let one = meta_xml(&counted_strings_meta(&[8], 20));
     let two = meta_xml(&counted_strings_meta(&[8, 8], 20));
     let item_at = one.find("<meta:item").expect("an item is written");
     let prefix = one[..item_at].rfind('\n').expect("a line before it") + 1;
     let overhead = two.len() - one.len() - 8;
 
-    // The stores that put the last item's charge exactly on the budget: as many
-    // whole runs of the text block as fit, one shorter run for the remainder,
-    // and a last item whose own text is written after the charge and so is no
-    // part of the sum.
+    // The stores that put the last item's charge exactly on the budget.
     let whole = (BUDGET - prefix + META_TEXT_LEN) / (overhead + META_TEXT_LEN);
     let remainder = BUDGET - prefix - whole * overhead - (whole - 1) * META_TEXT_LEN;
     assert!(
@@ -3708,8 +3235,7 @@ fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
         stores
     };
 
-    // The budget is the payload's, so the payload has to be inside the floor
-    // for `BUDGET` to be the number this states.
+    // The budget is the payload's, so it has to be inside the floor.
     let payload = counted_strings_meta(&stores(0), 16);
     assert!(
         payload.len() * 256 <= BUDGET,
@@ -3717,8 +3243,7 @@ fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
         payload.len()
     );
 
-    // Exactly on the budget the walk goes on, and the read after it is what
-    // stops the file.
+    // Exactly on the budget the walk goes on, and the read after it stops it.
     assert_eq!(
         meta_bad_read(&payload),
         (0x210, meta::Malformed::DataRange),
@@ -3736,25 +3261,9 @@ fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_meta_file_round_trips_byte_for_byte() {
-    // R5.8b's exit criterion, and it has been run: all 49,614 of 49,614
-    // payloads render and are applied back byte for byte, 2026-09-01, over the
-    // `RPF_METADATA` dump (`docs/metadata-encodings.md`). Setting the gate over
-    // a dump that is not there still fails loudly rather than passing over
-    // nothing — `each_meta_payload` refuses on a count that is not the
-    // corpus's.
-    //
-    // **What it proves is narrower than it looks**, and the difference matters
-    // most for the member widths `kind` derives. `from_xml` applies the
-    // document `to_xml` has just written: every value matches what is already
-    // in the payload, so nothing is written at all, and byte-for-byte equality
-    // is the payload being handed back. What this establishes is that the walk
-    // reached every value without refusing and that the re-parse agreed with
-    // the render, over 1,487,349,189 elements — **not** that a member's width
-    // is right. A wrong stride that lands on nulls, on zeroes or on pointers
-    // that still resolve round-trips byte for byte and renders nonsense. The
-    // widths that are actually pinned are pinned elsewhere: `0x50` by its
-    // product equalling the gap to the next member in 51,168 of 51,168, and the
-    // rest by the extent check and by the census. `kind` says which is which.
+    // Narrower than it looks: `from_xml` applies the document `to_xml` just
+    // wrote, so nothing is written and equality is the payload handed back. It
+    // says the walk reached every value, not that a member's width is right.
     let mut failed = Vec::new();
     let names = Dictionary::default();
     let mut trip = |name: &str, dumped: &Dumped| {

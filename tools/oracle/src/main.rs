@@ -1,10 +1,6 @@
 //! Oracle generator. Runs the reference implementation over an archive and
-//! writes down what it saw, so that our own reader can be checked against
-//! something that is not us.
-//!
-//! This crate is deliberately outside the workspace and is never built by
-//! continuous integration. DR-007: the reference implementation is an oracle,
-//! not a dependency. What gets committed is this program's output.
+//! writes down what it saw, so our own reader can be checked against something
+//! that is not us. Deliberately outside the workspace; its output is committed.
 //!
 //! Usage: `cargo run --release -- <archive.rpf> > ../../fixtures/<name>.json`
 
@@ -104,8 +100,7 @@ fn dump_entry(entry: &RpfEntry) -> EntryDump {
 }
 
 /// Record this archive's entry table, then descend into any nested archive and
-/// record that too. Paths address through the nesting in one string, which is
-/// the shape R6.4 wants.
+/// record that too. Paths address through the nesting in one string.
 fn dump_archives(
     archive: &RpfArchive,
     data: &[u8],
@@ -145,9 +140,8 @@ fn main() -> Result<()> {
         .context("archive path has no file name")?
         .to_owned();
 
-    // No keys. DR-006 keeps key material out of this repository, and the
-    // reference implementation wants a pre-dumped blob we decline to hold. The
-    // oracle therefore covers unencrypted archives only, which DR-007 records.
+    // No keys: key material stays out of this repository, so the oracle covers
+    // unencrypted archives only.
     let file = RpfFile::open(path, None)?;
 
     let mut archives = Vec::new();

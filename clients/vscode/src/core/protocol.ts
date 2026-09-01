@@ -1,9 +1,7 @@
 /**
  * The shapes on the wire, as `crates/rpf/src/serve.rs` writes them.
  *
- * Declarations only: nothing here parses an archive, and nothing here decides
- * anything. `docs/conventions.md` §1 — the client is a transport and an
- * editor-API adapter.
+ * Declarations only: nothing here parses an archive or decides anything.
  */
 
 /** A JSON value, as the wire carries one. */
@@ -22,17 +20,15 @@ export interface Request {
 
 /** The error object a rejected call answers with. */
 export interface WireError {
-    /** Negative is JSON-RPC's own; positive is the exit code. DR-008, DR-010. */
+    /** Negative is JSON-RPC's own; positive is the exit code. */
     code: number;
     message: string;
     /**
      * Where the protocol puts anything more than a code and a sentence.
      *
-     * `reason` is the failure's own name — an `rpf_core::Error` variant, one of
-     * the daemon's own, or JSON-RPC's — and is on every error object the daemon
+     * `reason` is the failure's own name, on every error object the daemon
      * writes. It is a finer classification within a code and never a
-     * replacement for one: DR-010 makes the number the contract, and that is
-     * unchanged. DR-032 §5.
+     * replacement for one: the number is the contract.
      */
     data?: { reason?: string };
 }
@@ -48,11 +44,10 @@ export interface Response {
 /**
  * One progress notification: an object with a `method` and no `id`.
  *
- * `request` is the `id` of the request that started the work when that `id` is
- * small, and a string describing its size when it is not — DR-008's third
- * amendment. `handle` is `null` for a `pack`, which has no session — DR-014.
- * Notifications are dropped when the client is behind, so `skipped` says how
- * many, and nothing may be computed from how many arrived.
+ * `request` is the starting request's `id` when that `id` is small, and a
+ * string describing its size when it is not; `handle` is `null` for a `pack`,
+ * which has no session. Notifications are dropped when the client is behind, so
+ * nothing may be computed from how many arrived.
  */
 export interface Progress {
     handle: number | null;
@@ -92,17 +87,16 @@ export interface ReadEntry {
     /**
      * Which form these bytes are: the entry's own, or its XML view.
      *
-     * Never `'auto'` — that is a question and not an answer. DR-053.
+     * Never `'auto'` — that is a question and not an answer.
      */
     as: Exclude<ViewName, 'auto'>;
     /**
      * What the entry's payload announces itself to be, and `null` when it
      * announces nothing or was not read.
      *
-     * **This is the only thing a client may decide a presentation from.** The
-     * scope boundary is self-describing formats: a `.ymt` is `PSO` in some
-     * archives, `RBF` in others and a resource in most, so an extension is not
-     * evidence about anything. DR-044, DR-053.
+     * **This is the only thing a client may decide a presentation from.** An
+     * extension is not evidence: a `.ymt` is `PSO` in some archives, `RBF` in
+     * others and a resource in most.
      */
     encoding: 'xml' | 'text' | 'rbf' | 'pso' | null;
     bytes: string;
@@ -110,7 +104,7 @@ export interface ReadEntry {
 
 /**
  * What `write`, `delete` and `mkdir` answer. One shape for every method that
- * buffers a change, so a client reads one answer. DR-026.
+ * buffers a change, so a client reads one answer.
  */
 export interface Wrote {
     path: string;
@@ -130,10 +124,8 @@ export interface Renamed {
 /**
  * One change no in-place patch can express, and what it does.
  *
- * A structural change is always a rebuild — an entry added or removed moves the
- * entry table, which moves the names blob, which moves the floor every payload
- * sits above — and the verdict is reached for the whole set before anything is
- * compressed. DR-026.
+ * A structural change is always a rebuild, and the verdict is reached for the
+ * whole set before anything is compressed.
  */
 export interface Structural {
     path: string;
@@ -154,7 +146,7 @@ export interface Committed {
     structural?: Structural[];
 }
 
-/** What `verify` answers, whatever it finds. DR-008's fourth amendment. */
+/** What `verify` answers, whatever it finds. */
 export interface Verified {
     path: string;
     entries_checked: number;
@@ -221,8 +213,7 @@ export interface Discarded {
  * What `forget` answers: one change out of the buffer, and what is left.
  *
  * `forgotten` is false for a path nothing was buffered at, which is not a
- * failure — a client withdrawing a gesture it may never have sent should not
- * have to track that, and `paths` says what is there either way. DR-032 §4.
+ * failure; `paths` says what is there either way.
  */
 export interface Forgotten {
     path: string;

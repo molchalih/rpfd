@@ -1,11 +1,5 @@
-//! The reads both directions of the conversion share.
-//!
-//! One owner for the pointer decode, the bounds-checked reads and the counted
-//! form's arithmetic (`docs/conventions.md` §3), so the `verified` rows those
-//! encode are encoded exactly once. Reading a value and writing one are
-//! opposite operations sharing an itinerary — the relation `rbf`'s
-//! `token::read` and `token::write` stand in — and this is what they genuinely
-//! share.
+//! The reads both directions of the conversion share: pointer decode,
+//! bounds-checked reads, and the counted form's arithmetic.
 
 use crate::{
     error::Result,
@@ -20,8 +14,8 @@ use super::{
 
 /// A place inside a data block: the block, and how far into it.
 ///
-/// Where a value is. A [`super::MetaPointer`] resolves to one and nothing else
-/// does, which is what keeps the two pointer kinds apart at the type level.
+/// Only a [`super::MetaPointer`] resolves to one, which keeps the two pointer
+/// kinds apart at the type level.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Spot<'a> {
     /// The block the value is in.
@@ -31,8 +25,7 @@ pub(super) struct Spot<'a> {
 }
 
 impl<'a> Spot<'a> {
-    /// Where this spot is in the payload, which is what a refusal reports and
-    /// what an edit writes at.
+    /// Where this spot is in the payload.
     pub(super) fn address(self) -> u64 {
         self.block.address(self.offset)
     }
@@ -41,9 +34,7 @@ impl<'a> Spot<'a> {
     ///
     /// # Errors
     ///
-    /// [`Malformed::DataRange`] when the sum does not fit an offset, which is
-    /// checked here rather than at the read so that the failure names the
-    /// arithmetic that produced it.
+    /// [`Malformed::DataRange`] when the sum does not fit an offset.
     pub(super) fn step(self, by: u32) -> Result<Self> {
         let offset = self
             .offset
@@ -59,9 +50,7 @@ impl<'a> Spot<'a> {
     ///
     /// # Errors
     ///
-    /// [`Malformed::DataRange`] when they do not lie inside the block, which is
-    /// §6's rule that every read is bounds-checked against the containing
-    /// declaration — here the length the block's own row states.
+    /// [`Malformed::DataRange`] when they do not lie inside the block.
     pub(super) fn bytes(self, len: u32) -> Result<&'a [u8]> {
         let gone = || bad(self.address(), Malformed::DataRange);
         let from = usize::try_from(self.offset).map_err(|_| gone())?;
@@ -93,8 +82,8 @@ pub(super) struct Values<'a, 'b> {
 impl<'a> Values<'a, '_> {
     /// Where the pointer at `spot` lands, or `None` when it is null.
     ///
-    /// The `Meta` pointer, and never the resource pointer the header's own
-    /// fields carry: `docs/metadata-encodings.md`, Two pointer kinds.
+    /// The `Meta` pointer, never the resource pointer the header's own fields
+    /// carry.
     ///
     /// # Errors
     ///
@@ -120,11 +109,8 @@ impl<'a> Values<'a, '_> {
 
     /// A counted field: where its bytes are, and how many of them it owns.
     ///
-    /// The store is `min(count1, count2)`, which is the bound `PSO` arrived at
-    /// over 39,469 counted strings — the two counts swap roles, and the smaller
-    /// is the one that never claims room the file has not spent. `secondary`
-    /// for this encoding, and every read through it is bounds-checked against
-    /// the block the pointer lands in.
+    /// The store is `min(count1, count2)`: the two counts swap roles, and the
+    /// smaller never claims room the file has not spent.
     ///
     /// # Errors
     ///
@@ -141,12 +127,9 @@ impl<'a> Values<'a, '_> {
 
     /// An array's items: where the first one is, and how many there are.
     ///
-    /// `count1` alone, unlike [`Values::counted`]: for an array the second
-    /// count is the capacity of the allocation and the first is how much of it
-    /// is in use, which is the reading `PSO`'s `ATARRAY` uses over 59,811
-    /// members. An array is never read past `count1` and never written past it
-    /// either — its length is an allocation, and DR-052 refuses a document
-    /// that changes one.
+    /// `count1` alone, unlike [`Values::counted`]: for an array `count2` is the
+    /// allocation's capacity and `count1` how much is in use. An array is never
+    /// read or written past `count1`.
     ///
     /// # Errors
     ///
@@ -171,11 +154,9 @@ pub(super) fn until_nul(bytes: &[u8]) -> &[u8] {
 
 /// How a name hash is spelled in the document.
 ///
-/// The dictionary, and one guard on top of it: a name beginning
-/// [`RESERVED_PREFIX`] is rendered as its placeholder instead. `Dictionary::load`
-/// refuses a name beginning `pso:` because that mapping's vocabulary would
-/// otherwise be ambiguous, and this encoding's prefix is a different string, so
-/// the guard is asked here rather than left to a check that does not cover it.
+/// The dictionary, plus one guard: a name beginning [`RESERVED_PREFIX`] is
+/// rendered as its placeholder instead, since `Dictionary::load` guards only
+/// its own prefix.
 pub(super) fn spell(names: &Dictionary, hash: u32) -> String {
     let name = names.render(hash);
     if name.starts_with(RESERVED_PREFIX) {
