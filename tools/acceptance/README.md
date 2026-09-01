@@ -30,6 +30,36 @@ Paths come from the environment where they differ per machine:
 `RPF_ACCEPT_SERVER`, `RPF_ACCEPT_DLC`, `RPF_ACCEPT_CLIENT`, `RPF_ACCEPT_ADDR`,
 `RPF_ACCEPT_STATE`, `RPF_BIN`.
 
+## Two rules for staging, both measured the hard way
+
+**The archive must differ in LENGTH from the last one served.** A same-length,
+different-content `dlc.rpf` is not re-fetched by the client — measured
+2026-09-01, and invisible in the console line, because two archives descended
+from one edit both answer `class=1`. If a perturbation does not change the
+length, change it deliberately: an extra small entry does it. A differing length
+is **necessary and not sufficient** — a reconnect has been seen to decline a
+refetch across a 512-byte difference — so it does not replace the rule below.
+
+**The join must be a fresh start from the launcher, not a reconnect.** A DLC
+pack is mounted at game start, so a client that downloads a newly staged archive
+after it started is still running the previous one.
+
+`acceptance.sh` decides both from four timestamps — when it staged, the mtime of
+the archive in the client's package cache, the `started at` line of
+`clientdata/main_logs.txt`, and the `at=` of the report line itself. A run is
+readable only when they are in that order:
+
+```
+staged <= cached <= client started <= reported
+```
+
+The fourth exists because the first three describe the machine as it is *now*,
+not the transcript in the log: a report written before the current client
+started came from the previous one. `acceptance.sh` prints `delivery: fresh` or
+`delivery: VOID …` with the reason. **Read the `delivery:` line before the
+`result:` line** — five joins have printed a passing-looking class value for an
+archive their run was not about.
+
 ## What it answers, and in whose vocabulary
 
 `docs/acceptance.md` §5's, and it invents no class of its own:

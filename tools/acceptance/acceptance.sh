@@ -117,14 +117,25 @@ stage() {
 cache_dir() {
     local want
     want=$(cat "$STATE_DIR/staged.size" 2>/dev/null || echo 0)
-    local d f
+    [ "$want" -gt 0 ] || return 1
+    local d hit
     for d in "$CLIENT_ROOT"/client_resources/*/; do
         [ -d "$d" ] || continue
-        for f in "$d"*; do
-            [ -f "$f" ] || continue
-            if [ "$(stat -c %s "$f")" = "$want" ]; then printf '%s\n' "$d"; return 0; fi
-        done
+        # A server's package directory holds a handful of files. The one other
+        # directory here is a 26 GB production server's cache with tens of
+        # thousands, and walking it costs minutes, so it is skipped by count
+        # before anything is stat'ed.
+        [ "$(ls -1 "$d" 2>/dev/null | head -64 | wc -l)" -lt 64 ] || continue
+        hit=$(find "$d" -maxdepth 1 -type f -size "${want}c" -print -quit 2>/dev/null)
+        [ -n "$hit" ] && { printf '%s\n' "$d" | tee "$STATE_DIR/cache.dir"; return 0; }
     done
+    # Not found by length is itself informative — the client holds no copy of
+    # what is staged — so fall back to the directory a previous run identified,
+    # which is what lets the delivery gate say VOID rather than say nothing.
+    if [ -s "$STATE_DIR/cache.dir" ]; then
+        cat "$STATE_DIR/cache.dir"
+        return 0
+    fi
     return 1
 }
 
@@ -144,8 +155,9 @@ cache_dir() {
 #
 # Deliverable is `staged <= cached <= started`.
 delivery_note() {
+    local log_file=${1:-}
     local main=$CLIENT_ROOT/clientdata/main_logs.txt
-    local d big started_at cached_at staged_at ok=0
+    local d big started_at cached_at staged_at reported_at ok=0
     d=$(cache_dir) || return 0
     big=$(ls -S "$d" 2>/dev/null | head -1)
     [ -n "$big" ] || return 0
@@ -173,6 +185,28 @@ delivery_note() {
         ok=1
     else
         printf '%s\n' 'delivery: fresh - the staged archive was fetched before this client started.'
+    fi
+
+    # The three timestamps above describe the machine as it is NOW. They do not
+    # say that the transcript in the run log came from the client they describe:
+    # a report written before the current client started is a report from the
+    # previous one, and it will sit in the log looking like a result. So the
+    # report's own time is the fourth timestamp, and the order that makes a run
+    # readable is  staged <= cached <= started <= reported.
+    if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+        reported_at=$(grep -a '^rpf:acceptance' "$log_file" | tail -1 |
+            sed -n 's/.*at=\([0-9T:.-]*Z\).*/\1/p')
+        if [ -n "$reported_at" ]; then
+            reported_at=$(date -d "$reported_at" +%s 2>/dev/null) || reported_at=
+        fi
+        if [ -n "$reported_at" ]; then
+            printf 'delivery: reported %s\n' "$(date -d "@$reported_at" '+%F %T')"
+            if [ "$reported_at" -lt "$started_at" ]; then
+                printf '%s\n' 'delivery: VOID - this transcript predates the running client.'
+                printf '%s\n' 'delivery: it was reported by the client before this one, about the archive before this one.'
+                ok=1
+            fi
+        fi
     fi
     return $ok
 }
@@ -207,7 +241,7 @@ classify() {
     failure=$(grep -a '^rpf:error' "$log_file" | tail -1 || true)
     [ -n "$failure" ] && printf 'probe error: %s\n' "$failure"
     breadcrumb=$(grep -a '^rpf:probe' "$log_file" | tail -1 || true)
-    delivery_note || true
+    delivery_note "$log_file" || true
 
     # The exit code is printed as well as returned, because a caller that pipes
     # this through `tail` reads the pipe's status and not the harness's.
