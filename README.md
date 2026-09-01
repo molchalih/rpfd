@@ -1,24 +1,10 @@
-<img src=".github/banner.svg" alt="rpf" width="820">
-
-# rpf
+<img src=".github/banner.svg" alt="rpf" width="800">
 
 A dependency-light Rust toolchain for reading, editing and rebuilding RPF7
 archives — the `dlc.rpf` files RAGE Multiplayer and FiveM servers hand to their
 clients, and the archives Grand Theft Auto V ships. One command-line binary with
 no runtime prerequisite; the same code serves JSON-RPC, which a VS Code
 extension uses to open entries as ordinary files.
-
-## What it does
-
-- Lists, reads, writes, adds, removes and renames entries, addressing through
-  nested archives with a single path, encrypted or not.
-- Converts the binary metadata encodings — `RBF`, `PSO` and the
-  resource-embedded `Meta` — to XML, and reads the XML back into the entry.
-- Patches in place when the new payload fits, rebuilds when it does not, and
-  says which it did.
-- Extracts to a directory tree, packs a tree back, verifies against the
-  checksums the extraction recorded.
-- Reports as JSON on every command, and answers the same objects over JSON-RPC.
 
 ## Formats
 
@@ -45,12 +31,31 @@ is under the transform.
 
 ## Installing
 
-No published release yet. The toolchain is pinned in `rust-toolchain.toml`.
+Prebuilt binaries for macOS, Windows and Linux are attached to each release. To
+build from source instead — the toolchain is pinned in `rust-toolchain.toml`:
 
 ```
 git clone <this repository> && cd rpf
 cargo build --release          # target/release/rpf
 ```
+
+Encrypted archives need key material, which is extracted from your own
+installation:
+
+```
+$ rpf keys extract GTA5.exe         # the AES key and the hash lookup table
+$ rpf keys extract Launcher.exe     # the second AES key, carried by no game executable
+$ rpf keys extract <memory image>   # the NG expanded keys and decrypt tables
+```
+
+No key material is bundled here, and none ever will be. Each source is cached
+under the hash of its own bytes in `./keys`, which every command that opens an
+archive consults without a flag; `--cache-dir` selects another cache, and is the
+one way to keep several installations apart. `rpf keys invalidate` empties a
+cache. No command prints a key — only offsets, lengths, counts and paths. NG
+material stands in the clear only in a memory image of a running game, which is
+therefore the sole route to an NG archive; obtaining such an image is out of
+scope here. An archive whose material is absent fails rather than guessing.
 
 ## Usage
 
@@ -122,51 +127,6 @@ Every reporting command takes `--json`. `rpf --help` lists the rest, and
 `clients/agent/README.md` is the page for driving the tool from a program: the
 JSON shapes, what each exit code means for a caller, the failure object `--json`
 answers with, and `cat --out` for a payload nobody is going to read.
-
-## Key material
-
-**No key material is bundled here, and none ever will be.** It comes from your
-own installation. An executable carries the AES key and the hash lookup table,
-which is everything an AES archive needs:
-
-```
-$ rpf keys extract GTA5.exe
-source      GTA5.exe
-sha256      677e4e355cfbdb13273b1d992407e3c261b3a108dc4dd5c8a0c4c1da651802e5
-found in    this source
-aes key     32 bytes at 0x1e34c98
-hash lut    256 bytes at 0x1b7bcc0
-ng material not in this source (an executable never carries it; it is in the clear only in a memory image of a running game)
-cache       ./keys
-```
-
-`Launcher.exe` reports a `launcher` line as well: that is the second AES key,
-and no game executable carries it.
-
-The NG expanded keys and decrypt tables are in the clear only in a memory image
-of a running game, so `rpf keys extract <memory image>` is the only source of
-them — and therefore the only route to reading or writing an NG archive. How to
-obtain such an image is out of scope here.
-
-```
-$ rpf keys cache
-cache   ./keys
-entries 1
-```
-
-The cache holds one entry per source file, under the hash of that file. Material
-is identified by the hash of each value's own bytes; no command prints a key,
-only offsets, lengths, counts and paths. Once cached, every command that opens
-an archive finds it — no flag to pass. `--cache-dir` names another cache, and is
-the one way to keep several installations apart; it is global, so every command
-that opens an archive takes it too. `rpf keys invalidate` empties a cache.
-
-An NG archive opened without a memory image fails rather than guessing:
-
-```
-$ rpf ls dlc.rpf
-rpf: archive is encrypted (tag 0x0fefffff); no key material available
-```
 
 ## The daemon
 

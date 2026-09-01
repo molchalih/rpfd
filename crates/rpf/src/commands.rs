@@ -340,38 +340,35 @@ fn report_written(destination: &Path, len: u64, json_out: bool) {
 
 /// Whether standard output is a regular file: the one destination that can hold
 /// a payload nobody is going to read.
-fn holds_payloads() -> bool {
-    duplicated_stdout().is_some_and(|out| out.metadata().is_ok_and(|it| it.is_file()))
-}
-
-/// Standard output as a file this process owns and closes, on a platform whose
-/// descriptors can be duplicated.
+///
+/// On a platform whose descriptors can be duplicated, the duplicate's metadata
+/// answers it.
 #[cfg(unix)]
-fn duplicated_stdout() -> Option<fs::File> {
+fn holds_payloads() -> bool {
     use std::os::fd::AsFd as _;
     std::io::stdout()
         .as_fd()
         .try_clone_to_owned()
         .ok()
         .map(fs::File::from)
+        .is_some_and(|out| out.metadata().is_ok_and(|it| it.is_file()))
 }
 
-/// Standard output as a file this process owns and closes, on a platform whose
-/// handles can be duplicated.
+/// Whether standard output is a regular file: the one destination that can hold
+/// a payload nobody is going to read.
+///
+/// A pipe's handle carries a file's attributes here, so metadata would call a
+/// pipe a file. Only the handle's own type tells the two apart.
 #[cfg(windows)]
-fn duplicated_stdout() -> Option<fs::File> {
-    use std::os::windows::io::AsHandle as _;
-    std::io::stdout()
-        .as_handle()
-        .try_clone_to_owned()
-        .ok()
-        .map(fs::File::from)
+fn holds_payloads() -> bool {
+    winapi_util::file::typ(std::io::stdout()).is_ok_and(|it| it.is_disk())
 }
 
-/// Standard output as a file, on a platform that will not say: never one.
+/// Whether standard output is a regular file, on a platform that will not say:
+/// never one.
 #[cfg(not(any(unix, windows)))]
-fn duplicated_stdout() -> Option<fs::File> {
-    None
+fn holds_payloads() -> bool {
+    false
 }
 
 /// Bytes onto standard output, under the rule that a destination which is not a

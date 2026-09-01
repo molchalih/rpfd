@@ -23,10 +23,12 @@ mod common;
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
 /// How long a wait on a thread of this file's own may take before it is a failure.
+#[cfg(unix)]
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Joins `handle` within [`PATIENCE`], failing rather than waiting for ever on
 /// the thread `what` names.
+#[cfg(unix)]
 #[track_caller]
 fn join_within<T>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
     let started = std::time::Instant::now();
