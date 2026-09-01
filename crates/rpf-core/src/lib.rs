@@ -1,7 +1,4 @@
 //! Reading, editing and rebuilding RAGE Package File (`.rpf`) archives.
-//!
-//! Version-specific facts live behind [`format::Version`]; `RPF7` is its only
-//! implementation.
 
 pub mod archive;
 pub mod build;

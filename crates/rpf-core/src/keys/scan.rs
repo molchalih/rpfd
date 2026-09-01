@@ -13,41 +13,21 @@ use crate::{
     watch::{Flow, Step, Watch},
 };
 
-/// A value to be found by the SHA-1 of its exact bytes.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Anchor {
-    /// How many bytes the value occupies.
     pub(super) len: usize,
-    /// SHA-1 of those bytes.
     pub(super) digest: [u8; ANCHOR_DIGEST_LEN],
 }
 
-/// A value that was found, and where.
 #[derive(Debug)]
 pub(super) struct Sighting {
-    /// Offset in the source, from its start.
     pub(super) offset: u64,
-    /// The bytes themselves.
     pub(super) bytes: Vec<u8>,
 }
 
-/// How far the window advances between reads, in bytes.
 const STRIDE: usize = 1 << 20;
 
 /// Finds each of `anchors`, returning a slot per anchor in the same order.
-///
-/// A slot is `None` when nothing in the source hashed to that anchor. Where a
-/// value occurs more than once the lowest offset is reported, and every anchor
-/// carrying that digest is filled from it.
-///
-/// `what` names the material for the watcher, which is told once per block
-/// read. A scan that has found everything stops where it is, so the last step
-/// can name fewer blocks than the total.
-///
-/// # Errors
-///
-/// [`Error::Io`] if the source cannot be read, naming the offset reached;
-/// [`Error::Cancelled`] if the watcher said to stop.
 pub(super) fn find<S: Read + Seek, W: Watch>(
     source: &mut S,
     anchors: &[Anchor],
@@ -134,7 +114,6 @@ pub(super) fn find<S: Read + Seek, W: Watch>(
     Ok(found)
 }
 
-/// Reads until `buffer` is full or the source ends, and says how much arrived.
 fn fill<S: Read>(source: &mut S, buffer: &mut [u8], base: u64) -> Result<usize> {
     let mut filled = 0_usize;
     while filled < buffer.len() {
@@ -175,10 +154,8 @@ mod tests {
         watch::{Flow, Step, Watch},
     };
 
-    /// What the tests here call the material they plant.
     const SEARCHING: &str = "a planted value";
 
-    /// A search nobody is watching.
     fn look<S: std::io::Read + std::io::Seek>(
         source: &mut S,
         anchors: &[Anchor],
@@ -186,7 +163,6 @@ mod tests {
         find(source, anchors, SEARCHING, &mut Unwatched)
     }
 
-    /// Every step it was told about.
     #[derive(Default)]
     struct Seen(Vec<(String, u32, u32, u64)>);
 
@@ -198,7 +174,6 @@ mod tests {
         }
     }
 
-    /// A watcher that stops after `after` steps.
     struct Stops {
         after: u32,
         seen: u32,
@@ -215,7 +190,6 @@ mod tests {
         }
     }
 
-    /// A block of bytes that will not occur by accident.
     fn planted(seed: u8, len: usize) -> Vec<u8> {
         (0..len)
             .map(|i| {
@@ -255,9 +229,6 @@ mod tests {
 
     #[test]
     fn a_value_off_the_alignment_is_not_found() {
-        // The scan steps eight bytes at a time, so a value not beginning on an
-        // eight-byte boundary is invisible to it. Pinned rather than fixed:
-        // the stride is what makes the scan affordable.
         let value = planted(5, 32);
         let mut hay = haystack(4096);
         plant(&mut hay, 2044, &value);
@@ -279,8 +250,6 @@ mod tests {
 
     #[test]
     fn a_value_straddling_a_read_boundary_is_found() {
-        // The buffer is a stride plus the longest anchor, so consecutive reads
-        // overlap and a value can span the boundary.
         let value = planted(11, 1024);
         let at = STRIDE - 512;
         let mut hay = haystack(STRIDE * 2);
@@ -307,8 +276,6 @@ mod tests {
 
     #[test]
     fn two_anchors_of_one_value_are_both_filled() {
-        // Many NG decrypt-table anchors repeat an earlier one, so one sighting
-        // has to fill every slot that asked for it.
         let value = planted(19, 1024);
         let mut hay = haystack(8192);
         plant(&mut hay, 2048, &value);
@@ -327,8 +294,6 @@ mod tests {
 
     #[test]
     fn a_source_that_is_exactly_the_value_finds_it() {
-        // A read shorter than the anchor holds no window and is skipped; a read
-        // of exactly the anchor holds one.
         let value = planted(53, 32);
         let found = look(&mut Cursor::new(value.clone()), &[anchor(&value)]).unwrap();
         let sighting = found[0]
@@ -347,8 +312,6 @@ mod tests {
 
     #[test]
     fn a_scan_reports_one_step_per_block_and_counts_bytes_read() {
-        // The step is a block because that is where the reads are, and where a
-        // cancellation can land.
         let absent = planted(29, 32);
         let mut watching = Seen::default();
         let end = STRIDE * 3 + 17;
@@ -374,8 +337,6 @@ mod tests {
 
     #[test]
     fn a_scan_that_finds_everything_stops_before_the_end() {
-        // A complete search ends early, and the watcher sees fewer steps than
-        // the total rather than a stall.
         let value = planted(31, 32);
         let mut hay = haystack(STRIDE * 3);
         plant(&mut hay, 512, &value);
@@ -426,8 +387,6 @@ mod tests {
         assert!(watching.0.is_empty(), "{:?}", watching.0);
     }
 
-    /// A source that answers `EINTR` before each of its first `left` reads and
-    /// its own bytes after that.
     struct Interrupting {
         inner: Cursor<Vec<u8>>,
         left: usize,
@@ -449,7 +408,6 @@ mod tests {
         }
     }
 
-    /// A source that hands over `head` and then fails once, permanently.
     struct Failing {
         head: Vec<u8>,
         at: usize,
@@ -498,8 +456,6 @@ mod tests {
 
     #[test]
     fn a_read_that_actually_fails_is_reported_with_how_far_it_got() {
-        // An error that is not `Interrupted` ends the scan and names the offset
-        // reached, rather than being retried or taken for the end of the source.
         let value = planted(47, 32);
         let head = haystack(512);
         let mut source = Failing {
@@ -516,8 +472,6 @@ mod tests {
         }
     }
 
-    /// A source that fills whatever it is handed in one call, and refuses to
-    /// be asked again once there is nothing left to fill.
     struct FillsOnceAndRefusesAnEmptyAsk;
 
     impl std::io::Read for FillsOnceAndRefusesAnEmptyAsk {

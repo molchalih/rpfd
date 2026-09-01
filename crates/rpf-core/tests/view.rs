@@ -1,10 +1,5 @@
-//! Reading an entry as XML and writing a document back into it through
-//! `rpf_core::view`: which entries have a view, what a request for one they
-//! have not answers, that a converted write is a write of the entry's own
-//! encoding, and that a resource is never sniffed for one.
-//!
-//! Corpus-free; the `PSO` cases here are about routing rather than about a
-//! `PSO` file.
+//! Reading an entry as XML and writing a document back through
+//! `rpf_core::view`.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -24,9 +19,8 @@ use rpf_core::{
 
 const AT: &str = "data/thing.ymt";
 
-/// The document the `RBF` fixture is built from, and converts back to: one
-/// string attribute and one value record, the pair that cannot be told apart by
-/// how they are spelled.
+/// One string attribute and one value record: the pair that cannot be told
+/// apart by how they are spelled.
 const DOCUMENT: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                         <Root name=\"hello\">\n  \
                         <count rbf:uint=\"7\"/>\n\
@@ -133,7 +127,6 @@ fn an_rbf_entry_reads_as_the_document_and_says_what_it_holds() {
 
 #[test]
 fn a_document_that_was_not_edited_writes_the_identical_payload_back() {
-    // A read and a write with no edit between them must leave the entry alone.
     let payload = rbf_payload(DOCUMENT);
     let viewed = read(archive_holding(&payload), View::Xml).expect("has a view");
     let written = apply(archive_holding(&payload), View::Xml, &viewed.bytes).expect("applies");
@@ -188,9 +181,8 @@ fn a_resource_entry_does_not_claim_an_xml_view_whatever_its_payload_says() {
 
 #[test]
 fn a_resource_entry_takes_no_document_whatever_its_payload_begins_with() {
-    // The write side of the row above: dispatching on a resource payload's own
-    // leading bytes would write a tokenised payload into a resource entry when
-    // its first four bytes happen to be `RBF0`.
+    // Dispatching on the payload's leading bytes would tokenise into a resource
+    // entry whose first four bytes happen to be `RBF0`.
     let bytes = build_with(
         FileKind::Resource {
             declared: Some(ResourceFlags {
@@ -203,8 +195,7 @@ fn a_resource_entry_takes_no_document_whatever_its_payload_begins_with() {
     let refused = apply(bytes.clone(), View::Xml, EDITED.as_bytes())
         .expect_err("a resource has no view to write into");
     assert_eq!(refused.name(), "NoXmlView");
-    // `auto` refuses too: handing the document back for the commit to write
-    // would be a silent replacement, not a fallback.
+    // `auto` refuses too: handing the document back would be a silent replacement.
     let refused =
         apply(bytes, View::Auto, EDITED.as_bytes()).expect_err("auto has nothing to apply to");
     assert_eq!(refused.name(), "NoXmlView");
@@ -212,8 +203,7 @@ fn a_resource_entry_takes_no_document_whatever_its_payload_begins_with() {
 
 #[test]
 fn a_pso_entry_is_asked_of_the_pso_codec_and_not_of_the_other_one() {
-    // Routing only: `NoXmlView` here would mean the entry reached no codec, and
-    // `NotRbf` that it reached the wrong one.
+    // `NoXmlView` would mean no codec was reached, `NotRbf` the wrong one.
     let refused = read(
         archive_holding(b"PSIN\x01\x02\x03\x04sections here"),
         View::Xml,
@@ -240,7 +230,6 @@ fn a_plain_xml_entry_is_its_own_view_and_an_edit_of_it_is_the_document() {
 
 #[test]
 fn auto_hands_a_payload_that_is_not_a_document_to_the_entry_untouched() {
-    // `auto` must never turn a write `raw` would take into a refusal.
     let held = rbf_payload(DOCUMENT);
     let other = rbf_payload(EDITED);
     assert_eq!(
@@ -249,7 +238,7 @@ fn auto_hands_a_payload_that_is_not_a_document_to_the_entry_untouched() {
     );
 }
 
-/// The write that goes through `edit`, which is where DR-050's rule is asked.
+/// The write that goes through `edit`, where the encoding rule is asked.
 fn commits(archive_bytes: Vec<u8>, payload: &[u8]) -> rpf_core::Result<Vec<u8>> {
     let mut src = Cursor::new(archive_bytes);
     let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("opens");
@@ -275,8 +264,7 @@ fn commits(archive_bytes: Vec<u8>, payload: &[u8]) -> rpf_core::Result<Vec<u8>> 
 
 #[test]
 fn converting_is_not_a_way_round_the_guardrail_that_refuses_a_document() {
-    // The document itself is still refused; the payload that same document
-    // converts to is taken, because it is `RBF`.
+    // The document is refused; what it converts to is taken, because it is `RBF`.
     let held = rbf_payload(DOCUMENT);
     let refused = commits(archive_holding(&held), EDITED.as_bytes())
         .expect_err("a document is not a payload");
@@ -299,8 +287,6 @@ fn converting_is_not_a_way_round_the_guardrail_that_refuses_a_document() {
 
 #[test]
 fn a_document_that_does_not_describe_the_entry_is_refused_rather_than_taken() {
-    // `--as xml` is not a way to smuggle arbitrary bytes past the rule: a
-    // document this entry cannot take never becomes a payload at all.
     let held = rbf_payload(DOCUMENT);
     let refused = apply(
         archive_holding(&held),
@@ -314,19 +300,14 @@ fn a_document_that_does_not_describe_the_entry_is_refused_rather_than_taken() {
     );
 }
 
-// A resource whose payload comes apart exactly as intended and is not a `Meta`
-// has no view, and `auto`'s fallback for "no view" must not hand the offered
-// document back as the resource's payload.
-
 /// The flag words of a one-page resource: 512 bytes of system and no graphics.
 const RESOURCE_FLAGS: ResourceFlags = ResourceFlags {
     system: 0xA800_0000,
     graphics: 0x2000_0000,
 };
 
-/// A resource payload that comes apart and is not a `Meta`: 24 opaque bytes,
-/// then 512 zero bytes deflated, inflating to exactly the length
-/// [`RESOURCE_FLAGS`] declares.
+/// 24 opaque bytes, then 512 bytes deflated, inflating to exactly the length
+/// [`RESOURCE_FLAGS`] declares; it comes apart and is not a `Meta`.
 fn plain_resource(fill: u8) -> Vec<u8> {
     use std::io::Write as _;
     let mut payload = vec![0xFF_u8; 24];
@@ -342,9 +323,8 @@ fn payload_in(bytes: Vec<u8>) -> Vec<u8> {
     archive.extract(&mut src, index).expect("extracts")
 }
 
-/// What lands on disk when `offered` is written into the one entry as `view` —
-/// `view::apply` and then the rebuild. Refused or taken, what matters is the
-/// payload that ends up in the archive.
+/// The payload that ends up in the archive when `offered` is written into the
+/// one entry as `view`, refused or taken.
 fn landed(bytes: Vec<u8>, view: View, offered: &[u8]) -> Vec<u8> {
     match apply(bytes.clone(), view, offered) {
         Ok(payload) => payload_in(commits(bytes, &payload).expect("the archive rebuilds")),
@@ -401,9 +381,8 @@ fn a_resource_that_is_not_a_meta_takes_no_document_and_the_bytes_prove_it() {
 
 #[test]
 fn a_resource_whose_row_is_corrupt_refuses_a_write_rather_than_overwriting_it() {
-    // The read runs before `auto` decides anything, so a row no reader can
-    // follow takes no write: it would put bytes at an offset nobody can name.
-    // `--as raw` is the escape hatch.
+    // A row no reader can follow takes no write: it would put bytes at an offset
+    // nobody can name. `--as raw` is the escape hatch.
     let mut bytes = build_with(
         FileKind::Resource {
             declared: Some(RESOURCE_FLAGS),
@@ -416,8 +395,7 @@ fn a_resource_whose_row_is_corrupt_refuses_a_write_rather_than_overwriting_it() 
     let row = 16 + 16 * 2;
     bytes[row + 5..row + 8].copy_from_slice(&[0xFF, 0xFF, 0xFF]);
 
-    // By name rather than through `Archive::locate`, which reads the entry to
-    // see whether it nests an archive and fails on this row first.
+    // By name, not `Archive::locate`, which reads the entry and fails on this row.
     let mut src = Cursor::new(bytes);
     let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("the archive still opens");
     let index = archive.find(AT).expect("the entry is still listed");

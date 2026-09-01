@@ -1,15 +1,4 @@
-//! The XML read back, and applied to the file it was written from.
-//!
-//! This takes the original payload as well as the document, because a `PSO`
-//! file carries bytes the document does not: an opaque `PSIG`, an encrypted
-//! `STRE`, a `PSCH` describing structures the data never instantiates, and
-//! `PSIN` no walk from the root reaches.
-//!
-//! The walk is [`super::render`]'s read backwards — the same schema, block
-//! table and addresses in the same order — so no structural fact of the file
-//! changes: no block moves, no count changes, no pointer is rewritten. A value
-//! that no longer fits is a refusal ([`NotPsoXml::TooLong`]), and so is an
-//! array of a different length or a structure of a different member list.
+//! The XML read back and applied to the file: `render`'s walk, backwards, so nothing structural changes.
 
 use quick_xml::{
     Reader, XmlVersion,
@@ -35,21 +24,10 @@ use crate::{
     },
 };
 
-/// How the bits a bitset holds are separated.
 const BITS_SEPARATOR: char = ' ';
 
-/// How the lanes of a vector are separated.
 const LANE_SEPARATOR: char = ',';
 
-/// Reads the XML [`super::render`] wrote and applies it to the payload it was
-/// written from.
-///
-/// # Errors
-///
-/// [`Error::BadPso`] if `payload` contradicts itself, [`Error::UnsupportedPso`]
-/// if it carries a member type this build does not decode, and
-/// [`Error::NotPsoXml`] if `document` is not XML or does not describe this
-/// payload.
 pub(super) fn write(payload: &[u8], document: &[u8], names: &Dictionary) -> Result<Vec<u8>> {
     let sections = section::chain(payload).map_err(|(at, cause)| bad(at, cause))?;
     let find = |tag: [u8; 4]| sections.iter().find(|section| section.tag == tag).copied();
@@ -102,9 +80,7 @@ pub(super) fn write(payload: &[u8], document: &[u8], names: &Dictionary) -> Resu
     Ok(out)
 }
 
-/// The `CHKS` section, recomputed: a Jenkins one-at-a-time hash seeded
-/// `0x3FAC7125` over the whole file, each byte taken as a signed `int8`, with
-/// the `fileSize` and `checksum` fields zeroed first.
+/// The `CHKS` section, recomputed as a seeded Jenkins one-at-a-time hash over the whole file.
 mod checksum {
     use super::{Malformed, bad, section};
     use crate::error::Result;
@@ -118,14 +94,6 @@ mod checksum {
     /// Where the checksum sits inside the section.
     const CHECKSUM_AT: usize = 12;
 
-    /// Rewrites the `CHKS` section, if the file has one.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::Checksum`] when the section is not the twenty bytes it
-    /// always is, or when a field would fall outside them: the writes are
-    /// bounded by the section rather than by the file, so a chain declaring a
-    /// shorter `CHKS` cannot have the next section's header written over.
     pub(super) fn restamp(file: &mut [u8], chks: Option<section::Section<'_>>) -> Result<()> {
         let Some(chks) = chks else { return Ok(()) };
         let at = chks.at;
@@ -141,8 +109,7 @@ mod checksum {
         put(file, at, CHECKSUM_AT, hash)
     }
 
-    /// Writes one big-endian `u32` field of the section at `at`, bounded by the
-    /// section's own length rather than by the file's.
+    /// Writes one big-endian `u32` field of the section at `at`, bounded by the section itself.
     fn put(file: &mut [u8], at: usize, field: usize, value: u32) -> Result<()> {
         let gone = || bad(u64::try_from(at).unwrap_or(u64::MAX), Malformed::Checksum);
         let base = at.checked_add(field).ok_or_else(gone)?;
@@ -156,8 +123,7 @@ mod checksum {
         Ok(())
     }
 
-    /// The seeded, signed-byte Jenkins one-at-a-time hash; the unsigned
-    /// variant matches nothing.
+    /// The seeded, signed-byte Jenkins one-at-a-time hash.
     fn jenkins(bytes: &[u8]) -> u32 {
         let mut hash: u32 = SEED;
         for byte in bytes {
@@ -179,8 +145,6 @@ mod checksum {
     mod tests {
         use super::*;
 
-        /// A field ending exactly on the section's boundary is the last one a
-        /// `CHKS` can hold and must still be accepted.
         #[test]
         fn put_accepts_a_field_that_ends_exactly_on_the_sections_boundary() {
             let mut file = vec![0u8; 40];
@@ -193,8 +157,6 @@ mod checksum {
             );
         }
 
-        /// One byte past that boundary is refused rather than written into
-        /// whatever follows the section.
         #[test]
         fn put_refuses_a_field_that_reaches_one_byte_past_the_boundary() {
             let mut file = vec![0xAAu8; 40];
@@ -207,22 +169,17 @@ mod checksum {
     }
 }
 
-/// One element of the document: its name, its one reserved attribute, and its
-/// children. Every element carries exactly one `pso:` attribute, so a record's
-/// type is written down rather than inferred.
 #[derive(Debug)]
 struct Node {
-    /// Where in the document it opened, so a refusal names a place an editor
-    /// can put a cursor on.
+    /// Where in the document it opened, so a refusal can name a place for the cursor.
     position: u64,
     tag: String,
-    /// Its reserved attribute's word, with [`RESERVED_PREFIX`] removed.
+    /// Its reserved attribute's word, with `RESERVED_PREFIX` removed.
     word: String,
     value: String,
     children: Vec<Node>,
 }
 
-/// Reads the document into the tree it describes.
 fn read_tree(document: &[u8]) -> Result<Node> {
     let mut reader = Reader::from_reader(document);
     reader.config_mut().expand_empty_elements = true;
@@ -297,12 +254,10 @@ fn read_tree(document: &[u8]) -> Result<Node> {
     root.ok_or_else(|| at(&reader, NotPsoXml::Empty))
 }
 
-/// Whether a character is XML whitespace, and so may be indentation.
 fn is_space(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
-/// Reads an opening tag into the node it stands for.
 fn opening(start: &BytesStart<'_>, position: u64) -> std::result::Result<Node, NotPsoXml> {
     let tag = start.name().into_inner().to_owned();
     let mut reserved: Option<(String, String)> = None;
@@ -339,30 +294,23 @@ fn opening(start: &BytesStart<'_>, position: u64) -> std::result::Result<Node, N
     })
 }
 
-/// The walk in progress: the payload it reads and the copy it writes.
 #[derive(Debug)]
 struct Applier<'a> {
-    /// The original `PSIN` section. Every address, count and pointer the walk
-    /// follows is read from here, so an edit cannot move the walk.
+    /// The original `PSIN` section, so an edit cannot move the walk.
     data: Data<'a>,
     edited: Vec<u8>,
     schema: &'a Schema,
     names: &'a Dictionary,
 }
 
-/// The three numbers the schema declares about an array, so that applying one
-/// is a function of six arguments rather than seven.
 #[derive(Debug, Clone, Copy)]
 struct Array {
-    /// How the elements are reached.
     layout: Layout,
-    /// Which member of the owning structure describes one element.
     element: u16,
     /// How many, for the forms whose count is in the schema.
     count: u16,
 }
 
-/// Where a value is, and what describes it.
 #[derive(Debug, Clone, Copy)]
 struct At<'a> {
     /// The structure whose member list an element index resolves against.
@@ -373,7 +321,6 @@ struct At<'a> {
 }
 
 impl<'a> Applier<'a> {
-    /// Applies one structure instance.
     fn structure(
         &mut self,
         name: u32,
@@ -416,7 +363,6 @@ impl<'a> Applier<'a> {
         Ok(())
     }
 
-    /// Applies one value — a member of a structure, or one element of an array.
     fn value(&mut self, kind: Kind, tag: &str, at: At<'a>, node: &Node) -> Result<()> {
         match kind {
             Kind::Scalar(scalar) => {
@@ -453,7 +399,6 @@ impl<'a> Applier<'a> {
         }
     }
 
-    /// Applies one of the six string forms.
     fn text(&mut self, form: Text, tag: &str, at: At<'a>, node: &Node) -> Result<()> {
         let word = form.word();
         match form {
@@ -512,7 +457,6 @@ impl<'a> Applier<'a> {
         }
     }
 
-    /// Applies a nested structure, inline or through a pointer.
     fn nested(&mut self, form: Nested, tag: &str, at: At<'a>, node: &Node) -> Result<()> {
         let (name, address) = match form {
             Nested::Structure(name) => (name, at.address),
@@ -526,8 +470,7 @@ impl<'a> Applier<'a> {
         self.structure(name, address, tag, node, at.depth)
     }
 
-    /// The value an enum element names: a name the file's own table carries,
-    /// and otherwise the decimal the renderer falls back to.
+    /// The value an enum element names, or the decimal the renderer falls back to.
     fn enumerated(&self, table: u32, node: &Node) -> Result<i32> {
         if let Some(key) = self.keyed(table, &node.value, node)? {
             return Ok(key);
@@ -535,8 +478,7 @@ impl<'a> Applier<'a> {
         node.value.parse().map_err(|_| unreadable(node))
     }
 
-    /// The key an enum table gives a rendered name, when exactly one does;
-    /// more than one is [`NotPsoXml::Ambiguous`] rather than a choice.
+    /// The key an enum table gives a rendered name, when exactly one does.
     fn keyed(&self, table: u32, wanted: &str, node: &Node) -> Result<Option<i32>> {
         let Some(entries) = self.schema.enum_table(table) else {
             return Ok(None);
@@ -583,7 +525,6 @@ impl<'a> Applier<'a> {
         Ok(value)
     }
 
-    /// Applies an array and its items.
     fn array(&mut self, array: Array, tag: &str, at: At<'a>, node: &Node) -> Result<()> {
         let Array {
             layout,
@@ -642,7 +583,6 @@ impl<'a> Applier<'a> {
         }
     }
 
-    /// Applies an `ATBINARYMAP` and its entries.
     fn map(&mut self, tag: &str, at: At<'a>, node: &Node) -> Result<()> {
         expect(node, tag, MAP)?;
         expect_value(node, ATBINARYMAP)?;
@@ -677,8 +617,7 @@ impl<'a> Applier<'a> {
     }
 }
 
-/// The writes. Every one is bounds-checked against the section, and every one
-/// is at an address [`super::render`] read the same value from.
+/// The writes, each bounds-checked against the section.
 impl Applier<'_> {
     fn put(&mut self, address: u32, bytes: &[u8]) -> Result<()> {
         let gone = || bad(u64::from(address), Malformed::DataRange);
@@ -689,9 +628,7 @@ impl Applier<'_> {
         Ok(())
     }
 
-    /// Writes a string into the `room` bytes it has, NUL-terminated when there
-    /// is a byte to spare, and answers how many bytes it wrote. Nothing past
-    /// the terminator is touched, so an unedited trip is byte-identical.
+    /// Writes a string into its `room` bytes, NUL-terminated when there's a byte to spare.
     fn put_string(&mut self, address: u32, room: u32, node: &Node) -> Result<u32> {
         let bytes = text::decode(&node.value).ok_or(Error::NotPsoXml {
             position: node.position,
@@ -715,7 +652,6 @@ impl Applier<'_> {
         Ok(len)
     }
 
-    /// Writes an enum's value at its stored width.
     fn put_signed(&mut self, width: Width, address: u32, value: i32, node: &Node) -> Result<()> {
         match width {
             Width::Eight => {
@@ -730,7 +666,6 @@ impl Applier<'_> {
         }
     }
 
-    /// Writes a bitset's value at its stored width.
     fn put_unsigned(&mut self, width: Width, address: u32, value: u64) -> Result<()> {
         let bytes = value.to_be_bytes();
         let from = bytes
@@ -743,7 +678,6 @@ impl Applier<'_> {
         self.put(address, &tail)
     }
 
-    /// Writes a fixed-width value.
     fn put_scalar(&mut self, scalar: Scalar, address: u32, node: &Node) -> Result<()> {
         let text = node.value.as_str();
         let bad_value = || unreadable(node);
@@ -810,14 +744,11 @@ impl Applier<'_> {
     }
 }
 
-/// How many bytes a string may be written into: the `store` its form gives it,
-/// and never less than the `was` bytes already there — a payload whose string
-/// already fills its store must still write back unchanged.
+/// How many bytes a string may be written into: never less than the `was` bytes already there.
 fn room(store: u32, was: usize) -> u32 {
     store.max(u32::try_from(was).unwrap_or(u32::MAX))
 }
 
-/// A value that does not read back as what its type word says it is.
 fn unreadable(node: &Node) -> Error {
     Error::NotPsoXml {
         position: node.position,
@@ -827,12 +758,10 @@ fn unreadable(node: &Node) -> Error {
     }
 }
 
-/// The element name an array item or a map entry is written under.
 fn reserved_item() -> String {
     format!("{RESERVED_PREFIX}{ITEM}")
 }
 
-/// Checks an element's name and its type word.
 fn expect(node: &Node, tag: &str, word: &str) -> Result<()> {
     if node.tag != tag {
         return Err(Error::NotPsoXml {
@@ -855,8 +784,6 @@ fn expect(node: &Node, tag: &str, word: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks the value of an element's reserved attribute, where the mapping fixes
-/// it: a structure's own type, and an array's or a map's subtype.
 fn expect_value(node: &Node, wanted: &str) -> Result<()> {
     if node.value != wanted {
         return Err(Error::NotPsoXml {
@@ -870,15 +797,12 @@ fn expect_value(node: &Node, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks that a null pointer is still written down as one; `pso:null` carries
-/// the type word the value would have had, since an empty string and an absent
-/// one differ.
+/// Checks that a null pointer is still written down as one, under `pso:null`.
 fn expect_null(node: &Node, tag: &str, word: &str) -> Result<()> {
     expect(node, tag, NULL)?;
     expect_value(node, word)
 }
 
-/// Checks that an element has exactly the children the file says it has.
 fn expect_children(node: &Node, wanted: usize) -> Result<&[Node]> {
     if node.children.len() != wanted {
         return Err(Error::NotPsoXml {
@@ -893,8 +817,7 @@ fn expect_children(node: &Node, wanted: usize) -> Result<&[Node]> {
     Ok(&node.children)
 }
 
-/// The half-float `f32` narrows to, or `None` when it does not narrow exactly:
-/// storing the nearest half would make document and payload disagree.
+/// The half-float `f32` narrows to, or `None` when it doesn't narrow exactly.
 fn narrow(number: f32) -> Option<u16> {
     let bits = number.to_bits();
     let sign = u16::try_from(bits >> 31).ok()? << 15;
@@ -946,15 +869,10 @@ fn narrow(number: f32) -> Option<u16> {
 mod tests {
     use super::*;
 
-    /// An arbitrary structure name, distinct from any member name used here.
     const ROOT_NAME: u32 = 0xD98B_B561;
-    /// An arbitrary member name, distinct from [`ROOT_NAME`] and [`ARRAYINFO`].
     const MEMBER_NAME: u32 = 0x1234_5678;
-    /// The `ARRAYINFO` sentinel.
     const ARRAYINFO: u32 = 0x0000_0100;
 
-    /// A one-entry `PMAP` block table naming a block of `length` bytes at
-    /// `offset`.
     fn one_block_pmap(offset: i32, length: i32) -> Vec<u8> {
         let mut pmap = vec![0u8; 8];
         pmap.extend_from_slice(&1i32.to_be_bytes()); // rootId
@@ -967,13 +885,10 @@ mod tests {
         pmap
     }
 
-    /// A block table naming one block, large enough that a landing anywhere
-    /// inside it is in range.
     fn trivial_blocks() -> Blocks {
         Blocks::read(&one_block_pmap(0, 64), 64).expect("a minimal block table reads")
     }
 
-    /// A document node, built directly rather than parsed.
     fn node(tag: &str, word: &str, value: &str) -> Node {
         Node {
             position: 0,
@@ -1058,8 +973,6 @@ mod tests {
         };
         let leaf = node("tag", STRUCT, "whatever");
 
-        // At the ceiling itself the depth check must not be what refuses:
-        // `UndefinedStructure` should surface instead.
         let at_ceiling = applier.structure(0xDEAD_BEEF, 0, "tag", &leaf, MAX_DEPTH);
         assert!(
             matches!(
@@ -1085,7 +998,6 @@ mod tests {
         );
     }
 
-    /// A minimal valid `PSO`: one block, one structure, one `UINT` member.
     fn one_uint_pso() -> Vec<u8> {
         let mut psin = Vec::new();
         psin.extend_from_slice(&section::PSIN);
@@ -1149,7 +1061,6 @@ mod tests {
         );
     }
 
-    /// A `PSO` whose one member is a null `STRUCT` pointer.
     fn nullable_struct_pointer_pso() -> Vec<u8> {
         let mut psin = Vec::new();
         psin.extend_from_slice(&section::PSIN);
@@ -1212,8 +1123,6 @@ mod tests {
         );
     }
 
-    /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`,
-    /// the pointer naming a second block that holds the one item.
     fn pointer_with_count_pso() -> Vec<u8> {
         let mut psin = Vec::new();
         psin.extend_from_slice(&section::PSIN);

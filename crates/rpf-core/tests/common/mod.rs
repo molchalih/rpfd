@@ -1,6 +1,5 @@
-//! The RPF7 header and entry-row layout, hand-encoded once for the tests that
-//! assemble an archive byte by byte. No width is restated here; every one is
-//! asked of the version seam.
+//! The RPF7 header and entry-row layout, hand-encoded for the tests that
+//! assemble an archive byte by byte. Every width is asked of the version seam.
 #![allow(
     dead_code,
     reason = "each including test crate gets its own copy of this module and \
@@ -36,8 +35,7 @@ pub fn directory_row(name_offset: u32, first_child: u32, child_count: u32) -> [u
 }
 
 /// One file row: a 16-bit name offset, a 24-bit compressed size, a 24-bit
-/// block offset carrying the resource bit, and the two words whose meaning
-/// depends on that bit.
+/// block offset carrying the resource bit, then two words read per that bit.
 pub fn file_row(
     name_offset: u16,
     compressed_len: u32,
@@ -54,8 +52,8 @@ pub fn file_row(
     row
 }
 
-/// [`file_row`] for a stored binary file: compressed size 0 is the stored
-/// sentinel, and the real length is the word at offset 8.
+/// [`file_row`] for a stored binary file: compressed size 0 is the sentinel,
+/// and the real length is the word at offset 8.
 pub fn stored_row(name_offset: u16, block: u32, len: u32) -> [u8; ROW_LEN] {
     file_row(name_offset, 0, block, len, 0)
 }

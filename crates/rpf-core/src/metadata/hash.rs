@@ -1,13 +1,4 @@
 //! Names are hashes, and the dictionary that renders them is cosmetic.
-//!
-//! `PSO` stores every structure and member name as a Jenkins one-at-a-time
-//! hash. A dictionary turns those back into words; an unresolved hash renders
-//! as `hash_XXXXXXXX` and parses back to the same `u32` without [`joaat`] being
-//! invoked, so a dictionary changes how a document looks, never what it means.
-//! [`Dictionary::load`] checks `joaat(name) == key` and drops the entry when it
-//! fails, which is what makes that unconditional.
-//!
-//! No dictionary ships with this repository; the empty one is a complete answer.
 
 use std::collections::{BTreeMap, btree_map::Entry};
 
@@ -16,15 +7,12 @@ use super::text::is_xml_name;
 /// How an unresolved hash is rendered, before its eight upper-case hex digits.
 pub const PLACEHOLDER_PREFIX: &str = "hash_";
 
-/// How many hex digits a placeholder carries: a `u32`, always padded.
 const PLACEHOLDER_DIGITS: usize = 8;
 
-/// The reserved XML name prefix the `PSO` mapping uses; a dictionary name
-/// beginning with it is refused at load as ambiguous.
+/// The reserved XML name prefix a dictionary name is refused for beginning with.
 pub const RESERVED_PREFIX: &str = "pso:";
 
-/// The Jenkins one-at-a-time hash, seed 0, over the literal bytes: no case
-/// folding and no terminator. Not [`crate::format`]'s NG name hash.
+/// The Jenkins one-at-a-time hash, seed 0, over the literal bytes.
 #[must_use]
 pub fn joaat(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0;
@@ -39,14 +27,12 @@ pub fn joaat(bytes: &[u8]) -> u32 {
 }
 
 /// How an unresolved hash is written: `hash_` and eight upper-case hex digits.
-/// [`unplaceholder`] is the exact inverse and does not invoke [`joaat`].
 #[must_use]
 pub fn placeholder(hash: u32) -> String {
     format!("{PLACEHOLDER_PREFIX}{hash:0PLACEHOLDER_DIGITS$X}")
 }
 
-/// The hash a [`placeholder`] spells, or `None` when `text` is not one: the
-/// prefix, then exactly eight hex digits and nothing else.
+/// The hash a placeholder spells, or `None` when `text` is not one.
 #[must_use]
 pub fn unplaceholder(text: &str) -> Option<u32> {
     let digits = text.strip_prefix(PLACEHOLDER_PREFIX)?;
@@ -56,15 +42,13 @@ pub fn unplaceholder(text: &str) -> Option<u32> {
     u32::from_str_radix(digits, 16).ok()
 }
 
-/// A hash-to-name dictionary whose every name is a valid XML name, begins with
-/// neither [`RESERVED_PREFIX`] nor a [`placeholder`], and hashes to its key.
+/// A hash-to-name dictionary whose every name is a valid XML name.
 #[derive(Debug, Clone, Default)]
 pub struct Dictionary {
     names: BTreeMap<u32, Box<str>>,
 }
 
-/// What a [`Dictionary::load`] produced. Loading never fails: an entry that
-/// does not check out is dropped and reported, and `dictionary` stays usable.
+/// What loading a dictionary produced; loading itself never fails.
 #[derive(Debug, Clone)]
 pub struct Loaded {
     /// Every entry that checked out.
@@ -73,7 +57,7 @@ pub struct Loaded {
     pub rejected: Vec<Rejected>,
 }
 
-/// One entry a dictionary file offered and [`Dictionary::load`] would not take.
+/// One entry a dictionary file offered that loading would not take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejected {
     /// Which line of the file, counting from 1.
@@ -88,20 +72,18 @@ pub struct Rejected {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Rejection {
-    /// The line carried a key field that is not hexadecimal, or does not fit a
-    /// `u32`.
+    /// The line's key field is not hexadecimal, or does not fit a `u32`.
     Key,
-    /// The name does not hash to the key the file stated, so rendering it
-    /// would make a rebuilt file reference a member that does not exist.
+    /// The name does not hash to the key the file stated.
     Mismatch {
         /// What the file said the hash was.
         stated: u32,
-        /// What [`joaat`] of the name actually is.
+        /// What the hash of the name actually is.
         computed: u32,
     },
     /// The name is not one this build can write as an XML element name.
     Name,
-    /// The name begins with [`RESERVED_PREFIX`], or spells a [`placeholder`].
+    /// The name begins with the reserved prefix, or spells a placeholder.
     Reserved,
     /// The key is already taken by a different name.
     Collision {
@@ -111,18 +93,12 @@ pub enum Rejection {
 }
 
 impl Dictionary {
-    /// The empty dictionary, which is a complete answer; a constant so a
-    /// caller with no dictionary can lend one for longer than a call.
+    /// The empty dictionary, which is a complete answer.
     pub const EMPTY: &'static Self = &Self {
         names: BTreeMap::new(),
     };
 
     /// Reads a dictionary file and keeps the entries that check out.
-    ///
-    /// One entry per line: a bare name, whose key is [`joaat`] of it; or a hex
-    /// key and a name separated by whitespace, a comma or an equals sign, the
-    /// key checked against [`joaat`] of the name. Blank and `#` lines are
-    /// ignored and are not rejections.
     #[must_use]
     pub fn load(text: &str) -> Loaded {
         let mut dictionary = Self::default();
@@ -149,7 +125,6 @@ impl Dictionary {
         }
     }
 
-    /// Checks one entry and keeps it; `stated` is the key the file gave.
     fn insert(&mut self, stated: Option<&str>, name: &str) -> Result<(), Rejection> {
         let computed = joaat(name.as_bytes());
         if let Some(text) = stated {
@@ -203,8 +178,7 @@ impl Dictionary {
         self.names.is_empty()
     }
 
-    /// How a hash is written: its name if there is one, else its
-    /// [`placeholder`]. The only place a name reaches a document.
+    /// How a hash is written: its name if there is one, else its placeholder.
     #[must_use]
     pub fn render(&self, hash: u32) -> String {
         self.name(hash)
@@ -212,7 +186,6 @@ impl Dictionary {
     }
 }
 
-/// Splits a dictionary line into its optional key and its name.
 fn split(body: &str) -> (Option<&str>, &str) {
     match body.split_once([' ', '\t', ',', '=']) {
         Some((key, rest)) => (Some(key.trim()), rest.trim_matches([' ', '\t', ',', '='])),
@@ -226,7 +199,6 @@ mod tests {
 
     #[test]
     fn the_hash_is_the_one_three_independent_corpora_agree_on() {
-        // The empty string decides what a zero name hash means.
         assert_eq!(joaat(b"32BIT"), 0xAF08_5554);
         assert_eq!(joaat(b"params"), 0x3518_C7D8);
         assert_eq!(joaat(b""), 0);
@@ -234,7 +206,6 @@ mod tests {
 
     #[test]
     fn the_hash_matches_names_that_occur_in_the_corpus_itself() {
-        // Structure and member name hashes present in shipped files.
         assert_eq!(joaat(b"CMapTypes"), 0xD98B_B561);
         assert_eq!(joaat(b"CCreatureMetaData"), 0x79B7_DCE5);
         assert_eq!(joaat(b"CPackFileMetaData"), 0x93A6_8A2F);
@@ -269,8 +240,6 @@ mod tests {
 
     #[test]
     fn an_entry_whose_name_does_not_hash_to_its_key_is_rejected() {
-        // `params_` is a keyword-escape artefact: the key is `joaat("params")`
-        // and the name has a trailing underscore.
         let loaded = Dictionary::load("0x3518C7D8 params_\n0x3518C7D8 params\n");
         assert_eq!(loaded.dictionary.len(), 1);
         assert_eq!(loaded.dictionary.name(0x3518_C7D8), Some("params"));
@@ -287,8 +256,6 @@ mod tests {
 
     #[test]
     fn an_entry_that_matches_only_lowercased_is_rejected() {
-        // The hash does not fold case, so a key of the lowercased spelling
-        // disagrees with the name it renders.
         let key = joaat(b"cmaptypes");
         let loaded = Dictionary::load(&format!("{key:08X} CMapTypes"));
         assert!(loaded.dictionary.is_empty());
@@ -349,8 +316,6 @@ mod tests {
             Dictionary::load("1leading").rejected[0].cause,
             Rejection::Name
         );
-        // A line with a separator is a key and a name, so `a b` is the key
-        // `0xa` and the name `b`.
         assert!(matches!(
             Dictionary::load("a b").rejected[0].cause,
             Rejection::Mismatch { stated: 0xa, .. }
@@ -367,7 +332,6 @@ mod tests {
             Dictionary::load("pso:item").rejected[0].cause,
             Rejection::Reserved
         );
-        // A name that merely starts `hash_` is not a placeholder.
         assert_eq!(Dictionary::load("hash_of_a_thing").rejected.len(), 0);
     }
 
@@ -380,8 +344,6 @@ mod tests {
             "the same name twice is not a clash"
         );
 
-        // A genuine collision: `joaat("aqaa") == joaat("elue")`. The bare form
-        // is needed because a stated key would be a `Mismatch` first.
         assert_eq!(joaat(b"aqaa"), joaat(b"elue"));
         let loaded = Dictionary::load("aqaa\nelue\n");
         assert_eq!(loaded.dictionary.len(), 1);

@@ -1,10 +1,4 @@
-//! The walk from the root block, and the XML it writes.
-//!
-//! Driven by the file's own `PSCH` and by nothing else. Every read is
-//! bounds-checked against the `PSIN` section and every pointer against its own
-//! block's length, and the walk carries a depth ceiling and a budget, both
-//! charged in [`Writer::empty`] and [`Writer::open`] — the only two places an
-//! element is written, and so the only charge an array path cannot escape.
+//! The walk from the root block to XML, bounds-checked against a depth/node/byte budget.
 
 use quick_xml::escape::escape;
 
@@ -26,45 +20,26 @@ use crate::{
     },
 };
 
-/// The word an array item or a map entry is written under, reserved by the
-/// `pso:` prefix [`Dictionary::load`] refuses a dictionary name to begin with.
 pub(super) const ITEM: &str = "item";
 
-/// The word a null pointer is written under. Its value is the type word the
-/// value would have had.
 pub(super) const NULL: &str = "null";
 
-/// The word a structure is written under: as the attribute naming a
-/// structure's own type — the only place a pointer's concrete type is written
-/// down — and as the value of `pso:null` for a null structure pointer.
 pub(super) const STRUCT: &str = "struct";
 
-/// The word an array is written under; its value is which of the six `ARRAY`
-/// subtypes it is.
 pub(super) const ARRAY: &str = "array";
 
-/// The word an `ATBINARYMAP` is written under.
 pub(super) const MAP: &str = "map";
 
 /// The one `MAP` subtype that occurs: 98 members, all of them subtype 1.
 pub(super) const ATBINARYMAP: &str = "atbinarymap";
 
-/// The word an enum is written under.
 pub(super) const ENUM: &str = "enum";
 
-/// The word a bitset is written under.
 pub(super) const BITSET: &str = "bitset";
 
-/// How far each level of nesting is indented.
 const INDENT: &str = "  ";
 
 /// Reads a `PSO` payload and writes the XML that describes it.
-///
-/// # Errors
-///
-/// [`crate::Error::BadPso`] when the file contradicts itself, and
-/// [`crate::Error::UnsupportedPso`] when it is well formed and carries a member
-/// type this build does not decode.
 pub(super) fn write(payload: &[u8], names: &Dictionary) -> Result<Vec<u8>> {
     let sections = section::chain(payload).map_err(|(at, cause)| bad(at, cause))?;
     let find = |tag: [u8; 4]| {
@@ -95,31 +70,24 @@ pub(super) fn write(payload: &[u8], names: &Dictionary) -> Result<Vec<u8>> {
     };
     let tag = names.render(root.name);
     writer.structure(root.name, root.offset, &tag, Place::root())?;
-    // The per-element check is asked before the element is written, so the
-    // document may overshoot by the last one; asking again here makes
-    // `document_budget` a bound the answer obeys.
+    // The per-element check runs before writing, so the document may overshoot by
+    // one; asking again here makes `document_budget` a bound the answer obeys.
     if writer.out.len() > writer.budget {
         return Err(bad(0, Malformed::TooLarge));
     }
     Ok(writer.out.into_bytes())
 }
 
-/// The walk in progress.
 #[derive(Debug)]
 struct Writer<'a> {
-    /// The data section and the block table that addresses it.
     data: Data<'a>,
     schema: &'a Schema,
     names: &'a Dictionary,
     out: String,
     nodes: usize,
-    /// The most bytes of document this payload is allowed to write:
-    /// `MAX_OUTPUT_RATIO` of it, and never less than `MIN_OUTPUT`.
     budget: usize,
 }
 
-/// How deep the walk is, and how far the line is indented; the two move
-/// together everywhere except inside an array.
 #[derive(Debug, Clone, Copy)]
 struct Place {
     depth: usize,
@@ -127,7 +95,6 @@ struct Place {
 }
 
 impl Place {
-    /// The root's place.
     const fn root() -> Self {
         Self {
             depth: 0,
@@ -135,7 +102,6 @@ impl Place {
         }
     }
 
-    /// One level in.
     const fn inside(self) -> Self {
         Self {
             depth: self.depth.saturating_add(1),
@@ -144,14 +110,12 @@ impl Place {
     }
 }
 
-/// Where a value is, and what describes it.
 #[derive(Debug, Clone, Copy)]
 struct At<'a> {
     /// The structure whose member list an element index resolves against.
     owner: &'a Structure,
     /// Where the value starts, from the start of the `PSIN` section.
     address: u32,
-    /// Where in the document it goes.
     place: Place,
 }
 
@@ -162,7 +126,6 @@ struct Items {
     reserved: &'static str,
     /// Its value: which subtype the container is.
     word: &'static str,
-    /// The member that describes one item.
     described: Member,
     base: u32,
     stride: u32,
@@ -170,7 +133,6 @@ struct Items {
 }
 
 impl<'a> Writer<'a> {
-    /// Writes one structure instance as an element named `tag`.
     fn structure(&mut self, name: u32, address: u32, tag: &str, place: Place) -> Result<()> {
         let schema = self.schema;
         let names = self.names;
@@ -206,7 +168,6 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    /// Writes one value — a member of a structure, or one element of an array.
     fn value(&mut self, kind: Kind, tag: &str, at: At<'a>) -> Result<()> {
         match kind {
             Kind::Scalar(scalar) => {
@@ -226,7 +187,6 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Writes one of the six string forms.
     fn text(&mut self, form: Text, tag: &str, at: At<'a>) -> Result<()> {
         let names = self.names;
         let word = form.word();
@@ -254,8 +214,6 @@ impl<'a> Writer<'a> {
         self.leaf(tag, &reserved(word), &value, at.place)
     }
 
-    /// Writes a nested structure, inline or through a pointer; subtypes 3 and
-    /// 4 carry no type of their own, it is the target block's `nameHash`.
     fn nested(&mut self, form: Nested, tag: &str, at: At<'a>) -> Result<()> {
         let (name, address) = match form {
             Nested::Structure(name) => (name, at.address),
@@ -269,7 +227,6 @@ impl<'a> Writer<'a> {
         self.structure(name, address, tag, at.place)
     }
 
-    /// Writes an enum, by the name its own table gives the stored value.
     fn enumerated(&mut self, width: Width, table: u32, tag: &str, at: At<'a>) -> Result<()> {
         let value = self.signed(width, at.address)?;
         let rendered = self
@@ -279,8 +236,6 @@ impl<'a> Writer<'a> {
         self.leaf(tag, &reserved(ENUM), &rendered, at.place)
     }
 
-    /// Writes a bitset as the set of bits it holds: a bit the enum names by
-    /// that name, one it does not by its index.
     fn bits(&mut self, width: Width, table: Option<u32>, tag: &str, at: At<'a>) -> Result<()> {
         let value = self.unsigned(width, at.address)?;
         let mut set = Vec::new();
@@ -298,7 +253,6 @@ impl<'a> Writer<'a> {
         self.leaf(tag, &reserved(BITSET), &set.join(" "), at.place)
     }
 
-    /// Writes an array and its items.
     fn array(
         &mut self,
         layout: Layout,
@@ -316,8 +270,7 @@ impl<'a> Writer<'a> {
             _ => (at.address, count),
         };
         if count == 0 {
-            // An empty array's element type is never asked for: a `PSCH`
-            // legitimately describes structures the data never instantiates.
+            // Never asked for: a `PSCH` may describe structures the data never instantiates.
             return self.empty(tag, &attribute(&reserved(ARRAY), layout.word()), at.place);
         }
         let described = *at
@@ -343,8 +296,7 @@ impl<'a> Writer<'a> {
         )
     }
 
-    /// Where an out-of-line array's items are, and how many; a null pointer
-    /// with a non-zero count is the file contradicting itself.
+    /// Where an out-of-line array's items are, and how many.
     fn counted(&self, address: u32, count: u16) -> Result<(u32, u16)> {
         match self.data.block_pointer(address)? {
             Some((_, base)) => Ok((base, count)),
@@ -353,9 +305,6 @@ impl<'a> Writer<'a> {
         }
     }
 
-    /// Writes an `ATBINARYMAP` and its entries: the counted pointer at byte 8
-    /// lands on an array of key/value structures typed by the block's
-    /// `nameHash`, so a map needs no vocabulary of its own.
     fn map(&mut self, tag: &str, at: At<'a>) -> Result<()> {
         let header = at.address.saturating_add(MAP_POINTER_AT);
         let count = self.data.half(header.saturating_add(COUNT_AT))?;
@@ -385,7 +334,6 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    /// Writes the items of an array.
     fn items(&mut self, tag: &str, items: Items, at: At<'a>) -> Result<()> {
         let attributes = attribute(&reserved(items.reserved), items.word);
         if items.count == 0 {
@@ -411,15 +359,12 @@ impl<'a> Writer<'a> {
     }
 }
 
-/// One reserved attribute, as it is written.
 fn attribute(name: &str, value: &str) -> String {
     format!(" {name}=\"{}\"", escape(value))
 }
 
 impl Writer<'_> {
-    /// Charges one element against the ceilings, from [`Writer::empty`] and
-    /// [`Writer::open`] — every element this mapping writes, and so the only
-    /// charge a nest of inline arrays cannot escape.
+    /// Charges one element against the depth, node, and byte ceilings.
     fn spend(&mut self, place: Place) -> Result<()> {
         if place.depth > MAX_DEPTH {
             return Err(bad(0, Malformed::TooDeep));
@@ -428,10 +373,8 @@ impl Writer<'_> {
         if self.nodes > MAX_NODES {
             return Err(bad(0, Malformed::TooManyNodes));
         }
-        // Charged in bytes as well as in elements, because an element is not a
-        // fixed number of bytes: it carries two spaces of indent per level.
-        // Checked before the element, so the document overshoots by at most
-        // the one being written.
+        // Charged in bytes too, since indent makes an element's size variable;
+        // checked before writing, so the document overshoots by at most one.
         if self.out.len() > self.budget {
             return Err(bad(0, Malformed::TooLarge));
         }
@@ -507,13 +450,11 @@ impl Writer<'_> {
         }
     }
 
-    /// Writes an empty element carrying one reserved attribute.
     fn leaf(&mut self, tag: &str, reserved: &str, value: &str, place: Place) -> Result<()> {
         let attributes = attribute(reserved, value);
         self.empty(tag, &attributes, place)
     }
 
-    /// Writes an empty element with the attributes already rendered.
     fn empty(&mut self, tag: &str, attributes: &str, place: Place) -> Result<()> {
         self.spend(place)?;
         self.indent(place.indent);
@@ -524,7 +465,6 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Writes an opening tag with the attributes already rendered.
     fn open(&mut self, tag: &str, attributes: &str, place: Place) -> Result<()> {
         self.spend(place)?;
         self.indent(place.indent);
@@ -535,7 +475,7 @@ impl Writer<'_> {
         Ok(())
     }
 
-    /// Writes the closing tag of an element [`Writer::open`] has charged for.
+    /// Writes the closing tag of an element that `open` already charged for.
     fn close(&mut self, tag: &str, place: Place) {
         self.indent(place.indent);
         self.out.push_str("</");
@@ -544,8 +484,6 @@ impl Writer<'_> {
     }
 }
 
-/// A word, as the reserved name that carries it: one spelling of the prefix,
-/// and the same constant [`Dictionary::load`] refuses a name to begin with.
 fn reserved(word: &str) -> String {
     format!("{RESERVED_PREFIX}{word}")
 }
@@ -560,15 +498,11 @@ mod tests {
     use super::*;
     use crate::error::Error;
 
-    /// An arbitrary structure name, distinct from any member name used here.
     const ROOT_NAME: u32 = 0xD98B_B561;
-    /// An arbitrary member name, distinct from [`ROOT_NAME`] and [`ARRAYINFO`].
     const MEMBER_NAME: u32 = 0x1234_5678;
-    /// The `ARRAYINFO` sentinel.
     const ARRAYINFO: u32 = 0x0000_0100;
 
-    /// A one-entry `PMAP` block table naming a block of `length` bytes at
-    /// `offset`.
+    /// A one-entry `PMAP` block table naming a block of `length` bytes at `offset`.
     fn one_block_pmap(offset: i32, length: i32) -> Vec<u8> {
         let mut pmap = vec![0u8; 8];
         pmap.extend_from_slice(&1i32.to_be_bytes());
@@ -717,8 +651,7 @@ mod tests {
         );
     }
 
-    /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`,
-    /// the pointer naming a second block that holds the one item.
+    /// A `PSO` whose one field is a `PointerWithCount` array of one `UINT`.
     fn pointer_with_count_pso() -> Vec<u8> {
         let mut psin = Vec::new();
         psin.extend_from_slice(&section::PSIN);
@@ -779,12 +712,10 @@ mod tests {
         );
     }
 
-    /// A distinct member name for the fine-tuning field.
     const FINE_NAME: u32 = 0x4444_4444;
 
     /// A payload whose root has an inline array of `outer` inline arrays of
     /// `inner` zero-length strings and a fixed inline string of `fine` bytes.
-    /// Items are zero-stride, so only `fine` costs real payload bytes.
     fn calibrated_pso(outer: u16, inner: u16, fine: u16) -> Vec<u8> {
         let fine = usize::from(fine);
         let mut psin = Vec::new();

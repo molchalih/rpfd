@@ -31,8 +31,8 @@ fn stored(path: &str) -> FileSpec {
     }
 }
 
-/// Builds an archive into a real file and hands back its bytes — a cursor grows
-/// on a write past its end and a file does not, hiding truncation.
+/// Builds into a real file, not a cursor: a cursor grows on a write past its
+/// end and hides truncation.
 fn built(files: &[FileSpec], directories: &[String], contents: &[u8]) -> Vec<u8> {
     let mut sink = tempfile::NamedTempFile::new().expect("temp file");
     rpf_core::build(
@@ -105,8 +105,7 @@ fn adding(contents: &[u8]) -> Change {
     }
 }
 
-/// An `RSC7` payload of `len` bytes past its header, which is the smallest
-/// thing `build` will accept as a resource.
+/// An `RSC7` payload of `len` bytes past its header.
 fn resource(len: usize) -> Vec<u8> {
     let mut bytes = b"RSC7".to_vec();
     bytes.extend_from_slice(&7_u32.to_le_bytes());
@@ -140,8 +139,6 @@ fn an_added_entry_brings_its_parents_with_it() {
     assert_eq!(contents(&rebuilt, "data/deep/b.txt"), b"second".to_vec());
 }
 
-/// The payload decides whether a new entry is a resource, because there is no
-/// entry yet to ask.
 #[test]
 fn a_payload_that_is_a_resource_becomes_a_resource_entry() {
     let source = built(&[stored("a.txt")], &[], b"first");
@@ -180,7 +177,6 @@ fn a_payload_that_is_not_a_resource_becomes_a_binary_entry() {
     }
 }
 
-/// Creating an entry a caller merely misspelled is the failure this guards.
 #[test]
 fn a_write_that_did_not_ask_to_create_is_still_not_found() {
     let source = built(&[stored("a.txt")], &[], b"first");
@@ -285,13 +281,11 @@ fn tagged(tag: u32) -> Vec<u8> {
 }
 
 /// An NG archive's every region is keyed by `(hash(name) + length + 61) % 101`,
-/// so what it is called is part of what it is; an AES archive takes its key
-/// from the tag alone and is the same archive under any name.
+/// so its name is part of it; an AES archive is keyed by the tag alone.
 #[test]
 fn a_nested_aes_archive_is_renamed_and_a_nested_ng_one_is_not() {
     let renaming = Changes::one("inner.rpf", Change::RenameTo("other.rpf".to_owned()));
 
-    // The AES half: what lands under the new name is the payload byte for byte.
     let aes = tagged(rpf7::ENCRYPTION_AES);
     let rebuilt = rewritten(&built(&[stored("inner.rpf")], &[], &aes), &renaming);
     assert_eq!(paths(&rebuilt), vec!["other.rpf"]);
@@ -304,7 +298,6 @@ fn a_nested_aes_archive_is_renamed_and_a_nested_ng_one_is_not() {
     assert_eq!(refused.name(), "CannotRenameKeyed", "{refused:?}");
 }
 
-/// The caller says what it means by removing the target in the same change set.
 #[test]
 fn renaming_onto_an_existing_path_is_refused() {
     let source = built(&[stored("a.txt"), stored("b.txt")], &[], b"same");
@@ -315,7 +308,6 @@ fn renaming_onto_an_existing_path_is_refused() {
     }
 }
 
-/// Removals are applied before renames, which is what lets this go through.
 #[test]
 fn removing_the_target_first_lets_a_rename_take_its_place() {
     let source = built(&[stored("a.txt"), stored("b.txt")], &[], b"same");
@@ -327,8 +319,6 @@ fn removing_the_target_first_lets_a_rename_take_its_place() {
     assert_eq!(paths(&rebuilt), vec!["b.txt"]);
 }
 
-/// The two are different archives; moving bytes between them is not one
-/// rebuild.
 #[test]
 fn renaming_into_a_nested_archive_is_refused() {
     let inner = built(&[stored("f.txt")], &[], b"inner");
@@ -343,7 +333,6 @@ fn renaming_into_a_nested_archive_is_refused() {
     }
 }
 
-/// `build` derives parents from file paths and cannot see an empty directory.
 #[test]
 fn a_created_directory_survives_with_nothing_in_it() {
     let source = built(&[stored("a.txt")], &[], b"first");
@@ -366,8 +355,7 @@ fn creating_a_directory_that_is_already_there_is_refused() {
 #[test]
 fn a_structural_change_inside_a_nested_archive_cascades() {
     let inner = built(&[stored("f.txt")], &[], b"inner");
-    // Only the nested archive, because `built` serves one payload to every file
-    // it is given: a second entry would hold the inner archive's bytes too.
+    // Only the nested archive: `built` serves one payload to every file.
     let source = built(&[stored("sub/inner.rpf")], &[], &inner);
 
     let mut changes = Changes::new();
@@ -422,7 +410,6 @@ fn a_rename_into_a_directory_of_a_nested_archive_keeps_the_whole_path() {
     assert_eq!(contents(&rebuilt, "sub/inner.rpf/data/moved.txt"), b"inner");
 }
 
-/// The plan says so before anything is written, rather than entry by entry.
 #[test]
 fn a_structural_change_cannot_be_patched_in_place() {
     let source = built(&[stored("a.txt")], &[], b"first");
@@ -507,7 +494,6 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
     let mut src = Cursor::new(source);
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
 
-    // A caller that means to replace the target removes it in the same set.
     let mut buffered = Changes::new();
     buffered.set("readme.txt", Change::Remove { recursive: false });
     rpf_core::allows(
@@ -519,7 +505,6 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
     )
     .expect("a buffered removal frees the path a rename moves onto");
 
-    // And the other direction: a rename has already claimed the path.
     let mut buffered = Changes::new();
     buffered.set("readme.txt", Change::RenameTo("moved.txt".to_owned()));
     match rpf_core::allows(
@@ -533,8 +518,6 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    // A rename of a directory takes what is inside it with it, so a change
-    // addressing through the old name no longer resolves.
     let mut buffered = Changes::new();
     buffered.set("data", Change::RenameTo("info".to_owned()));
     match rpf_core::allows(
@@ -548,7 +531,6 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
         other => panic!("expected not found, got {other:?}"),
     }
 
-    // A buffered write has nothing to write to once what holds it is removed.
     let mut buffered = Changes::new();
     buffered.set(
         "data/a.txt",
@@ -569,7 +551,6 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
         other => panic!("expected not found, got {other:?}"),
     }
 
-    // A change reaching none of the buffered ones is decided by the archive.
     let mut buffered = Changes::new();
     buffered.set("readme.txt", Change::Remove { recursive: false });
     rpf_core::allows(
@@ -582,8 +563,7 @@ fn a_change_is_judged_against_the_changes_already_buffered() {
     .expect("an unrelated removal decides nothing about this rename");
 }
 
-/// A set holds one change per path. Two writes are not a second change —
-/// saving one file twice is what an editor does.
+/// A set holds one change per path.
 #[test]
 fn a_second_change_of_another_kind_at_one_path_is_refused() {
     let mut buffered = Changes::new();
@@ -636,7 +616,6 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
         "and reaches nothing else"
     );
 
-    // Replaced by a plain write, the removal is no longer in the index.
     changes.set(
         "data",
         Change::Write {
@@ -647,7 +626,6 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
     );
     assert!(!changes.bears_on("data/a.txt"));
 
-    // A rename reaches the path it moves onto as well as the one it moves.
     changes.set("readme.txt", Change::RenameTo("moved.txt".to_owned()));
     assert!(changes.bears_on("moved.txt"));
 
@@ -659,7 +637,6 @@ fn the_changes_that_restructure_are_the_ones_no_patch_expresses() {
     assert_eq!(changes.len(), 2);
 }
 
-/// An archive without its root directory is not an archive.
 #[test]
 fn the_root_cannot_be_removed_or_renamed() {
     let source = built(&[stored("a.txt")], &[], b"first");
@@ -704,8 +681,7 @@ fn the_entry_count_and_names_blob_follow_the_change() {
     verified.outcome().expect("reads back clean");
 }
 
-/// `Change::Write` holds a trait object, which is `Send + Sync` only if the
-/// trait asks for them.
+/// `Change::Write` holds a trait object, `Send + Sync` only if the trait asks.
 #[test]
 fn a_change_set_is_still_send_and_sync() {
     const fn assert_send<T: Send>() {}
@@ -717,8 +693,7 @@ fn a_change_set_is_still_send_and_sync() {
     assert_sync::<rpf_core::Change>();
 }
 
-/// `tree_of` applies removals before writes, so without this the removal takes
-/// the empty directory out and the write implies it back holding a file.
+/// `tree_of` applies removals before writes.
 #[test]
 fn a_directory_the_set_writes_into_is_not_empty_either() {
     let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
@@ -744,8 +719,6 @@ fn a_directory_the_set_writes_into_is_not_empty_either() {
     }
 }
 
-/// The combination itself is not refused: `recursive` is how a caller says it
-/// wants the old directory gone and a new one implied by the write.
 #[test]
 fn saying_recursive_allows_the_directory_to_be_rebuilt_by_the_write() {
     let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
@@ -765,8 +738,6 @@ fn saying_recursive_allows_the_directory_to_be_rebuilt_by_the_write() {
     assert_eq!(paths(&rebuilt), vec!["c.txt", "empty", "empty/fresh.txt"]);
 }
 
-/// `allows` resolves the offered change against the buffered set through
-/// `tree_of`, so the rule lands in one place and both frontends get it.
 #[test]
 fn the_wire_refuses_the_removal_the_set_has_already_filled() {
     let source = built(&[stored("c.txt")], &["empty".to_owned()], b"same");
@@ -793,13 +764,10 @@ fn the_wire_refuses_the_removal_the_set_has_already_filled() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    // And with `recursive`, which is how a caller says it meant both.
     let said = Change::Remove { recursive: true };
     rpf_core::allows(&mut src, &archive, &buffered, "empty", &said).expect("recursive is allowed");
 }
 
-/// `tree_of` removes before it renames, so the removal alone would take the
-/// empty directory out and the rename imply it back holding the moved file.
 #[test]
 fn a_directory_the_set_renames_into_is_not_empty_either() {
     let source = built(&[stored("a.txt")], &["empty".to_owned()], b"same");
@@ -817,7 +785,6 @@ fn a_directory_the_set_renames_into_is_not_empty_either() {
         other => panic!("expected a refusal, got {:?}", other.map(|b| b.len())),
     }
 
-    // The destination is what makes the rename bear on the removal at all.
     let mut src = std::io::Cursor::new(source.clone());
     let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
         .expect("the archive parses");
@@ -833,8 +800,7 @@ fn a_directory_the_set_renames_into_is_not_empty_either() {
     }
 }
 
-/// "Arrives under this directory" is not "exists anywhere": conflating them
-/// makes an empty directory undeletable while any creation is buffered.
+/// "Arrives under this directory" is not "exists anywhere".
 #[test]
 fn a_creation_outside_the_directory_leaves_it_empty() {
     let source = built(&[stored("a.txt")], &["empty".to_owned()], b"same");
@@ -850,7 +816,6 @@ fn a_creation_outside_the_directory_leaves_it_empty() {
         "the empty directory outlived a removal that named it"
     );
 
-    // A new directory named outside it is no more of an arrival than a file is.
     let mut changes = Changes::new();
     changes.set("elsewhere", Change::MakeDirectory);
     changes.set("empty", Change::Remove { recursive: false });
@@ -858,9 +823,6 @@ fn a_creation_outside_the_directory_leaves_it_empty() {
     assert_eq!(paths(&rebuilt), vec!["a.txt", "elsewhere"]);
 }
 
-/// Two changes with no path in common decide nothing about each other, so
-/// `bearing_on` resolves the offered change against the subset that could
-/// reach it and leaves the rest out.
 #[test]
 fn a_removal_is_answered_against_the_changes_that_reach_it() {
     let source = built(
@@ -872,8 +834,8 @@ fn a_removal_is_answered_against_the_changes_that_reach_it() {
     let archive = rpf_core::Archive::open(&mut src, &rpf_core::Unlock::unkeyed())
         .expect("the archive parses");
 
-    // `forget` puts the freed path back, leaving the rename in the set claiming
-    // a path that exists again.
+    // `forget` puts the freed path back, leaving the rename claiming a path
+    // that exists again.
     let mut buffered = Changes::new();
     buffered.set("other.txt", Change::Remove { recursive: false });
     buffered.set("a.txt", Change::RenameTo("other.txt".to_owned()));
@@ -886,7 +848,6 @@ fn a_removal_is_answered_against_the_changes_that_reach_it() {
     rpf_core::allows(&mut src, &archive, &buffered, "empty", &unrelated)
         .expect("an empty directory is still empty");
 
-    // The rename really has gone stale, which makes the answer above an answer.
     let again = Change::RenameTo("other.txt".to_owned());
     assert!(
         matches!(
@@ -896,8 +857,7 @@ fn a_removal_is_answered_against_the_changes_that_reach_it() {
         "the rename should now be refused on its own account"
     );
 
-    // `allows` would not have admitted this write, so the set is built
-    // directly; the removal is still decided without it.
+    // `allows` would not have admitted this write, so the set is built directly.
     let mut buffered = Changes::new();
     buffered.set(
         "missing.txt",
@@ -911,8 +871,6 @@ fn a_removal_is_answered_against_the_changes_that_reach_it() {
         .expect("a write elsewhere does not decide this removal");
 }
 
-/// `at_or_under` folds case, so the path *at* the directory — the replacing
-/// case — has to be recognised however the caller spells it.
 #[test]
 fn a_replacing_rename_holds_however_the_caller_spells_it() {
     for spelling in ["empty", "EMPTY", "Empty"] {
@@ -930,9 +888,8 @@ fn a_replacing_rename_holds_however_the_caller_spells_it() {
     }
 }
 
-/// The names blob is NUL-terminated, so `a\0b` would be written and read back
-/// as `a`, and two paths differing only after the NUL would collide where the
-/// collision check — comparing the names asked for — cannot see it.
+/// The names blob is NUL-terminated, so `a\0b` would be read back as `a` and
+/// two paths differing only after the NUL would collide unseen.
 #[test]
 fn a_nul_inside_a_path_is_refused_rather_than_silently_truncating_it() {
     let source = built(&[stored("a.txt")], &[], b"same");
@@ -947,8 +904,7 @@ fn a_nul_inside_a_path_is_refused_rather_than_silently_truncating_it() {
     }
 }
 
-/// `Bytes::len`, `Contents::is_empty` and `Changes::iter` are surface a caller
-/// is offered and no code in this crate calls.
+/// Surface a caller is offered and no code in this crate calls.
 #[test]
 fn the_accessors_a_caller_is_offered_answer_what_they_promise() {
     use rpf_core::Contents as _;
@@ -961,7 +917,6 @@ fn the_accessors_a_caller_is_offered_answer_what_they_promise() {
     assert_eq!(three.len().expect("a length"), 3);
     assert!(!three.is_empty().expect("emptiness"));
 
-    // `iter` and the `IntoIterator` twin are the same iteration.
     let mut changes = Changes::new();
     changes.set("a.txt", Change::Remove { recursive: false });
     changes.set("b.txt", Change::MakeDirectory);
@@ -972,8 +927,7 @@ fn the_accessors_a_caller_is_offered_answer_what_they_promise() {
 }
 
 /// Contents whose reader answers [`std::io::ErrorKind::Interrupted`] before
-/// each of its first reads, which the loop reading a new entry's first four
-/// bytes has to tolerate.
+/// each of its first reads.
 #[derive(Debug)]
 struct Interrupted {
     bytes: Vec<u8>,

@@ -1,8 +1,7 @@
-//! Archives that are wrong on purpose. Every one of them must come back as a
-//! named error, never a panic, a hang, or a plausible-but-wrong value.
-//!
-//! Each archive is assembled byte by byte from the codec's own constants, so no
-//! test here carries a width of its own.
+//! Archives that are wrong on purpose: every one must come back as a named
+//! error, never a panic, a hang, or a plausible-but-wrong value. Each is
+//! assembled byte by byte from the codec's own constants, so no test here
+//! carries a width of its own.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -37,8 +36,8 @@ fn deflate(plain: &[u8]) -> Vec<u8> {
 }
 
 /// A root directory over `count` stored files, named `a`, `b`, … in one blob,
-/// each holding sixteen bytes a block apart from block 8 on. Well formed as it
-/// stands; layout tests replace the rows they care about.
+/// each holding sixteen bytes a block apart from block 8 on. Well formed;
+/// layout tests replace the rows they care about.
 fn named_root(count: u32) -> (Vec<[u8; ROW_LEN]>, Vec<u8>) {
     let mut names = vec![0u8];
     let mut rows = vec![directory_row(0, 1, count)];
@@ -53,7 +52,7 @@ fn named_root(count: u32) -> (Vec<[u8; ROW_LEN]>, Vec<u8>) {
 
 #[test]
 fn a_directory_that_is_its_own_child_is_refused_at_parse() {
-    // Two directories, the second claiming itself: a parent walk never ends.
+    // Two directories, the second claiming itself.
     let rows = [directory_row(0, 1, 1), directory_row(0, 1, 1)];
     let bytes = archive_bytes(&rows, &[0, 0, 0], 512);
 
@@ -67,8 +66,7 @@ fn a_directory_that_is_its_own_child_is_refused_at_parse() {
 
 #[test]
 fn two_directories_that_claim_each_other_are_refused_at_parse() {
-    // The same failure one link longer: 0 holds 1, 1 holds 0. Nothing is out
-    // of range, so a walk does not run off the end — it runs for ever.
+    // The same failure one link longer: 0 holds 1, 1 holds 0.
     let rows = [directory_row(0, 1, 1), directory_row(0, 0, 1)];
     let bytes = archive_bytes(&rows, &[0, 0, 0], 512);
 
@@ -82,9 +80,9 @@ fn two_directories_that_claim_each_other_are_refused_at_parse() {
 
 #[test]
 fn a_self_claiming_directory_is_refused_even_when_a_later_entry_reclaims_its_child() {
-    // Entry 1 claims itself and entry 2 claims entry 1 too. The parent map is
-    // single-valued, so entry 2's claim overwrites entry 1's and the parent
-    // chain terminates while the children relation still holds the cycle.
+    // Entry 1 claims itself and entry 2 claims entry 1 too: the parent map is
+    // single-valued, so the parent chain terminates while the children relation
+    // still holds the cycle.
     let rows = [
         directory_row(0, 1, 2),
         directory_row(0, 1, 1),
@@ -102,8 +100,8 @@ fn a_self_claiming_directory_is_refused_even_when_a_later_entry_reclaims_its_chi
 
 #[test]
 fn two_directories_claiming_one_child_are_refused() {
-    // Every entry claims every entry after it: no cycle and nothing out of
-    // range, but a lattice whose root-to-leaf paths double per row.
+    // Every entry claims every entry after it: a lattice whose root-to-leaf
+    // paths double per row.
     const ROWS: u32 = 26;
     let rows: Vec<[u8; ROW_LEN]> = (0..ROWS)
         .map(|index| directory_row(0, index + 1, ROWS - 1 - index))
@@ -127,8 +125,8 @@ fn two_directories_claiming_one_child_are_refused() {
 
 #[test]
 fn a_directory_tree_deeper_than_the_limit_is_refused() {
-    // A chain of directories, each holding the next: a tree, but arbitrarily
-    // deep. The bound belongs at parse, so no walker carries its own counter.
+    // A chain of directories, each holding the next. The bound belongs at parse,
+    // so no walker carries its own counter.
     let deep = MAX_DEPTH + 1;
     let rows: Vec<[u8; ROW_LEN]> = (0..=deep)
         .map(|index| {
@@ -203,7 +201,7 @@ fn a_child_range_past_the_entry_table_is_still_refused() {
 #[test]
 fn archives_nested_deeper_than_the_limit_are_refused() {
     // A stack of archives, one per block, each holding the remaining tail as
-    // its only file: without a bound the descent's depth is the caller's.
+    // its only file.
     let levels = MAX_DEPTH + 2;
     let bytes = stacked_archives(levels);
 
@@ -248,10 +246,9 @@ fn stacked_archives(levels: u32) -> Vec<u8> {
 
 #[test]
 fn a_names_blob_every_entry_shares_does_not_cost_one_copy_each() {
-    // 40,000 legitimate entries, all pointing at offset 0 of one 40,000-byte
-    // blob: materialising each name separately costs entry_count × names_len.
-    // Asserted structurally — every entry resolves to the same bytes at one
-    // address, which a copying reader cannot do.
+    // 40,000 entries all pointing at offset 0 of one 40,000-byte blob. Asserted
+    // structurally: every entry resolves to the same bytes at one address,
+    // which a copying reader cannot do.
     const ENTRIES: u32 = 40_000;
     const NAMES_LEN: usize = 40_000;
 
@@ -321,8 +318,8 @@ fn an_allocation_never_spans_a_payload_that_began_before_it() {
 
 #[test]
 fn an_allocation_of_an_index_that_does_not_exist_says_so() {
-    // The caller can act on "there is no entry 99"; it cannot act on "entry 99
-    // is a directory", which searching the extents first would report.
+    // Searching the extents first would report "entry 99 is a directory", which
+    // a caller cannot act on.
     let (rows, names) = named_root(3);
     let bytes = archive_bytes(&rows, &names, 8_192);
 
@@ -444,8 +441,7 @@ fn a_file_too_short_to_hold_a_header_is_not_an_archive() {
 
 #[test]
 fn an_entry_table_that_does_not_fit_the_archive_is_refused() {
-    // A header claiming 100 entries in a 64-byte file: the entry table is what
-    // does not fit, and saying so tells the caller where to look.
+    // A header claiming 100 entries in a 64-byte file.
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&MAGIC);
     bytes.extend_from_slice(&100_u32.to_le_bytes());
@@ -537,7 +533,7 @@ fn a_name_offset_past_the_names_blob_is_refused() {
 #[test]
 fn names_are_still_resolved_where_they_overlap() {
     // Two entries pointing into one string, the second name being the tail of
-    // the first: legal, and what a bound on total name bytes would refuse.
+    // the first.
     let rows = [
         directory_row(0, 1, 1),
         file_row(1, 0, 8, 4, 0),
@@ -554,8 +550,8 @@ fn names_are_still_resolved_where_they_overlap() {
 
 #[test]
 fn a_name_that_is_not_utf_8_is_refused_rather_than_repaired() {
-    // A lossy repair would hand back a name that does not address the entry it
-    // came from. 0xFF and 0xFE begin no UTF-8 sequence at all.
+    // 0xFF and 0xFE begin no UTF-8 sequence at all, and a lossy repair would
+    // hand back a name that does not address its entry.
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 8, 16, 0)];
     let bytes = archive_bytes(&rows, b"\0\xFF\xFE\0", 8_192);
 
@@ -583,8 +579,6 @@ fn a_name_that_is_not_utf_8_is_refused_rather_than_repaired() {
 
 #[test]
 fn a_deflate_stream_that_lies_about_its_length_is_refused() {
-    // The payload inflates perfectly well but is not the length the entry table
-    // promised: the archive contradicts itself rather than being unreadable.
     let payload = deflate(&[b'x'; 64]);
     let rows = [
         directory_row(0, 1, 1),
@@ -614,16 +608,15 @@ fn a_deflate_stream_that_lies_about_its_length_is_refused() {
     );
 }
 
-/// System page flags naming exactly one page of the base 512 bytes, which is
-/// the smallest resource there is.
+/// Flags naming exactly one page of the base 512 bytes: the smallest resource.
 const ONE_SYSTEM_PAGE: u32 = 0x0800_0000;
 
 /// What [`ONE_SYSTEM_PAGE`] with no graphics pages inflates to.
 const ONE_SYSTEM_PAGE_LEN: usize = 512;
 
-/// A resource payload: an `RSC7` header for one system page, then a deflate
-/// stream of exactly that much. The header's version is the top nibble of each
-/// flag word, so flags naming no version make it zero.
+/// An `RSC7` header for one system page, then a deflate stream of exactly that
+/// much. The header's version is the top nibble of each flag word, so flags
+/// naming no version make it zero.
 fn resource_payload() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC_RSC7);
@@ -679,7 +672,7 @@ fn a_resource_that_ends_exactly_at_its_payload_verifies_clean() {
 #[test]
 fn a_resource_whose_stream_ends_before_its_payload_is_reported_by_verify() {
     // The stream is self-terminating, so the 200 bytes after it inflate to
-    // nothing: only the archive's own account of itself is wrong.
+    // nothing.
     let payload = resource_payload();
     let tail = 200_u32;
     let declared = payload.len() as u32 + tail;
@@ -726,7 +719,6 @@ fn a_resource_whose_stream_ends_before_its_payload_is_reported_by_verify() {
 
 #[test]
 fn a_resource_corrupted_inside_its_stream_is_still_caught() {
-    // Bytes changed within the stream fail as a stream, not as a tail.
     let mut payload = resource_payload();
     let at = payload.len() - 4;
     for byte in &mut payload[at - 3..at] {
@@ -754,8 +746,6 @@ fn a_resource_corrupted_inside_its_stream_is_still_caught() {
 
 #[test]
 fn a_binary_entry_whose_stream_ends_before_its_payload_is_reported_by_verify() {
-    // The read path is shared, so a deflated binary entry declaring more than
-    // its stream occupies is the same hole as the resource above.
     let stream = deflate(&[b'x'; ONE_SYSTEM_PAGE_LEN]);
     let tail = 200_u32;
     let declared = stream.len() as u32 + tail;
@@ -786,8 +776,8 @@ fn a_binary_entry_whose_stream_ends_before_its_payload_is_reported_by_verify() {
 
 #[test]
 fn a_tail_is_referenced_by_its_entry_and_is_verifys_to_report() {
-    // `unreferenced_bytes` is what no region claims, and a tail is claimed. A
-    // tail is visible only after inflating, which a summary does not do.
+    // `unreferenced_bytes` is what no region claims, and a tail is claimed; a
+    // tail shows only after inflating, which a summary does not do.
     let stream = deflate(&[b'x'; ONE_SYSTEM_PAGE_LEN]);
     let tail = 200_u32;
     let tidy = one_file_archive(&stream, stream.len() as u32, 0, ONE_SYSTEM_PAGE_LEN as u32);
@@ -852,7 +842,7 @@ fn a_payload_that_is_not_deflate_at_all_is_refused() {
 }
 
 /// A deflate stream stopped at a block boundary without its final block, as a
-/// `Sync` flush leaves it: what is missing is the stream saying it is over.
+/// `Sync` flush leaves it.
 fn unterminated(plain: &[u8]) -> Vec<u8> {
     let mut encoder =
         flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -864,9 +854,8 @@ fn unterminated(plain: &[u8]) -> Vec<u8> {
 }
 
 /// A stream that ran out of input is refused even when it produced exactly the
-/// length its entry declares. The refusal is the decompressor's — `flate2`
-/// 1.1.10 is the first release answering `UnexpectedEof` rather than `Ok(0)`,
-/// which is why `Cargo.toml` asks for that version and not `1.1`.
+/// length its entry declares. `flate2` 1.1.10 is the first release answering
+/// `UnexpectedEof` rather than `Ok(0)`, which is why `Cargo.toml` pins it.
 #[test]
 fn a_deflate_stream_that_never_terminates_is_refused_at_its_declared_length() {
     let plain = [0xAA_u8; ONE_SYSTEM_PAGE_LEN];
@@ -941,9 +930,8 @@ fn a_resource_declaring_no_compressed_size_is_refused_rather_than_guessed() {
     );
 }
 
-/// A resource too small to hold its own header is refused when read as the file
-/// it is outside the archive, not only as contents: the two forms reach the
-/// answer through different arithmetic.
+/// The file-outside-the-archive form and the contents form reach the answer
+/// through different arithmetic, so both are checked.
 #[test]
 fn a_resource_smaller_than_its_own_header_is_refused_by_extract_too() {
     let rows = [
@@ -972,8 +960,7 @@ fn a_resource_smaller_than_its_own_header_is_refused_by_extract_too() {
     );
 }
 
-/// A resource of exactly its header and nothing else is a resource: the header
-/// is what a resource must have, not what it must exceed.
+/// The header is what a resource must have, not what it must exceed.
 #[test]
 fn a_resource_of_exactly_its_header_is_extracted_whole() {
     let header = &resource_payload()[..RESOURCE_HEADER_LEN as usize];
@@ -1010,8 +997,7 @@ fn one_binary_archive(payload: &[u8], declared: u32) -> Vec<u8> {
     bytes
 }
 
-/// `payload_is_resource` says yes when the payload really is one. No real
-/// archive reaches this case, so the yes has to be built.
+/// No real archive reaches this case, so the yes has to be built.
 #[test]
 fn a_payload_that_is_a_resource_is_read_as_one() {
     let payload = resource_payload();
@@ -1031,7 +1017,6 @@ fn a_payload_that_is_a_resource_is_read_as_one() {
     );
 }
 
-/// The magic alone is a payload, and the entry carrying it need not be flagged.
 /// Four bytes is the least that can be compared, so this is also the boundary.
 #[test]
 fn a_payload_of_exactly_the_magic_is_the_magic() {
@@ -1057,8 +1042,7 @@ fn a_payload_of_exactly_the_magic_is_the_magic() {
     );
 }
 
-/// A payload too short to hold the magic is not one, whatever follows it: the
-/// bytes after a payload are not its own.
+/// The bytes after a payload are not its own, so a short one is not the magic.
 #[test]
 fn a_payload_too_short_for_the_magic_is_not_read_past() {
     let bytes = one_binary_archive(&MAGIC_RSC7, MAGIC_RSC7.len() as u32 - 1);
@@ -1078,7 +1062,6 @@ fn a_payload_too_short_for_the_magic_is_not_read_past() {
 
 #[test]
 fn a_name_that_climbs_out_of_the_archive_is_refused_on_read() {
-    // `specs_of` is the one route from entries to a tree specification.
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
     let bytes = archive_bytes(&rows, b"\0../escaped.txt\0", 4_096);
 
@@ -1134,9 +1117,8 @@ fn a_directory_whose_name_climbs_out_of_the_archive_is_refused_on_read() {
 
 #[test]
 fn a_name_no_host_can_hold_is_still_one_node_of_a_tree() {
-    // Tree rules and host rules are two questions, and only the first is a
-    // rebuild's: `aux.ytd` is a device name on Windows and an ordinary node of
-    // an archive's tree, so refusing it here makes such an archive unrepairable.
+    // `aux.ytd` is a device name on Windows and an ordinary node of an archive's
+    // tree, so refusing it here would make such an archive unrepairable.
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 4, 16, 0)];
     let bytes = archive_bytes(&rows, b"\0aux.ytd\0", 4_096);
     let mut source = Cursor::new(bytes);
@@ -1173,8 +1155,7 @@ fn a_name_no_host_can_hold_is_still_one_node_of_a_tree() {
 #[test]
 fn a_name_windows_would_trim_is_still_one_node_of_a_tree() {
     // Windows drops a trailing dot or space before opening a name, so `a.txt.`
-    // and `a.txt ` are one file there and two entries here — a host rule, so
-    // the archive itself stays readable.
+    // and `a.txt ` are one file there and two entries here.
     for name in [b"a.txt.", b"a.txt "] {
         let mut names = vec![0u8];
         names.extend_from_slice(name);
@@ -1221,8 +1202,8 @@ fn a_name_windows_would_trim_is_still_one_node_of_a_tree() {
     }
 }
 
-/// A sixteen-byte header of `version`, with the fields RPF7 would put there.
-/// The version is answered from the first four bytes, before any layout.
+/// A sixteen-byte header of `version`, with the fields RPF7 would put there;
+/// the version is answered from the first four bytes, before any layout.
 fn header_of(magic: [u8; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(&magic);
@@ -1234,7 +1215,6 @@ fn header_of(magic: [u8; 4]) -> Vec<u8> {
 
 #[test]
 fn an_archive_of_another_version_is_refused_by_its_own_name() {
-    // An unreadable version is not a corrupt archive.
     for (magic, version) in [
         (*b"RPF0", 0_u8),
         (*b"RPF2", 2),
@@ -1267,8 +1247,8 @@ fn an_archive_of_another_version_is_refused_by_its_own_name() {
 
 #[test]
 fn a_version_this_build_cannot_read_is_its_own_category() {
-    // Not `Corrupt` — nothing is malformed — and not `Refused`, since the
-    // caller's request was fine: no key opens it, and the missing part is here.
+    // Not `Corrupt` — nothing is malformed — and not `Refused`: the caller's
+    // request was fine.
     let error = Archive::open(
         &mut Cursor::new(header_of(*b"RPF2")),
         &rpf_core::Unlock::unkeyed(),
@@ -1279,9 +1259,9 @@ fn a_version_this_build_cannot_read_is_its_own_category() {
 
 #[test]
 fn a_nested_archive_of_another_version_is_named_by_locate_and_invisible_to_info() {
-    // `UnsupportedVersion` carries an offset so a nested archive of another
-    // version names where it is. That holds through `locate` and not the sniff,
-    // which maps every failure but `TooDeep` to `None`.
+    // `UnsupportedVersion` carries an offset naming where the nested archive is.
+    // That holds through `locate` and not the sniff, which maps every failure
+    // but `TooDeep` to `None`.
     let rows = [directory_row(0, 1, 1), file_row(1, 0, 2, 16, 0)];
     let mut bytes = archive_bytes(&rows, b"\0inner.rpf\0", 4_096);
     let mut header = Vec::new();
@@ -1310,7 +1290,6 @@ fn a_nested_archive_of_another_version_is_named_by_locate_and_invisible_to_info(
         "expected the version and its offset, got {error:?}"
     );
 
-    // Through the sniff, it is not there at all: the limit, pinned.
     let summary = rpf_core::Summary::of(&mut source, &archive, "").expect("info summarises");
     assert_eq!(summary.nested_archives, 0, "the sniff swallows the version");
     let verified =
@@ -1345,8 +1324,7 @@ fn bytes_that_are_not_an_rpf_header_at_all_are_still_not_an_archive() {
 
 #[test]
 fn two_children_of_one_directory_that_are_one_name_are_refused_on_read() {
-    // `child_named` folds case, so the second of these is unreachable by any
-    // spelling of its own path — including its own.
+    // `child_named` folds case, so the second is unreachable by any spelling.
     let rows = [
         directory_row(0, 1, 2),
         file_row(1, 0, 4, 16, 0),
@@ -1375,8 +1353,7 @@ fn two_children_of_one_directory_that_are_one_name_are_refused_on_read() {
 
 #[test]
 fn a_collision_between_two_directories_is_refused_on_read() {
-    // A directory pair collides as a file pair does, and it is `directories_of`
-    // rather than `specs_of` that carries an empty one into a tree.
+    // `directories_of` rather than `specs_of` carries an empty one into a tree.
     let rows = [
         directory_row(0, 1, 2),
         directory_row(1, 3, 0),
@@ -1402,7 +1379,7 @@ fn a_collision_between_two_directories_is_refused_on_read() {
 #[test]
 fn one_name_carried_by_two_entries_is_not_reported_as_a_case_collision() {
     // An exact duplicate is its own answer, not a case collision naming one
-    // string twice: the reader gives the same three answers the writer does.
+    // string twice.
     let rows = [
         directory_row(0, 1, 2),
         file_row(1, 0, 4, 16, 0),
@@ -1467,8 +1444,8 @@ fn one_name_in_two_directories_is_not_a_collision() {
 
 #[test]
 fn a_name_two_siblings_answer_to_is_refused_rather_than_resolved_to_the_first() {
-    // The patch path never reaches `check_names`; `plan` resolves through
-    // `locate`, which folds case, so ambiguity is answered there instead.
+    // The patch path never reaches `check_names`: `plan` resolves through
+    // `locate`, which folds case, so ambiguity is answered there.
     let rows = [
         directory_row(0, 1, 2),
         file_row(1, 0, 4, 16, 0),
@@ -1547,13 +1524,11 @@ fn a_byte_changed_inside_a_stored_entry_is_caught_only_against_a_manifest() {
         "the entry reads back, and reads back wrong",
     );
 
-    // What the archive can say about itself: nothing.
     assert!(
         problems(&changed).is_empty(),
         "an archive carries no record of its own stored contents",
     );
 
-    // What the manifest can: its checksums are taken from the sound archive.
     let sound_archive = Archive::open(
         &mut Cursor::new(bytes.clone()),
         &rpf_core::Unlock::unkeyed(),
@@ -1643,8 +1618,6 @@ fn a_resource_is_checked_against_the_file_it_is_outside_the_archive() {
 
 #[test]
 fn a_verify_with_no_manifest_says_it_checked_no_contents() {
-    // No manifest is the ordinary case, so it has to work without reporting the
-    // stronger claim: entries read back is not contents checked against.
     let sound = b"hello there!";
     let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
     let archive = Archive::open(
@@ -1665,7 +1638,6 @@ fn a_verify_with_no_manifest_says_it_checked_no_contents() {
 #[test]
 fn a_manifest_that_records_no_checksum_leaves_the_entry_unchecked() {
     // A missing checksum means not recorded — never "the contents matched".
-    // The entry is one of `checked` and not one of `contents_checked`.
     let sound = b"hello there!";
     let bytes = one_file_archive(sound, 0, 0, sound.len() as u32);
     let archive = Archive::open(

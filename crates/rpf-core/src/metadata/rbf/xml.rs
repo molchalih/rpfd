@@ -1,12 +1,4 @@
 //! The XML an `RBF` document is written as, and read back from.
-//!
-//! Nothing here infers a type from how a value is spelled — `x` and `type` are
-//! real attribute names, and real string values are bare digits — so every
-//! record's type is written down.
-//!
-//! The dot separates the two reserved forms totally: `rbf:float3` has none and
-//! is a value record, `rbf:float.x` has one and is an attribute. A name
-//! containing a dot splits at the first, so `a.b` is `rbf:float.a.b`.
 
 use quick_xml::{
     Reader, XmlVersion,
@@ -23,28 +15,24 @@ use crate::{
     metadata::text::{self, float, unfloat},
 };
 
-/// The reserved attribute that carries an open element's two meaningless words,
-/// which are always 0 and so never written for a shipped file.
+/// The reserved attribute that carries an open element's two meaningless words.
 const UNKNOWN: &str = "unknown";
 
-/// How far each level of nesting is indented.
 const INDENT: &str = "  ";
 
-/// The type words, one per [`Scalar`] variant.
+/// The type words, one per `Scalar` variant.
 const UINT: &str = "uint";
 const FLOAT: &str = "float";
 const BOOL: &str = "bool";
 const FLOAT3: &str = "float3";
 const STRING: &str = "string";
 
-/// Writes the document as XML.
 pub(super) fn write(document: &Document) -> Vec<u8> {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     write_element(&mut out, document.root(), 0);
     out.into_bytes()
 }
 
-/// Writes one element and everything under it.
 fn write_element(out: &mut String, element: &Element, depth: usize) {
     indent(out, depth);
     out.push('<');
@@ -98,7 +86,6 @@ fn write_element(out: &mut String, element: &Element, depth: usize) {
     }
 }
 
-/// Writes a value record as an empty element carrying its type.
 fn write_value(out: &mut String, name: &Name, value: &Scalar, depth: usize) {
     indent(out, depth);
     out.push('<');
@@ -111,21 +98,18 @@ fn write_value(out: &mut String, name: &Name, value: &Scalar, depth: usize) {
     out.push_str("\"/>\n");
 }
 
-/// Writes a closing tag and the newline after it.
 fn close(out: &mut String, name: &Name) {
     out.push_str("</");
     out.push_str(name.as_str());
     out.push_str(">\n");
 }
 
-/// Writes `depth` levels of indentation.
 fn indent(out: &mut String, depth: usize) {
     for _ in 0..depth {
         out.push_str(INDENT);
     }
 }
 
-/// The type word a value is written with.
 fn word_of(value: &Scalar) -> &'static str {
     match value {
         Scalar::Uint(_) => UINT,
@@ -136,7 +120,6 @@ fn word_of(value: &Scalar) -> &'static str {
     }
 }
 
-/// A value, as the text of its attribute.
 fn render(value: &Scalar) -> String {
     match value {
         Scalar::Uint(number) => number.to_string(),
@@ -147,7 +130,6 @@ fn render(value: &Scalar) -> String {
     }
 }
 
-/// An element that has been opened and not yet closed.
 struct Building {
     name: Name,
     kind: Kind,
@@ -155,23 +137,14 @@ struct Building {
     text: String,
 }
 
-/// Whether an open tag is an element or a value record.
 enum Kind {
-    /// An element, with its two meaningless words and its attribute records.
     Element {
         unknown: [u16; 2],
         attributes: Vec<Attribute>,
     },
-    /// A value record, which is a name, a type and a value and nothing else.
     Value(Scalar),
 }
 
-/// Reads XML into the document it describes.
-///
-/// # Errors
-///
-/// [`Error::NotRbfXml`] if the XML is not well formed, or is and does not
-/// describe an `RBF` document.
 pub(super) fn read(document: &[u8]) -> Result<Document> {
     let mut reader = Reader::from_reader(document);
     reader.config_mut().expand_empty_elements = true;
@@ -292,12 +265,10 @@ fn push_text(stack: &mut [Building], chunk: &str) -> std::result::Result<(), Not
     }
 }
 
-/// Whether a character is XML whitespace, and so may be indentation.
 fn is_space(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
-/// Checks a name and says which refusal it is if it is not one.
 fn named(text: &str) -> std::result::Result<Name, NotRbf> {
     Name::new(text).map_err(|cause| NotRbf::Unrepresentable { cause })
 }
@@ -363,13 +334,11 @@ fn opening(start: &quick_xml::events::BytesStart<'_>) -> std::result::Result<Kin
     }
 }
 
-/// The two words `rbf:unknown` carries.
 fn words(value: &str) -> Option<[u16; 2]> {
     let (first, second) = value.split_once(' ')?;
     Some([first.parse().ok()?, second.parse().ok()?])
 }
 
-/// A value of the type `word` names.
 fn scalar(word: &str, value: &str, key: &str) -> std::result::Result<Scalar, NotRbf> {
     let bad = || NotRbf::BadValue {
         name: key.to_owned(),
@@ -461,7 +430,6 @@ mod tests {
 
     #[test]
     fn whitespace_outside_the_root_is_tolerated_and_anything_else_is_not() {
-        // `push_text`'s only `None` arm: nothing is open to receive the text.
         read(b"<root></root>\n").expect("trailing whitespace is not text");
         assert_eq!(
             refused(b"<root></root>stray"),

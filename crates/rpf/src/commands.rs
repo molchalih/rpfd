@@ -1,7 +1,4 @@
-//! The commands themselves.
-//!
-//! Every one of them is a thin call into `rpf-core`; nothing here knows the
-//! byte layout of an archive.
+//! The commands themselves, each a thin call into `rpf-core`.
 
 use std::{
     fs,
@@ -24,15 +21,14 @@ use crate::{
 };
 
 /// Scratch space for a cascading rebuild: unnamed temporary files beside the
-/// rebuilt archive, so an intermediate lands on the filesystem the result has
-/// to fit on and an interrupted rebuild leaves nothing behind.
+/// rebuilt archive.
 #[derive(Debug)]
 pub struct ScratchIn {
     directory: PathBuf,
 }
 
 impl ScratchIn {
-    /// Scratch beside `path`, which is where the rebuilt archive is going.
+    /// Scratch beside `path`, where the rebuilt archive is going.
     pub fn beside(path: &Path) -> Self {
         Self {
             directory: path
@@ -47,16 +43,12 @@ impl rpf_core::Scratch for ScratchIn {
     type Sink = fs::File;
 
     fn create(&mut self) -> rpf_core::Result<fs::File> {
-        // The offset is the sink's own, and `Error::Io` carries no path, so the
-        // directory this failed in is not named.
         tempfile::tempfile_in(&self.directory)
             .map_err(|source| rpf_core::Error::Io { offset: 0, source })
     }
 }
 
-/// Progress on standard error, for a person watching a long rebuild.
-///
-/// Only when standard error is a terminal.
+/// Progress on standard error, when it is a terminal.
 struct OnStderr {
     silent: bool,
     /// How wide the line last written was, so the next one can cover it.
@@ -64,7 +56,7 @@ struct OnStderr {
 }
 
 impl OnStderr {
-    /// Reports if there is someone there to read it.
+    /// Reports only if there is someone there to read it.
     fn new() -> Self {
         Self {
             silent: !std::io::stderr().is_terminal(),
@@ -72,8 +64,7 @@ impl OnStderr {
         }
     }
 
-    /// Whether a line has been written that nothing has closed yet: what
-    /// [`Drop`] acts on.
+    /// Whether a line has been written that nothing has closed yet.
     const fn line_is_open(&self) -> bool {
         !self.silent && self.written > 0
     }
@@ -94,9 +85,7 @@ impl Watch for OnStderr {
     }
 }
 
-/// Ends the progress line, however the work it was reporting on ended.
-///
-/// Every path passes through here, including a scan that stops early. `written`
+/// Ends the progress line, including for a scan that stopped early. `written`
 /// is zero once a completed walk has closed its own line, so that case does not
 /// get a second newline.
 impl Drop for OnStderr {
@@ -108,26 +97,22 @@ impl Drop for OnStderr {
     }
 }
 
-/// Spaces enough to cover what a shorter line leaves behind.
-///
-/// A carriage return and spaces rather than the ANSI erase-to-end-of-line,
-/// which a plain Windows console prints instead of obeying.
+/// Spaces enough to cover what a shorter line leaves behind. Spaces rather than
+/// the ANSI erase-to-end-of-line, which a plain Windows console prints instead
+/// of obeying.
 fn padding(written: usize, now: usize) -> String {
     " ".repeat(written.saturating_sub(now))
 }
 
-/// What opens an archive at this path, if it turns out to be encrypted.
-///
-/// An NG archive's key is derived from the archive's own file name. Nothing is
-/// read here: the key cache is consulted only if an archive refuses to open
-/// without it.
+/// What opens an archive at this path, if it turns out to be encrypted. An NG
+/// archive's key is derived from the archive's own file name.
 fn unlock_for(path: &Path, named_cache: Option<&Path>) -> rpf_core::Unlock {
     let Some(cache) = cache_of(named_cache) else {
         return rpf_core::Unlock::unkeyed();
     };
-    // Lossy, deliberately. A name this host cannot spell as UTF-8 hashes over
-    // `EF BF BD` and chooses a key the packer did not; the root-directory check
-    // then refuses it as `WrongKey`, which is the truthful answer.
+    // Lossy deliberately: a name this host cannot spell as UTF-8 hashes over
+    // `EF BF BD` and chooses a key the packer did not, which the root-directory
+    // check then refuses as `WrongKey`.
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -135,22 +120,17 @@ fn unlock_for(path: &Path, named_cache: Option<&Path>) -> rpf_core::Unlock {
     rpf_core::Unlock::cached(cache, name)
 }
 
-/// Opens an archive file and parses its table of contents.
-///
-/// The one place either frontend opens an archive. `named_cache` is
-/// `--cache-dir`, and `None` is the platform's own.
+/// Opens an archive file and parses its table of contents. `named_cache` is
+/// `--cache-dir`; `None` is the platform's own.
 pub fn open(path: &Path, named_cache: Option<&Path>) -> Result<(fs::File, Archive)> {
     let mut file = fs::File::open(path).map_err(|source| opening(path, source))?;
     let archive = Archive::open(&mut file, &unlock_for(path, named_cache))?;
     Ok((file, archive))
 }
 
-/// Why an archive would not open, classified by who has to act on it.
-///
-/// A filesystem path that runs *past* a file is an in-archive path spelled as a
-/// filesystem one, which is a refusal rather than an I/O failure. Asked of the
-/// path rather than of the error, because which `io::ErrorKind` a platform
-/// produces for it varies and the shape of the path does not.
+/// Why an archive would not open, classified by who has to act on it. A path
+/// that runs *past* a file is an in-archive path spelled as a filesystem one,
+/// which is a refusal rather than an I/O failure.
 pub fn opening(path: &Path, source: std::io::Error) -> Failure {
     if let Some(archive) = path.ancestors().skip(1).find(|above| above.is_file()) {
         return Failure::Refused {
@@ -168,10 +148,8 @@ pub fn opening(path: &Path, source: std::io::Error) -> Failure {
     }
 }
 
-/// `info` — the header, and what the entries add up to.
-///
-/// `inside` is empty for the archive itself, and names a nested archive
-/// otherwise.
+/// `info` — the header, and what the entries add up to. `inside` is empty for
+/// the archive itself, and names a nested archive otherwise.
 pub fn info(path: &Path, inside: &str, named_cache: Option<&Path>, json_out: bool) -> Result<()> {
     let (mut file, archive) = open(path, named_cache)?;
     let summary = rpf_core::Summary::of(&mut file, &archive, inside)?;
@@ -231,18 +209,14 @@ pub fn ls(
     Ok(())
 }
 
-/// One `ls` row as JSON, for whichever frontend is reporting it.
-///
-/// One place for it, so `--json ls` and the daemon's `list` cannot drift apart.
+/// One `ls` row as JSON, shared by `--json ls` and the daemon's `list`.
 pub fn listing_row(listed: &rpf_core::Listed) -> Value {
     let (kind, len) = named(listed);
     json!({ "path": listed.path, "kind": kind, "len": len, "encoding": encoding_named(listed) })
 }
 
-/// What a listed entry is called, and the one number reported beside it.
-///
-/// A directory's number is how many children it holds and a file's is its
-/// length.
+/// What a listed entry is called, and the number beside it: a directory's
+/// children, or a file's length.
 fn named(listed: &rpf_core::Listed) -> (&'static str, u64) {
     match listed.kind {
         ListedKind::Directory { children } => ("directory", u64::from(children)),
@@ -251,12 +225,9 @@ fn named(listed: &rpf_core::Listed) -> (&'static str, u64) {
     }
 }
 
-/// What a listed entry's payload announces itself to be, in the one spelling
-/// both frontends report it in.
-///
-/// `None` — `null` on the wire — for a directory, for a resource, whose payload
-/// is not read, and for a binary entry nothing recognised. The four spellings
-/// are [`rpf_core::Encoding::name`]'s: `"xml"`, `"text"`, `"rbf"` and `"pso"`.
+/// What a listed entry's payload announces itself to be, spelled as
+/// [`rpf_core::Encoding::name`] does. `None` for a directory, a resource, or a
+/// binary entry nothing recognised.
 fn encoding_named(listed: &rpf_core::Listed) -> Option<&'static str> {
     let ListedKind::Binary { encoding, .. } = listed.kind else {
         return None;
@@ -264,11 +235,8 @@ fn encoding_named(listed: &rpf_core::Listed) -> Option<&'static str> {
     Some(encoding?.name())
 }
 
-/// A view, with the dictionary the command line has to offer with it.
-///
-/// The empty one: a hash no dictionary names is rendered `hash_XXXXXXXX` and
-/// read back as the same hash, so a dictionary changes legibility and never the
-/// payload.
+/// A view, with the empty dictionary: an unnamed hash renders as
+/// `hash_XXXXXXXX` and reads back as the same hash.
 const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
     rpf_core::view::Wanted {
         view,
@@ -277,9 +245,6 @@ const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
 }
 
 /// The command line's spelling of [`View`], for `--as`.
-///
-/// A wrapper rather than a second enum, so `--as xml` and the daemon's
-/// `"as": "xml"` can never come to mean different things.
 #[derive(Debug, Clone, Copy)]
 pub struct ViewArg(View);
 
@@ -304,8 +269,15 @@ impl clap::ValueEnum for ViewArg {
     }
 }
 
-/// `cat` — one entry's contents on standard output.
-pub fn cat(path: &Path, inside: &str, view: View, named_cache: Option<&Path>) -> Result<()> {
+/// `cat` — one entry's contents on standard output, or into `out`.
+pub fn cat(
+    path: &Path,
+    inside: &str,
+    view: View,
+    out: Option<&Path>,
+    named_cache: Option<&Path>,
+    json_out: bool,
+) -> Result<()> {
     let (mut file, archive) = open(path, named_cache)?;
     let (holder, index) = archive.locate(&mut file, inside)?;
     if holder.entry(index)?.is_directory() {
@@ -313,23 +285,33 @@ pub fn cat(path: &Path, inside: &str, view: View, named_cache: Option<&Path>) ->
             reason: format!("{inside} is a directory"),
         });
     }
-    // A converted view is a whole document either way — the conversion reads
-    // the payload and writes another — so there is no stream to keep.
     if view != View::Raw {
         let viewed = rpf_core::view::read(&mut file, &holder, index, inside, wanted(view))?;
-        return to_stdout(inside, &viewed.bytes);
+        return match out {
+            Some(destination) => {
+                write_file(destination, &viewed.bytes)?;
+                report_written(destination, viewed.bytes.len() as u64, json_out);
+                Ok(())
+            }
+            None => to_stdout(inside, &viewed.bytes),
+        };
     }
     // `extract`, not `read`: this has to be the same form `put` accepts, or
     // `rpf cat … > f && rpf put … f` would fail on every resource.
-    let out = std::io::stdout();
-
-    // Into a pipe or a file the entry goes straight through and is never held.
-    // A terminal is the one case that has to see the bytes before it writes any
-    // of them, and also the case where they are small.
-    if !out.is_terminal() {
+    if let Some(destination) = out {
         let mut contents = holder.extracted(&mut file, index)?;
-        // Standard output is line-buffered, which is a 1 KiB buffer that
-        // `io::copy` declines to use.
+        let len = stream_file(destination, &mut contents)?;
+        report_written(destination, len, json_out);
+        return Ok(());
+    }
+
+    // A destination that is not a file has to see the bytes before it writes
+    // any of them, because it may not take them at all.
+    if holds_payloads() {
+        let mut contents = holder.extracted(&mut file, index)?;
+        let out = std::io::stdout();
+        // Standard output is line-buffered, a 1 KiB buffer `io::copy` declines
+        // to use.
         let mut sink = std::io::BufWriter::with_capacity(64 * 1024, out.lock());
         let failing = |source: std::io::Error| {
             rpf_core::Error::carried(source).map_or_else(
@@ -347,23 +329,63 @@ pub fn cat(path: &Path, inside: &str, view: View, named_cache: Option<&Path>) ->
     to_stdout(inside, &holder.extract(&mut file, index)?)
 }
 
-/// Bytes a caller asked for, onto standard output, under the rule that a
-/// terminal takes text and nothing else.
-///
-/// Refused at this tool's own boundary rather than at the platform's, which
-/// differ: Windows' console writer declines bytes that are not UTF-8, and a
-/// macOS terminal accepts them and is ruined by them.
+/// Reports a payload written to a file, in place of the payload itself.
+fn report_written(destination: &Path, len: u64, json_out: bool) {
+    if json_out {
+        emit(&json!({ "path": destination.display().to_string(), "len": len }));
+    } else {
+        println!("{len} bytes to {}", destination.display());
+    }
+}
+
+/// Whether standard output is a regular file: the one destination that can hold
+/// a payload nobody is going to read.
+fn holds_payloads() -> bool {
+    duplicated_stdout().is_some_and(|out| out.metadata().is_ok_and(|it| it.is_file()))
+}
+
+/// Standard output as a file this process owns and closes, on a platform whose
+/// descriptors can be duplicated.
+#[cfg(unix)]
+fn duplicated_stdout() -> Option<fs::File> {
+    use std::os::fd::AsFd as _;
+    std::io::stdout()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .map(fs::File::from)
+}
+
+/// Standard output as a file this process owns and closes, on a platform whose
+/// handles can be duplicated.
+#[cfg(windows)]
+fn duplicated_stdout() -> Option<fs::File> {
+    use std::os::windows::io::AsHandle as _;
+    std::io::stdout()
+        .as_handle()
+        .try_clone_to_owned()
+        .ok()
+        .map(fs::File::from)
+}
+
+/// Standard output as a file, on a platform that will not say: never one.
+#[cfg(not(any(unix, windows)))]
+fn duplicated_stdout() -> Option<fs::File> {
+    None
+}
+
+/// Bytes onto standard output, under the rule that a destination which is not a
+/// file takes text and nothing else.
 fn to_stdout(inside: &str, bytes: &[u8]) -> Result<()> {
-    let out = std::io::stdout();
-    if !goes_to(bytes, out.is_terminal()) {
+    if !goes_to(bytes, holds_payloads()) {
         return Err(Failure::Refused {
             reason: format!(
-                "{inside} is not text and standard output is a terminal; \
-                 redirect it to a file or a pipe"
+                "{inside} is not text and standard output is a terminal or a \
+                 pipe; pass --out FILE, or redirect standard output to a file"
             ),
         });
     }
-    let mut sink = std::io::BufWriter::with_capacity(64 * 1024, out.lock());
+    let mut sink = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
     sink.write_all(bytes)
         .and_then(|()| sink.flush())
         .map_err(|source| Failure::Io {
@@ -373,9 +395,6 @@ fn to_stdout(inside: &str, bytes: &[u8]) -> Result<()> {
 }
 
 /// How a change to what an archive holds is allowed to happen.
-///
-/// Grouped rather than passed as more parameters: a call site reading
-/// `remove(a, b, false, true)` says nothing about which `false` is which.
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub struct ChangeOptions {
     /// Write even into a detected game installation.
@@ -386,11 +405,8 @@ pub struct ChangeOptions {
     pub dry_run: bool,
 }
 
-/// How a write is allowed to happen: [`ChangeOptions`], and the two questions
-/// only replacing an entry can be asked.
-///
-/// Adding, removing and renaming always rebuild, so `--rebuild` would have one
-/// value on `rm`, `mv` and `mkdir` and is not offered there.
+/// How a write is allowed to happen: [`ChangeOptions`], plus what only
+/// replacing an entry can be asked.
 #[derive(Debug, Clone, Copy, clap::Args)]
 pub struct WriteOptions {
     /// What every change to an archive may be told.
@@ -428,9 +444,6 @@ impl From<ChangeOptions> for WriteOptions {
 }
 
 /// `put` — replace one entry.
-///
-/// Reads the file and hands the whole of the decision to [`apply`], where every
-/// command that changes an archive goes.
 pub fn put(
     path: &Path,
     inside: &str,
@@ -441,9 +454,9 @@ pub fn put(
 ) -> Result<()> {
     let view = View::from(options.view);
     let contents: std::sync::Arc<dyn rpf_core::Contents> = if view == View::Raw {
-        // A regular file is opened when the library wants it, so a donor of any
-        // size costs a buffer rather than its length. Anything that can be
-        // neither reopened nor seeked is read once and held.
+        // A regular file is opened when the library wants it, so a donor costs
+        // a buffer rather than its length. Anything that can be neither
+        // reopened nor seeked is read once and held.
         match fs::metadata(from) {
             Ok(found) if found.is_file() => std::sync::Arc::new(Donor::at(from)),
             _ => {
@@ -456,8 +469,7 @@ pub fn put(
         }
     } else {
         // A document is converted against the entry it is going into, so the
-        // entry is read here. What is buffered is the payload, in the entry's
-        // own encoding.
+        // entry is read here.
         std::sync::Arc::new(rpf_core::Bytes::new(convert(
             path,
             inside,
@@ -485,9 +497,7 @@ pub fn put(
 }
 
 /// A file on this machine, offered to the library as the contents of a write.
-///
-/// The library opens this when it wants the bytes and never holds them, so
-/// `rpf put` of a donor costs a buffer rather than the donor.
+/// It is opened when the bytes are wanted and never held.
 #[derive(Debug)]
 pub struct Donor(PathBuf);
 
@@ -501,7 +511,7 @@ impl Donor {
 
 impl rpf_core::Contents for Donor {
     // `offset: 0`: the source is not the archive, so there is no offset in it
-    // to name. The path is named where this surfaces.
+    // to name.
     fn open(&self) -> rpf_core::Result<Box<dyn rpf_core::Payload + '_>> {
         let file =
             fs::File::open(&self.0).map_err(|source| rpf_core::Error::Io { offset: 0, source })?;
@@ -515,10 +525,8 @@ impl rpf_core::Contents for Donor {
     }
 }
 
-/// The payload a document at `from` becomes, against the entry it is going into.
-///
-/// The archive is opened for reading only, so `--dry-run` reaches it on the
-/// same terms every other refusal does.
+/// The payload a document at `from` becomes, against the entry it is going
+/// into. The archive is opened for reading only, so `--dry-run` reaches it.
 fn convert(
     path: &Path,
     inside: &str,
@@ -577,9 +585,8 @@ pub fn remove(
     )
 }
 
-/// `mv` — move an entry to another path in the same archive.
-///
-/// A destination the archive already holds is refused rather than replaced.
+/// `mv` — move an entry to another path in the same archive. A destination the
+/// archive already holds is refused rather than replaced.
 pub fn rename(
     path: &Path,
     from: &str,
@@ -618,22 +625,17 @@ pub fn make_directory(
 
 /// What an attempt to write a change set in place came to.
 enum Attempted {
-    /// It was written, or a dry run reported what would have been. There is
-    /// nothing left to do.
+    /// Written, or reported by a dry run. Nothing left to do.
     Done,
-    /// No patch can express this set, or its payloads will not fit. The
-    /// archive has to be rebuilt, and nothing has been written.
+    /// The archive has to be rebuilt, and nothing has been written.
     MustRebuild,
 }
 
 /// Applies a set of changes to an archive, patching in place when every one of
 /// them fits where it already sits and rebuilding when any does not.
 ///
-/// The one path every write takes: `put`, `rm`, `mv` and `mkdir` differ in the
-/// [`Changes`] they build and in nothing else. A rebuild is atomic and a patch
-/// is not, and the report says which ran. `dry_run` takes the same decision and
-/// stops before acting on it, refusals included. `inside` is the in-archive
-/// path the command is about, which a report names.
+/// A rebuild is atomic and a patch is not, and the report says which ran.
+/// `dry_run` takes the same decision and stops before acting on it.
 pub fn apply(
     path: &Path,
     inside: &str,
@@ -699,11 +701,8 @@ pub fn apply(
     Ok(())
 }
 
-/// Tries to write `changes` where the entries already sit, reporting whatever
-/// it decided.
-///
-/// A dry run only reads: needing write permission to answer "what would this
-/// write do" would make it useless on the archives worth asking about.
+/// Tries to write `changes` where the entries already sit. A dry run only
+/// reads, so it needs no write permission.
 fn in_place(
     path: &Path,
     changes: &Changes,
@@ -752,7 +751,6 @@ fn in_place(
         rpf_core::Plan::Structural(structural) => {
             // A dry run has to answer a refusal as well as a plan, so `allows`
             // runs the resolution the rebuild runs and throws the result away.
-            // Asked only of changes a patch could not express.
             for change in &structural {
                 let asked = changes.at(&change.path).ok_or_else(|| Failure::Refused {
                     reason: format!("{} is not a change that was asked for", change.path),
@@ -775,12 +773,10 @@ fn in_place(
     }
 }
 
-/// Whether these bytes may go to standard output as it stands.
-///
-/// A terminal takes text; anything else goes to a file or a pipe. Separated
-/// from [`cat`] so the rule can be tested without a pseudo-terminal.
-fn goes_to(bytes: &[u8], terminal: bool) -> bool {
-    !terminal || std::str::from_utf8(bytes).is_ok()
+/// Whether these bytes may go to standard output: a file takes anything, a
+/// terminal and a pipe take text.
+fn goes_to(bytes: &[u8], file: bool) -> bool {
+    file || std::str::from_utf8(bytes).is_ok()
 }
 
 /// Reports one patch, made or merely planned.
@@ -807,8 +803,7 @@ fn report_patch(entry: &rpf_core::Planned, dry_run: bool, json_out: bool) {
     }
 }
 
-/// Reports that a change would force a rebuild because no patch can express
-/// it, and which change.
+/// Reports that a change would force a rebuild because no patch can express it.
 fn report_would_restructure(change: &rpf_core::Structural, json_out: bool) {
     if json_out {
         emit(&json!({
@@ -842,29 +837,16 @@ fn report_would_rebuild(entry: &rpf_core::TooLarge, json_out: bool) {
 
 /// Whether an extraction may write into a directory that already holds
 /// something.
-///
-/// An enum rather than a boolean, because the two cases are named decisions
-/// rather than a switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Existing {
-    /// Refuse a target that holds anything. What both frontends do unless told
-    /// otherwise.
+    /// Refuse a target that holds anything. The default.
     Refuse,
     /// Write into it, replacing what an entry names and leaving the rest.
     Overwrite,
 }
 
-/// Refuses a target that already holds something.
-///
-/// An extraction claims the tree **is** the archive — `pack` reads it back and
-/// `verify --against` checks against its manifest — and a tree that also holds
-/// files no entry names is not that. A target that does not exist, and an empty
-/// directory, are unaffected.
-///
-/// # Errors
-///
-/// [`Failure::Refused`] naming what is there, and [`Failure::Io`] for a target
-/// that cannot be read at all.
+/// Refuses a target that already holds something: an extraction claims the tree
+/// **is** the archive, which a tree holding files no entry names is not.
 fn refuse_existing(into: &Path, existing: Existing) -> Result<()> {
     if existing == Existing::Overwrite {
         return Ok(());
@@ -907,10 +889,8 @@ pub struct Extracted {
     pub manifest: std::path::PathBuf,
 }
 
-/// `extract` — write every entry to a tree, with the manifest beside it.
-///
-/// The archive being read is claimed before anything is created, so an
-/// extraction cannot write over its own source.
+/// `extract` — write every entry to a tree, with the manifest beside it. The
+/// source archive is claimed first, so an extraction cannot write over it.
 pub fn extract(
     path: &Path,
     into: &Path,
@@ -959,20 +939,9 @@ pub fn extract(
 /// Writes every entry of an open archive to a tree, with the manifest beside
 /// it.
 ///
-/// Nested archives come out as the `.rpf` files they are, byte for byte, and
-/// packing puts them back untouched. One [`Step`] per file written, and a
-/// stopped extraction leaves the files it had already written where they are.
-/// `existing` decides what happens when the target already holds something, and
+/// Nested archives come out as the `.rpf` files they are, byte for byte.
 /// `claimed` is asked of **every path this will write** before anything is
 /// created, because a tree cannot be renamed into place.
-///
-/// # Errors
-///
-/// [`Failure::Refused`] for a target that already holds something,
-/// whatever `claimed` returns for a path this would write,
-/// [`Failure::Io`] for a file or directory that could not be written,
-/// `Error::Cancelled` when the watcher stops it, and as
-/// `rpf_core::Manifest::of` for an archive whose names no host can hold.
 pub fn extract_into<R: std::io::Read + std::io::Seek>(
     src: &mut R,
     archive: &Archive,
@@ -981,8 +950,8 @@ pub fn extract_into<R: std::io::Read + std::io::Seek>(
     claimed: &dyn Fn(&Path) -> Option<Failure>,
     watch: &mut impl Watch,
 ) -> Result<Extracted> {
-    // Before the walk and before anything is created: a tree cannot be renamed
-    // into place, so a refusal found part-way would leave the part written.
+    // Before anything is created: a tree cannot be renamed into place, so a
+    // refusal found part-way would leave the part written.
     refuse_existing(into, existing)?;
 
     let manifest = rpf_core::Manifest::of_contents(src, archive, watch)?;
@@ -1012,9 +981,8 @@ pub fn extract_into<R: std::io::Read + std::io::Seek>(
         if let Some(parent) = target.parent() {
             create_dir(parent)?;
         }
-        // Streamed rather than read and then written, so an extraction costs
-        // its buffer rather than its largest entry. A read that fails part-way
-        // leaves the entry's file there and short.
+        // Streamed, so an extraction costs its buffer rather than its largest
+        // entry.
         let mut contents = archive.extracted(&mut *src, *index)?;
         let moved = stream_file(&target, &mut contents)?;
 
@@ -1067,20 +1035,12 @@ pub fn pack(
 }
 
 /// Builds an archive from a tree and its manifest, replacing whatever is at
-/// `archive_path`.
+/// `archive_path`. Written to a temporary file and renamed into place, so a
+/// stopped `pack` leaves the destination as it was.
 ///
-/// Written to a temporary file in the same directory and renamed into place, so
-/// a `pack` that is stopped part-way leaves the destination as it was, at the
-/// version the manifest names.
-///
-/// A tree whose manifest names an encrypted tag packs back under that tag's own
-/// transform, keyed by the **output** archive's name: an archive is read back
-/// under the name it is written at.
-///
-/// # Errors
-///
-/// [`Failure::GameInstall`] unless `force`, [`Failure::Io`] for a file in the
-/// manifest that is not in the tree, and as `rpf_core::Manifest::pack_into`.
+/// An encrypted tag packs back under that tag's own transform, keyed by the
+/// **output** archive's name: an archive is read back under the name it is
+/// written at.
 pub fn pack_from(
     from: &Path,
     archive_path: &Path,
@@ -1100,10 +1060,8 @@ pub fn pack_from(
     })?;
 
     // A missing file is reported as itself rather than as a build failure: the
-    // tree is the caller's, and naming the path is the actionable part.
+    // actionable part is the path.
     let mut missing = None;
-    // The version the tree came out of: a tree extracted from one version must
-    // not be packed as another.
     let report = manifest.pack_into(
         scratch.as_file_mut(),
         &unlock,
@@ -1134,17 +1092,9 @@ pub fn pack_from(
     Ok(report)
 }
 
-/// Where a tree will land, resolved as far as the filesystem already goes.
-///
-/// An extraction may be told to write into a directory that does not exist yet,
-/// at any depth, so this walks up until something resolves and joins the rest
-/// back on. That is what makes a path a caller spelled relatively comparable
-/// with the canonical path a session claimed.
-///
-/// # Errors
-///
-/// [`Failure::Refused`] for a path with no component that resolves at all,
-/// which on any platform this runs on means one that names nothing.
+/// Where a tree will land, resolved as far as the filesystem already goes: the
+/// target may not exist yet, at any depth, so this walks up until something
+/// resolves and joins the rest back on.
 fn resolved_root(into: &Path) -> Result<PathBuf> {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut here: &Path = into;
@@ -1187,20 +1137,15 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
-/// Writes a file as its contents stream out of wherever they come from, and
-/// answers how many bytes moved.
-///
-/// The two sides fail differently: a failed **read** stays the container's and
-/// names the entry, and a failed **write** is this frontend's and names the
-/// file.
+/// Streams contents into a file, answering how many bytes moved. A failed read
+/// stays the container's and names the entry; a failed write names the file.
 fn stream_file<S: std::io::Read>(path: &Path, contents: &mut S) -> Result<u64> {
     let named = || path.display().to_string();
     let file = fs::File::create(path).map_err(|source| Failure::Io {
         path: named(),
         source,
     })?;
-    // Buffered because `io::copy` moves in the sink's own buffer when the sink
-    // has one, and in 8 KiB steps when it does not.
+    // Buffered because `io::copy` moves in 8 KiB steps into an unbuffered sink.
     let mut target = std::io::BufWriter::with_capacity(64 * 1024, file);
     let moved = std::io::copy(contents, &mut target).map_err(|source| {
         rpf_core::Error::carried(source).map_or_else(
@@ -1212,7 +1157,7 @@ fn stream_file<S: std::io::Read>(path: &Path, contents: &mut S) -> Result<u64> {
         )
     })?;
     // Flushed here rather than left to the drop, which has nowhere to report a
-    // failure: the last write of the file is as able to fail as any other.
+    // failure.
     target.flush().map_err(|source| Failure::Io {
         path: named(),
         source,
@@ -1235,20 +1180,13 @@ fn refuse_game_install(path: &Path, force: bool) -> Result<()> {
     }
 }
 
-/// Moves a freshly written archive into place, keeping any permissions the
-/// file it replaces already had.
-///
-/// The replace is atomic in the sense that no reader sees a torn file at the
-/// destination name; it is not a promise about power loss. On Windows and NTFS
-/// it is refused for a read-only destination, and for one another program holds
-/// open without allowing deletion.
+/// Moves a freshly written archive into place, keeping any permissions the file
+/// it replaces already had. No reader sees a torn file at the destination name.
 ///
 /// # Errors
 ///
-/// [`Failure::Io`] naming the archive if the scratch file cannot be flushed or
-/// moved into place. Also if the replaced file's permissions cannot be put back
-/// on afterwards, which is the one failure that leaves the **new archive in
-/// place** — correct, complete, and carrying the scratch file's own mode.
+/// A failure to restore permissions leaves the **new archive in place**, whole
+/// and carrying the scratch file's own mode.
 pub fn persist(scratch: tempfile::NamedTempFile, path: &Path) -> Result<()> {
     let mut scratch = scratch;
     scratch
@@ -1268,8 +1206,7 @@ pub fn persist(scratch: tempfile::NamedTempFile, path: &Path) -> Result<()> {
 
     // `fs::rename` rather than `NamedTempFile::persist`, which on Windows is
     // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` and refuses to replace a
-    // destination *anything* holds open — including this process, which holds
-    // the archive it is rebuilding.
+    // destination *anything* holds open — including this process.
     let (file, scratch_path) = scratch.keep().map_err(|error| Failure::Io {
         path: path.display().to_string(),
         source: error.error,
@@ -1294,17 +1231,8 @@ pub fn persist(scratch: tempfile::NamedTempFile, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The manifest inside an extracted tree.
-///
-/// One spelling of where a tree's own record is: `pack` reads a tree back
-/// through it, and `verify --against` checks an archive against it. The tree is
-/// named, not the file, whose name is `rpf-core`'s to decide.
-///
-/// # Errors
-///
-/// [`Failure::Io`] when there is no manifest in `tree`, or it cannot be read,
-/// and as `rpf_core::Manifest::from_json` for one this build does not
-/// understand.
+/// The manifest inside an extracted tree. The tree is named, not the file,
+/// whose name is `rpf-core`'s to decide.
 pub fn manifest_in(tree: &Path) -> Result<rpf_core::Manifest> {
     let path = tree.join(rpf_core::MANIFEST_NAME);
     let text = fs::read_to_string(&path).map_err(|source| Failure::Io {
@@ -1316,9 +1244,6 @@ pub fn manifest_in(tree: &Path) -> Result<rpf_core::Manifest> {
 
 /// What a `verify` measured, and how far past the archive's own promises it
 /// reached.
-///
-/// Three numbers rather than one: "27 entries verified" means every entry was
-/// read back, and an archive says nothing at all about a stored entry's bytes.
 #[derive(Debug)]
 pub struct Checked {
     /// The walk itself: what was read, and what did not come back.
@@ -1331,17 +1256,8 @@ pub struct Checked {
 
 impl Checked {
     /// Whether the manifest the caller named answered the question it was
-    /// asked.
-    ///
-    /// Checksums are joined to entries by path, so a manifest describing a
-    /// *different* archive names none of them, checks nothing, and is refused
-    /// rather than reported as a success. A walk that found problems reports
-    /// those instead.
-    ///
-    /// # Errors
-    ///
-    /// [`Failure::Refused`] when a manifest was given and nothing at all was
-    /// checked against it.
+    /// asked: one describing a *different* archive names no entry, checks
+    /// nothing, and is refused rather than reported as a success.
     fn answered(&self) -> Result<()> {
         let Some(ref tree) = self.against else {
             return Ok(());
@@ -1371,19 +1287,11 @@ impl Checked {
 }
 
 /// Reads every entry back, against the manifest of an extracted tree when one
-/// is named.
+/// is named. One walk either way.
 ///
-/// One walk either way. A stored entry is why the manifest question exists: it
-/// declares no inflated length and carries no deflate stream that ends, so
-/// nothing in the archive says what its bytes should be. Digesting is bounded
-/// work inside the step the entry already reports, so `done` and `total` are
-/// the same numbers with a manifest and without one.
-///
-/// # Errors
-///
-/// As [`manifest_in`] for a tree with no manifest in it, [`Failure::Refused`]
-/// when the manifest names no entry this archive holds — [`Checked::answered`]
-/// — and as `rpf_core::Verified::of` for a walk that could not finish.
+/// A stored entry is why the manifest question exists: it declares no inflated
+/// length and carries no deflate stream that ends, so nothing in the archive
+/// says what its bytes should be.
 pub fn verified<R: std::io::Read + std::io::Seek>(
     src: &mut R,
     archive: &Archive,
@@ -1406,19 +1314,13 @@ pub fn verified<R: std::io::Read + std::io::Seek>(
     Ok(checked)
 }
 
-/// One `verify` problem as JSON, for whichever frontend is reporting it.
-///
-/// The path and the reason apart rather than as one string: a reason carries
-/// colons of its own — `entry 0: payload did not inflate` — so a consumer
-/// cannot split them back apart.
+/// One `verify` problem as JSON. Path and reason apart rather than as one
+/// string: a reason carries colons of its own.
 pub fn verify_problem(problem: &rpf_core::Problem) -> Value {
     json!({ "path": problem.path, "reason": problem.error.to_string() })
 }
 
-/// A `verify` report as JSON, for whichever frontend is reporting it.
-///
-/// One place, so the two frontends carry the same numbers and the same problems
-/// under the same names.
+/// A `verify` report as JSON, shared by both frontends.
 pub fn verify_report(path: &Path, checked: &Checked, problems: &[Value]) -> Value {
     json!({
         "path": path.display().to_string(),
@@ -1430,14 +1332,9 @@ pub fn verify_report(path: &Path, checked: &Checked, problems: &[Value]) -> Valu
     })
 }
 
-/// What a `verify` measured, in the words a person reads.
-///
-/// Never the bare count: `contents_checked` is zero unless a manifest was
-/// given, and the gap between the two counts is explained rather than left to
-/// be misread, because nothing here can tell an entry inside a nested archive
-/// from one the manifest did not record. An entry that did not read back is a
-/// third reason for the gap, and it is named rather than apportioned to either
-/// of the other two.
+/// What a `verify` measured, in the words a person reads. Never the bare count:
+/// the gap between the two counts is explained, because nothing here can tell
+/// an entry inside a nested archive from one the manifest did not record.
 fn coverage(checked: &Checked) -> Vec<String> {
     let read = format!("{} entries read back", checked.verified.checked);
     let Some(ref tree) = checked.against else {
@@ -1522,11 +1419,8 @@ const FROM_EXECUTABLE: &str = "executable";
 /// Material read back from the cache instead of scanned for.
 const FROM_CACHE: &str = "cache";
 
-/// What a `keys` command found, and the whole of what it may say.
-///
-/// Offsets, lengths, a digest and paths. **No key crosses this boundary**:
-/// nothing that leaves here can render into key material, because it holds
-/// none.
+/// What a `keys` command found: offsets, lengths, a digest and paths. **No key
+/// crosses this boundary.**
 #[derive(Debug, Clone)]
 pub struct KeysFound {
     /// The executable it came from, as the caller named it.
@@ -1540,26 +1434,19 @@ pub struct KeysFound {
     /// Where the NG hash lookup table sits in the executable.
     pub hash_lut_at: u64,
     /// Where the launcher's own AES key sits, where the source carried it.
-    ///
-    /// `None` for every game executable and every memory image of one: it is in
-    /// `Launcher.exe` and nothing else. An offset, never a key.
+    /// `None` for anything but `Launcher.exe`. An offset, never a key.
     pub launcher_key_at: Option<u64>,
-    /// The NG material, where the source carried it.
-    ///
-    /// `None` for a game executable and `Some` for a memory image of one. Its
+    /// The NG material, carried by a memory image and not by an executable. Its
     /// absence is not a failure: an archive with the AES tag needs none of it.
     pub ng: Option<NgFound>,
     /// The cache it was written to or read from, if this machine has one.
     pub cache: Option<PathBuf>,
 }
 
-/// The NG material a source carried, said in what may be said about it.
-///
-/// Counts and positions; like [`KeysFound`] it holds no key.
+/// The NG material a source carried, as counts and positions. It holds no key.
 #[derive(Debug, Clone, Copy)]
 pub struct NgFound {
-    /// How many expanded keys were found, which is all of them or this is not
-    /// reported at all.
+    /// How many expanded keys were found: all of them, or nothing is reported.
     pub expanded_keys: usize,
     /// Where the expanded keys start in the source.
     pub expanded_keys_at: u64,
@@ -1580,9 +1467,8 @@ pub struct CacheCount {
 }
 
 /// The cache a `keys` command works on: the one named, or the platform's.
-///
-/// `None` is a complete answer rather than a failure — no `HOME` on a Unix, no
-/// `%APPDATA%` on Windows — and the material is still extracted.
+/// `None` is a complete answer rather than a failure, and material is still
+/// extracted.
 fn cache_of(named: Option<&Path>) -> Option<Cache> {
     match named {
         Some(directory) => Some(Cache::at(directory)),
@@ -1590,16 +1476,9 @@ fn cache_of(named: Option<&Path>) -> Option<Cache> {
     }
 }
 
-/// Finds the key material in a game executable, caching what it found.
-///
-/// The cache is keyed by the executable's own SHA-256, so a hit is material
-/// from *this* file and the offsets it reports are true of it.
-///
-/// # Errors
-///
-/// [`Failure::Io`] if the executable cannot be read or the cache cannot be
-/// written, naming which of the two; `Error::UnrecognisedExecutable` — exit 9 —
-/// if the file carries neither value.
+/// Finds the key material in a game executable, caching what it found. The
+/// cache is keyed by the executable's own SHA-256, so a hit is material from
+/// *this* file and the offsets it reports are true of it.
 pub fn find_keys(
     executable: &Path,
     named_cache: Option<&Path>,
@@ -1665,10 +1544,8 @@ fn found(
     }
 }
 
-/// A cache read or write that failed, reported against the directory.
-///
-/// The container's own `Io` renders as "i/o failure at offset 0", which names
-/// nothing anyone can act on; the actionable half is where the cache is.
+/// A cache read or write that failed, reported against the directory rather
+/// than as the container's offset-0 `Io`, which names nothing actionable.
 fn cache_failed(directory: &Path, error: rpf_core::Error) -> Failure {
     match error {
         rpf_core::Error::Io { source, .. } => at(directory, source),
@@ -1685,24 +1562,12 @@ fn at(path: &Path, source: std::io::Error) -> Failure {
 }
 
 /// Where extracted material is kept, and how many entries are there.
-///
-/// # Errors
-///
-/// [`Failure::Io`] if the directory exists and cannot be read.
 pub fn cache_state(named: Option<&Path>) -> Result<CacheCount> {
     counted(cache_of(named), |cache| Ok(cache.entries()?.len()))
 }
 
-/// Removes every entry the cache holds, and says how many there were.
-///
-/// Whole rather than one entry at a time: re-extraction already replaces the
-/// entry for a given executable, so a per-entry removal could only leave the
-/// other entries' key material on the machine.
-///
-/// # Errors
-///
-/// [`Failure::Io`] if the directory cannot be read or an entry cannot be
-/// removed.
+/// Removes every entry the cache holds, and says how many there were. Whole
+/// rather than per-entry, so no other entry's key material is left behind.
 pub fn invalidate_keys(named: Option<&Path>) -> Result<CacheCount> {
     counted(cache_of(named), |cache| Ok(cache.clear()?))
 }
@@ -1710,9 +1575,8 @@ pub fn invalidate_keys(named: Option<&Path>) -> Result<CacheCount> {
 /// One cache, counted by whichever of the two operations asked.
 fn counted(cache: Option<Cache>, how: impl Fn(&Cache) -> Result<usize>) -> Result<CacheCount> {
     let entries = match cache.as_ref() {
-        // `Error::Io` carries an offset and no path, which is meaningless for
-        // a directory that could not be read. The frontend is the one that
-        // knows the directory, so it is the one that names it.
+        // `Error::Io` carries an offset and no path; the frontend is the one
+        // that knows the directory.
         Some(cache) => how(cache).map_err(|failure| match failure {
             Failure::Container(rpf_core::Error::Io { source, .. }) => at(cache.directory(), source),
             other => other,
@@ -1726,10 +1590,6 @@ fn counted(cache: Option<Cache>, how: impl Fn(&Cache) -> Result<usize>) -> Resul
 }
 
 /// `keys extract` — find the key material a source carries.
-///
-/// # Errors
-///
-/// As [`find_keys`].
 pub fn keys_extract(executable: &Path, cache: Option<&Path>, json_out: bool) -> Result<()> {
     let found = find_keys(executable, cache, &mut OnStderr::new())?;
 
@@ -1744,8 +1604,7 @@ pub fn keys_extract(executable: &Path, cache: Option<&Path>, json_out: bool) -> 
             "hash lut    {HASH_LUT_LEN} bytes at {:#x}",
             found.hash_lut_at
         );
-        // Only where the source carries it, and no line for its absence: an
-        // executable that does not hold it is every executable but one.
+        // No line for its absence: every executable but one lacks it.
         if let Some(at) = found.launcher_key_at {
             println!("launcher    {AES_KEY_LEN} bytes at {at:#x}");
         }
@@ -1767,10 +1626,8 @@ pub fn keys_extract(executable: &Path, cache: Option<&Path>, json_out: bool) -> 
     Ok(())
 }
 
-/// Where the material came from, as a person reads it.
-///
-/// The wire keeps saying `executable` — a contract value clients read — but a
-/// memory image is not one, and the line a person reads should not say it is.
+/// Where the material came from, as a person reads it. The wire keeps saying
+/// `executable`, a contract value, but a memory image is not one.
 fn how_found(from: &str) -> &'static str {
     if from == FROM_CACHE {
         "the cache"
@@ -1779,21 +1636,12 @@ fn how_found(from: &str) -> &'static str {
     }
 }
 
-/// What to tell someone whose source carried no NG material.
-///
-/// Said once, because the human line and the JSON field are the same fact. It
-/// is not an error: every archive outside the NG set opens without it. It says
-/// where the material *can* be found and claims nothing about the source in
-/// hand, which may be an image taken too early, of the wrong process, or carved
-/// short.
+/// What to tell someone whose source carried no NG material. It says where the
+/// material *can* be found and claims nothing about the source in hand.
 const NG_ABSENT: &str =
     "an executable never carries it; it is in the clear only in a memory image of a running game";
 
 /// `keys cache` — where extracted material is kept, and how much is there.
-///
-/// # Errors
-///
-/// As [`cache_state`].
 pub fn keys_cache(cache: Option<&Path>, json_out: bool) -> Result<()> {
     let state = cache_state(cache)?;
 
@@ -1807,10 +1655,6 @@ pub fn keys_cache(cache: Option<&Path>, json_out: bool) -> Result<()> {
 }
 
 /// `keys invalidate` — remove every cached entry.
-///
-/// # Errors
-///
-/// As [`invalidate_keys`].
 pub fn keys_invalidate(cache: Option<&Path>, json_out: bool) -> Result<()> {
     let state = invalidate_keys(cache)?;
 
@@ -1826,11 +1670,8 @@ pub fn keys_invalidate(cache: Option<&Path>, json_out: bool) -> Result<()> {
     Ok(())
 }
 
-/// One extraction as JSON, for whichever frontend is reporting it.
-///
-/// One place for the shape, so `--json keys extract` and the daemon's
-/// `keys.extract` are the same object. Every field is something that may leave
-/// the machine: an offset in decimal, a length, the source's digest, and paths.
+/// One extraction as JSON, shared by `--json keys extract` and the daemon's
+/// `keys.extract`. Every field is one that may leave the machine.
 #[must_use]
 pub fn keys_report(found: &KeysFound) -> Value {
     json!({
@@ -1843,10 +1684,8 @@ pub fn keys_report(found: &KeysFound) -> Value {
     })
 }
 
-/// The values an extraction found, each as a name, a length and a position.
-///
-/// The NG rows and the launcher key are present only when the source carried
-/// them, so a consumer reads the list rather than assuming a fixed length.
+/// The values an extraction found, each as a name, a length and a position. The
+/// list is not a fixed length: some rows appear only when the source has them.
 fn values_found(found: &KeysFound) -> Value {
     let mut values = vec![
         json!({ "name": "aes_key", "len": AES_KEY_LEN, "at": found.aes_key_at }),
@@ -1931,9 +1770,6 @@ mod tests {
 
     #[test]
     fn a_shorter_progress_line_covers_the_one_before_it() {
-        // The reuse is a carriage return and spaces rather than the ANSI
-        // erase-to-end-of-line, which a plain Windows console prints instead of
-        // obeying.
         assert_eq!(padding(20, 8).len(), 12, "the tail of the longer line");
         assert_eq!(padding(8, 20), "", "a longer line covers itself");
         assert_eq!(padding(8, 8), "", "the same width needs nothing");
@@ -1941,20 +1777,17 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_takes_text_and_nothing_else() {
-        // Windows' console writer refuses bytes that are not UTF-8 and a macOS
-        // terminal accepts them and is ruined by them. One rule for all three.
-        assert!(goes_to("hello".as_bytes(), true));
-        assert!(goes_to("ä".as_bytes(), true), "text is text past ASCII");
-        assert!(!goes_to(b"RSC7\xff\xfe", true));
-        assert!(!goes_to(&[0x80], true), "a lone continuation byte");
+    fn a_terminal_or_a_pipe_takes_text_and_nothing_else() {
+        assert!(goes_to("hello".as_bytes(), false));
+        assert!(goes_to("ä".as_bytes(), false), "text is text past ASCII");
+        assert!(!goes_to(b"RSC7\xff\xfe", false));
+        assert!(!goes_to(&[0x80], false), "a lone continuation byte");
     }
 
     #[test]
     fn what_an_extraction_reports_is_offsets_lengths_a_digest_and_paths() {
-        // This is the object both frontends print, so the set of fields in it
-        // is the set of things key extraction can put where somebody else can
-        // read them. A field added without being thought about fails here.
+        // The set of fields here is the set of things key extraction can put
+        // where somebody else can read them.
         let found = KeysFound {
             executable: std::path::PathBuf::from("/games/GTA5.exe"),
             source: "0".repeat(64),
@@ -1999,9 +1832,7 @@ mod tests {
 
     #[test]
     fn an_extraction_that_found_ng_material_reports_counts_and_positions() {
-        // The other half of the field-set check above, on the shape only a
-        // memory image produces: two counts and two offsets, and nothing that
-        // could render into one of the values they summarise.
+        // The shape only a memory image produces: two counts and two offsets.
         let found = KeysFound {
             executable: std::path::PathBuf::from("/dumps/gta5.dmp"),
             source: "0".repeat(64),
@@ -2047,8 +1878,7 @@ mod tests {
     #[test]
     fn a_walk_that_stops_early_leaves_its_line_for_drop_to_close() {
         // `scan::find` stops the moment every anchor is found, so the arm that
-        // closes the progress line on `done == total` is never reached and the
-        // report's first line lands on top of it.
+        // closes the line on `done == total` is never reached.
         let mut watching = OnStderr {
             silent: false,
             written: 0,
@@ -2067,7 +1897,7 @@ mod tests {
              unreachable and the report will be printed on top of it"
         );
 
-        // A walk that does reach its end closes its own line, and must not then
+        // A walk that reaches its end closes its own line, and must not then
         // get a second newline from `Drop`.
         watching.step(Step {
             path: "key material",
@@ -2077,7 +1907,6 @@ mod tests {
         });
         assert!(!watching.line_is_open(), "a finished walk left a line open");
 
-        // A watcher nobody can see never has a line to close either way.
         let mut piped = OnStderr {
             silent: true,
             written: 0,
@@ -2093,9 +1922,6 @@ mod tests {
 
     #[test]
     fn what_a_missing_ng_survey_says_is_not_a_claim_about_the_source_in_hand() {
-        // "A memory image of one does" is asserted at precisely the user it is
-        // wrong for: the one whose image was taken too early, of the wrong
-        // process, or carved short.
         assert!(
             !NG_ABSENT.contains("this"),
             "the line refers to the source in hand: {NG_ABSENT}"
@@ -2109,9 +1935,8 @@ mod tests {
 
     #[test]
     fn an_extraction_that_found_the_launcher_key_reports_one_more_offset() {
-        // The third half of the field-set check above, on the shape only
-        // `Launcher.exe` produces: one row of the same three fields every other
-        // row has, and no top-level field at all.
+        // The shape only `Launcher.exe` produces: one more row, and no
+        // top-level field at all.
         let found = KeysFound {
             executable: std::path::PathBuf::from("/launcher/Launcher.exe"),
             source: "0".repeat(64),
@@ -2152,8 +1977,6 @@ mod tests {
         inner.sort_unstable();
         assert_eq!(inner, ["at", "len", "name"], "{}", values[2]);
 
-        // A source without it says nothing about it rather than saying it is
-        // absent: that is every executable but one.
         let without = KeysFound {
             launcher_key_at: None,
             ..found
@@ -2168,9 +1991,6 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_configuration_directory_reports_no_cache() {
-        // `Cache::platform` answers `None` where the environment does not say
-        // where a configuration directory is, and that is a complete answer
-        // rather than a failure: the material was still found.
         let found = KeysFound {
             executable: std::path::PathBuf::from("/games/GTA5.exe"),
             source: "0".repeat(64),
@@ -2185,11 +2005,9 @@ mod tests {
     }
 
     #[test]
-    fn a_pipe_or_a_file_takes_anything() {
-        // `rpf cat … > f && rpf put … f` is the round trip the command exists
-        // for, and every resource in it is bytes rather than text.
-        assert!(goes_to(b"RSC7\xff\xfe", false));
-        assert!(goes_to(&[0x80], false));
-        assert!(goes_to(&[], false));
+    fn a_file_takes_anything() {
+        assert!(goes_to(b"RSC7\xff\xfe", true));
+        assert!(goes_to(&[0x80], true));
+        assert!(goes_to(&[], true));
     }
 }

@@ -1,7 +1,5 @@
-//! Whether the NG transform's forward direction derives from the decrypt tables
-//! this build already holds. Gated: `RPF_GAME_IMAGE` names the memory image the
-//! material is scanned from, `RPF_CORPUS` the directory holding the real
-//! ciphertext.
+//! Whether the NG forward transform derives from the decrypt tables this build
+//! holds. Gated on `RPF_GAME_IMAGE` (the memory image) and `RPF_CORPUS`.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -17,18 +15,15 @@ use rpf_core::{
     keys::{Material, NG_EXPANDED_KEY_LEN, NG_ROUNDS},
 };
 
-/// The NG-encrypted archive in the corpus, by the relative path that addresses
-/// it.
+/// The NG-encrypted archive in the corpus, by relative path.
 const NG_ARCHIVE: &str = "gtav_ng/dlc.rpf";
 
 const ROUND_KEY_LEN: usize = crypto::CIPHER_BLOCK_LEN;
 
-/// How many blocks of the archive the round trip runs over: enough that a table
-/// wrong in one byte value is hit.
+/// Enough blocks that a table wrong in one byte value is hit.
 const BLOCKS: usize = 4096;
 
-/// Reports a skip, naming the test and the gate that was not there;
-/// `RPF_REQUIRE_<GATE>` turns that gate's absence into a failure.
+/// Reports a skip; `RPF_REQUIRE_<GATE>` turns that gate's absence into a failure.
 fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -39,8 +34,7 @@ fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     None
 }
 
-/// The key material the memory image carries, scanned once for this binary and
-/// never written anywhere.
+/// The key material the memory image carries, scanned once and never written out.
 fn scanned() -> Result<Arc<Material>, String> {
     static HELD: std::sync::OnceLock<Result<Arc<Material>, String>> = std::sync::OnceLock::new();
     HELD.get_or_init(|| {
@@ -101,8 +95,8 @@ fn round_key(expanded: &[u8], round: usize) -> [u8; ROUND_KEY_LEN] {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
 fn every_round_of_the_transform_derives_from_the_decrypt_tables_alone() {
-    // All seventeen: the factorisation `NgRound::solve` uses finds what the
-    // reference implementation sweeps 2^32 values for on rounds 2 through 15.
+    // The factorisation `NgRound::solve` uses finds what the reference
+    // implementation sweeps 2^32 values for on rounds 2 through 15.
     let test = "every_round_of_the_transform_derives_from_the_decrypt_tables_alone";
     let Some(material) = material(test) else {
         return;
@@ -122,9 +116,6 @@ fn every_round_of_the_transform_derives_from_the_decrypt_tables_alone() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive() {
-    // Real tables, a real expanded key and real ciphertext: the claim is that
-    // the algebra closes over the material this tool actually meets, not merely
-    // over synthetic tables.
     let test = "a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive";
     let Some(material) = material(test) else {
         return;
@@ -134,8 +125,8 @@ fn a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive() {
     };
     let ng = material.ng().expect("the image carries the NG half");
 
-    // Chosen by name and length exactly as `Cipher` chooses it, so the round
-    // keys below are the ones the archive was written with.
+    // Chosen by name and length as `Cipher` chooses it, so the round keys below
+    // are the ones the archive was written with.
     let index = crypto::Cipher::new(
         crypto::Scheme::Ng,
         &material,
@@ -193,8 +184,8 @@ fn a_derived_round_undoes_the_decrypt_round_on_bytes_from_an_ng_archive() {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
 fn a_derived_round_undoes_the_decrypt_round_under_every_key_the_material_holds() {
-    // The round key is exclusive-ored in, so a derivation that got the affine
-    // part wrong could still round-trip under one key and fail under another.
+    // The round key is exclusive-ored in, so a derivation with the affine part
+    // wrong can still round-trip under one key and fail under another.
     let test = "a_derived_round_undoes_the_decrypt_round_under_every_key_the_material_holds";
     let Some(material) = material(test) else {
         return;
@@ -244,10 +235,9 @@ fn rank(words: &[u32]) -> usize {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE must be set")]
 fn a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column() {
-    // 256 distinct differences spanning eight dimensions means the table is a
-    // byte permutation into a subspace — an AES-shaped T-box — and the round
-    // inverts by elimination plus one 256-byte permutation per column. Anything
-    // else and the inverse has to be swept for.
+    // 256 distinct differences spanning eight dimensions means the table is an
+    // AES-shaped T-box, so the round inverts by elimination plus one 256-byte
+    // permutation per column rather than by a sweep.
     let test = "a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column";
     let Some(material) = material(test) else {
         return;
@@ -278,8 +268,6 @@ fn a_rounds_table_differences_are_an_eight_dimensional_space_in_every_column() {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn the_derived_transform_undoes_the_whole_decrypt_transform_on_an_ng_archives_bytes() {
-    // All seventeen rounds run backwards over real bytes: the statement "an NG
-    // archive can be written back".
     let test = "the_derived_transform_undoes_the_whole_decrypt_transform_on_an_ng_archives_bytes";
     let Some(material) = material(test) else {
         return;

@@ -1,7 +1,4 @@
-//! One row of the entry table, once its version has been decoded away.
-//!
-//! Directory, binary and resource are separate variants because the two
-//! trailing words of the row mean different things in each.
+//! One decoded row of the entry table: directory, binary, or resource.
 
 /// What an entry is, and the fields that only that kind has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,23 +14,18 @@ pub enum EntryKind {
     Binary {
         /// Payload offset, in blocks, from the archive's own base.
         block: u32,
-        /// On-disk size. Zero means stored rather than deflated, and then
-        /// `uncompressed_len` is the real length.
+        /// On-disk size; zero means stored, and `uncompressed_len` then holds the real length.
         compressed_len: u32,
         /// Length the payload inflates to.
         uncompressed_len: u32,
-        /// Per-entry encryption field: non-zero means the payload is under the
-        /// archive's own transform.
+        /// Non-zero encryption field: the payload is under the archive's own transform.
         encryption: u32,
     },
-    /// A file whose payload is an `RSC7` resource.
-    ///
-    /// Carries no uncompressed length: both trailing words are flags, and the
-    /// length comes from [`crate::format::resource::resource_len`].
+    /// A file whose payload is an `RSC7` resource; length comes from `resource_len` instead.
     Resource {
         /// Payload offset, in blocks, from the archive's own base.
         block: u32,
-        /// On-disk size, **including** the 16-byte `RSC7` header.
+        /// On-disk size, including the 16-byte `RSC7` header.
         compressed_len: u32,
         /// System page flags.
         system_flags: u32,

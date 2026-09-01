@@ -1,6 +1,5 @@
 //! What an entry is, decided from its bytes and its row and from nothing else.
-//! Mostly synthetic so it runs without game data; the gated half adds real
-//! `PSO` bytes and a real resource whose payload does not begin with `RSC7`.
+//! Mostly synthetic; the gated half runs against real game data.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -34,8 +33,7 @@ fn deflate(plain: &[u8]) -> Vec<u8> {
 }
 
 /// An archive of one directory over one file, whose payload sits at block 1.
-/// `word8` is the uncompressed length for a binary entry and the system flags
-/// for a resource one.
+/// `word8` is the uncompressed length, or the system flags for a resource.
 fn one_file_archive(payload: &[u8], declared: u32, block_flag: u32, word8: u32) -> Vec<u8> {
     let rows = [
         directory_row(0, 1, 1),
@@ -63,8 +61,7 @@ fn classified(bytes: &[u8], index: u32) -> Classification {
         .expect("the entry is there")
 }
 
-/// The four heads the corpus recognises, and one it does not, each as the
-/// sixteen bytes a real payload begins with.
+/// The four recognised heads and one that is not, each sixteen bytes wide.
 const HEADS: &[(&[u8], Option<Encoding>)] = &[
     (b"<?xml version=\"1", Some(Encoding::Xml)),
     (b"RBF0\x00\x0eCMapType", Some(Encoding::Rbf)),
@@ -75,8 +72,6 @@ const HEADS: &[(&[u8], Option<Encoding>)] = &[
 
 #[test]
 fn every_encoding_is_recognised_through_the_deflate_stream_that_holds_it() {
-    // The head is read from an entry's contents, not from the payload where it
-    // sits on disk, which would answer `Binary` for all five.
     for &(contents, expected) in HEADS {
         let stored_as = classified(&stored(contents), 1);
         let deflated_as = classified(&deflated(contents), 1);
@@ -101,8 +96,7 @@ fn resource_payload(contents: &[u8]) -> Vec<u8> {
 
 #[test]
 fn a_resource_is_classified_by_its_row_and_its_payload_is_never_read() {
-    // Two resources, one whose contents are XML and one whose payload begins
-    // with XML: a sniff would have to be refused on both. The row decides.
+    // One resource whose contents are XML, one whose payload begins with XML.
     let inflating_to_xml = resource_payload(b"<?xml version=\"1.0\"?><CMapTypes/>");
     let beginning_with_xml = b"<?xml version=\"1.0\"?><CMapTypes/>          ".to_vec();
 
@@ -129,8 +123,8 @@ fn a_resource_is_classified_by_its_row_and_its_payload_is_never_read() {
 
 #[test]
 fn the_window_is_sixteen_bytes_and_a_shorter_one_calls_more_payloads_text() {
-    // Sixteen, not eight: `.bik` and `.awc` payloads whose ASCII magic runs out
-    // after four would otherwise read as text. This is one, in miniature.
+    // Sixteen, not eight: an ASCII magic running out after four would
+    // otherwise read as text.
     let mut contents = b"ADATabcdefghijkl".to_vec();
     assert_eq!(
         classified(&stored(&contents), 1),
@@ -152,8 +146,6 @@ fn the_window_is_sixteen_bytes_and_a_shorter_one_calls_more_payloads_text() {
 
 #[test]
 fn a_payload_that_begins_rsc7_does_not_make_a_binary_entry_a_resource() {
-    // An entry with the magic and without the resource bit, which nothing stops
-    // a third party from writing. The bit decides, both ways.
     let payload = resource_payload(b"anything at all");
     let bytes = stored(&payload);
 
@@ -204,9 +196,7 @@ fn a_directory_is_the_one_entry_with_no_payload_to_classify() {
 
 #[test]
 fn a_payload_that_does_not_read_back_is_unknown_binary_rather_than_a_failure() {
-    // A deflate stream that is not one. Every walk asks this of every entry, so
-    // a listing must not stop at the first unreadable payload; `verify` is where
-    // it gets reported.
+    // A declared deflate stream that is not one.
     let bytes = one_file_archive(b"<?xml version=\"1", 16, 0, 4_096);
 
     assert_eq!(classified(&bytes, 1), Classification::Binary);
@@ -248,12 +238,11 @@ fn a_listing_row_carries_what_the_head_named() {
 /// The unencrypted sample, by the relative path that addresses it.
 const SAMPLE: &str = "rmrp_bp16_meringls63amg24/dlc.rpf";
 
-/// The AES-encrypted archive, the only one in `assets/` holding a real binary
-/// metadata payload.
+/// The AES-encrypted archive holding a real binary metadata payload.
 const AES_ARCHIVE: &str = "gtav_aes/des_canister.rpf";
 
-/// Reports a skip, naming the test and the gate that was not there;
-/// `RPF_REQUIRE_<GATE>` turns that gate's absence into a failure.
+/// Reports a skip; `RPF_REQUIRE_<GATE>` turns that gate's absence into a
+/// failure.
 fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -280,8 +269,7 @@ fn archive_path(test: &str, relative: &str) -> Option<PathBuf> {
     }
 }
 
-/// The material a game executable carries: the AES key, and none of the NG
-/// values.
+/// The material a game executable carries: the AES key, no NG values.
 fn executable_material(test: &str) -> Option<Arc<Material>> {
     let Some(root) = env::var_os("RPF_GAME_EXE") else {
         return skip(test, "RPF_GAME_EXE", "RPF_GAME_EXE is not set");
@@ -322,8 +310,6 @@ fn walked(bytes: Vec<u8>, unlock: &Unlock) -> Vec<(String, &'static str, Option<
 #[test]
 #[cfg_attr(no_corpus, ignore = "RPF_CORPUS must name a directory of archives")]
 fn the_samples_five_metadata_entries_are_all_plain_xml() {
-    // The classifier's negative control: no binary encodings, a byte-order mark
-    // on `setup2.xml`, and resources that do begin with `RSC7`.
     let test = "the_samples_five_metadata_entries_are_all_plain_xml";
     let Some(path) = archive_path(test, SAMPLE) else {
         return;
@@ -379,8 +365,7 @@ fn the_samples_five_metadata_entries_are_all_plain_xml() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_aes_archives_manifest_is_a_pso_and_its_resources_are_resources() {
-    // `_manifest.ymf` is `PSO`, which no extension rule would have said: `.ymf`
-    // carries `RBF` elsewhere.
+    // `.ymf` carries `RBF` elsewhere, so no extension rule would say `PSO`.
     let test = "the_aes_archives_manifest_is_a_pso_and_its_resources_are_resources";
     let Some(path) = archive_path(test, AES_ARCHIVE) else {
         return;

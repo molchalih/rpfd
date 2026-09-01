@@ -1,6 +1,5 @@
-//! Every unencrypted path works with no key material present at all: the whole
-//! cycle runs, no key cache is created on the way, and an archive that is
-//! encrypted answers [`Error::NeedsKey`] rather than opening or failing.
+//! Every unencrypted path with no key material present: the cycle runs, no key
+//! cache is created, and an encrypted archive answers [`Error::NeedsKey`].
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -68,8 +67,8 @@ fn built(files: &[FileSpec], contents: &BTreeMap<String, Vec<u8>>) -> Vec<u8> {
     fs::read(sink.path()).expect("readable")
 }
 
-/// A header whose encryption tag is not `OPEN`, and nothing else: nothing past
-/// the tag is read before the refusal.
+/// Magic, version, entry count, encryption tag: nothing past the tag is read
+/// before the refusal.
 fn encrypted_header(tag: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     out.extend_from_slice(b"7FPR");
@@ -168,8 +167,6 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
         Archive::open(&mut rebuilt_source, &unkeyed()).expect("the rebuild opens");
     let manifest = Manifest::of(&rebuilt_archive).expect("describes");
     assert_eq!(manifest.specs().len(), files.len());
-    // The tree records what it came out of, so it cannot be packed as another
-    // container without saying so.
     assert_eq!(manifest.version, rebuilt_archive.version());
     assert_eq!(manifest.codec, rebuilt_archive.version().codec());
     assert_eq!(manifest.schema, rpf_core::manifest::SCHEMA_VERSION);
@@ -195,9 +192,8 @@ fn the_whole_unencrypted_cycle_runs_and_leaves_no_key_cache_behind() {
 
 #[test]
 fn an_encrypted_archive_asks_for_a_key_rather_than_being_opened_or_refused() {
-    // `0x0FFFFFF9` is the AES tag and `0x0FEFFFFF` the NG one. Only those two:
-    // `0` and `CFXP` are unimplemented here, so pinning what they answer would
-    // turn implementing them into a failing test.
+    // `0x0FFFFFF9` is the AES tag, `0x0FEFFFFF` the NG one. `0` and `CFXP` are
+    // left out: pinning them would turn implementing them into a failure.
     for tag in [0x0FFF_FFF9_u32, 0x0FEF_FFFF] {
         assert!(!Version::Rpf7.is_open(tag));
         let error = Archive::open(&mut Cursor::new(encrypted_header(tag)), &unkeyed())
@@ -212,8 +208,6 @@ fn an_encrypted_archive_asks_for_a_key_rather_than_being_opened_or_refused() {
 
 #[test]
 fn the_key_cache_is_never_consulted_by_opening_an_archive() {
-    // `Archive::open` takes a source and nothing else, so there is no argument
-    // through which key material could reach the reader.
     let scratch = tempfile::tempdir().expect("a temporary directory");
     let absent = scratch.path().join("no-such-cache");
     let cache = Cache::at(&absent);
@@ -233,10 +227,7 @@ fn the_key_cache_is_never_consulted_by_opening_an_archive() {
 
 #[test]
 fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
-    // Every walk sniffs each payload for a nested archive, so a plain archive
-    // carrying an encrypted one must give a count and a named refusal rather
-    // than a failed walk. Sixteen bytes of header suffice: nothing past the
-    // encryption tag is read.
+    // Sixteen bytes of header suffice: nothing past the encryption tag is read.
     const TAG: u32 = 0x0FEF_FFFF;
 
     let mut contents = BTreeMap::new();
@@ -251,8 +242,8 @@ fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
         summary.locked_archives, 1,
         "the nested encrypted archive was not counted as locked"
     );
-    // `nested_archives` is how many the sniff found, `locked_archives` how many
-    // of those did not open.
+    // `nested_archives` counts what the sniff found; `locked_archives` those of
+    // them that did not open.
     assert_eq!(summary.nested_archives, 1);
 
     let verified = Verified::of(&mut source, &archive, &mut Unwatched).expect("walks");
@@ -270,8 +261,8 @@ fn an_encrypted_archive_nested_in_a_plain_one_is_counted_locked_and_says_why() {
     );
     assert_eq!(locked[0].error.category(), Category::NeedsKey);
 
-    // The walk's verdict is the key failure, not `VerifyFailed`: the bytes are
-    // not wrong, this machine simply has no key for part of them.
+    // The verdict is the key failure, not `VerifyFailed`: the bytes are not
+    // wrong, this machine has no key for part of them.
     let refused = verified
         .outcome()
         .expect_err("an archive this build cannot open did not read back whole");

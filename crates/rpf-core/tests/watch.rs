@@ -1,7 +1,5 @@
 //! Watching a long write or a long read: what it reports, and stopping one
 //! part-way.
-//!
-//! Corpus-free: each test builds the archive it needs.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -44,7 +42,6 @@ impl Watch for Recorder {
     }
 }
 
-/// Three files, so a build has something to report between.
 fn specs() -> Vec<FileSpec> {
     ["a.txt", "b.txt", "c.txt"]
         .into_iter()
@@ -113,8 +110,6 @@ fn stopping_a_build_stops_it_and_says_so() {
 
 #[test]
 fn a_cancellation_is_its_own_category() {
-    // A cancel is the caller's own doing, so it is neither a refusal nor a
-    // corrupt archive.
     let mut watch = Recorder::stopping_after(1);
     let mut out = Cursor::new(Vec::new());
     let stopped = rpf_core::build(
@@ -146,8 +141,6 @@ fn a_caller_that_does_not_care_says_so() {
 
 #[test]
 fn a_cascading_rebuild_reports_the_nested_archive_it_is_rebuilding() {
-    // Each ancestor is rebuilt in turn, so the report is one sequence per
-    // archive, innermost first.
     let mut inner = Cursor::new(Vec::new());
     rpf_core::build(
         &mut inner,

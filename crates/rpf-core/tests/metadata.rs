@@ -1,9 +1,7 @@
-//! The metadata layer against the metadata both games ship.
-//!
-//! Unedited in, unedited out, byte-identical, over the shipped corpus rather
-//! than over made-up documents. No game data is tracked: payloads are located
-//! through `RPF_METADATA` and what is committed is a count and a list of
-//! digests. With it unset every test that needs it is `#[ignore]`d.
+//! The metadata layer against the metadata both games ship: unedited in,
+//! unedited out, byte-identical, over the shipped corpus. No game data is
+//! tracked — payloads are located through `RPF_METADATA`, and only a count and
+//! a list of digests are committed. With it unset, those tests are `#[ignore]`d.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -31,10 +29,8 @@ use sha2::{Digest, Sha256};
 /// What the committed fixture describes.
 const FIXTURE: &str = "../../fixtures/rbf-metadata.json";
 
-/// Refuses, naming the test and what it would have read.
-///
-/// There is no third outcome: `eprintln!` is captured, so a test that skipped
-/// quietly would read as a pass, and a missing corpus is `#[ignore]`d first.
+/// Refuses, naming the test and what it would have read. There is no quiet
+/// skip: `eprintln!` is captured, so a skip would read as a pass.
 fn refuse(test: &str, reason: &str) -> ! {
     panic!("{test} cannot run: {reason}");
 }
@@ -51,8 +47,8 @@ fn stated_count(fixture: &str) -> usize {
     .expect("a count fits")
 }
 
-/// Every payload under `RPF_METADATA` that opens with `magic`, by file name;
-/// recognition is from content, and the count is checked against the fixture's.
+/// Every payload under `RPF_METADATA` opening with `magic`, by file name.
+/// Recognition is from content; the count is checked against the fixture's.
 fn payloads(test: &str, magic: [u8; 4]) -> BTreeMap<String, Vec<u8>> {
     let Some(root) = env::var_os("RPF_METADATA") else {
         refuse(
@@ -144,7 +140,6 @@ fn every_shipped_rbf_file_round_trips_byte_for_byte() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_corpus_is_the_one_the_fixture_describes() {
-    // The fixture records the `sha256` of every payload it describes.
     let files = payloads("the_corpus_is_the_one_the_fixture_describes", rbf::MAGIC);
     let fixture: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(FIXTURE).expect("fixture readable"))
@@ -246,7 +241,6 @@ fn not_xml(document: &str) -> rbf::NotRbf {
 
 #[test]
 fn the_minimal_payload_is_the_baseline_the_malformed_cases_are_mutations_of() {
-    // Every malformed case below breaks this one payload in one way.
     let xml = rbf::to_xml(&minimal()).expect("the minimal payload converts");
     assert_eq!(
         str::from_utf8(&xml).expect("UTF-8"),
@@ -266,7 +260,6 @@ fn a_payload_that_is_not_rbf_is_refused_by_its_magic() {
 
 #[test]
 fn a_truncated_token_stream_is_refused_at_every_length() {
-    // Every prefix of a valid payload is an error, and none of them is a panic.
     let whole = minimal();
     for len in 4..whole.len() {
         let error = rbf::to_xml(&whole[..len]).expect_err("a prefix is not a document");
@@ -507,8 +500,8 @@ fn the_two_meaningless_words_survive_a_round_trip() {
     assert_eq!(rbf::from_xml(&xml).expect("and back"), payload);
 }
 
-/// The minimal payload with one more child, whose descriptor is `new`: naming
-/// the index past the table introduces one, naming an index it holds reuses it.
+/// The minimal payload with one more child: naming the index past the table
+/// introduces a descriptor, naming an index it holds reuses one.
 fn with_second_child(new: bool) -> Vec<u8> {
     let mut out = minimal();
     out.truncate(out.len() - 2); // the close, put back below
@@ -526,8 +519,8 @@ fn with_second_child(new: bool) -> Vec<u8> {
 
 #[test]
 fn a_name_two_descriptors_declare_is_read_and_written_back_once() {
-    // The reader accepts a name declared twice; the writer rebuilds the table
-    // keyed by name alone, so the second declaration is a dropped duplicate.
+    // The writer rebuilds the table keyed by name alone, so a second
+    // declaration of one name is dropped.
     let twice = with_second_child(true);
     let once = with_second_child(false);
     assert_eq!(
@@ -536,15 +529,12 @@ fn a_name_two_descriptors_declare_is_read_and_written_back_once() {
         "the second declaration is a two-byte length and a one-byte name"
     );
 
-    // The document does not know the difference.
     let from_twice = rbf::to_xml(&twice).expect("converts");
     assert_eq!(from_twice, rbf::to_xml(&once).expect("converts"));
 
-    // The payload does, which is what the round trip gives here.
     assert_eq!(rbf::from_xml(&from_twice).expect("and back"), once);
     assert_ne!(rbf::from_xml(&from_twice).expect("and back"), twice);
 
-    // And normalising is a fixed point: the form the writer chose survives.
     let from_once = rbf::to_xml(&once).expect("converts");
     assert_eq!(rbf::from_xml(&from_once).expect("and back"), once);
 }
@@ -564,7 +554,6 @@ fn a_blob_that_is_only_whitespace_survives() {
 
 #[test]
 fn the_categories_are_the_ones_a_caller_acts_on() {
-    // A corrupt payload, an unsupported rendering, and a refused document.
     assert_eq!(
         rbf::to_xml(b"nope").expect_err("not RBF").category(),
         Category::Corrupt
@@ -618,12 +607,12 @@ const ROOT_NAME: u32 = 0xD98B_B561;
 /// The name hash of its one member.
 const MEMBER_NAME: u32 = 0x1234_5678;
 
-/// The `ARRAYINFO` sentinel: the name hash a member carries when it describes
-/// another member's element type rather than a field of its own.
+/// The name hash a member carries when it describes another member's element
+/// type rather than a field of its own.
 const ARRAYINFO: u32 = 0x0000_0100;
 
 /// A minimal valid `PSO`: one block, one structure, one `UINT` member, built by
-/// hand so it shares no bug with the reader. Every case below mutates it.
+/// hand so it shares no bug with the reader.
 fn minimal_pso() -> Vec<u8> {
     let mut psin = Vec::new();
     psin.extend_from_slice(&pso::MAGIC);
@@ -703,7 +692,6 @@ fn a_payload_that_is_not_pso_is_refused_by_its_first_section_tag() {
 
 #[test]
 fn a_truncated_payload_is_refused_at_every_length() {
-    // Every prefix of a valid payload is an error, and none of them is a panic.
     let whole = minimal_pso();
     for len in 0..whole.len() {
         let error = pso::to_xml(&whole[..len], &Dictionary::default())
@@ -732,7 +720,6 @@ fn a_section_chain_that_does_not_reach_the_end_is_refused() {
 
 #[test]
 fn a_block_that_is_not_inside_the_data_section_is_refused() {
-    // The block table is checked against the data section at construction.
     let mut past = minimal_pso();
     let length_at = 20 + 8 + 4 + 2 + 2 + 12;
     past[length_at..length_at + 4].copy_from_slice(&4096i32.to_be_bytes());
@@ -787,8 +774,8 @@ fn a_member_type_this_build_does_not_decode_is_unsupported_not_corrupt() {
 
 #[test]
 fn a_document_is_bounded_in_bytes_and_not_only_in_elements() {
-    // No node budget can be the memory bound: an element is not a fixed number
-    // of bytes, since it carries two spaces of indent per level of depth.
+    // No node budget can be the memory bound: an element carries two spaces of
+    // indent per level of depth, so it is not a fixed number of bytes.
     let payload = nested_arrays_pso(u16::MAX);
     let error =
         pso::to_xml(&payload, &Dictionary::default()).expect_err("a document this size is refused");
@@ -970,7 +957,6 @@ fn a_pointer_outside_its_own_block_is_refused_rather_than_recovered() {
     broken[16..20].copy_from_slice(&pointer.to_be_bytes());
     assert_eq!(pso_malformed(&broken), pso::Malformed::Pointer);
 
-    // And a block id the table does not hold.
     let mut absent = cyclic_pso();
     absent[16..20].copy_from_slice(&9u32.to_be_bytes());
     assert_eq!(pso_malformed(&absent), pso::Malformed::Pointer);
@@ -1067,7 +1053,6 @@ fn a_payload_missing_a_section_the_walk_needs_is_refused() {
 
 #[test]
 fn a_section_too_short_for_its_own_header_is_refused() {
-    // A section's own header has to fit inside the length it declared.
     let mut payload = minimal_pso();
     let psch = payload
         .windows(4)
@@ -1182,7 +1167,6 @@ physicsDictionary
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_name_the_corpus_renders_reads_back_to_the_hash_it_came_from() {
-    // Whatever a name is spelled as, it names the same `u32` on the way back.
     let files = payloads(
         "every_name_the_corpus_renders_reads_back_to_the_hash_it_came_from",
         pso::MAGIC,
@@ -1216,8 +1200,8 @@ fn every_name_the_corpus_renders_reads_back_to_the_hash_it_came_from() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_two_cases_the_document_called_undecodable_decode() {
-    // Two cases the census once called undecodable both decode. A reader that
-    // trusted the wrapped `dataOffset` would render `0.0, 0.0, 0.0` here.
+    // A reader that trusted the wrapped `dataOffset` would render
+    // `0.0, 0.0, 0.0` here.
     let files = payloads(
         "the_two_cases_the_document_called_undecodable_decode",
         pso::MAGIC,
@@ -1331,8 +1315,7 @@ fn the_section_census_the_document_states_is_what_the_corpus_has() {
     assert_eq!(seen.len(), stated.len(), "there is no ninth section tag");
 }
 
-/// [`minimal_pso`] with its one member re-typed, and its four bytes of data
-/// replaced.
+/// [`minimal_pso`] with its member re-typed and its four data bytes replaced.
 fn retyped_pso(code: u8, subtype: u8, reference: u32, data: [u8; 4]) -> Vec<u8> {
     let mut payload = minimal_pso();
     let len = payload.len();
@@ -1459,9 +1442,8 @@ fn bitset_pso() -> Vec<u8> {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_pso_file_round_trips_byte_for_byte() {
-    // The trip carries the payload as well as the document: what the document
-    // cannot carry — `PSIG`, `STRE`, an unreached `PSIN` byte, the schema — is
-    // taken from the payload rather than invented.
+    // What the document cannot carry — `PSIG`, `STRE`, an unreached `PSIN`
+    // byte, the schema — is taken from the payload rather than invented.
     let files = payloads(
         "every_shipped_pso_file_round_trips_byte_for_byte",
         pso::MAGIC,
@@ -1526,9 +1508,9 @@ fn a_dictionary_does_not_change_what_a_round_trip_produces() {
     );
 }
 
-/// The `CHKS` recipe, transcribed a second time so agreement with `rpf-core` is
-/// evidence: a Jenkins one-at-a-time hash seeded `0x3FAC7125` over the whole
-/// file, each byte signed, with `fileSize` and `checksum` zeroed first.
+/// A Jenkins one-at-a-time hash seeded `0x3FAC7125` over the whole file, each
+/// byte signed, with `fileSize` and `checksum` zeroed first. Transcribed a
+/// second time, so agreement with `rpf-core` is evidence.
 fn chks_of(file: &[u8]) -> u32 {
     let at = chks_at(file).expect("the file carries a CHKS");
     let mut zeroed = file.to_vec();
@@ -1559,8 +1541,7 @@ fn chks_at(payload: &[u8]) -> Option<usize> {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_checksum_recipe_reproduces_every_stored_one() {
-    // `from_xml` recomputes the checksum rather than copying it, and the recipe
-    // here is transcribed from the format notes rather than from `rpf-core`.
+    // `from_xml` recomputes the checksum rather than copying it.
     let files = payloads(
         "the_checksum_recipe_reproduces_every_stored_one",
         pso::MAGIC,
@@ -1602,7 +1583,6 @@ fn the_checksum_recipe_reproduces_every_stored_one() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn the_corpus_carries_a_checksum_in_the_files_the_encodings_say_it_does() {
-    // A census: it says the number the test above quotes was there to check.
     let files = payloads(
         "the_corpus_carries_a_checksum_in_the_files_the_encodings_say_it_does",
         pso::MAGIC,
@@ -1636,8 +1616,7 @@ fn sections_of(payload: &[u8]) -> Vec<([u8; 4], u32)> {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn an_edited_value_is_that_value_changed_and_nothing_else() {
-    // A round trip is only worth something if an edit reaches the bytes: one
-    // float, its four bytes and the checksum's four are all that may differ.
+    // Only one float's four bytes and the checksum's four may differ.
     let files = payloads(
         "an_edited_value_is_that_value_changed_and_nothing_else",
         pso::MAGIC,
@@ -1734,7 +1713,6 @@ fn the_schema_comes_from_the_payload_and_the_document_is_checked_against_it() {
             found: "lodDist".to_owned(),
         }
     );
-    // And a type word that is not the one the schema says.
     assert_eq!(
         pso_refused(
             &payload,
@@ -1894,7 +1872,6 @@ fn an_enum_two_keys_render_the_same_name_for_is_refused_rather_than_guessed() {
         }) => assert_eq!(name, "hash_11111111"),
         other => panic!("expected an ambiguous refusal, got {other:?}"),
     }
-    // The same file with two names is not ambiguous and round-trips.
     let payload = enum_pso(0x1111_1111, 0x2222_2222);
     let xml = pso::to_xml(&payload, &names).expect("converts");
     assert_eq!(
@@ -2097,7 +2074,6 @@ fn a_checksum_section_that_is_not_twenty_bytes_is_refused_rather_than_overwritte
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    // The same file with the twenty bytes it always has is stamped.
     let mut good = minimal_pso();
     let at = good.len();
     good.extend_from_slice(b"CHKS");
@@ -2153,9 +2129,9 @@ fn an_array_item_added_or_removed_is_refused_because_the_length_is_the_payloads(
 /// How many resource `Meta` files both installs ship.
 const META_FILES: usize = 49_614;
 
-/// One dumped resource `Meta` payload: its bytes, and the page boundary they do
-/// not carry. Every resource pointer resolves against the boundary between
-/// system and graphics pages, which the dump records in the file's name.
+/// One dumped resource `Meta` payload: its bytes, and the boundary between
+/// system and graphics pages that every resource pointer resolves against,
+/// which the payload does not carry and the dump records in the file's name.
 #[derive(Debug)]
 struct Dumped {
     /// The inflated payload, exactly as the archive holds it.
@@ -2164,10 +2140,9 @@ struct Dumped {
     system_len: usize,
 }
 
-/// Every resource `Meta` payload under `RPF_METADATA`, one at a time, and how
-/// many there were: the dump is 2.85 GB, so one is held at a time. Recognition
-/// is `meta::identifies`, since a `Meta` has no magic at its front; a dump of
-/// the wrong size or without system lengths is refused after the walk.
+/// Every resource `Meta` payload under `RPF_METADATA`, one at a time because the
+/// dump is 2.85 GB. Recognition is `meta::identifies`, since a `Meta` has no
+/// magic at its front; a dump of the wrong size is refused after the walk.
 fn each_meta_payload(test: &str, mut visit: impl FnMut(&str, &Dumped)) -> usize {
     let Some(root) = env::var_os("RPF_METADATA") else {
         refuse(
@@ -2284,8 +2259,7 @@ fn every_shipped_meta_file_carries_the_header_the_probe_measured() {
 #[test]
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_meta_file_parses_from_the_system_length_its_name_carries() {
-    // `meta::parse` needs the page boundary, which is read back out of the
-    // dumped file's name; every file is then walked from its own tables.
+    // The page boundary `meta::parse` needs is read back out of the file's name.
     let mut failed = Vec::new();
     let mut structures = 0_usize;
     let mut blocks = 0_usize;
@@ -2721,7 +2695,6 @@ fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() 
         "both pointers render, and both render the same value"
     );
 
-    // Unedited, the two writes agree and the file is written back as it was.
     assert_eq!(
         meta::from_xml(
             &payload,
@@ -2733,7 +2706,6 @@ fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() 
         payload
     );
 
-    // Edited on one side alone, the two disagree, and that is the refusal.
     let half = document.replace(
         "<hash_66660000 meta:uint=\"7\"/>",
         "<hash_66660000 meta:uint=\"99\"/>",
@@ -2746,7 +2718,6 @@ fn an_edit_two_elements_disagree_over_is_refused_rather_than_silently_dropped() 
         }
     );
 
-    // Edited on both, they agree again and the edit lands once.
     let whole = document.replace("meta:uint=\"7\"", "meta:uint=\"99\"");
     let written = meta::from_xml(
         &payload,
@@ -3035,7 +3006,6 @@ fn a_type_code_outside_the_table_is_refused_rather_than_guessed_at() {
 
 #[test]
 fn a_member_that_does_not_fit_its_own_structure_is_refused() {
-    // A member's value has to lie inside the structure the file declares.
     let mut payload = minimal_meta();
     payload[0x68] = 3; // structLength, against a four-byte `UINT` at offset 0
     let error = meta::to_xml(&payload, payload.len(), &Dictionary::default())
@@ -3114,7 +3084,6 @@ fn a_null_pointer_that_still_declares_a_count_is_a_file_contradicting_itself() {
 
 #[test]
 fn a_null_pointer_that_declares_nothing_is_read_rather_than_refused() {
-    // Null and counting nothing is what an absent value looks like.
     let mut empty = rich_meta(0, 0);
     empty[0x310..0x318].copy_from_slice(&0u64.to_le_bytes());
     empty[0x320..0x328].copy_from_slice(&0u64.to_le_bytes());
@@ -3243,14 +3212,12 @@ fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
         payload.len()
     );
 
-    // Exactly on the budget the walk goes on, and the read after it stops it.
     assert_eq!(
         meta_bad_read(&payload),
         (0x210, meta::Malformed::DataRange),
         "a document of exactly the budget is written, and the `UINT` after it is not"
     );
 
-    // One byte over, the last item is never written at all.
     assert_eq!(
         meta_bad_read(&counted_strings_meta(&stores(1), 16)),
         (0, meta::Malformed::TooLarge),
@@ -3262,8 +3229,8 @@ fn a_meta_document_is_bounded_in_bytes_at_the_byte_the_budget_names() {
 #[cfg_attr(no_metadata, ignore = "RPF_METADATA is not set")]
 fn every_shipped_meta_file_round_trips_byte_for_byte() {
     // Narrower than it looks: `from_xml` applies the document `to_xml` just
-    // wrote, so nothing is written and equality is the payload handed back. It
-    // says the walk reached every value, not that a member's width is right.
+    // wrote, so this says the walk reached every value, not that a member's
+    // width is right.
     let mut failed = Vec::new();
     let names = Dictionary::default();
     let mut trip = |name: &str, dumped: &Dumped| {

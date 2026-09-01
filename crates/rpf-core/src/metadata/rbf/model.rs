@@ -1,23 +1,14 @@
-//! The `RBF` document, and the invariants that make it one.
-//!
-//! Every constraint the two encodings impose is checked in a constructor here,
-//! so a value of these types converts to `RBF` bytes and to XML without either
-//! conversion being able to fail.
+//! The `RBF` document; every constraint is checked in a constructor, so conversion cannot fail.
 
 use std::collections::BTreeSet;
 
 use crate::metadata::text::is_xml_name;
 
-/// The reserved XML name prefix, deliberately a prefix and not a namespace:
-/// real descriptor names carry `::`, which no namespace can.
 pub(super) const RESERVED_PREFIX: &str = "rbf:";
 
-/// The largest descriptor table the one-byte index can address: `0xFD` and
-/// `0xFF` are taken by the blob and close records, leaving `0x00`–`0xFC`.
+/// The largest descriptor table the one-byte index can address (`0x00`–`0xFC`).
 pub(super) const MAX_NAMES: usize = 253;
 
-/// How deeply elements may nest: the format states no limit, but every walk
-/// recurses, and a stack overflow is an abort no `Result` catches.
 pub(super) const MAX_DEPTH: usize = 256;
 
 /// Why a byte stream is not a well-formed `RBF` token stream.
@@ -30,8 +21,7 @@ pub enum Malformed {
     Truncated,
     /// A close or blob record's second byte was not the `0xFF` marker.
     Marker,
-    /// A descriptor index named neither an existing descriptor nor the next
-    /// one, so there is no name for the record. `0xFE` lands here too.
+    /// A descriptor index names neither an existing descriptor nor the next one.
     DescriptorIndex,
     /// A data-type byte outside the seven records this encoding has.
     DataType,
@@ -47,8 +37,7 @@ pub enum Malformed {
     TooDeep,
 }
 
-/// Why a well-formed document cannot cross to the other encoding — the same
-/// list in both directions.
+/// Why a well-formed document cannot cross to the other encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Unrepresentable {
@@ -57,8 +46,7 @@ pub enum Unrepresentable {
         /// The bytes, as they were read.
         name: Vec<u8>,
     },
-    /// A name is not one this build writes: an XML name of ASCII letters,
-    /// digits, `_`, `:`, `.` and `-`, starting with a letter, `_` or `:`.
+    /// A name isn't a valid XML name syntax this build writes.
     NameSyntax {
         /// The name.
         name: String,
@@ -95,14 +83,12 @@ pub enum Unrepresentable {
     },
     /// A blob has no bytes, which XML cannot tell from an element with no text.
     EmptyBlob,
-    /// A blob shares its element with child elements, named values or a second
-    /// blob, which XML text cannot tell apart from indentation.
+    /// A blob shares its element with other content, which XML text can't tell apart.
     BlobNotAlone {
         /// The element's name.
         name: String,
     },
-    /// The document uses more distinct names than the 253 the token stream's
-    /// one-byte descriptor index can address.
+    /// The document uses more distinct names than the descriptor table can address.
     TooManyNames {
         /// How many.
         count: usize,
@@ -115,8 +101,7 @@ pub enum Unrepresentable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NotRbf {
-    /// The XML is not well formed. `detail` is what the parser reported, for a
-    /// human; `position` on the surrounding error is what a caller acts on.
+    /// The XML itself is not well formed.
     Syntax {
         /// The parser's own account of it.
         detail: String,
@@ -125,17 +110,14 @@ pub enum NotRbf {
     Empty,
     /// The document has more than one root element.
     SecondRoot,
-    /// The outermost element is a value record. A document's root is an
-    /// element, because the token stream's first record is an open element.
+    /// The outermost element is a value record, not an element.
     RootNotElement,
     /// A reserved `rbf:` attribute this build does not define.
     UnknownReserved {
         /// The attribute name, prefix included.
         name: String,
     },
-    /// An element carrying a value record's reserved attribute also carries
-    /// something else. A value record is a name, a type and a value, and
-    /// nothing more.
+    /// An element with a value record's reserved attribute also carries something else.
     ValueNotAlone {
         /// The element's name.
         name: String,
@@ -145,11 +127,9 @@ pub enum NotRbf {
         /// The reserved attribute name, prefix included.
         name: String,
     },
-    /// Text appeared where the mapping puts none: in an element that also has
-    /// child elements, or outside the root.
+    /// Text appeared where the mapping puts none.
     UnexpectedText,
-    /// A backslash escape in a string or a blob is not one this encoding
-    /// writes: `\\` and `\xNN` are the only two.
+    /// A backslash escape isn't one this encoding writes (only `\\` and `\xNN`).
     BadEscape,
     /// The document says something the token stream cannot carry.
     Unrepresentable {
@@ -158,13 +138,10 @@ pub enum NotRbf {
     },
 }
 
-/// A descriptor name: an element's, an attribute's or a value's, valid as an
-/// XML name and short enough for the token stream's `u16` length.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Name(String);
 
 impl Name {
-    /// Checks a name and keeps it.
     pub(super) fn new(text: &str) -> Result<Self, Unrepresentable> {
         if text.len() > usize::from(u16::MAX) {
             return Err(Unrepresentable::NameTooLong { len: text.len() });
@@ -182,24 +159,20 @@ impl Name {
         Ok(Self(text.to_owned()))
     }
 
-    /// The name.
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// The name's bytes, which is what the token stream writes.
     pub(super) fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 }
 
-/// A `0x60` string value: raw bytes with a `u16` length, not a `String`,
-/// because records carry bytes at or above `0x80`.
+/// A `0x60` string value: raw bytes with a `u16` length, not a `String`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Str(Vec<u8>);
 
 impl Str {
-    /// Checks the length and keeps the bytes.
     pub(super) fn new(bytes: Vec<u8>) -> Result<Self, Unrepresentable> {
         if bytes.len() > usize::from(u16::MAX) {
             return Err(Unrepresentable::StringTooLong { len: bytes.len() });
@@ -212,13 +185,11 @@ impl Str {
     }
 }
 
-/// A `0xFD` raw byte blob: an element's text, never empty so that an element
-/// with text stays distinguishable from one without.
+/// A `0xFD` raw byte blob: an element's text, never empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Blob(Vec<u8>);
 
 impl Blob {
-    /// Checks the length and keeps the bytes.
     pub(super) fn new(bytes: Vec<u8>) -> Result<Self, Unrepresentable> {
         if bytes.is_empty() {
             return Err(Unrepresentable::EmptyBlob);
@@ -235,7 +206,6 @@ impl Blob {
     }
 }
 
-/// A value: everything a record can hold that is not an element.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Scalar {
     /// `0x10`, four bytes.
@@ -250,18 +220,15 @@ pub(super) enum Scalar {
     Str(Str),
 }
 
-/// One of an element's attribute records.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Attribute {
     pub(super) name: Name,
     pub(super) value: Scalar,
 }
 
-/// Something inside an element that is not one of its attributes.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Node {
     Element(Element),
-    /// A named value.
     Value {
         /// Its name.
         name: Name,
@@ -270,17 +237,13 @@ pub(super) enum Node {
     },
 }
 
-/// What an element carries; the two are exclusive, since a blob is the sole
-/// content of its element.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Content {
     /// Nested elements and named values, in order. Empty for a leaf.
     Children(Vec<Node>),
-    /// One raw byte blob.
     Blob(Blob),
 }
 
-/// An open element and everything under it.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Element {
     name: Name,
@@ -290,8 +253,6 @@ pub(super) struct Element {
 }
 
 impl Element {
-    /// Checks an element and keeps it. `unknown` is the two `u16`s an open
-    /// element carries before its attribute count, always 0 but never assumed.
     pub(super) fn new(
         name: Name,
         unknown: [u16; 2],
@@ -319,7 +280,6 @@ impl Element {
         })
     }
 
-    /// Its name.
     pub(super) fn name(&self) -> &Name {
         &self.name
     }
@@ -338,18 +298,12 @@ impl Element {
     }
 }
 
-/// A whole `RBF` document: one root element.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Document {
     root: Element,
 }
 
 impl Document {
-    /// Checks that the tree is shallow enough to walk, and keeps it.
-    ///
-    /// The walk is iterative on purpose: it establishes the depth bound, so it
-    /// cannot be the thing that overflows while checking it. [`MAX_NAMES`] is
-    /// not checked here — it is the token writer's limit, not the document's.
     pub(super) fn new(root: Element) -> Result<Self, Unrepresentable> {
         let mut pending: Vec<(&Element, usize)> = vec![(&root, 1)];
         while let Some((element, depth)) = pending.pop() {

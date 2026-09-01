@@ -1,8 +1,4 @@
-//! The `RBF` token stream: bytes to [`Document`] and back.
-//!
-//! The stream is flat and self-terminating: four magic bytes, then records, and
-//! the file ends when the last open element closes. No header, no version, no
-//! length, no string table, no alignment, no padding; all little-endian.
+//! The `RBF` token stream: magic bytes then records, all little-endian, to `Document` and back.
 
 use std::collections::BTreeMap;
 
@@ -15,16 +11,13 @@ use super::{
 };
 use crate::error::{Error, Result};
 
-/// What the write path answers: a refusal in the module's own vocabulary,
-/// because the seam that called it is what knows whose fault it is.
+/// What the write path answers: a refusal in the module's own vocabulary.
 type Written<T> = std::result::Result<T, Unrepresentable>;
 
-/// The close record, `FF FF`. Pops the stack; with the stack empty the file
-/// ends.
+/// The close record, `FF FF`. Pops the stack; with the stack empty the file ends.
 const CLOSE: u8 = 0xFF;
 
-/// The raw byte blob record, `FD FF len:u32 bytes[len]`. No name, no
-/// descriptor.
+/// The raw byte blob record, `FD FF len:u32 bytes[len]`.
 const BLOB: u8 = 0xFD;
 
 /// The second byte of both the close record and the blob record.
@@ -45,14 +38,12 @@ const FLOAT3: u8 = 0x50;
 /// `0x60` — string, `len:u16` then that many bytes, not NUL-terminated.
 const STRING: u8 = 0x60;
 
-/// A cursor over the stream that can only read forwards and in bounds.
 struct Tokens<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Tokens<'a> {
-    /// A failure at the cursor's position.
     fn bad(&self, cause: Malformed) -> Error {
         Error::BadRbf {
             offset: u64::try_from(self.at).unwrap_or(u64::MAX),
@@ -60,7 +51,6 @@ impl<'a> Tokens<'a> {
         }
     }
 
-    /// The next `len` bytes.
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
         let end = self
             .at
@@ -74,7 +64,6 @@ impl<'a> Tokens<'a> {
         Ok(taken)
     }
 
-    /// The next byte.
     fn byte(&mut self) -> Result<u8> {
         let taken = self.take(1)?;
         taken
@@ -106,13 +95,11 @@ impl<'a> Tokens<'a> {
         Ok(f32::from_le_bytes(self.word()?))
     }
 
-    /// Whether every byte has been read.
     fn spent(&self) -> bool {
         self.at >= self.bytes.len()
     }
 }
 
-/// An element that has been opened and not yet closed.
 struct Open {
     name: Name,
     unknown: [u16; 2],
@@ -123,16 +110,10 @@ struct Open {
 }
 
 impl Open {
-    /// Whether the next record belongs in the attribute list: the first
-    /// `attrCount` records are the attributes, and anything that opens or blobs
-    /// before the quota is filled is a count that lied.
     fn wants_attribute(&self) -> bool {
         self.attributes.len() < self.attributes_wanted
     }
 
-    /// Whether a child element or a blob may begin here: not while attributes
-    /// are still owed, and not once a blob has arrived, since a blob is the
-    /// sole content of its element.
     fn admits_content(&self, tokens: &Tokens<'_>) -> Result<()> {
         if self.blob.is_some() {
             return Err(unrepresentable(Unrepresentable::BlobNotAlone {
@@ -145,7 +126,6 @@ impl Open {
         Ok(())
     }
 
-    /// Closes the element.
     fn close(self) -> Result<Element> {
         if self.wants_attribute() {
             return Err(Error::BadRbf {
@@ -171,12 +151,6 @@ fn unrepresentable(cause: Unrepresentable) -> Error {
     Error::UnrepresentableRbf { cause }
 }
 
-/// Reads a payload into the document it describes.
-///
-/// # Errors
-///
-/// [`Error::BadRbf`] if the stream is not well formed, and
-/// [`Error::UnrepresentableRbf`] if it is and says something XML cannot carry.
 pub(super) fn read(payload: &[u8]) -> Result<Document> {
     let mut tokens = Tokens {
         bytes: payload,
@@ -238,9 +212,7 @@ pub(super) fn read(payload: &[u8]) -> Result<Document> {
     Document::new(element).map_err(unrepresentable)
 }
 
-/// Reads one named record — `descIdx:u8 dataType:u8 [nameLen:u16 name]` and
-/// its payload — and puts it where it belongs. The name comes after the type
-/// byte, not before it.
+/// Reads one named record and its payload, and puts it where it belongs.
 fn named(
     tokens: &mut Tokens<'_>,
     descriptors: &mut Vec<Name>,
@@ -285,7 +257,6 @@ fn named(
     Ok(())
 }
 
-/// Reads the `0xFF` that is the second byte of a close or blob record.
 fn expect_marker(tokens: &mut Tokens<'_>) -> Result<()> {
     if tokens.byte()? == MARKER {
         Ok(())
@@ -305,8 +276,7 @@ fn reoffset(error: Error, at: usize) -> Error {
     }
 }
 
-/// The name a record's descriptor index refers to: an index equal to the
-/// current count introduces one, a lower one reuses it, a higher one has none.
+/// The name a record's descriptor index refers to.
 fn descriptor(tokens: &mut Tokens<'_>, descriptors: &mut Vec<Name>, index: usize) -> Result<Name> {
     if index == descriptors.len() {
         let len = usize::from(tokens.u16()?);
@@ -324,7 +294,6 @@ fn descriptor(tokens: &mut Tokens<'_>, descriptors: &mut Vec<Name>, index: usize
         .ok_or_else(|| tokens.bad(Malformed::DescriptorIndex))
 }
 
-/// The value a record of type `kind` carries.
 fn scalar(tokens: &mut Tokens<'_>, kind: u8) -> Result<Scalar> {
     match kind {
         UINT => Ok(Scalar::Uint(tokens.u32()?)),
@@ -345,8 +314,6 @@ fn scalar(tokens: &mut Tokens<'_>, kind: u8) -> Result<Scalar> {
     }
 }
 
-/// The descriptor table as it is built, keyed by name alone, which is what
-/// reproduces the shipped files byte for byte.
 struct Descriptors<'a>(BTreeMap<&'a str, u8>);
 
 impl<'a> Descriptors<'a> {
@@ -365,12 +332,6 @@ impl<'a> Descriptors<'a> {
     }
 }
 
-/// Writes the document as an `RBF` payload.
-///
-/// # Errors
-///
-/// [`Unrepresentable::TooManyNames`] if the document uses more distinct names
-/// than the one-byte descriptor index can address.
 pub(super) fn write(document: &Document) -> Written<Vec<u8>> {
     let mut out = MAGIC.to_vec();
     let mut descriptors = Descriptors(BTreeMap::new());
@@ -413,7 +374,6 @@ fn write_element<'a>(
     Ok(())
 }
 
-/// Writes a named value record.
 fn write_value<'a>(
     out: &mut Vec<u8>,
     descriptors: &mut Descriptors<'a>,
@@ -464,7 +424,6 @@ fn write_record<'a>(
     Ok(())
 }
 
-/// Writes a raw byte blob record.
 fn write_blob(out: &mut Vec<u8>, blob: &Blob) -> Written<()> {
     let len = u32::try_from(blob.as_bytes().len()).map_err(|_| Unrepresentable::BlobTooLong {
         len: blob.as_bytes().len(),
@@ -476,7 +435,6 @@ fn write_blob(out: &mut Vec<u8>, blob: &Blob) -> Written<()> {
     Ok(())
 }
 
-/// The data-type byte a value is written with.
 fn kind_of(value: &Scalar) -> u8 {
     match value {
         Scalar::Uint(_) => UINT,

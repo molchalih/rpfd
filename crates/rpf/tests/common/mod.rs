@@ -1,6 +1,5 @@
 //! Real `RBF`, `PSO` and `Meta` payloads, and the documents they convert to.
-//!
-//! Shared by both frontends' tests. No game data: each payload is built here.
+//! Shared by both frontends' tests; each payload is built here, from no game data.
 #![allow(
     dead_code,
     reason = "each including test crate gets its own copy of this module and \
@@ -119,9 +118,8 @@ pub const META_FLAGS: rpf_core::ResourceFlags = rpf_core::ResourceFlags {
     graphics: 0x2000_0000,
 };
 
-/// The same 512 bytes with the boundary declared in the wrong place. The entry
-/// reads back identically — only the sum is checked — and the `Meta` does not,
-/// because every pointer it holds is resolved against the system half.
+/// The same 512 bytes with the boundary declared in the wrong place: only the
+/// sum is checked, and every pointer is resolved against the system half.
 pub const META_ELSEWHERE: rpf_core::ResourceFlags = rpf_core::ResourceFlags {
     system: 0x2000_0000,
     graphics: 0xA800_0000,
@@ -139,8 +137,7 @@ pub const META_EDITED: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                                <hash_12345678 meta:uint=\"9\"/>\n\
                                </hash_D98BB561>\n";
 
-/// A `Meta` payload under construction, so that the fixture states the bytes it
-/// means and nothing else.
+/// A `Meta` payload under construction, stating the bytes it means.
 struct MetaBytes(Vec<u8>);
 
 impl MetaBytes {
@@ -216,9 +213,8 @@ pub fn meta_resource() -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// An AES-tagged archive holding a **keyed** resource, on a machine with no game
-// installed. What is planted below is thirty-two zero bytes and a table of
-// zeros — not a key, and derived from none.
+// An AES-tagged archive holding a **keyed** resource: what is planted below is
+// thirty-two zero bytes and a table of zeros — not a key, and derived from none.
 // ---------------------------------------------------------------------------
 
 /// The bytes of a hexadecimal digest.

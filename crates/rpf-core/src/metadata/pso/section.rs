@@ -1,49 +1,26 @@
-//! The section chain, and reading big-endian words out of one.
-//!
-//! A file is a concatenation of sections, each a four-character tag and a `u32`
-//! length that includes the eight-byte header, summing to the file's length.
-//! Everything is big-endian, even on a little-endian build.
+//! Sections are a four-character tag plus a big-endian `u32` length, header included.
 
 use super::model::Malformed;
 
-/// How long a section header is: the tag and the length.
 pub(super) const HEADER_LEN: u32 = 8;
 
 /// The data section's tag. Everything else points into it.
 pub(super) const PSIN: [u8; 4] = *b"PSIN";
-/// The block table's tag.
 pub(super) const PMAP: [u8; 4] = *b"PMAP";
-/// The embedded schema's tag.
 pub(super) const PSCH: [u8; 4] = *b"PSCH";
-/// The checksum's tag.
 pub(super) const CHKS: [u8; 4] = *b"CHKS";
 
-/// How long a `CHKS` section is: `ident`, `length`, `fileSize`, `checksum`,
-/// `unk0`. Writes are bounded by this, so a chain declaring a shorter `CHKS` is
-/// refused instead of overwriting the next section's header.
+/// How long a `CHKS` section is: `ident`, `length`, `fileSize`, `checksum`, `unk0`.
 pub(super) const CHKS_LEN: usize = 20;
 
-/// One section of a `PSO` file: its tag, and its bytes, header included.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Section<'a> {
-    /// Its four-character tag.
     pub(super) tag: [u8; 4],
-    /// Where its tag sits in the payload.
     pub(super) at: usize,
-    /// Its bytes, from its tag to the byte before the next section.
     pub(super) bytes: &'a [u8],
 }
 
-/// Every section of `payload`, in order.
-///
-/// The chain must land exactly on the end: no slack, no trailer and no padding
-/// between sections.
-///
-/// # Errors
-///
-/// [`Malformed::NotPso`] if the first tag is not `PSIN`, [`Malformed::Section`]
-/// if a header or a length does not fit, and [`Malformed::Trailing`] if the
-/// chain stops short of the end.
+/// Every section of `payload`, in order; the chain must land exactly on the end.
 pub(super) fn chain(payload: &[u8]) -> Result<Vec<Section<'_>>, (u64, Malformed)> {
     let mut sections = Vec::new();
     let mut at: usize = 0;
@@ -115,10 +92,7 @@ pub(super) fn f32(bytes: &[u8], at: usize) -> Option<f32> {
     u32(bytes, at).map(f32::from_bits)
 }
 
-/// The big-endian IEEE 754 half at `at`, widened to an `f32`.
-///
-/// Done by hand because the pinned toolchain has no `f16`; the widening is
-/// exact.
+/// The big-endian IEEE 754 half at `at`, widened exactly to an `f32`.
 pub(super) fn f16(bytes: &[u8], at: usize) -> Option<f32> {
     let bits = u16(bytes, at)?;
     let sign = u32::from(bits & 0x8000) << 16;

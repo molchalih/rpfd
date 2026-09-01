@@ -4,7 +4,7 @@
 // Any model-info lookup on this model may end the client process, so every
 // risky call is announced a beat before it is made and every path reports:
 // silence would be indistinguishable from a payload that did not load.
-const MODEL_NAME = "volga5";
+const MODEL_NAME = "vesta";
 const MODEL = mp.game.joaat(MODEL_NAME);
 
 // The models the streaming half asks about, in order, and why there are two.
@@ -19,7 +19,23 @@ const MODEL = mp.game.joaat(MODEL_NAME);
 // from the untouched archive, three times, at one instruction. This pack is a
 // different producer and a 2020 build, so the question is open again — and the
 // stock model goes first so that a death on the second is attributable.
-const STREAM_MODEL_NAMES = ["adder", MODEL_NAME];
+// Three, and the middle one is the control that makes the third readable.
+//
+// `adder` is a base-game model: it says the streamer answers at all.
+// `avarus` is a **Rockstar DLC** vehicle from `mpbiker` — declared in that
+// pack's own `vehicles.meta`, with `avarus.yft` (2,359,296 bytes) inside
+// `mpbikervehicles.rpf`, a nested archive inside a `dlc.rpf`. That is the exact
+// shape of the question: an archetype from a DLC's metadata whose asset lives
+// in a nested archive. The only difference from ours is that the game mounts
+// that pack from its own install and this one is served by RAGE Multiplayer.
+//
+// So if `avarus` streams and the served pack's model does not, the DLC path
+// works in this session and the failure is the served pack's. If `avarus` dies
+// too, no DLC vehicle asset streams here and the loop cannot show a large
+// binary payload for anyone — which is a limit of the harness, not of any
+// archive. Four earlier deaths could not tell those apart.
+const DLC_CONTROL_NAME = "avarus";
+const STREAM_MODEL_NAMES = ["adder", DLC_CONTROL_NAME, MODEL_NAME];
 var streamIndex = 0;
 
 function streamName() {
@@ -43,6 +59,7 @@ const POLL_MS = 250;
 // that dies has still produced the `class=` line naming the archive the game
 // read; `false` is only safe when the streamed model cannot fault this build.
 var NATIVES_FIRST = true;
+
 
 function say(event) {
     var args = Array.prototype.slice.call(arguments, 1);

@@ -1,9 +1,4 @@
 //! Which encodings have an XML view, and the conversion each of them is.
-//!
-//! One dispatcher per direction over the encodings [`Encoding`] names, plus a
-//! pair for resource-embedded `Meta`, which is recognised from the entry's kind
-//! and the contents' magic rather than from a payload's head. The set of
-//! encodings with a view is written down only here; `None` means there is none.
 
 use crate::{
     error::Result,
@@ -11,13 +6,8 @@ use crate::{
 };
 
 /// The XML view of this payload, or `None` when its encoding has none.
-///
-/// The encoding is the payload's own, by [`Encoding::of`] over its head.
-///
 /// # Errors
-///
-/// Whatever the encoding's own converter answers for a payload that announces
-/// an encoding and then contradicts it.
+/// Returns an error if the payload announces an encoding then contradicts it.
 pub fn to_xml(payload: &[u8], names: &Dictionary) -> Result<Option<Vec<u8>>> {
     let head = payload.get(..Encoding::HEAD_LEN).unwrap_or(payload);
     match Encoding::of(head) {
@@ -28,16 +18,9 @@ pub fn to_xml(payload: &[u8], names: &Dictionary) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// The payload `document` describes, applied to the payload it came from, or
-/// `None` when that payload's encoding has no XML view.
-///
-/// `payload` is the file being edited and not a template, and the encoding is
-/// its own, never the document's.
-///
+/// The payload `document` describes, applied back, or `None` when there's no XML view.
 /// # Errors
-///
-/// [`crate::Error::NotRbfXml`] or [`crate::Error::NotPsoXml`] for a document
-/// that does not describe this payload.
+/// Returns an error if `document` does not describe this payload.
 pub fn from_xml(payload: &[u8], document: &[u8], names: &Dictionary) -> Result<Option<Vec<u8>>> {
     let head = payload.get(..Encoding::HEAD_LEN).unwrap_or(payload);
     match Encoding::of(head) {
@@ -48,16 +31,9 @@ pub fn from_xml(payload: &[u8], document: &[u8], names: &Dictionary) -> Result<O
     }
 }
 
-/// The XML view of a resource entry's **inflated contents**, or `None` when
-/// they are not a `Meta`.
-///
-/// What the contents are is [`meta::identifies`]; `system_len` is how many of
-/// them are system pages, a fact about the entry that every resource pointer is
-/// resolved against.
-///
+/// The XML view of a resource entry's inflated contents, or `None` when not a `Meta`.
 /// # Errors
-///
-/// [`crate::Error::BadMeta`] and [`crate::Error::UnsupportedMeta`].
+/// Returns an error if the contents look like a `Meta` but aren't one this build supports.
 pub fn resource_to_xml(
     contents: &[u8],
     system_len: usize,
@@ -69,16 +45,9 @@ pub fn resource_to_xml(
     meta::to_xml(contents, system_len, names).map(Some)
 }
 
-/// The payload `document` describes, applied to the resource contents it came
-/// from, or `None` when those contents are not a `Meta`.
-///
-/// [`resource_to_xml`]'s direction reversed: the contents are the file being
-/// edited and not a template.
-///
+/// The payload `document` describes, applied to those resource contents, or `None` if not a `Meta`.
 /// # Errors
-///
-/// [`crate::Error::NotMetaXml`] for a document that does not describe these
-/// contents, plus the payload's own refusals.
+/// Returns an error if `document` does not describe these contents.
 pub fn resource_from_xml(
     contents: &[u8],
     system_len: usize,
@@ -112,7 +81,6 @@ mod tests {
             to_xml(payload, &names).expect("a view").as_deref(),
             Some(&payload[..])
         );
-        // And the document replaces it.
         let edited = b"<?xml version=\"1.0\"?><CMapTypes><a/></CMapTypes>";
         assert_eq!(
             from_xml(payload, edited, &names)
@@ -138,7 +106,6 @@ mod tests {
 
     #[test]
     fn the_dispatch_is_the_payloads_own_encoding_and_never_the_documents() {
-        // What the entry holds decides, not the document.
         let names = Dictionary::default();
         let payload = b"Version 1\r\nabcdef";
         assert_eq!(

@@ -41,8 +41,8 @@ const OPAQUE: u8 = 0xFF;
 /// imported from the code under test.
 const MEASURED: [usize; 2] = [16, 24];
 
-/// A resource payload as a Rockstar archive holds one: an opaque header of
-/// `header_len` bytes that is not an `RSC7` header, then the deflate stream.
+/// An opaque header of `header_len` bytes that is not an `RSC7` header, then
+/// the deflate stream.
 fn opaque_resource(header_len: usize) -> Vec<u8> {
     let mut payload = vec![OPAQUE; header_len];
     payload.extend_from_slice(&deflated_page());
@@ -57,8 +57,8 @@ fn deflated_page() -> Vec<u8> {
     encoder.finish().expect("finishes")
 }
 
-/// An archive holding one resource per header length in `headers`, named `r0`,
-/// `r1` and so on in ascending order, each one payload of [`opaque_resource`].
+/// One resource per header length in `headers`, named `r0`, `r1` and so on in
+/// ascending order.
 fn archive_of(headers: &[usize]) -> Vec<u8> {
     let mut names = vec![0_u8];
     let mut rows = vec![common::directory_row(0, 1, headers.len() as u32)];
@@ -90,7 +90,6 @@ fn archive_of(headers: &[usize]) -> Vec<u8> {
     out
 }
 
-/// The contents of every entry of an archive, by name.
 fn contents_of(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut src = Cursor::new(bytes.to_vec());
     let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
@@ -125,9 +124,8 @@ fn a_resource_stream_is_found_at_whichever_boundary_its_payload_uses() {
     );
 }
 
-/// The stream's length is the payload's extent less the header it actually
-/// carries, so a boundary and a length taken from different candidates would
-/// leave bytes unaccounted for.
+/// The stream's length is the payload's extent less the header it carries, so a
+/// boundary and a length from different candidates would leave bytes over.
 #[test]
 fn a_resource_at_any_boundary_accounts_for_its_whole_payload() {
     let bytes = archive_of(&MEASURED);
@@ -181,8 +179,8 @@ fn the_boundaries_the_code_carries_are_the_ones_that_were_measured() {
 
 #[test]
 fn a_payload_that_begins_no_stream_reports_the_first_boundarys_failure() {
-    // A near miss at the second boundary: a whole stream 24 bytes in inflating
-    // to half of what the flags declare, where the first boundary has none.
+    // A near miss at the second boundary: a whole stream 24 bytes in inflating to
+    // half of what the flags declare, where the first boundary has none.
     let mut short = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     short.write_all(&vec![0_u8; 256]).expect("deflates");
     let short = short.finish().expect("finishes");
@@ -213,8 +211,8 @@ fn a_payload_that_begins_no_stream_reports_the_first_boundarys_failure() {
     );
 }
 
-/// A payload that satisfies no candidate comes back as the failure it is,
-/// rather than as whichever attempt got furthest.
+/// A payload that satisfies no candidate reports its own failure, not whichever
+/// attempt got furthest.
 #[test]
 fn a_resource_that_inflates_short_of_its_flags_is_reported_against_its_entry() {
     let mut encoder =
@@ -264,7 +262,6 @@ fn a_resource_that_inflates_short_of_its_flags_is_reported_against_its_entry() {
         "the walk names the one entry that did not read back and no other"
     );
 
-    // Passthrough is untouched: the payload leaves the archive byte for byte.
     assert_eq!(
         archive.extract(&mut src, 1).expect("extracts")[..payload.len()],
         payload[..],
@@ -318,8 +315,8 @@ fn a_payload_with_its_own_header_beats_the_flag_words_the_entry_declares() {
     payload.extend_from_slice(&GRAPHICS_FLAGS.to_le_bytes());
     payload.extend_from_slice(&deflated_page());
 
-    // Flags declaring 128 KB, which the payload is not: taking the entry's
-    // would make the read below a length mismatch.
+    // Flags declaring 128 KB, which the payload is not: taking the entry's would
+    // make the read below a length mismatch.
     let built = build_one(
         FileKind::Resource {
             declared: Some(ResourceFlags {
@@ -369,7 +366,6 @@ fn a_patch_of_a_resource_that_carries_no_header_takes_the_entrys_flag_words() {
     );
 }
 
-/// A source that counts the bytes read out of it.
 struct Counting<S> {
     inner: S,
     read: u64,
@@ -395,8 +391,6 @@ impl<S: std::io::Seek> std::io::Seek for Counting<S> {
     }
 }
 
-/// The write is not refused when it is offered; the read path is what catches
-/// it.
 #[test]
 fn a_text_payload_written_into_a_resource_entry_is_taken_and_then_caught() {
     let mut file = Cursor::new(archive_of(&[MEASURED[0]]));
@@ -448,8 +442,8 @@ fn noise(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// An inflate reads its input, so the bytes asked of the source are what
-/// separates one pass over the stream from two.
+/// The bytes asked of the source are what separates one pass over the stream
+/// from two.
 #[test]
 fn a_verify_inflates_a_resource_once_where_a_read_of_it_pays_twice() {
     let plain = noise(65_536);
@@ -521,7 +515,6 @@ fn rows_of(bytes: &[u8]) -> BTreeMap<String, (u32, u32)> {
         .collect()
 }
 
-/// Every entry of an archive as the file `extract` writes into a tree, by path.
 fn extracted_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let mut src = Cursor::new(bytes.to_vec());
     let archive = Archive::open(&mut src, &Unlock::unkeyed()).expect("parses");
@@ -533,7 +526,6 @@ fn extracted_of(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
-/// Packs the tree `manifest` describes, taking each payload from `contents`.
 fn pack(manifest: &Manifest, contents: &BTreeMap<String, Vec<u8>>) -> rpf_core::Result<Vec<u8>> {
     let held = contents.clone();
     let mut out = Cursor::new(Vec::new());
@@ -576,8 +568,8 @@ fn a_resource_packs_from_the_flag_words_its_manifest_records() {
     );
 }
 
-/// Flag words that were not recorded are never guessed at: a guess produces an
-/// archive that parses, packs and verifies but does not load.
+/// A guessed flag word produces an archive that parses, packs and verifies but
+/// does not load.
 #[test]
 fn a_tree_whose_manifest_records_no_flag_words_is_refused_at_the_entry_that_lacks_them() {
     let bytes = archive_of(&[MEASURED[0]]);
@@ -635,7 +627,6 @@ fn a_resource_that_carries_its_own_header_packs_from_a_manifest_that_records_non
     assert_eq!(extracted_of(&packed), extracted);
 }
 
-/// Builds a one-entry archive holding `payload` at `r0.ydr`.
 fn build_one(kind: FileKind, payload: &[u8]) -> rpf_core::Result<Vec<u8>> {
     let files = vec![FileSpec {
         path: "r0.ydr".to_owned(),

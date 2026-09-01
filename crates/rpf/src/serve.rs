@@ -1,12 +1,6 @@
 //! `serve --stdio`: a long-lived process with warm state, framed as one JSON
 //! object per line. Writes are buffered until `commit`, and an archive is open
-//! in one session at a time.
-//!
-//! Three threads, each blocking on exactly one thing: standard input is read on
-//! its own, standard output written on a third, and the worker between them
-//! waits when the client is more than [`ANSWER_BACKLOG`] behind. The reading
-//! thread never waits — one that waits is the deadlock the three exist to
-//! avoid.
+//! in one session at a time. The reading thread never waits.
 
 use std::{
     collections::BTreeMap,
@@ -31,9 +25,6 @@ use serde_json::{Value, json};
 use crate::{commands, exit::Failure, install};
 
 /// JSON-RPC's own error codes, for a request that did not follow the protocol.
-///
-/// Negative is the protocol's numbering and positive is the exit code the same
-/// failure would produce on the command line.
 const INVALID_REQUEST: i64 = -32600;
 /// No such method.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -42,47 +33,30 @@ const INVALID_PARAMS: i64 = -32602;
 /// The line was not JSON.
 const PARSE_ERROR: i64 = -32700;
 
-/// How many progress notifications may be waiting to be written before further
-/// ones are dropped. It is the only thing on this wire that may be dropped.
+/// How many progress notifications may queue before further ones are dropped —
+/// the only thing on this wire that may be.
 const PROGRESS_BACKLOG: usize = 64;
 
-/// How many bytes of answers may be queued and unwritten before the worker
-/// waits for the client to catch up.
-///
-/// Bounded because unbounded queueing of large reads ran to gigabytes of
-/// resident memory. One answer always goes through however big it is.
+/// How many bytes of answers may be queued before the worker waits for the
+/// client to catch up. One answer always goes through however big it is.
 const ANSWER_BACKLOG: usize = 8 * 1024 * 1024;
 
 /// How much of one line is written before the count of what the far end has
-/// taken is brought up to date.
-///
-/// The count moves only once a whole piece has cleared, so the piece size is a
-/// floor under what the count can measure.
+/// taken is brought up to date, and so a floor under what that count measures.
 const WRITE_PIECE: usize = 1024;
 
 /// How long the far end's reading is measured over.
-///
-/// A window rather than idleness since the last look, so that one pause in a
-/// client that is otherwise keeping up does not truncate a response mid-line.
 const DRAIN_WINDOW: Duration = Duration::from_secs(5);
 
 /// How many bytes standard output must take in one [`DRAIN_WINDOW`] for the far
-/// end to count as still there: four kilobytes a second across it.
-///
-/// Below it a client cannot be told from one that has gone, and is cut off with
-/// exit 7 rather than waited on for ever.
+/// end to count as still there. Below it a client is cut off with exit 7.
 const DRAIN_FLOOR: usize = 20 * 1024;
 
 /// Which file an open handle is on, as the operating system names one.
 ///
 /// A resolved path is not a file identity: a hard link, and a firmlinked macOS
-/// volume, both give one file two true canonical paths.
-///
-/// Whether a file can be named is settled at runtime on Windows — a redirector
-/// answers with a zero volume serial, which names nothing — so `Unnamed` is
-/// reachable. An unnamed file is equal to nothing, itself included, so an
-/// identity that could not be read falls back to the path and can never
-/// manufacture a match.
+/// volume, both give one file two true canonical paths. An unnamed file is
+/// equal to nothing, itself included, so it can never manufacture a match.
 #[derive(Clone, Copy)]
 enum FileId {
     /// The device and inode the operating system named.
@@ -101,24 +75,13 @@ enum FileId {
         /// Which file on it.
         index: u64,
     },
-    /// This file is named by nothing but its path — because the platform
-    /// names none, or because the volume it is on does not.
+    /// Named by nothing but its path: the platform or the volume names none.
     #[cfg(not(unix))]
     Unnamed,
 }
 
 impl FileId {
     /// What the operating system calls the file behind an open handle.
-    ///
-    /// The handle is asked on every platform, including one that has no name to
-    /// answer with. On Unix an `fstat` that fails means the handle is broken and
-    /// the archive is not held; on Windows not answering is a property of the
-    /// volume rather than of the handle, and is `Unnamed` instead.
-    ///
-    /// # Errors
-    ///
-    /// [`Failure::Io`] where the platform's identity call can fail — on Unix,
-    /// if the open handle cannot be statted.
     fn of(file: &fs::File, path: &Path) -> crate::exit::Result<Self> {
         Self::named_by(file).map_err(|source| Failure::Io {
             path: path.display().to_string(),
@@ -137,17 +100,9 @@ impl FileId {
         })
     }
 
-    /// The identity behind an open handle: the volume serial number and file
-    /// index `GetFileInformationByHandle` gives, where the volume gives them.
-    ///
-    /// Both halves are behind `windows_by_handle`, which the pinned stable
-    /// toolchain does not have, so `winapi-util` makes the call rather than
-    /// reading a [`fs::Metadata`].
-    ///
-    /// Both halves have to be non-zero, and the call failing is not an error: a
-    /// zero in either half is the volume saying it does not name its files (the
-    /// `\\wsl.localhost` redirector does), and taking it at face value would
-    /// make every file on that volume equal to every other.
+    /// The volume serial number and file index `GetFileInformationByHandle`
+    /// gives. A zero in either half is the volume saying it does not name its
+    /// files, which is `Unnamed` rather than an error.
     #[cfg(windows)]
     #[allow(
         clippy::unnecessary_wraps,
@@ -169,15 +124,14 @@ impl FileId {
         })
     }
 
-    /// The identity behind an open handle: on this platform, none. The handle
-    /// is statted anyway, because a file that cannot be statted is not held.
+    /// No identity on this platform, but the handle is statted anyway: a file
+    /// that cannot be statted is not held.
     #[cfg(not(any(unix, windows)))]
     fn named_by(file: &fs::File) -> io::Result<Self> {
         file.metadata().map(|_| Self::Unnamed)
     }
 
-    /// Whether these are one file. Always false where files are unnamed: an
-    /// identity that does not exist is not evidence that two paths are one.
+    /// Whether these are one file. Always false where files are unnamed.
     const fn is(self, other: Self) -> bool {
         match (self, other) {
             #[cfg(unix)]
@@ -206,14 +160,13 @@ impl FileId {
 struct Session {
     /// The resolved path: what the session claims, reports back, and rebuilds.
     path: PathBuf,
-    /// The file that path led to. Refreshed by every commit: a rebuild replaces
-    /// the archive by rename, so the file afterwards is not the file before.
+    /// The file that path led to. Refreshed by every commit, which may replace
+    /// the archive by rename.
     id: FileId,
     file: fs::File,
     archive: Archive,
-    /// What has been changed and not committed: new contents for an entry, or
-    /// an entry added, removed or renamed. `commit` decides between patching
-    /// and rebuilding for the whole set of them.
+    /// What has been changed and not committed. `commit` decides between
+    /// patching and rebuilding for the whole set.
     pending: Changes,
 }
 
@@ -223,23 +176,15 @@ struct State {
     sessions: BTreeMap<u64, Session>,
     next_handle: u64,
     /// `--cache-dir`, as this process was started with, and `None` for the
-    /// platform's own.
-    ///
-    /// A process-wide choice rather than a parameter on every method that opens
-    /// an archive: a daemon serves one install at a time. A `keys.*` request
-    /// that names a `cache` still overrides it.
+    /// platform's own. A `keys.*` request naming a `cache` overrides it.
     cache: Option<PathBuf>,
 }
 
 impl State {
     /// The handle holding an archive, and the name it holds it under.
     ///
-    /// Either the path or the file settles it: the file catches a second name
-    /// for one archive, the path catches a new file at a name a session holds.
-    /// Derived from the open sessions rather than kept beside them, so a claim
-    /// is released exactly one way — the session going away. `id` is absent when
-    /// the file is not there to be statted, the ordinary case for an archive
-    /// `pack` is about to create.
+    /// Either the path or the file settles it. `id` is absent when the file is
+    /// not there to be statted.
     fn holder_of(&self, path: &Path, id: Option<FileId>) -> Option<(u64, &Path)> {
         self.sessions
             .iter()
@@ -248,18 +193,13 @@ impl State {
     }
 }
 
-/// How much of a request's `id` is echoed back to somebody who did not send it.
-///
-/// A cancel answer and a progress notification echo the `id` of a *different*
-/// request, once per line the client writes, so an unbounded echo lets a large
-/// `id` multiply into gigabytes. A response still echoes its own `id` whole,
-/// which costs what the client wrote and no more.
+/// How much of a request's `id` is echoed onto a line the client did not ask
+/// for: unbounded, a large `id` would multiply into gigabytes. A response still
+/// echoes its own `id` whole.
 const NAME_ECHO: usize = 128;
 
-/// What a cancel answer or a progress notification may echo of a job's `id`.
-///
-/// The whole `id` when it is small enough to be quoted back on every line, and
-/// its size when it is not. [`NAME_ECHO`].
+/// The whole `id` when it is small enough to quote back, its size when it is
+/// not. [`NAME_ECHO`].
 fn name_of(request: &Value) -> Value {
     let rendered = render(request);
     if rendered.len() <= NAME_ECHO {
@@ -268,16 +208,14 @@ fn name_of(request: &Value) -> Value {
     json!(format!("<an id of {} bytes>", rendered.len()))
 }
 
-/// The one long operation that can be running, named by the `id` of the request
-/// that started it — the one name a client has before the answer comes back.
+/// The one long operation that can be running, named by the `id` that started
+/// it.
 struct Job {
     /// What a cancel is matched against: the whole `id`, whatever its size.
     request: Value,
     /// What an answer echoes back. [`NAME_ECHO`].
     name: Value,
-    /// The session it runs against, or `None` for the one operation that has
-    /// none: `pack` builds an archive from a tree and is named by its output
-    /// path rather than by a handle.
+    /// The session it runs against, or `None` for `pack`, which has none.
     handle: Option<u64>,
     /// What the client is told is running: `"commit"` while it is still being
     /// decided, then `"patch"` or `"rebuild"`.
@@ -289,12 +227,8 @@ struct Job {
 }
 
 /// Whether a running operation can be stopped, and what to say when it cannot.
-///
-/// A reason rather than a bare `false`: the two cases that cannot be stopped
-/// cannot be stopped for different reasons.
 enum Stoppable {
-    /// It can be. A cancel naming it marks it, and the watcher sees that
-    /// between entries.
+    /// It can be, and the watcher sees the mark between entries.
     Yes,
     /// It cannot, and this is why.
     No(&'static str),
@@ -309,17 +243,15 @@ const PATCHING: &str =
     "a patch in place writes the bytes of one edit; there is no part-way to stop at";
 
 /// What a `cancel` acts on: at most one operation, and only the one it names.
-///
-/// One lock rather than a flag per question, so that reading what is running
-/// and marking it cancelled cannot be separated.
+/// One lock, so reading what runs and marking it cancelled cannot be separated.
 #[derive(Default)]
 struct Cancellation {
     job: Mutex<Option<Job>>,
 }
 
 impl Cancellation {
-    /// The running job. A poisoned lock is recovered rather than reported:
-    /// what it guards is still readable.
+    /// The running job. A poisoned lock is recovered: what it guards is still
+    /// readable.
     fn job(&self) -> MutexGuard<'_, Option<Job>> {
         self.job.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -347,16 +279,13 @@ impl Cancellation {
         self.job().as_ref().is_some_and(|job| job.cancelled)
     }
 
-    /// Forgets it, so that a cancel arriving afterwards finds nothing running
-    /// and is answered rather than stored against whatever runs next.
+    /// Forgets it, so a later cancel finds nothing rather than being stored
+    /// against whatever runs next.
     fn finish(&self) {
         *self.job() = None;
     }
 
     /// Answers a `cancel`, and acts on it when it names what is running.
-    ///
-    /// Reading what is running and marking it cancelled happen under one lock,
-    /// so the operation told to stop is the operation that was named.
     fn ask(&self, request: Option<&Value>, handle: Option<u64>) -> Value {
         let mut running = self.job();
         let Some(job) = running.as_mut() else {
@@ -394,12 +323,10 @@ struct Backlog {
     queued: AtomicUsize,
     /// Set when a write to standard output failed.
     broken: AtomicBool,
-    /// Set when standard input has ended, so that a worker waiting for the
-    /// client to catch up can tell a client that is still there from one the
-    /// daemon is now only waiting on.
+    /// Set when standard input has ended.
     ending: AtomicBool,
-    /// Bytes standard output has taken. The measure both waits use for whether
-    /// the far end is reading slowly or not at all.
+    /// Bytes standard output has taken, which is how both waits tell a slow far
+    /// end from an absent one.
     taken: AtomicUsize,
     /// Bytes of answers queued by the worker and not yet written.
     answers: Mutex<usize>,
@@ -408,8 +335,7 @@ struct Backlog {
 }
 
 impl Backlog {
-    /// Bytes of answers queued and not yet written. A poisoned lock is
-    /// recovered rather than reported: what it guards is still readable.
+    /// Bytes of answers queued and not yet written.
     fn answers(&self) -> MutexGuard<'_, usize> {
         self.answers.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -429,20 +355,15 @@ impl Backlog {
 
 /// One line waiting to be written.
 enum Outgoing {
-    /// A response, or the answer to a cancel. Never dropped.
-    ///
-    /// `counted` says whether it was weighed against [`ANSWER_BACKLOG`], and so
-    /// whether writing it gives room back. Only the worker's answers are: the
-    /// reading thread must never wait for room.
+    /// A response, or the answer to a cancel. Never dropped. `counted` says
+    /// whether it was weighed against [`ANSWER_BACKLOG`]; only the worker's are.
     Answer { text: String, counted: bool },
     /// Progress. Dropped when the client is behind.
     Progress(String),
 }
 
-/// What the reading thread and the worker share.
-///
-/// Nothing here blocks on the far end of standard output: emitting queues a
-/// line and returns, and one thread writes them.
+/// What the reading thread and the worker share. Nothing here blocks on the far
+/// end of standard output: emitting queues a line and returns.
 struct Wire {
     lines: mpsc::Sender<Outgoing>,
     backlog: Arc<Backlog>,
@@ -451,10 +372,7 @@ struct Wire {
 
 impl Wire {
     /// Queues one response, waiting first while the client is too far behind.
-    ///
-    /// Only the worker calls this, and it is the only thread that may wait
-    /// here. While it waits the reading thread goes on reading and cancels go
-    /// on being answered.
+    /// Only the worker calls this, and it is the only thread that may wait here.
     fn answer(&self, value: &Value) {
         let text = render(value);
         let len = text.len();
@@ -471,11 +389,8 @@ impl Wire {
         }
     }
 
-    /// Queues one answer without waiting for room: the reading thread's.
-    ///
-    /// A reading thread that blocks cannot be told anything, the cancel
-    /// included. Uncounted rather than unbounded — [`NAME_ECHO`] is what keeps
-    /// what it queues proportional to the line that asked for it.
+    /// Queues one answer without waiting for room: the reading thread's, which
+    /// must never block. [`NAME_ECHO`] is what bounds it.
     fn answer_now(&self, value: &Value) {
         let _ = self.lines.send(Outgoing::Answer {
             text: render(value),
@@ -483,12 +398,9 @@ impl Wire {
         });
     }
 
-    /// Waits until there is room for one more answer of `len` bytes.
-    ///
-    /// One answer always fits when nothing is queued, however big it is. The
-    /// wait is unbounded while standard input is open — the pipe the client is
-    /// not draining is its own — and bounded by [`DRAIN_FLOOR`] once it has
-    /// ended.
+    /// Waits until there is room for one more answer of `len` bytes. One always
+    /// fits when nothing is queued; the wait is unbounded while standard input
+    /// is open, and bounded by [`DRAIN_FLOOR`] once it has ended.
     fn make_room(&self, len: usize) {
         let mut answers = self.backlog.answers();
         while !self.gone() && *answers > 0 && answers.saturating_add(len) > ANSWER_BACKLOG {
@@ -541,10 +453,8 @@ fn render(value: &Value) -> String {
     })
 }
 
-/// Writes queued lines, flushing each.
-///
-/// On its own thread and owning standard output outright: this is the only call
-/// in the daemon that can block for as long as a client declines to read.
+/// Writes queued lines, flushing each. The only call in the daemon that can
+/// block for as long as a client declines to read.
 fn writing(lines: &mpsc::Receiver<Outgoing>, backlog: &Backlog) {
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -559,7 +469,7 @@ fn writing(lines: &mpsc::Receiver<Outgoing>, backlog: &Backlog) {
         if !backlog.broken.load(Ordering::SeqCst) && !write_line(&mut out, &text, backlog) {
             backlog.broken.store(true, Ordering::SeqCst);
         }
-        // Whether or not it reached the far end: a worker waiting for room a
+        // Whether or not it reached the far end: a worker waiting on room a
         // dropped line still held would wait for ever.
         if counted {
             backlog.wrote(text.len());
@@ -568,11 +478,8 @@ fn writing(lines: &mpsc::Receiver<Outgoing>, backlog: &Backlog) {
     let _ = out.flush();
 }
 
-/// Writes one line and its newline, a piece at a time, and says whether it got
-/// there.
-///
-/// In pieces, each flushed, so that what the far end has taken is known while a
-/// long line is still being written. [`WRITE_PIECE`].
+/// Writes one line and its newline in flushed pieces, so that what the far end
+/// has taken is known mid-line, and says whether it got there. [`WRITE_PIECE`].
 fn write_line(out: &mut impl Write, text: &str, backlog: &Backlog) -> bool {
     let mut rest = text.as_bytes();
     while !rest.is_empty() {
@@ -592,14 +499,13 @@ fn write_line(out: &mut impl Write, text: &str, backlog: &Backlog) -> bool {
     true
 }
 
-/// Reports progress as notifications, and stops when a cancel has arrived or
-/// when there is nobody left to report to.
+/// Reports progress as notifications, and stops on a cancel or on nobody being
+/// left to report to.
 struct Notifying<'a> {
     wire: &'a Wire,
     /// The session being reported on, or `None` for a `pack`, which has none.
     handle: Option<u64>,
-    /// What the notification echoes of the request that started the write.
-    /// [`NAME_ECHO`].
+    /// What the notification echoes of the request. [`NAME_ECHO`].
     name: &'a Value,
     /// Whether the caller asked for progress at all.
     wanted: bool,
@@ -624,8 +530,6 @@ impl Watch for Notifying<'_> {
             self.stopped = Some(Stopped::Cancelled);
             return Flow::Stop;
         }
-        // Recorded rather than folded into a cancel: the caller asked for one
-        // of these and not the other.
         if self.wire.gone() {
             self.stopped = Some(Stopped::OutputGone);
             return Flow::Stop;
@@ -663,10 +567,9 @@ impl Notifying<'_> {
     }
 }
 
-/// Translates a stopped write into the failure that actually happened.
-///
-/// The library has one variant for "the watcher said stop" and this daemon
-/// stops for two unrelated reasons, only one of which the caller asked for.
+/// Translates a stopped write into the failure that actually happened: the
+/// library has one variant for "the watcher said stop" and this daemon stops
+/// for two unrelated reasons.
 fn stopped_as(stopped: Option<Stopped>, failure: Failure) -> Failure {
     if matches!(stopped, Some(Stopped::OutputGone))
         && matches!(
@@ -690,7 +593,7 @@ enum Incoming {
     /// A request, to be handled in order.
     Request(String),
     /// Reading stopped, and why. Never silently: a daemon that stops accepting
-    /// requests and says nothing exits 0 having failed.
+    /// requests and says nothing would exit 0 having failed.
     Ended(Failure),
 }
 
@@ -698,8 +601,7 @@ enum Incoming {
 enum Seen {
     /// A `cancel`, acted on or refused, with the object to write back.
     Cancel(Value),
-    /// A `cancel` sent as a notification: acted on where its parameters allowed
-    /// it, and the specification forbids answering it either way.
+    /// A `cancel` sent as a notification, which must not be answered.
     CancelNotification,
     /// Anything else. It goes to the worker, in order.
     Request,
@@ -709,8 +611,7 @@ enum Seen {
 ///
 /// # Errors
 ///
-/// [`Failure::Io`] if standard input or standard output failed part-way, which
-/// is what makes the exit code say so.
+/// [`Failure::Io`] if standard input or output failed part-way.
 pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
     let backlog = Arc::new(Backlog::default());
     let (lines, queued) = mpsc::channel::<Outgoing>();
@@ -731,8 +632,6 @@ pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
     let reading_wire = Arc::clone(&wire);
     let reader = thread::spawn(move || {
         reading(io::stdin().lock(), &reading_wire, &queue);
-        // Every way out of that loop means the same thing: no more requests
-        // are coming.
         reading_wire.backlog.ending.store(true, Ordering::SeqCst);
         reading_wire.backlog.room.notify_all();
     });
@@ -760,8 +659,7 @@ pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
     drop(wire);
     let emptied = drain(&drained, &backlog);
     if emptied {
-        // So that the process cannot outlive a line it is half way through
-        // writing.
+        // So the process cannot outlive a line it is half way through writing.
         let _ = writer.join();
     }
 
@@ -789,12 +687,8 @@ pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
     Ok(())
 }
 
-/// Waits for the writing thread to reach the end of its queue, for as long as
-/// the far end keeps up with [`DRAIN_FLOOR`].
-///
-/// Returns `true` when the queue is empty and every line in it was written
-/// whole. A client that sent a request before closing standard input has not
-/// thereby given up the answer to it.
+/// Waits for the writing thread to empty its queue, for as long as the far end
+/// keeps up with [`DRAIN_FLOOR`]. `true` when every line was written whole.
 fn drain(drained: &mpsc::Receiver<()>, backlog: &Backlog) -> bool {
     let mut before = backlog.taken.load(Ordering::SeqCst);
     loop {
@@ -813,10 +707,7 @@ fn drain(drained: &mpsc::Receiver<()>, backlog: &Backlog) -> bool {
 }
 
 /// The reading thread: one line at a time, cancels answered where they stand.
-///
-/// `input` is a parameter for the same reason [`Opening`] is one: the property
-/// this thread carries — that it waits on nothing the client controls — is
-/// otherwise only observable through a pipe and a clock.
+/// `input` is a parameter so a test can drive it. [`Opening`].
 fn reading(input: impl BufRead, wire: &Wire, queue: &mpsc::Sender<Incoming>) {
     for line in input.lines() {
         let line = match line {
@@ -833,7 +724,7 @@ fn reading(input: impl BufRead, wire: &Wire, queue: &mpsc::Sender<Incoming>) {
             continue;
         }
         // Ahead of the queue: a cancel that waits its turn arrives after the
-        // thing it would have cancelled has finished.
+        // thing it would have cancelled finished.
         match answer_cancel(&line, &wire.cancel) {
             Seen::Cancel(answer) => {
                 wire.answer_now(&answer);
@@ -858,29 +749,22 @@ fn reading(input: impl BufRead, wire: &Wire, queue: &mpsc::Sender<Incoming>) {
     }
 }
 
-/// What a `cancel` names.
-///
-/// Both optional, and `None` for either means "whichever one is running". A
-/// parameter that was *given* must never end up here as `None`: that is the
-/// difference between stopping nothing and stopping somebody else's commit.
+/// What a `cancel` names. `None` for either means "whichever one is running",
+/// so a parameter that was given must never end up here as `None`.
 struct Aim {
     request: Option<Value>,
     handle: Option<u64>,
 }
 
-/// Reads what a `cancel` names, or says why its parameters do not say.
-///
-/// Answered ahead of `dispatch`, so it validates for itself. An unknown key is
-/// refused too, which no other method does: here every parameter is optional and
-/// the default is the destructive one, so a misspelled key would silently be the
-/// widest possible aim.
+/// Reads what a `cancel` names, or says why its parameters do not say. An
+/// unknown key is refused, unlike elsewhere: every parameter here is optional
+/// and the default is the widest aim, so a misspelling would silently widen it.
 fn aim(params: Option<&Value>) -> std::result::Result<Aim, String> {
     let unaimed = Aim {
         request: None,
         handle: None,
     };
     let given = match params {
-        // No parameters at all still means "whatever is running", unchanged.
         None | Some(Value::Null) => return Ok(unaimed),
         Some(given) => given,
     };
@@ -910,10 +794,7 @@ fn aim(params: Option<&Value>) -> std::result::Result<Aim, String> {
 }
 
 /// Answers `cancel` from the reading thread, or hands the line back.
-///
-/// `cancelling` is false when nothing was running, when the cancel names
-/// something else, and when what is running cannot be stopped — each with the
-/// reason. Parameters that cannot be read are refused rather than acted on.
+/// Parameters that cannot be read are refused rather than acted on.
 fn answer_cancel(line: &str, cancel: &Cancellation) -> Seen {
     let Ok(request) = serde_json::from_str::<Value>(line) else {
         return Seen::Request;
@@ -951,8 +832,7 @@ fn respond(state: &mut State, line: &str, wire: &Wire) -> Option<Value> {
     let named = id.clone().unwrap_or(Value::Null);
     let outcome = dispatch(state, method, &params, wire, &named);
 
-    // A request with no id is a notification, which the specification forbids
-    // answering.
+    // A request with no id is a notification, which must not be answered.
     let id = id?;
     Some(match outcome {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
@@ -961,19 +841,12 @@ fn respond(state: &mut State, line: &str, wire: &Wire) -> Option<Value> {
 }
 
 /// A JSON-RPC error object: a number, a sentence, and the failure's own name.
-///
-/// `reason` in `data` is a stable symbol — an `rpf_core::Error` variant's name,
-/// or one of the frontend's own — and is on every error object this daemon
-/// writes, so a client never has to ask whether it is there.
+/// `reason` in `data` is a stable symbol and is on every error object.
 fn error_of(id: &Value, rejected: &Rejected) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {
-            "code": rejected.code(),
-            "message": rejected.message(),
-            "data": { "reason": rejected.reason() },
-        },
+        "error": crate::advice::object(rejected.code(), &rejected.message(), rejected.reason()),
     })
 }
 
@@ -987,8 +860,7 @@ fn protocol(code: i64, message: String) -> Rejected {
 enum Rejected {
     /// The request did not follow the protocol. JSON-RPC's own codes.
     Protocol { code: i64, message: String },
-    /// The work was attempted and did not succeed. The code is the one the
-    /// process would exit with.
+    /// The work was attempted and did not succeed, under the exit code.
     Failed(Failure),
 }
 
@@ -1001,12 +873,8 @@ impl Rejected {
         }
     }
 
-    /// The name that goes beside the number.
-    ///
-    /// A code classifies who has to act and is shared by every refusal there
-    /// is, so a client that has to tell two refusals apart would otherwise have
-    /// to read the rendered sentence, which is not a contract. Additive: the
-    /// number is unchanged.
+    /// The name that goes beside the number, so a client can tell two refusals
+    /// apart without reading the sentence.
     fn reason(&self) -> &'static str {
         match *self {
             Self::Protocol { code, .. } => match code {
@@ -1034,8 +902,7 @@ impl From<Failure> for Rejected {
     }
 }
 
-/// So that a container failure is classified once rather than at each call
-/// site.
+/// So a container failure is classified once rather than at each call site.
 impl From<rpf_core::Error> for Rejected {
     fn from(error: rpf_core::Error) -> Self {
         Self::Failed(Failure::Container(error))
@@ -1102,9 +969,8 @@ fn handle_of(params: &Value) -> Answer<u64> {
         .ok_or_else(|| invalid_params("\"handle\" is required, as a number".to_owned()))
 }
 
-/// Whether the caller wants progress notifications at all, which it does
-/// unless it says otherwise: a 3000-entry archive is 3000 lines, and a caller
-/// with nowhere to put them has to be able to decline.
+/// Whether the caller wants progress notifications, which it does unless it
+/// says otherwise.
 fn wants_progress(params: &Value) -> Answer<bool> {
     match params.get("progress") {
         None | Some(Value::Null) => Ok(true),
@@ -1124,11 +990,8 @@ fn flag(params: &Value, name: &str) -> Answer<bool> {
     }
 }
 
-/// The view a request asks for, which is the entry's own bytes unless it says
-/// otherwise.
-///
-/// `"raw"` is the default because a wire addition never changes what a request
-/// already meant.
+/// The view a request asks for, defaulting to `"raw"` so that a wire addition
+/// never changes what a request already meant.
 fn view_of(params: &Value) -> Answer<View> {
     match params.get("as") {
         None | Some(Value::Null) => Ok(View::Raw),
@@ -1140,10 +1003,8 @@ fn view_of(params: &Value) -> Answer<View> {
     }
 }
 
-/// A view, with the dictionary this frontend offers with it.
-///
-/// The command line's `commands::wanted` is the same one: a hash spelled one
-/// way here and another way there would be two products.
+/// A view, with the dictionary this frontend offers with it. The command line's
+/// `commands::wanted` is the same one.
 const fn wanted(view: View) -> view::Wanted<'static> {
     view::Wanted {
         view,
@@ -1151,10 +1012,8 @@ const fn wanted(view: View) -> view::Wanted<'static> {
     }
 }
 
-/// What a view answered, in the one spelling `--as` takes.
-///
-/// [`View::Auto`] is a question and never an answer, so what is reported is
-/// whichever of the two forms came back.
+/// What a view answered. [`View::Auto`] is a question and never an answer, so
+/// this reports whichever of the two forms came back.
 const fn answered(xml: bool) -> &'static str {
     if xml {
         View::Xml.name()
@@ -1163,9 +1022,8 @@ const fn answered(xml: bool) -> &'static str {
     }
 }
 
-/// A handle that was never opened, or has been closed.
-///
-/// A well-formed request this daemon declines, so a refusal and not `-32602`.
+/// A handle that was never opened, or has been closed. A well-formed request
+/// this daemon declines, so a refusal and not `-32602`.
 fn no_such_handle(handle: u64) -> Rejected {
     Rejected::from(Failure::Refused {
         reason: format!("no open archive with handle {handle}"),
@@ -1181,11 +1039,8 @@ fn session<'a>(state: &'a mut State, params: &Value) -> Answer<&'a mut Session> 
         .ok_or_else(|| no_such_handle(handle))
 }
 
-/// The same, for a method that buffers a change.
-///
-/// An archive this build can read and cannot write back is refused where the
-/// caller asks, rather than at the commit that could never have landed. The
-/// answer is `rpf-core`'s, and is the one `rpf put` gets from the same call.
+/// The same, for a method that buffers a change. An archive this build can read
+/// and not write back is refused here rather than at the commit.
 fn writing_session<'a>(state: &'a mut State, params: &Value) -> Answer<&'a mut Session> {
     let session = session(state, params)?;
     session.archive.writable().map_err(Failure::Container)?;
@@ -1193,20 +1048,14 @@ fn writing_session<'a>(state: &'a mut State, params: &Value) -> Answer<&'a mut S
 }
 
 /// The archive a request names, as the one path a session reports and rebuilds.
-///
 /// Two names for one *file* do not resolve alike, which is what [`FileId`] is
-/// for. With one exception, which is the command line's too: a path that runs
-/// past a file is an in-archive path spelled as a filesystem one, and
-/// `commands::opening` decides it for both frontends so the two cannot answer
-/// one mistake with two numbers.
+/// for.
 fn resolve(path: &Path) -> crate::exit::Result<PathBuf> {
     fs::canonicalize(path).map_err(|source| commands::opening(path, source))
 }
 
-/// `open` — claim an archive, parse it, and keep it warm.
-///
-/// The claim is on the file as well as on the path, and the second `open` of
-/// one archive is refused.
+/// `open` — claim an archive, parse it, and keep it warm. The claim is on the
+/// file as well as the path, and a second `open` of one archive is refused.
 fn open(state: &mut State, params: &Value) -> Answered {
     let asked = PathBuf::from(string(params, "path")?);
     let path = resolve(&asked)?;
@@ -1234,7 +1083,7 @@ fn open(state: &mut State, params: &Value) -> Answered {
 
     Ok(json!({
         // The resolved path, not the one asked for: it is what the session
-        // claimed, and what a refusal will name.
+        // claimed and what a refusal names.
         "handle": handle,
         "path": reported,
         "entries": entries,
@@ -1242,11 +1091,8 @@ fn open(state: &mut State, params: &Value) -> Answered {
     }))
 }
 
-/// That an archive is held, and by which handle.
-///
-/// The path asked for and the path the holder claimed can differ — two names
-/// for one file — so both are named. One sentence for both of the refusals that
-/// need it, so a client is told the same thing however it ran into the claim.
+/// That an archive is held, and by which handle. The path asked for and the one
+/// the holder claimed can differ — two names for one file — so both are named.
 fn names_held(path: &Path, held: &Path, holder: u64) -> String {
     if held == path {
         format!("{} is already open on handle {holder}", path.display())
@@ -1272,10 +1118,7 @@ fn already_open(path: &Path, held: &Path, holder: u64) -> Failure {
 }
 
 /// `close` — forget a session, and release its claim on the archive.
-///
-/// Uncommitted edits are discarded, and the response says how many, so that
-/// losing them is never silent. A client that leaks handles locks itself out of
-/// its own archives for the life of the daemon.
+/// Uncommitted edits are discarded, and the response says how many.
 fn close(state: &mut State, params: &Value) -> Answered {
     let handle = handle_of(params)?;
     let closed = state
@@ -1296,21 +1139,10 @@ fn inside_of(params: &Value) -> String {
 
 /// `list` — the entries at a path, optionally recursively.
 ///
-/// It doubles as a `stat`: a directory answers its children, a nested archive
-/// answers what is inside it, and an ordinary file answers exactly one row
-/// rather than an error. A caller tells the two apart by comparing the row's
-/// `path` with the one it asked for — a child's path can never equal its
-/// parent's — and an empty directory answers `[]`.
-///
-/// A row's `path` is the whole in-archive path, addressed from the path that was
-/// asked for and in the caller's own spelling of it, so a row addresses `read`,
-/// `write` and `list` as it stands and must not be joined onto what was asked
-/// for.
-///
-/// A listing is the archive on disk: buffered changes are not in it. `read` is
-/// the one exception, because an editor that wrote a buffer and read it back
-/// must see what it wrote; `pending` is what a client confirms its own view
-/// against.
+/// It doubles as a `stat`: an ordinary file answers exactly one row rather than
+/// an error, and an empty directory answers `[]`. A row's `path` is the whole
+/// in-archive path and must not be joined onto what was asked for. A listing is
+/// the archive on disk: buffered changes are not in it.
 fn list(state: &mut State, params: &Value) -> Answered {
     let inside = inside_of(params);
     let recursive = flag(params, "recursive")?;
@@ -1324,16 +1156,9 @@ fn list(state: &mut State, params: &Value) -> Answered {
 
 /// `read` — one entry's bytes, as base64.
 ///
-/// A pending write is returned in preference to what is on disk: an editor that
-/// wrote a buffer and read it back should see what it wrote.
-///
-/// `"as"` says which form of the entry is wanted — `"raw"`, `"xml"` or
-/// `"auto"` — and the answer says which form it got, beside the `"encoding"`
-/// the entry holds. A client never asks the path what it is: the scope boundary
-/// is self-describing formats and `.ymt` is not one.
-///
-/// The preference for a buffered write reaches the conversion as well: what a
-/// document is converted from is the payload this method would answer.
+/// A pending write is answered in preference to what is on disk, conversion
+/// included. `"as"` says which form is wanted — `"raw"`, `"xml"` or `"auto"` —
+/// and the answer says which it got, beside the `"encoding"` the entry holds.
 fn read(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let view = view_of(params)?;
@@ -1354,9 +1179,8 @@ fn read(state: &mut State, params: &Value) -> Answered {
     }
 
     if let Some(buffered) = session.pending.contents_at(&inside) {
-        // Read out of the source rather than out of a buffer the session kept,
-        // and encoded as it is read, so the answer costs the encoded form and
-        // not a copy of the payload beside it.
+        // Encoded as it is read, so the answer costs the encoded form and not a
+        // copy of the payload beside it.
         let len = buffered.len()?;
         let mut encoder = base64::write::EncoderStringWriter::new(&BASE64);
         io::copy(&mut buffered.open()?, &mut encoder).map_err(|source| Failure::Io {
@@ -1364,7 +1188,7 @@ fn read(state: &mut State, params: &Value) -> Answered {
             source,
         })?;
         // A payload nothing asked a question of is not classified: `"raw"`,
-        // and `"encoding"` is `null` because it was not read.
+        // and `"encoding"` is `null`.
         return Ok(json!({
             "path": inside,
             "len": len,
@@ -1393,11 +1217,8 @@ fn read(state: &mut State, params: &Value) -> Answered {
     }))
 }
 
-/// The whole of a buffered write's payload.
-///
-/// Held rather than streamed, because a conversion is a whole document against
-/// a whole payload. What the daemon buffers is [`rpf_core::Bytes`] and is
-/// already in memory, so this is a copy rather than a second large read.
+/// The whole of a buffered write's payload, held rather than streamed because a
+/// conversion is a whole document against a whole payload.
 fn buffered_payload(session: &Session, inside: &str) -> Answer<Vec<u8>> {
     let Some(buffered) = session.pending.contents_at(inside) else {
         return Ok(Vec::new());
@@ -1414,16 +1235,9 @@ fn buffered_payload(session: &Session, inside: &str) -> Answer<Vec<u8>> {
 /// only the buffer to work from.
 ///
 /// The entry decides whether there is a view; the bytes decide only what is in
-/// it. A buffered read that sniffed the payload instead would answer
-/// `"encoding": "xml"` where the on-disk read answers `null` for the same entry.
-///
-/// The entry's flags and its transform travel with the answer — hence
-/// `rpf_core::view::held_in_hand` rather than a classification assembled here —
-/// because the system/graphics page boundary appears nowhere in the payload and
-/// a keyed resource's buffer is ciphertext.
-///
-/// A path the archive does not hold yet is a creation, and only its bytes can
-/// answer for it.
+/// it — the page boundary appears nowhere in the payload and a keyed resource's
+/// buffer is ciphertext. A path the archive does not hold yet is a creation, and
+/// only its bytes can answer for it.
 fn buffered_held(session: &mut Session, inside: &str, payload: &[u8]) -> Answer<view::Held> {
     match session.archive.locate(&mut session.file, inside) {
         Ok((holder, index)) => Ok(view::held_in_hand(
@@ -1441,10 +1255,8 @@ fn buffered_held(session: &mut Session, inside: &str, payload: &[u8]) -> Answer<
 
 /// `write` — buffer an edit. Nothing on disk changes until `commit`.
 ///
-/// `create: true` lets it be a path the archive does not hold yet, which is an
-/// entry added and therefore a rebuild. Without it a path that is not there is
-/// [`rpf_core::Error::NotFound`], which guards against creating an entry a
-/// caller merely misspelled.
+/// `create: true` lets it be a path the archive does not hold yet, which forces
+/// a rebuild; without it such a path is [`rpf_core::Error::NotFound`].
 fn write(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let encoded = string(params, "bytes")?;
@@ -1467,8 +1279,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
                 }
                 .into());
             }
-            // Converted against the payload `read` would have answered, and
-            // buffered as the payload it becomes, so the set holds the entry's
+            // Buffered as the payload it becomes, so the set holds the entry's
             // own encoding whatever route it came in by: a converted write
             // needs no `allow_encoding_change`.
             let bytes = if view == View::Raw {
@@ -1494,8 +1305,8 @@ fn write(state: &mut State, params: &Value) -> Answered {
             };
             // A removal or a rename above this path leaves the commit writing
             // to something that will not be there. `bears_on` answers that from
-            // the set alone, so the entry-table walk below is paid only for a
-            // write that could actually collide.
+            // the set alone, so the entry-table walk is paid only where it
+            // could collide.
             session.pending.admits(&inside, &change)?;
             if session.pending.bears_on(&inside) {
                 rpf_core::allows(
@@ -1509,11 +1320,8 @@ fn write(state: &mut State, params: &Value) -> Answered {
             record(session, &inside, change).map_err(Into::into)
         }
         // A path being created has no entry to check against, so the whole
-        // change is resolved instead. Only here, because `allows` walks the
-        // entry table.
+        // change is resolved instead.
         Err(rpf_core::Error::NotFound { .. }) if create => {
-            // Nothing to convert against either: an entry that is not there
-            // holds no encoding for a document to adopt.
             let bytes = view::applied(&[], view::Held::Nothing, &inside, wanted(view), offered)?;
             let change = Change::Write {
                 contents: std::sync::Arc::new(rpf_core::Bytes::new(bytes)),
@@ -1536,8 +1344,7 @@ fn write(state: &mut State, params: &Value) -> Answered {
 /// `delete` — buffer a removal. Nothing on disk changes until `commit`.
 ///
 /// `recursive: true` takes a directory's children with it; without it a
-/// directory that holds anything is refused, which is the shape `rpf rm` has.
-/// `list` goes on reporting the entry until the commit: see [`list`].
+/// directory that holds anything is refused.
 fn delete(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let recursive = flag(params, "recursive")?;
@@ -1546,9 +1353,8 @@ fn delete(state: &mut State, params: &Value) -> Answered {
 
 /// `rename` — buffer a move to another path in the same archive.
 ///
-/// `to` is a whole in-archive path, spelled the way `from` is, so a rename
-/// moves between directories as well as changing a name. A destination the
-/// archive already holds is refused rather than replaced.
+/// `to` is a whole in-archive path, so a rename moves between directories as
+/// well as changing a name. A destination already held is refused.
 fn rename(state: &mut State, params: &Value) -> Answered {
     let from = string(params, "from")?;
     let to = string(params, "to")?;
@@ -1575,13 +1381,9 @@ fn mkdir(state: &mut State, params: &Value) -> Answered {
     buffer(state, params, &inside, Change::MakeDirectory)
 }
 
-/// Records one change against a session, once the archive has agreed to it.
-///
-/// The agreement is `rpf_core::allows`, which runs the resolution a commit runs
-/// and throws the result away, so a change buffered here is one the commit will
-/// not refuse for the same reason. It is given the session's own buffer, so a
-/// collision with another buffered change is refused and a rename onto a path a
-/// buffered removal frees is accepted.
+/// Records one change against a session, once `rpf_core::allows` has agreed to
+/// it against the session's own buffer, so the commit will not refuse it for the
+/// same reason.
 fn buffer(state: &mut State, params: &Value, inside: &str, change: Change) -> Answered {
     let session = writing_session(state, params)?;
     rpf_core::allows(
@@ -1594,15 +1396,13 @@ fn buffer(state: &mut State, params: &Value, inside: &str, change: Change) -> An
     record(session, inside, change).map_err(Into::into)
 }
 
-/// Records one change against a session, and reports what is buffered.
-///
-/// One shape for every method that buffers, so a client reads one answer. `len`
-/// is the payload's, and `null` for a change that carries none.
+/// Records one change against a session, and reports what is buffered. One
+/// shape for every method that buffers; `len` is `null` for a change that
+/// carries no payload.
 ///
 /// # Errors
 ///
-/// Whatever the payload cannot be measured with — a `write` names a source
-/// rather than carrying bytes, so asking its length can fail.
+/// Whatever measuring the payload failed with.
 fn record(session: &mut Session, inside: &str, change: Change) -> crate::exit::Result<Value> {
     let len = match change {
         Change::Write { ref contents, .. } => Some(contents.len()?),
@@ -1616,11 +1416,8 @@ fn record(session: &mut Session, inside: &str, change: Change) -> crate::exit::R
     }))
 }
 
-/// `info` — the header, and what the entries add up to.
-///
-/// `path` means what it means to `list`: a path inside the archive the handle
-/// holds. Empty, or absent, is the archive itself; anything else names a nested
-/// archive.
+/// `info` — the header, and what the entries add up to. `path` is empty or
+/// absent for the archive itself, and otherwise names a nested archive.
 fn info(state: &mut State, params: &Value) -> Answered {
     let inside = inside_of(params);
     let session = session(state, params)?;
@@ -1642,14 +1439,11 @@ fn info(state: &mut State, params: &Value) -> Answered {
 
 /// `verify` — read every entry back and check it against what the archive says.
 ///
-/// Reading every entry is unbounded work, so it reports progress and takes a
-/// `cancel` while it runs. An entry that does not read back is reported in
-/// `problems` rather than as an error: the call did what it was asked.
-///
-/// `against` names an extracted tree of this archive on the daemon's own
-/// filesystem. Its manifest is the only thing that can see a stored entry's
-/// bytes change. Without it `contents_checked` is zero and `against` is `null`,
-/// so a client cannot read the zero as a result.
+/// Reports progress and takes a `cancel`. An entry that does not read back is
+/// reported in `problems` rather than as an error. `against` names an extracted
+/// tree of this archive, whose manifest is the only thing that can see a stored
+/// entry's bytes change; without it `contents_checked` is zero and `against` is
+/// `null`.
 fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let handle = handle_of(params)?;
     let against = optional_path(params, "against")?;
@@ -1687,18 +1481,12 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 
 /// `extract` — write every entry of an open archive to a tree.
 ///
-/// `into` is a directory on the daemon's own filesystem, which is what every
-/// path on this wire means. Unbounded work, so it reports progress and takes a
-/// `cancel`; a cancelled extraction leaves the files it had already written
-/// where they are, because a tree is not replaced by rename the way an archive
-/// is. `overwrite: true` lets it write into a directory that already holds
-/// something, which is refused without it.
+/// `into` is a directory on the daemon's own filesystem. It reports progress and
+/// takes a `cancel`; a cancelled extraction leaves what it had already written.
+/// `overwrite: true` lets it write into a non-empty directory.
 ///
-/// It refuses two things, both before anything is written. A session with
-/// buffered edits, because a tree means the archive as it is on disk and a
-/// merged one would leave an edit in two places. And a path an open session
-/// holds, asked once up front over every path the extraction will write, because
-/// a refusal found part-way would leave the part already written.
+/// It refuses a session with buffered edits, and a path an open session holds —
+/// both up front, because a refusal found part-way would leave half a tree.
 fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let handle = handle_of(params)?;
     let into = PathBuf::from(string(params, "into")?);
@@ -1708,7 +1496,7 @@ fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> A
 
     // Immutably, and a handle of its own: the claim check below reads every
     // session while this one is being extracted, which a `&mut Session` would
-    // forbid. `try_clone` also leaves the session's own handle where it was.
+    // forbid.
     let state: &State = state;
     let session = state
         .sessions
@@ -1756,10 +1544,8 @@ fn extract(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> A
     }))
 }
 
-/// Why a tree cannot be extracted while edits are still buffered.
-///
-/// It names them, because committing or discarding them is what the caller has
-/// to do.
+/// Why a tree cannot be extracted while edits are still buffered. It names them,
+/// because committing or discarding them is what the caller has to do.
 fn extracting_with_edits(pending: &Changes) -> Failure {
     let paths: Vec<&str> = pending.paths().collect();
     Failure::Refused {
@@ -1779,9 +1565,6 @@ fn extracting_with_edits(pending: &Changes) -> Failure {
 }
 
 /// Why an extraction cannot write here, and which handle has it.
-///
-/// `pack`'s sentence with this operation's name in it: the same corruption
-/// reached another way, and a client should recognise it as one thing.
 fn extracting_over_held(path: &Path, held: &Path, holder: u64) -> Failure {
     Failure::Refused {
         reason: format!(
@@ -1794,10 +1577,9 @@ fn extracting_over_held(path: &Path, held: &Path, holder: u64) -> Failure {
 
 /// `pack` — build an archive from a tree and its manifest.
 ///
-/// The one method with no handle: it makes an archive rather than working on
-/// one that is open, so both of its paths are on the daemon's filesystem.
-/// An archive an open session holds cannot be packed over, because every offset
-/// that session holds is true only of the bytes it parsed.
+/// It has no handle, and both of its paths are on the daemon's filesystem. An
+/// archive an open session holds cannot be packed over: every offset that
+/// session holds is true only of the bytes it parsed.
 fn pack(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let from = PathBuf::from(string(params, "from")?);
     let archive = PathBuf::from(string(params, "archive")?);
@@ -1809,9 +1591,6 @@ fn pack(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answ
     if let Some((holder, held)) = state.holder_of(&target, identity_of(&target)) {
         return Err(packing_over_held(&target, held, holder).into());
     }
-    // The cache this daemon was started with, which every session it opens an
-    // archive under already uses, so a tree whose manifest names an encrypted
-    // tag packs back under that tag's transform exactly as on the command line.
     let cache = state.cache.clone();
 
     let mut watch = Notifying {
@@ -1834,16 +1613,13 @@ fn pack(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answ
     }))
 }
 
-/// The path a write will land on, resolved as far as it exists.
-///
-/// [`resolve`] needs the file to be there and `pack` usually writes one that is
-/// not, so the directory is resolved and the name joined back on. That is the
-/// path a session would have claimed had it opened the file.
+/// The path a write will land on, resolved as far as it exists: [`resolve`]
+/// needs the file to be there and `pack` usually writes one that is not, so the
+/// directory is resolved and the name joined back on.
 ///
 /// # Errors
 ///
-/// [`Failure::Io`] when the directory does not resolve, and
-/// [`Failure::Refused`] for a path that names no file at all.
+/// The directory does not resolve, or the path names no file at all.
 fn target_of(path: &Path) -> crate::exit::Result<PathBuf> {
     if let Ok(resolved) = fs::canonicalize(path) {
         return Ok(resolved);
@@ -1859,10 +1635,7 @@ fn target_of(path: &Path) -> crate::exit::Result<PathBuf> {
 }
 
 /// What the operating system calls the file at a path, when there is one.
-///
-/// `None` covers both "nothing is there" and "it could not be statted": either
-/// way there is no identity to match a session's against, and the path is asked
-/// on its own.
+/// `None` covers both "nothing is there" and "it could not be statted".
 fn identity_of(path: &Path) -> Option<FileId> {
     let file = fs::File::open(path).ok()?;
     FileId::of(&file, path).ok()
@@ -1892,15 +1665,11 @@ fn optional_path(params: &Value, name: &str) -> Answer<Option<PathBuf>> {
 
 /// `keys.extract` — find the key material a game executable carries.
 ///
-/// One of the methods with no handle: `executable` and the optional `cache` are
-/// paths on the daemon's own filesystem. It reports offsets, lengths, the source
-/// executable's digest and where the material was cached, and never a key —
-/// `commands::keys_report` is the one place the object is built.
-///
-/// It sends no `progress` and cannot be stopped, and a scan of a full-process
-/// dump can hold the single worker thread for tens of minutes. It does register
-/// the job, as [`Stoppable::No`], so a cancel arriving in that window is told
-/// what is running and why it cannot stop rather than that nothing is.
+/// No handle: `executable` and the optional `cache` are paths on the daemon's
+/// filesystem. It reports offsets, lengths, the source digest and where the
+/// material was cached, and never a key. It sends no `progress` and cannot be
+/// stopped, but registers as [`Stoppable::No`] so a cancel is told what is
+/// running rather than that nothing is.
 fn keys_extract(state: &State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let executable = PathBuf::from(string(params, "executable")?);
     let cache = named_cache(state, params)?;
@@ -1915,9 +1684,6 @@ fn keys_extract(state: &State, params: &Value, wire: &Wire, request: &Value) -> 
 
 /// Which cache a `keys.*` request works on: the one it names, or the one this
 /// process was started with.
-///
-/// One function, so the wire's `cache` and `--cache-dir` cannot come to mean
-/// two things about which directory is read.
 fn named_cache(state: &State, params: &Value) -> Answer<Option<PathBuf>> {
     Ok(optional_path(params, "cache")?.or_else(|| state.cache.clone()))
 }
@@ -1955,15 +1721,8 @@ fn discard(state: &mut State, params: &Value) -> Answered {
     Ok(json!({ "discarded": dropped }))
 }
 
-/// `forget` — take one buffered change back, and say what is left.
-///
-/// Ordinary editor gestures remove a change rather than adding one — create a
-/// file and then delete it, rename an entry back to the name it started with —
-/// and without this the only way to reach the set they leave is `discard` and a
-/// replay of everything else.
-///
-/// `forgotten` is false for a path nothing is buffered at, which is not a
-/// failure: `paths` says what is actually there either way.
+/// `forget` — take one buffered change back, and say what is left. `forgotten`
+/// is false for a path nothing is buffered at, which is not a failure.
 fn forget(state: &mut State, params: &Value) -> Answered {
     let inside = string(params, "path")?;
     let session = session(state, params)?;
@@ -1978,15 +1737,12 @@ fn forget(state: &mut State, params: &Value) -> Answered {
 }
 
 /// Which of the two ways a commit will go, decided without writing anything.
-///
-/// `F` is what the patch writes through, which [`commit`] answers with the
-/// archive itself. [`Opening`] says why it is a parameter.
+/// `F` is what the patch writes through. [`Opening`].
 enum Decision<F> {
-    /// Every edit fits where its entry already sits, and the archive can be
-    /// opened for writing.
+    /// Every edit fits where its entry sits, and the archive opens for writing.
     Patch { patches: rpf_core::Patches, file: F },
-    /// One of them does not fit, or the caller asked for a rebuild, or the
-    /// archive cannot be opened for writing at all.
+    /// One does not fit, a rebuild was asked for, or the archive will not open
+    /// for writing.
     Rebuild,
 }
 
@@ -2000,8 +1756,8 @@ impl<F> Decision<F> {
         }
     }
 
-    /// Whether it can be stopped part-way. A patch cannot: it writes the bytes
-    /// of one edit, and there is no point between entries to stop at.
+    /// Whether it can be stopped part-way. A patch cannot: there is no point
+    /// between entries to stop at.
     const fn stoppable(&self) -> Stoppable {
         match *self {
             Self::Patch { .. } => Stoppable::No(PATCHING),
@@ -2024,20 +1780,12 @@ struct Asked<'a> {
     rebuild: bool,
 }
 
-/// How a commit opens the archive the patch writes through.
-///
-/// A parameter of [`decide`] rather than a call inside it, because the two
-/// registrations a commit makes — `"commit"` while it is deciding, `"patch"`
-/// from the first byte written — are only observable from inside the operation
-/// they cover, and watching for them from outside is watching a clock. `commit`
-/// answers the archive itself.
+/// How a commit opens the archive the patch writes through. A parameter of
+/// [`decide`] so that a test can observe the two registrations a commit makes
+/// from inside the operation they cover.
 trait Opening<F> {
-    /// Opens the archive at `path` for writing, or says it cannot be.
-    ///
-    /// # Errors
-    ///
-    /// Whatever opening it failed with. A commit reads that as "rebuild
-    /// instead" rather than as a failure.
+    /// Opens the archive at `path` for writing. A commit reads a failure here
+    /// as "rebuild instead".
     fn open(self, path: &Path) -> io::Result<F>;
 }
 
@@ -2050,19 +1798,14 @@ where
     }
 }
 
-/// The archive itself, which is what a commit patches. [`Opening`].
-///
-/// A second handle, because the warm one is open for reading: a session that
-/// only lists an archive must not need write permission on it. An archive that
-/// cannot be opened for writing can still be rebuilt beside itself.
+/// The archive itself, which is what a commit patches. A second handle, because
+/// a session that only lists an archive must not need write permission on it.
+/// [`Opening`].
 fn archive_for_writing(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new().write(true).open(path)
 }
 
 /// Decides between patching in place and rebuilding, and writes nothing.
-///
-/// Taken before the operation is registered as the one a `cancel` can name,
-/// because only one of the two can be stopped.
 fn decide<F>(
     session: &mut Session,
     asked_to_rebuild: bool,
@@ -2083,13 +1826,10 @@ fn decide<F>(
 
 /// `commit` — apply every buffered edit at once.
 ///
-/// Patches in place when every edit fits where its entry already sits, and
-/// rebuilds when any one of them does not. The choice is made for the set, not
-/// per edit.
-///
-/// `rebuild: true` asks for the rebuild regardless: the two are not equivalent
-/// in durability, since a rebuild is atomic and a patch is not, and the response
-/// reports which one ran. `progress: false` declines the notifications.
+/// Patches in place when every edit fits where its entry sits and rebuilds
+/// otherwise, for the set rather than per edit. `rebuild: true` asks for the
+/// rebuild regardless — it is atomic where a patch is not — and the response
+/// reports which one ran.
 fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> Answered {
     let force = flag(params, "force")?;
     let asked_to_rebuild = flag(params, "rebuild")?;
@@ -2104,7 +1844,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
         rebuild: asked_to_rebuild,
     };
     // Taken before the session is borrowed: re-opening after the write needs
-    // the same cache the session was opened with.
+    // the same cache.
     let cache = state.cache.clone();
     let session = session(state, params)?;
 
@@ -2114,8 +1854,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     // Asked here as well as where each change was buffered, so that a dry run
     // reports the refusal rather than a rebuild that could not happen.
     session.archive.writable().map_err(Failure::Container)?;
-    // Before the dry run, not after: what a commit would do here is refuse, and
-    // a dry run reports what the real call would do.
+    // Before the dry run: what the real call would do here is refuse.
     if !force {
         match install::detect(&session.path) {
             Some(install::Detected::Installation(root)) => {
@@ -2138,8 +1877,8 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     let method = outcome?;
 
     // Re-opened, so the warm state describes what is now on disk. The claim is
-    // re-taken with it: a rebuild replaces the archive by rename, and a claim
-    // kept on the old inode would claim a file nobody has.
+    // re-taken with it: a rebuild renames, and a claim kept on the old inode
+    // would claim a file nobody has.
     let path = session.path.clone();
     let (file, archive) = commands::open(&path, cache.as_deref())?;
     let entries = archive.entries().len();
@@ -2158,10 +1897,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
 }
 
 /// Registers itself, decides, registers what it decided so a `cancel` can name
-/// it, and does it.
-///
-/// Separate from [`commit`] so that the job is forgotten on the way out whether
-/// this succeeded or not.
+/// it, and does it. Separate from [`commit`] so the job is forgotten either way.
 fn commit_now<F: Write + Seek>(
     session: &mut Session,
     wire: &Wire,
@@ -2169,8 +1905,7 @@ fn commit_now<F: Write + Seek>(
     open: impl Opening<F>,
 ) -> crate::exit::Result<&'static str> {
     // Registered before the decision as well, because deciding reads and
-    // compresses every buffered edit, and forgotten by the caller whatever the
-    // outcome.
+    // compresses every buffered edit.
     wire.cancel.begin(
         asked.request,
         Some(asked.handle),
@@ -2192,15 +1927,12 @@ fn commit_now<F: Write + Seek>(
     Ok(method)
 }
 
-/// Reports what a commit would do, without doing any of it.
-///
-/// The decision is taken the same way the real commit takes it, so this is a
-/// prediction rather than an estimate. The buffered edits are left where they
-/// are.
+/// Reports what a commit would do, taking the decision the way the real commit
+/// takes it. The buffered edits are left where they are.
 fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
     if asked_to_rebuild {
-        // Nothing is allocated and nothing is restructured, so there is no
-        // plan to report — only the resolution.
+        // Nothing is allocated, so there is no plan to report — only the
+        // resolution.
         rpf_core::resolves(&mut session.file, &session.archive, &session.pending)?;
         return Ok(json!({ "committed": 0, "dry_run": true, "method": "rebuild" }));
     }
@@ -2244,8 +1976,7 @@ fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
             }))
         }
         // Nothing in place can add, remove or rename an entry, so the commit
-        // will rebuild whatever else is in the set. Reported as what it is
-        // rather than as a payload that would not fit.
+        // will rebuild whatever else is in the set.
         rpf_core::Plan::Structural(structural) => {
             let structural: Vec<Value> = structural
                 .iter()
@@ -2310,11 +2041,7 @@ mod tests {
     use crate::exit::Code;
 
     /// How long a thread that should never wait is given before it is called
-    /// wedged.
-    ///
-    /// Not a budget for work: every wait these tests forbid is on a channel or
-    /// a condvar and is either taken at once or never. It is here so that a
-    /// thread that does wait fails an assertion instead of hanging a sweep.
+    /// wedged, so that one which does fails an assertion instead of hanging.
     const WEDGED: Duration = Duration::from_secs(60);
 
     /// A cancelled write, as the library reports one.
@@ -2325,7 +2052,7 @@ mod tests {
     #[test]
     fn a_broken_output_pipe_is_not_reported_as_a_cancellation() {
         // Both arrive from the library as Error::Cancelled, because both are
-        // Flow::Stop, and a caller acts on them differently.
+        // Flow::Stop.
         assert!(matches!(
             stopped_as(Some(Stopped::OutputGone), cancelled()).code(),
             Code::Io
@@ -2340,11 +2067,8 @@ mod tests {
         ));
     }
 
-    /// [`Notifying::explain`] where the daemon actually calls it.
-    ///
-    /// The test above is the same conversion as a pure function, and passes
-    /// with nothing calling it. This drives the function the daemon does,
-    /// against a wire whose far end is already gone.
+    /// [`Notifying::explain`] where the daemon actually calls it: the test above
+    /// passes with nothing calling it.
     #[test]
     fn a_rebuild_that_loses_its_output_says_so_rather_than_claiming_a_cancel() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2388,8 +2112,8 @@ mod tests {
             ),
         };
 
-        // A wire whose standard output has already stopped accepting anything,
-        // which is the one condition that stops a rebuild without a cancel.
+        // Standard output already stopped accepting anything, which is the one
+        // condition that stops a rebuild without a cancel.
         let (lines, _queued) = mpsc::channel();
         let backlog = Arc::new(Backlog::default());
         backlog.broken.store(true, Ordering::SeqCst);
@@ -2432,10 +2156,8 @@ mod tests {
 
     #[test]
     fn a_pack_is_cancellable_and_is_named_by_nothing_but_its_request() {
-        // `pack` is the one operation with no session, so a cancel that names a
-        // handle names something else by construction. Naming nothing still
-        // means "whatever is running", and the answer reports no handle rather
-        // than inventing one.
+        // `pack` has no session, so a cancel that names a handle names something
+        // else by construction.
         let cancel = Cancellation::default();
         cancel.begin(&json!(7), None, "pack", Stoppable::Yes);
 
@@ -2453,8 +2175,6 @@ mod tests {
 
     #[test]
     fn a_patch_answers_a_cancel_with_what_it_actually_does() {
-        // A cancelled patch is not possible, and the client is told so rather
-        // than told a commit is stopping when it is not.
         let cancel = Cancellation::default();
         cancel.begin(&json!(7), Some(1), "patch", Stoppable::No(PATCHING));
 
@@ -2467,8 +2187,6 @@ mod tests {
 
     #[test]
     fn a_commit_that_has_not_decided_yet_says_that_rather_than_nothing() {
-        // Deciding reads and compresses every buffered edit, so neither
-        // "nothing is running" nor "cancelling" is the right answer during it.
         let cancel = Cancellation::default();
         cancel.begin(&json!(7), Some(1), "commit", Stoppable::No(DECIDING));
 
@@ -2478,12 +2196,8 @@ mod tests {
         assert_eq!(answer["reason"], json!(DECIDING), "{answer}");
     }
 
-    /// The archive a commit patches, which answers a `cancel` as it is written
-    /// through.
-    ///
-    /// The first write is the first byte of the patch, so the answer it takes
-    /// is the answer a client would get with the patch under way — without a
-    /// client, a thread, or a sleep. [`Opening`].
+    /// The archive a commit patches, which answers a `cancel` on its first write
+    /// — the first byte of the patch. [`Opening`].
     struct Asking<'a> {
         file: fs::File,
         cancel: &'a Cancellation,
@@ -2514,8 +2228,7 @@ mod tests {
     fn a_cancel_during_a_commit_that_patches_is_told_why_it_cannot() {
         // The two registrations the commit makes for itself, asked from inside
         // it at the two moments a cancel can arrive: dropping either `begin`
-        // leaves every other test green. Driving the daemon over a pipe instead
-        // asserts the speed of the machine rather than the daemon.
+        // leaves every other test green.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("test.rpf");
         let files: Vec<rpf_core::FileSpec> = ["a.txt", "b.txt"]
@@ -2542,8 +2255,7 @@ mod tests {
 
         let (file, archive) = commands::open(&path, None).expect("opens");
         let id = FileId::of(&file, &path).expect("named");
-        // The same length the entry already holds, so the commit decides to
-        // patch rather than to rebuild.
+        // The same length the entry already holds, so the commit patches.
         let mut session = Session {
             path,
             id,
@@ -2577,8 +2289,6 @@ mod tests {
         let deciding = RefCell::new(None);
         let patching = RefCell::new(None);
         let method = commit_now(&mut session, &wire, &asked, |path: &Path| {
-            // Called while the decision is still being taken: the patch is
-            // registered only once this has answered one.
             *deciding.borrow_mut() = Some(wire.cancel.ask(None, None));
             archive_for_writing(path).map(|file| Asking {
                 file,
@@ -2589,8 +2299,6 @@ mod tests {
         .expect("the edit fits where its entry sits");
         assert_eq!(method, "patch");
 
-        // Nothing in a commit that patches can be stopped, at either moment,
-        // and each says which of the two it is refusing from.
         let deciding = deciding.into_inner().expect("the commit opened its target");
         assert_eq!(deciding["cancelling"], json!(false), "{deciding}");
         assert_eq!(deciding["running"], json!("commit"), "{deciding}");
@@ -2607,10 +2315,6 @@ mod tests {
 
     #[test]
     fn a_key_scan_says_it_is_running_rather_than_that_nothing_is() {
-        // The window this closes is minutes wide: a scan of a full-process dump
-        // holds the worker thread that long. It still cannot be stopped, but
-        // "cannot stop, and here is why" and "there is no such operation" are
-        // different answers and only one of them is true.
         let cancel = Cancellation::default();
         cancel.begin(&json!(7), None, "keys.extract", Stoppable::No(SCANNING));
 
@@ -2620,8 +2324,6 @@ mod tests {
         assert_eq!(answer["reason"], json!(SCANNING), "{answer}");
         assert!(!cancel.stopped(), "a key scan was marked cancelled");
 
-        // And it is forgotten afterwards, so a later cancel is not answered
-        // against a scan that finished.
         cancel.finish();
         assert_eq!(cancel.ask(None, None)["running"], json!(null));
     }
@@ -2652,8 +2354,6 @@ mod tests {
 
     #[test]
     fn a_cancel_with_nothing_running_is_not_remembered() {
-        // A cancel with nothing running must not be stored, or it kills
-        // whatever commits next.
         let cancel = Cancellation::default();
         let answer = cancel.ask(None, None);
         assert_eq!(answer["cancelling"], json!(false), "{answer}");
@@ -2675,7 +2375,6 @@ mod tests {
             json!({"handle": -1}),
             json!({"handle": null}),
             json!({"handle": [2]}),
-            // A key spelled wrong is given too.
             json!({"handel": 2}),
             json!("not-an-object"),
             json!(7),
@@ -2729,9 +2428,8 @@ mod tests {
 
     #[test]
     fn a_cancel_answer_is_small_however_big_the_id_that_started_the_job() {
-        // A cancel answer is queued by the reading thread, which never waits
-        // for room, so it must stay proportional to the line that asked for it:
-        // echoing the job's whole `request` multiplies input into gigabytes.
+        // Queued by the reading thread, which never waits for room, so it must
+        // stay proportional to the line that asked for it.
         let cancel = Cancellation::default();
         let huge = json!("i".repeat(256 * 1024));
         cancel.begin(&huge, Some(1), "rebuild", Stoppable::Yes);
@@ -2777,7 +2475,6 @@ mod tests {
             "a second answer was queued behind one the client has not read a byte of"
         );
 
-        // Writing the first is what gives the room back.
         let Ok(Outgoing::Answer { text, counted }) = queued.recv() else {
             panic!("the first answer was not queued");
         };
@@ -2794,8 +2491,6 @@ mod tests {
 
     #[test]
     fn the_reading_thread_never_waits_for_room() {
-        // A reading thread that waits stops reading standard input, and the
-        // cancel it was answering is what cannot then arrive.
         let (wire, backlog, queued) = unread();
         wire.answer(&json!("x".repeat(ANSWER_BACKLOG)));
         let held = *backlog.answers();
@@ -2830,10 +2525,6 @@ mod tests {
 
     #[test]
     fn a_client_that_stops_reading_cannot_wedge_the_daemon() {
-        // Holding a lock across a write to standard output turns backpressure
-        // into a deadlock: the worker blocks with the lock held and the reading
-        // thread then blocks on it answering the cancel.
-        //
         // Asked of the reading thread directly, with the wire as far behind as
         // it can be: `reading` reaches the end of its input while an answer
         // bigger than the whole allowance sits unread. Nobody reads a byte of
@@ -2844,13 +2535,10 @@ mod tests {
         assert!(*backlog.answers() > ANSWER_BACKLOG);
         let held = *backlog.answers();
 
-        // A rebuild is running, and it is the one the cancel below names.
         wire.cancel
             .begin(&json!(3), Some(1), "rebuild", Stoppable::Yes);
 
-        // It goes on reporting progress the whole time, and progress is the one
-        // thing on this wire that may be dropped: a client that was not reading
-        // does not receive one notification per entry after the fact either.
+        // Progress is the one thing on this wire that may be dropped.
         let reported = 3000;
         let kept = (0..reported)
             .filter(|done| {
@@ -2876,8 +2564,7 @@ mod tests {
         });
 
         // The reading thread does not: it answers the cancel where it stands
-        // and accepts the megabyte behind it. A wedged one never reaches the
-        // end of this input.
+        // and accepts the megabyte behind it.
         let requests = format!(
             "{}\n{}\n",
             json!({"jsonrpc": "2.0", "id": 4, "method": "cancel", "params": {"handle": 1}}),
@@ -2890,8 +2577,6 @@ mod tests {
             reading(io::Cursor::new(requests), &reader, &queue);
         });
 
-        // A budget only so that a reading thread that does wait fails here
-        // rather than hanging for ever: a correct one does no waiting at all.
         let accepted = incoming
             .recv_timeout(WEDGED)
             .expect("the megabyte behind the cancel was accepted");
@@ -2914,8 +2599,7 @@ mod tests {
             "the reading thread's answer was counted against the backlog"
         );
 
-        // Every line is queued and the cancel's is the last of them: the
-        // worker's answer, sixty-four notifications, then the cancel answer.
+        // The worker's answer, sixty-four notifications, then the cancel answer.
         let written: Vec<Outgoing> = std::iter::from_fn(|| queued.try_recv().ok()).collect();
         assert_eq!(written.len(), 1 + PROGRESS_BACKLOG + 1);
         let Some(Outgoing::Answer { text, counted }) = written.last() else {

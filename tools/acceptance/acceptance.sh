@@ -176,10 +176,25 @@ delivery_note() {
     local main=$CLIENT_ROOT/clientdata/main_logs.txt
     local d big started_at cached_at staged_at reported_at ok=0
     d=$(cache_dir) || return 0
-    big=$(ls -S "$d" 2>/dev/null | head -1)
-    [ -n "$big" ] || return 0
-    cached_at=$(stat -c %Y "$d$big")
     staged_at=$(cat "$STATE_DIR/staged.at" 2>/dev/null || echo 0)
+
+    # The delivered copy is the file whose LENGTH is the staged archive's, and
+    # nothing else in that directory is evidence about this run. Taking the
+    # largest file instead — which this did until 2026-09-01 — reads the mtime
+    # of whatever stale archive happens to be biggest, and a client that had
+    # fetched an 11 MB pack beside a 26 MB leftover was told it had not.
+    local want
+    want=$(cat "$STATE_DIR/staged.size" 2>/dev/null || echo 0)
+    cached_at=$(find "$d" -maxdepth 1 -type f -size "${want}c" -printf '%T@\n' 2>/dev/null |
+        sort -n | tail -1 | cut -d. -f1)
+    if [ -z "$cached_at" ]; then
+        printf 'delivery: staged %s, and no file of %s bytes is in the client cache\n' \
+            "$(date -d "@$staged_at" '+%F %T')" "$want"
+        printf '%s\n' 'delivery: VOID - the client holds no copy of the staged archive.'
+        printf '%s\n' 'delivery: it has not fetched it. A same-length archive is never re-fetched;'
+        printf '%s\n' 'delivery: stage one whose LENGTH differs from the last, then start the client again.'
+        return 1
+    fi
     [ -f "$main" ] || return 0
     # `... started at 01-09-2026 02:56:37`, day first, local time.
     started_at=$(head -1 "$main" | sed -n 's/.*started at \([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{4\}\) \([0-9:]*\).*/\3-\2-\1 \4/p')
@@ -192,8 +207,8 @@ delivery_note() {
         "$(date -d "@$started_at" '+%F %T')"
 
     if [ "$cached_at" -lt "$staged_at" ]; then
-        printf '%s\n' 'delivery: VOID - the client never fetched the staged archive; its cached copy predates the staging.'
-        printf '%s\n' 'delivery: a same-length archive is not re-fetched. Stage one whose LENGTH differs from the last.'
+        printf '%s\n' 'delivery: VOID - the copy in the cache predates the staging, so it is a different build of the same length.'
+        printf '%s\n' 'delivery: stage one whose LENGTH differs from the last, then start the client again.'
         ok=1
     elif [ "$cached_at" -gt "$started_at" ]; then
         printf '%s\n' 'delivery: VOID - the staged archive was downloaded AFTER this client started.'

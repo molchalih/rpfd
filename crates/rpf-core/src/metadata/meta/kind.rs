@@ -1,79 +1,44 @@
-//! What a member's type code means, what a document calls it, and the ceilings
-//! a walk of one obeys.
-//!
-//! The 23 type codes are written down only here; a code outside them is
-//! [`Unsupported::DataType`] rather than a width that happened to fit. Three
-//! are aggregates whose width is not a constant: `0x50` is
-//! `referenceKey × element width` inline, `0x40` is a NUL-terminated string in
-//! a `referenceKey`-byte buffer, and `0x44`/`0x52` are the sixteen-byte counted
-//! form — a 64-bit pointer, `count1`, `count2` and a dead word.
-//!
-//! A member's value must lie inside its own structure, whose length the file
-//! states, so a wrong width is [`super::Malformed::MemberExtent`] rather than a
-//! read of the neighbour.
+//! What a member's type code means; the 23 codes this build names live only here.
 
 use crate::error::Result;
 
 use super::{Malformed, Member, Meta, Structure, bad, unsupported};
 
-/// The `ARRAYINFO` sentinel: the name hash a member carries when it describes
-/// another member's elements rather than a field of its own.
 pub(super) const ARRAYINFO: u32 = 0x0000_0100;
 
-/// How deeply structures may nest before the walk refuses; the format states no
-/// limit and an attacker-chosen pointer graph can name a cycle.
 pub(super) const MAX_DEPTH: usize = 128;
 
-/// How many elements one byte of payload may write; a depth limit alone leaves
-/// a diamond-shaped block graph acyclic, within the depth, and exponential.
 pub(super) const MAX_NODES_RATIO: usize = 8;
 
-/// How many elements any payload may write, whatever its size; the ceiling over
-/// the ratio, binding only above 8 MB of payload.
 pub(super) const MAX_NODES: usize = 64 << 20;
 
-/// How many elements a payload of `payload` bytes may write.
 pub(super) fn node_budget(payload: usize) -> usize {
     payload.saturating_mul(MAX_NODES_RATIO).min(MAX_NODES)
 }
 
-/// How many bytes of document one byte of payload may write, which is the bound
-/// the memory actually needs.
 pub(super) const MAX_OUTPUT_RATIO: usize = 256;
 
-/// The floor under [`MAX_OUTPUT_RATIO`]: a `Meta` addresses its data by block,
-/// so a small file can legitimately name a great deal of it.
 pub(super) const MIN_OUTPUT: usize = 16 * 1024 * 1024;
 
-/// The ceiling over [`MAX_OUTPUT_RATIO`], so the memory is bounded absolutely
-/// rather than by an attacker-chosen input.
 pub(super) const MAX_OUTPUT: usize = 1 << 30;
 
-/// How many bytes of document a payload of `payload` bytes may have: the
-/// ceiling `render` writes under and `apply` refuses a longer document against.
 #[expect(
     clippy::manual_clamp,
     reason = "two bounds that cannot panic, where clamp would"
 )]
 pub(super) fn document_budget(payload: usize) -> usize {
-    // Two bounds that cannot panic however either constant is tuned; `clamp`
-    // panics when its bounds cross.
     payload
         .saturating_mul(MAX_OUTPUT_RATIO)
         .max(MIN_OUTPUT)
         .min(MAX_OUTPUT)
 }
 
-/// How long a pointer field is: a `Meta` pointer is a 64-bit word.
 pub(super) const POINTER_LEN: u32 = 8;
 
-/// How long a counted field is: the pointer, two counts and a dead word.
 pub(super) const COUNTED_LEN: u32 = 16;
 
-/// Where `count1` sits inside a counted field.
 pub(super) const COUNT_AT: u32 = 8;
 
-/// Where `count2` sits inside a counted field.
 pub(super) const CAPACITY_AT: u32 = 10;
 
 /// A fixed-width value, and the width it occupies.
@@ -114,7 +79,6 @@ pub(super) enum Scalar {
 }
 
 impl Scalar {
-    /// The word its reserved attribute carries.
     pub(super) const fn word(self) -> &'static str {
         match self {
             Self::Bool => "bool",
@@ -136,7 +100,6 @@ impl Scalar {
         }
     }
 
-    /// How many bytes it occupies.
     pub(super) const fn bytes(self) -> u32 {
         match self {
             Self::Bool | Self::Byte | Self::UByte | Self::ByteEnum => 1,
@@ -161,29 +124,19 @@ pub(super) enum Kind {
     Scalar(Scalar),
     /// A structure, inline, whose type is the member's `referenceKey`.
     Structure(u32),
-    /// A pointer to a data block, `0x07` and `0x59`, whose type is that
-    /// block's tag rather than anything the member carries.
+    /// A pointer to a data block, `0x07` and `0x59`, typed by that block's tag.
     Pointer,
-    /// A counted array, `0x52`: a pointer, a length and a capacity, whose
-    /// element type is the `ARRAYINFO` member the `arrayInfoIndex` names.
+    /// A counted array, `0x52`, whose element type is its `ARRAYINFO` member.
     Array,
-    /// A fixed-length array of `referenceKey` elements, `0x50`, stored in the
-    /// member's own bytes; its element type resolves as [`Kind::Array`]'s.
+    /// A fixed-length array of `referenceKey` elements, `0x50`.
     InlineArray(u32),
     /// A counted string, `0x44`.
     Text,
-    /// A NUL-terminated string in an inline buffer of `referenceKey` bytes,
-    /// `0x40`; its `arrayInfoIndex` describes no elements and is not read.
+    /// A NUL-terminated string in an inline buffer of `referenceKey` bytes, `0x40`.
     InlineText(u32),
 }
 
 impl Kind {
-    /// What this type code means; the whole member, because three aggregate
-    /// forms read its `referenceKey`.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::UnsupportedMeta`] for a code outside the 23.
     pub(super) fn of(member: Member) -> Result<Self> {
         Ok(match member.type_code.get() {
             0x01 => Self::Scalar(Scalar::Bool),
@@ -213,36 +166,17 @@ impl Kind {
     }
 }
 
-/// One value the walk is at: the member that describes it, and the structure
-/// that member belongs to.
-///
-/// The owner is optional: a typed data block carries values and no member
-/// record for an `ARRAYINFO` index to resolve against.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Field<'a> {
-    /// What the file says this value is.
     pub(super) member: Member,
-    /// The structure the member belongs to, when there is one.
     pub(super) owner: Option<Structure<'a>>,
 }
 
 impl Field<'_> {
-    /// What kind of value it is.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::UnsupportedMeta`] for a type code outside the 23.
     pub(super) fn kind(self) -> Result<Kind> {
         Kind::of(self.member)
     }
 
-    /// The field describing this one's elements: `arrayInfoIndex` indexes the
-    /// owning structure's member array.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::ArrayInfo`] when there is no owner to resolve the index
-    /// against, or the owner has no such member.
     pub(super) fn element(self, at: u64) -> Result<Self> {
         let owner = self.owner.ok_or_else(|| bad(at, Malformed::ArrayInfo))?;
         let member = owner
@@ -254,25 +188,10 @@ impl Field<'_> {
         })
     }
 
-    /// How many bytes of its container one of these occupies, which is the
-    /// stride of an array of them.
-    ///
-    /// # Errors
-    ///
-    /// [`crate::Error::UnsupportedMeta`], [`Malformed::UndefinedStructure`],
-    /// [`Malformed::ArrayInfo`], and [`Malformed::TooDeep`] when the element
-    /// descriptions nest deeper than [`MAX_DEPTH`].
     pub(super) fn width(self, meta: &Meta<'_>, at: u64) -> Result<u32> {
         self.width_within(meta, at, MAX_DEPTH)
     }
 
-    /// [`Field::width`] with a width of zero refused: an element of no width
-    /// makes an array of any count occupy no bytes, so the extent check would
-    /// pass for every count.
-    ///
-    /// # Errors
-    ///
-    /// As [`Field::width`], plus [`Malformed::ZeroStride`].
     pub(super) fn stride(self, meta: &Meta<'_>, at: u64) -> Result<u32> {
         match self.width(meta, at)? {
             0 => Err(bad(at, Malformed::ZeroStride)),
@@ -280,7 +199,7 @@ impl Field<'_> {
         }
     }
 
-    /// [`Field::width`], with the fuel that bounds the `ARRAYINFO` chain.
+    /// `width`, with the fuel that bounds the `ARRAYINFO` chain.
     fn width_within(self, meta: &Meta<'_>, at: u64, fuel: usize) -> Result<u32> {
         let left = fuel
             .checked_sub(1)
@@ -310,18 +229,10 @@ impl Field<'_> {
     }
 }
 
-/// Whether a member is one of a structure's fields, or the description of
-/// another member's elements.
 pub(super) fn is_field(name: u32) -> bool {
     name != ARRAYINFO
 }
 
-/// Checks that a member's value lies inside the structure that declares it,
-/// which is the one place a derived width meets a length the file states.
-///
-/// # Errors
-///
-/// [`Malformed::MemberExtent`] when it does not.
 pub(super) fn fits(structure: &Structure<'_>, offset: u32, width: u32, at: u64) -> Result<()> {
     let end = offset
         .checked_add(width)
@@ -332,8 +243,8 @@ pub(super) fn fits(structure: &Structure<'_>, offset: u32, width: u32, at: u64) 
     Ok(())
 }
 
-/// A resource `Meta` file that is well formed and says something this build
-/// does not decode; the bytes are right and the missing part is here.
+/// A resource `Meta` file that is well formed but says something this build
+/// does not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Unsupported {
@@ -344,8 +255,7 @@ pub enum Unsupported {
     },
 }
 
-/// Why XML handed to [`super::from_xml`] does not describe the payload it was
-/// given beside; wrong bytes are [`Malformed`] instead.
+/// Why XML handed to `from_xml` does not describe the payload beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NotMetaXml {
@@ -360,8 +270,7 @@ pub enum NotMetaXml {
     SecondRoot,
     /// Elements nested deeper than the walk goes.
     TooDeep,
-    /// The document is longer than any document describing a payload this
-    /// size can be, which is refused before it is parsed.
+    /// The document is longer than one describing this payload can be.
     TooLarge {
         /// How many bytes a document editing this payload may have.
         budget: usize,
@@ -380,16 +289,14 @@ pub enum NotMetaXml {
         /// What the document called it.
         found: String,
     },
-    /// An element's type word, or the value the mapping fixes, is not the one
-    /// the file declares.
+    /// An element's type word, or a fixed attribute value, is not the file's.
     Word {
         /// What the file says.
         wanted: String,
         /// What the document says.
         found: String,
     },
-    /// An element has a different number of children than the file says; an
-    /// edit in place moves no allocation, so neither count can change.
+    /// An element has a different number of children than the file says.
     Children {
         /// Which element, as the document spells it.
         name: String,
@@ -406,10 +313,6 @@ pub enum NotMetaXml {
     /// A value carries a backslash escape this layer never writes.
     BadEscape,
     /// A string or a run of bytes is longer than the store it has to live in.
-    ///
-    /// Nothing here moves a block or rewrites a pointer, so a value may be
-    /// shortened and never lengthened past its own store. For a string the
-    /// store is one byte short of the room, the terminator taking the last.
     TooLong {
         /// Which element, as the document spells it.
         name: String,
@@ -420,9 +323,7 @@ pub enum NotMetaXml {
     },
     /// Text where this mapping writes none.
     UnexpectedText,
-    /// Two elements of the document write different bytes at one address,
-    /// which a file pointing at one value twice makes possible. A repeated
-    /// write of the same bytes is not one.
+    /// Two elements of the document write different bytes at one address.
     Aliased {
         /// The element that disagreed, as the document spells it.
         name: String,
@@ -435,23 +336,17 @@ pub enum NotMetaXml {
 mod tests {
     use super::*;
 
-    /// The largest resource `Meta` payload either shipped build carries.
     const LARGEST_SHIPPED_PAYLOAD: usize = 3_833_856;
 
-    /// The most elements any single shipped file writes, and the largest
-    /// document one writes.
     const MOST_SHIPPED_NODES: usize = 3_833_493;
     const LARGEST_SHIPPED_DOCUMENT: usize = 199 * 1_000_000;
 
     #[test]
     fn the_ceilings_bound_the_memory_absolutely_and_still_clear_the_corpus() {
-        // A ratio alone bounds the work only relative to an attacker-chosen
-        // input; a flat count alone is the wrong size for the corpus.
         assert_eq!(node_budget(usize::MAX), MAX_NODES);
         assert_eq!(document_budget(usize::MAX), MAX_OUTPUT);
         assert_eq!(document_budget(0), MIN_OUTPUT);
 
-        // At the largest shipped payload both budgets are still the ratio's.
         assert_eq!(
             node_budget(LARGEST_SHIPPED_PAYLOAD),
             LARGEST_SHIPPED_PAYLOAD * MAX_NODES_RATIO

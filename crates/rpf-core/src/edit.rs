@@ -1,6 +1,4 @@
-//! Changing what an archive holds, rather than what an entry holds: add an
-//! entry, remove one, rename one. Every such change rebuilds the archive,
-//! because it moves the entry table and so every payload after it.
+//! Changing what an archive holds: add, remove, or rename an entry, each a full rebuild.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -18,35 +16,27 @@ use crate::{
     name,
 };
 
-/// Where a [`Change::Write`]'s bytes come from, opened whenever they are
-/// wanted — more than once, so every call answers a fresh stream.
+/// Where a `Change::Write`'s bytes come from, opened fresh each time it may be wanted again.
 pub trait Contents: fmt::Debug + Send + Sync {
     /// The bytes, from their start.
-    ///
     /// # Errors
-    ///
     /// Whatever the source cannot be opened as.
     fn open(&self) -> Result<Box<dyn Payload + '_>>;
 
     /// How many bytes there are, without reading them.
-    ///
     /// # Errors
-    ///
     /// Whatever the source cannot be measured with.
     fn len(&self) -> Result<u64>;
 
     /// Whether there are none.
-    ///
     /// # Errors
-    ///
-    /// As [`Contents::len`], which is what it asks.
+    /// As `Contents::len`.
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
 }
 
-/// Contents a caller already holds, shared rather than owned so that a
-/// cascading rebuild does not copy them once per nesting level.
+/// Contents a caller already holds, shared so a cascading rebuild does not copy them per level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bytes(Arc<Vec<u8>>);
 
@@ -68,45 +58,32 @@ impl Contents for Bytes {
     }
 }
 
-/// One change to what an archive holds, keyed by the path it is about — which
-/// is why a rename carries only its destination.
+/// One change to what an archive holds, keyed by the path; a rename carries only its destination.
 #[derive(Debug, Clone)]
 pub enum Change {
     /// New contents for a path.
     Write {
-        /// The file as it exists **outside** the archive, which is the form
-        /// [`Archive::extract`] returns.
+        /// The file as it exists outside the archive, the form `Archive::extract` returns.
         contents: Arc<dyn Contents>,
-        /// Whether a path the archive does not hold is created rather than
-        /// refused with [`Error::NotFound`].
+        /// Whether a missing path is created rather than refused with `NotFound`.
         create: bool,
-        /// Whether the entry may end up holding a different encoding from the
-        /// one it holds now, rather than [`Error::WrongEncoding`].
+        /// Whether the entry's encoding may change, rather than refusing with `WrongEncoding`.
         allow_encoding_change: bool,
     },
     /// Remove the entry at a path.
     Remove {
-        /// Whether a directory takes its children with it, rather than a
-        /// directory holding anything being refused.
+        /// Whether a non-empty directory takes its children with it, rather than being refused.
         recursive: bool,
     },
-    /// Move the entry at a path to another path in the same archive.
-    ///
-    /// A directory takes everything below it, a destination inside a different
-    /// archive is refused, and one the archive already holds is
-    /// [`Error::AlreadyExists`] unless the same set removes it first.
+    /// Move the entry, and everything below it, to a path the archive does not already hold.
     RenameTo(String),
     /// Create a directory, and whatever above it is missing.
     MakeDirectory,
 }
 
-/// What a change is called when it has to be reported as one it is.
 const ADDS_ENTRY: &str = "adds an entry";
-/// As [`ADDS_ENTRY`].
 const REMOVES_ENTRY: &str = "removes an entry";
-/// As [`ADDS_ENTRY`].
 const RENAMES_ENTRY: &str = "renames an entry";
-/// As [`ADDS_ENTRY`].
 const ADDS_DIRECTORY: &str = "adds a directory";
 
 /// A change no in-place patch can express, and why.
@@ -119,8 +96,6 @@ pub struct Structural {
 }
 
 impl Structural {
-    /// The reason `change` cannot be patched in place, or `None` when it can;
-    /// a write is a patch when the entry is there and a rebuild when it is not.
     pub(crate) fn of(path: &str, change: &Change, exists: bool) -> Option<Self> {
         let what = match *change {
             Change::Write { .. } if exists => return None,
@@ -136,23 +111,18 @@ impl Structural {
     }
 }
 
-/// A set of changes to one archive, at most one per path, ordered by path so
-/// that the same set always reaches the same archive.
+/// A set of changes to one archive, at most one per path, ordered for determinism.
 #[derive(Debug, Clone, Default)]
 pub struct Changes {
     at: BTreeMap<String, Change>,
-    /// The keys of `at` whose changes are not plain writes: an index over `at`
-    /// rather than a second fact, so that reaching a path costs no full walk.
+    /// Keys of `at` that are not plain writes; an index avoiding a full walk to find them.
     structural: BTreeSet<String>,
 }
 
-/// Whether a change is one the archive's own answer about a path cannot
-/// account for: everything but a plain [`Change::Write`].
 fn restructuring(change: &Change) -> bool {
     !matches!(*change, Change::Write { create: false, .. })
 }
 
-/// What a change already in a set is, for a refusal that has to name it.
 fn does(change: &Change) -> &'static str {
     match *change {
         Change::Write { .. } => "a write",
@@ -162,7 +132,6 @@ fn does(change: &Change) -> &'static str {
     }
 }
 
-/// Where a change puts what it is about, when that is somewhere else.
 fn destination(change: &Change) -> Option<&str> {
     match *change {
         Change::RenameTo(ref to) => Some(to.as_str()),
@@ -170,8 +139,7 @@ fn destination(change: &Change) -> Option<&str> {
     }
 }
 
-/// Whether two changes, each a path and where it puts things, can reach one
-/// another, which they can only for paths at, under or above one of their own.
+/// Whether two changes can reach one another: paths at, under, or above either one.
 fn reach(one: (&str, Option<&str>), other: (&str, Option<&str>)) -> bool {
     let (here, moves_to) = one;
     let (there, moves_onto) = other;
@@ -199,8 +167,7 @@ impl Changes {
         changes
     }
 
-    /// New contents for paths the archive already holds, each a plain write:
-    /// neither creating an entry nor allowing its encoding to change.
+    /// New contents for paths the archive already holds, each a plain, non-creating write.
     #[must_use]
     pub fn writing(edits: BTreeMap<String, Vec<u8>>) -> Self {
         Self {
@@ -239,15 +206,9 @@ impl Changes {
         self.at.remove(path)
     }
 
-    /// Whether `change` can be recorded at `path` beside what is already here.
-    ///
-    /// A second change at a path drops the first, and the caller is owed the
-    /// refusal; two **writes** are not that, nor is the same change again.
-    /// Judged exactly as spelled, `x/y` and `x//y` being two keys here.
-    ///
+    /// Whether `change` can be recorded at `path` beside what is here (matched exactly, unfolded).
     /// # Errors
-    ///
-    /// [`Error::Claimed`], naming what is in the way.
+    /// `Claimed`, naming what is in the way.
     pub fn admits(&self, path: &str, change: &Change) -> Result<()> {
         let Some(held) = self.at.get(path) else {
             return Ok(());
@@ -272,15 +233,13 @@ impl Changes {
         })
     }
 
-    /// Whether anything in this set could change what the archive holds at
-    /// `path`, answered over the restructuring changes alone.
+    /// Whether anything in this set could change what the archive holds at `path`.
     #[must_use]
     pub fn bears_on(&self, path: &str) -> bool {
         self.restructuring_changes()
             .any(|(at, change)| reach((at, destination(change)), (path, None)))
     }
 
-    /// The changes that are not plain writes, by the path they are at.
     fn restructuring_changes(&self) -> impl Iterator<Item = (&str, &Change)> {
         self.structural
             .iter()
@@ -294,8 +253,7 @@ impl Changes {
         self.at.get(path)
     }
 
-    /// The contents a [`Change::Write`] at `path` carries, unopened, or `None`
-    /// for a path with no change or a change that is not a write.
+    /// Contents a `Change::Write` at `path` carries, unopened, or `None` otherwise.
     #[must_use]
     pub fn contents_at(&self, path: &str) -> Option<&dyn Contents> {
         match self.at.get(path) {
@@ -333,7 +291,6 @@ impl Changes {
     }
 }
 
-/// A set is iterated by reference: it is applied and then still describes it.
 impl<'a> IntoIterator for &'a Changes {
     type Item = (&'a str, &'a Change);
     type IntoIter = std::iter::Map<
@@ -346,24 +303,18 @@ impl<'a> IntoIterator for &'a Changes {
     }
 }
 
-/// Where one file of a rebuilt archive gets its bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Source {
-    /// From the entry of that index in the archive being rebuilt.
     Entry(u32),
-    /// From the [`Change::Write`] recorded at that path.
     Written(String),
 }
 
-/// One file of the archive being written: the spec [`crate::build`] is given,
-/// and the source its `fetch` answers.
 #[derive(Debug)]
 pub(crate) struct Node {
     pub(crate) spec: FileSpec,
     pub(crate) source: Source,
 }
 
-/// The tree an archive becomes once a set of changes is applied to it.
 #[derive(Debug)]
 pub(crate) struct Tree {
     pub(crate) nodes: Vec<Node>,
@@ -371,12 +322,10 @@ pub(crate) struct Tree {
 }
 
 impl Tree {
-    /// The files, as [`crate::build`] takes them.
     pub(crate) fn files(&self) -> Vec<FileSpec> {
         self.nodes.iter().map(|node| node.spec.clone()).collect()
     }
 
-    /// Where each file gets its bytes, by the path it will be written at.
     pub(crate) fn sources(&self) -> BTreeMap<&str, &Source> {
         self.nodes
             .iter()
@@ -384,8 +333,7 @@ impl Tree {
             .collect()
     }
 
-    /// Whether anything in the tree answers to `path`, folded because two
-    /// paths differing only in case are one name to every reader.
+    /// Whether anything in the tree answers to `path`, case-folded.
     fn holds(&self, path: &str) -> bool {
         let wanted = folded(path);
         self.nodes
@@ -395,10 +343,7 @@ impl Tree {
     }
 }
 
-/// Whether `path` is `under`, or is `under` itself.
-///
-/// Component-wise and case-folded, so `datastore` is not under `data` and
-/// `DATA/a.txt` is; [`same_name`] rather than [`folded`] allocates nothing.
+/// Whether `path` is `under`, or is it; component-wise and case-folded (`datastore` isn't).
 fn at_or_under(path: &str, under: &str) -> bool {
     let Some(head) = path.get(..under.len()) else {
         return false;
@@ -410,8 +355,6 @@ fn at_or_under(path: &str, under: &str) -> bool {
         }
 }
 
-/// `path` with the `from` prefix replaced by `to`, for a path that is `from` or
-/// is under it.
 fn moved(path: &str, from: &str, to: &str) -> String {
     match path.get(from.len()..) {
         Some(rest) if !rest.is_empty() => format!("{to}{rest}"),
@@ -419,8 +362,7 @@ fn moved(path: &str, from: &str, to: &str) -> String {
     }
 }
 
-/// Reads up to `into.len()` bytes, tolerating a source that answers in pieces;
-/// a payload shorter than the buffer is not a failure.
+/// Reads up to `into.len()` bytes; a short or piecewise source is not a failure.
 fn fill(from: &mut dyn Read, into: &mut [u8]) -> Result<usize> {
     let mut filled = 0_usize;
     while filled < into.len() {
@@ -437,15 +379,6 @@ fn fill(from: &mut dyn Read, into: &mut [u8]) -> Result<usize> {
     Ok(filled)
 }
 
-/// Refuses a payload that the entry it is being written into cannot hold.
-///
-/// Both write paths reach it here, so a caller falling back from one to the
-/// other gets the same answer; `allowed` is the caller saying it meant this.
-///
-/// # Errors
-///
-/// [`Error::WrongEncoding`] for a payload a tokenised entry will not take, and
-/// as [`Archive::classify`] and [`Contents::open`].
 pub(crate) fn check_encoding<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -472,16 +405,6 @@ pub(crate) fn check_encoding<R: Read + Seek>(
     })
 }
 
-/// The kind of entry a payload has to be written as, for a path the archive
-/// does not hold yet.
-///
-/// The payload decides, there being no entry to ask: one carrying an `RSC7`
-/// header states its own page flags, and one that does not becomes a binary
-/// entry rather than a resource with no flags anyone knows.
-///
-/// # Errors
-///
-/// Whatever the payload's own source fails to open or read with.
 fn kind_for(contents: &dyn Contents) -> Result<FileKind> {
     // Four bytes off the front, not the payload.
     let mut magic = [0_u8; MAGIC_RSC7.len()];
@@ -496,8 +419,6 @@ fn kind_for(contents: &dyn Contents) -> Result<FileKind> {
     })
 }
 
-/// The entry `path` names in `archive`, the root not being an entry a change
-/// may be about.
 fn entry_at(archive: &Archive, path: &str) -> Result<u32> {
     let index = archive.find(path)?;
     if index == 0 {
@@ -509,25 +430,13 @@ fn entry_at(archive: &Archive, path: &str) -> Result<u32> {
     Ok(index)
 }
 
-/// The tree `archive` becomes once `changes` are applied to it.
-///
-/// Resolved in one pass per kind of change, and the order between the kinds is
-/// part of the contract: **removals, then renames, then writes, then
-/// directories.** Removals first is what lets one set rename over a path it
-/// also removes. Every refusal is decided against the tree as it then stands.
-///
-/// # Errors
-///
-/// [`Error::NotFound`], [`Error::AlreadyExists`], [`Error::BadPath`],
-/// [`Error::WrongKind`], [`Error::WrongEncoding`],
-/// [`Error::CannotWriteEncrypted`], and as [`specs_of`].
+/// Tree `archive` becomes once `changes` apply; removals go first so a rename can claim its path.
 pub(crate) fn tree_of<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
     changes: &Changes,
 ) -> Result<Tree> {
-    // Where a rebuild's target is asked whether it can be written at all, for
-    // every level of a cascade and for the resolution `allows` runs early.
+    // Checked early so every level of a rebuild cascade and `allows`'s resolution see it.
     archive.writable()?;
     check_one_each(archive, changes)?;
     let mut tree = Tree {
@@ -584,10 +493,7 @@ pub(crate) fn tree_of<R: Read + Seek>(
     Ok(tree)
 }
 
-/// Refuses a set in which two changes are about one entry.
-///
-/// `x/y`, `x//y` and `X/Y` are three spellings of one entry, and applying two
-/// of them lets the last win and the loser vanish with an `Ok`.
+/// Refuses a set in which two changes are about one entry, by any of its spellings.
 fn check_one_each(archive: &Archive, changes: &Changes) -> Result<()> {
     let mut claimed: BTreeMap<u32, &str> = BTreeMap::new();
     for (path, _) in changes {
@@ -604,16 +510,12 @@ fn check_one_each(archive: &Archive, changes: &Changes) -> Result<()> {
     Ok(())
 }
 
-/// Whether `changes` puts anything below `held` that is not there yet: a
-/// directory the set writes into is not empty, whatever the archive says.
 fn arrives_under(changes: &Changes, held: &str) -> bool {
-    // The restructuring index, not the whole set: every arm below is a
-    // restructuring change, so this is the same answer over a smaller walk.
+    // The restructuring index, not the whole set: every arm below is one of those changes.
     changes
         .restructuring_changes()
         .any(|(at, change)| match *change {
-            // Only a creation adds a path; the path *at* `held` is the
-            // replacing case, so it is not an arrival.
+            // A path *at* `held` replaces it rather than arriving under it.
             Change::Write { create: true, .. } | Change::MakeDirectory => {
                 !same_name(at, held) && at_or_under(at, held)
             }
@@ -622,8 +524,6 @@ fn arrives_under(changes: &Changes, held: &str) -> bool {
         })
 }
 
-/// Takes the entry at `path` out of the tree, with its children when it is a
-/// directory and `recursive`.
 fn remove(
     archive: &Archive,
     tree: &mut Tree,
@@ -660,7 +560,6 @@ fn remove(
     Ok(())
 }
 
-/// Moves the entry at `path`, and everything under it, to `to`.
 fn rename<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -704,18 +603,7 @@ fn rename<R: Read + Seek>(
     Ok(())
 }
 
-/// Refuses a rename that would leave a **nested archive** keyed by a name it no
-/// longer has.
-///
-/// A nested archive travels through a rebuild as opaque bytes, and an NG
-/// archive's own table and names blob are keyed by the name its holder files it
-/// under, so renaming the entry leaves an archive that parses, verifies, and
-/// answers [`Error::WrongKey`] to whoever opens it. A move is the one
-/// exemption: the key takes the entry's own name and not its path.
-///
-/// # Errors
-///
-/// [`Error::CannotRenameKeyed`], naming the nested archive's tag and transform.
+/// Refuses a rename that would break a nested NG archive keyed by its own (soon-stale) filename.
 fn renamable<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -739,8 +627,7 @@ fn renamable<R: Read + Seek>(
             }
             (tag, scheme.named())
         }
-        // What keys it is unknown, so it is refused rather than guessed at.
-        // Unreachable with any tag this build defines.
+        // Refused rather than guessed at; unreachable with any tag this build defines.
         NestedTransform::Unknown { tag } => (tag, "unrecognised"),
     };
     Err(Error::CannotRenameKeyed {
@@ -751,17 +638,12 @@ fn renamable<R: Read + Seek>(
     })
 }
 
-/// What a [`Change::Write`] was told, beside the bytes.
 #[derive(Debug, Clone, Copy)]
 struct Told {
-    /// [`Change::Write::create`].
     create: bool,
-    /// [`Change::Write::allow_encoding_change`].
     allow_encoding_change: bool,
 }
 
-/// Puts new contents at `path`, creating the entry when the archive does not
-/// hold one and the caller asked for that.
 fn write<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -777,8 +659,7 @@ fn write<R: Read + Seek>(
             wanted: "file",
         }),
         Ok(index) => {
-            // The entry's own storage rule is kept: one that was stored stays
-            // stored, and one that was deflated is compressed again.
+            // The entry's own storage rule is kept: stored stays stored, deflated recompresses.
             let kind = kind_of(path, archive.entry(index)?)?;
             check_encoding(
                 src,
@@ -823,8 +704,7 @@ fn write<R: Read + Seek>(
     }
 }
 
-/// Adds a directory, and leaves whatever above it is missing to `build`, which
-/// creates a path's parents whether or not they were named.
+/// Adds a directory; parents left missing are created later by `build`.
 fn make_directory(tree: &mut Tree, path: &str) -> Result<()> {
     name::check_tree(path)?;
     if tree.holds(path) {
@@ -836,15 +716,7 @@ fn make_directory(tree: &mut Tree, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// The nested archive a path lands in, and the path within it.
-///
-/// `None` when the path names something in `archive` itself, a path nothing
-/// resolves included. Only the first nesting level: a change two archives down
-/// is grouped into the first, and the recursion groups it again.
-///
-/// # Errors
-///
-/// As [`Archive::child_named`] for a name more than one child answers to.
+/// Nested archive a path lands in and the path within it, one level deep; deeper changes recurse.
 pub(crate) fn landing_of(archive: &Archive, path: &str) -> Result<Option<(u32, String)>> {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut current = 0_u32;
@@ -865,19 +737,9 @@ pub(crate) fn landing_of(archive: &Archive, path: &str) -> Result<Option<(u32, S
     Ok(None)
 }
 
-/// Whether `change` can be made at `path`, against the archive **and** against
-/// the changes already buffered over it.
-///
-/// The same resolution a commit performs, run early and thrown away, so the
-/// rules are written once rather than once here and once there. It resolves the
-/// **set** and not one change: a rename onto a path a buffered removal frees is
-/// accepted, and one onto a path another buffered rename claims is not.
-///
+/// Whether `change` can be made at `path`, resolving the whole buffered set, not just `change`.
 /// # Errors
-///
-/// As `tree_of` and as `split`, [`Error::Claimed`] for a second change of
-/// another kind at `path`, and as [`Archive::locate`] for a path addressing
-/// through a nested archive that will not open.
+/// As `tree_of` and `split`, and `Claimed` for a conflicting buffered change at `path`.
 pub fn allows<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -906,12 +768,7 @@ pub fn allows<R: Read + Seek>(
     }
 }
 
-/// The buffered changes that bear on `change` at `path`, and no others.
-///
-/// Two changes with no path in common decide nothing about each other, so this
-/// subset gives the same answer as the whole set. A plain write is scanned for
-/// only when the offered change is a removal, which is the one kind that can
-/// take an entry out from under a write already buffered against it.
+/// Buffered changes bearing on `change` at `path`; a plain write is included only for a removal.
 fn bearing_on(buffered: &Changes, path: &str, change: &Change) -> Changes {
     let offered = (path, destination(change));
     let mut staged = Changes::new();
@@ -936,11 +793,6 @@ fn bearing_on(buffered: &Changes, path: &str, change: &Change) -> Changes {
     staged
 }
 
-/// Refuses a rename whose destination is in a different archive from its
-/// source.
-///
-/// A path that crossed the boundary silently would land as a *directory* named
-/// `something.rpf` inside the archive it came from.
 pub(crate) fn check_one_archive(archive: &Archive, from: &str, to: &str) -> Result<()> {
     let here = landing_of(archive, from)?.map(|(index, _)| index);
     let there = landing_of(archive, to)?.map(|(index, _)| index);
@@ -953,7 +805,6 @@ pub(crate) fn check_one_archive(archive: &Archive, from: &str, to: &str) -> Resu
     })
 }
 
-/// A rename's destination as the archive it lands in spells it.
 fn within_target(archive: &Archive, to: &str) -> Result<String> {
     Ok(match landing_of(archive, to)? {
         Some((_, within)) => within,
@@ -961,15 +812,6 @@ fn within_target(archive: &Archive, to: &str) -> Result<String> {
     })
 }
 
-/// Every change of a set, split into the ones this archive answers and the ones
-/// a nested archive does.
-///
-/// Keyed by the entry index of the archive they land in, so several changes
-/// inside one nested archive rebuild it **once**.
-///
-/// # Errors
-///
-/// As [`landing_of`], and [`Error::BadPath`] for a rename across archives.
 pub(crate) fn split(archive: &Archive, changes: &Changes) -> Result<(Changes, Grouped)> {
     let mut here = Changes::new();
     let mut nested: Grouped = BTreeMap::new();
@@ -1006,8 +848,7 @@ pub(crate) fn split(archive: &Archive, changes: &Changes) -> Result<(Changes, Gr
         }
     }
 
-    // A change to a nested archive's own bytes and one to something inside it
-    // are the same bytes twice, so the one addressing through it is refused.
+    // Its own bytes and something inside it are the same bytes twice; refuse the latter.
     for (path, _) in &here {
         let Ok(index) = archive.find(path) else {
             continue;
@@ -1022,10 +863,8 @@ pub(crate) fn split(archive: &Archive, changes: &Changes) -> Result<(Changes, Gr
     Ok((here, nested))
 }
 
-/// The changes landing inside one nested archive.
 #[derive(Debug)]
 pub(crate) struct Nested {
-    /// The first change that addressed through this archive.
     pub(crate) first: String,
     /// The changes, spelled as paths within it.
     pub(crate) changes: Changes,
@@ -1036,10 +875,7 @@ pub(crate) struct Nested {
 /// A path within a nested archive, and the path the caller addressed it by.
 pub(crate) type Spellings = BTreeMap<String, String>;
 
-/// The same failure, with every path it names spelled as the caller spelled it.
-///
-/// [`split`] re-keys such a change to the path *within* that archive, which is
-/// not one the caller can act on. Exact matches only.
+/// The same failure, with every path it names respelled as the caller spelled it (exact matches).
 pub(crate) fn respelled(mut failure: Error, spellings: &Spellings) -> Error {
     for named in named_paths_mut(&mut failure) {
         if let Some(spelt) = spellings.get(named.as_str()) {
@@ -1049,7 +885,6 @@ pub(crate) fn respelled(mut failure: Error, spellings: &Spellings) -> Error {
     failure
 }
 
-/// Every path a failure names that can be one of a change set's own.
 fn named_paths_mut(failure: &mut Error) -> Vec<&mut String> {
     match *failure {
         Error::NotFound { ref mut path, .. }
@@ -1078,7 +913,6 @@ mod tests {
     use super::{fill, named_paths_mut, respelled};
     use crate::error::Error;
 
-    /// A source whose first read fails uninterrupted, then ends.
     struct FailsOnceThenEnds {
         asked: Cell<u32>,
     }
@@ -1107,7 +941,6 @@ mod tests {
         fill(&mut source, &mut into).expect_err("a real read error must not be swallowed");
     }
 
-    /// A source that fills what it is handed, and refuses an empty ask.
     struct FillsOnceAndRefusesAnEmptyAsk;
 
     impl io::Read for FillsOnceAndRefusesAnEmptyAsk {

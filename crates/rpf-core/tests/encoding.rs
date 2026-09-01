@@ -1,10 +1,7 @@
 //! What an entry holding one metadata encoding will take as a replacement.
-//! `RBF` and `PSO` are tokenised and the runtime reads an entry as whatever it
-//! was, so XML or text written into one parses and does not load;
-//! `--allow-encoding-change` is the way through.
-//!
-//! Every case runs through all three write paths, which must not disagree.
-//! Corpus-free: every archive here is built by this crate's own writer.
+//! `RBF` and `PSO` are tokenised, so XML or text written into one parses and
+//! does not load; `--allow-encoding-change` is the way through. Every case runs
+//! through all three write paths.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -31,8 +28,7 @@ use rpf_core::{
 
 const AT: &str = "data/thing.ymt";
 
-/// A payload announcing each encoding, and one announcing none — a byte that is
-/// neither text nor a signature.
+/// A payload announcing each encoding, and one announcing none.
 fn payload(named: Option<Encoding>) -> Vec<u8> {
     match named {
         Some(Encoding::Rbf) => b"RBF0\x01\x02\x03\x04tokens here".to_vec(),
@@ -43,8 +39,8 @@ fn payload(named: Option<Encoding>) -> Vec<u8> {
     }
 }
 
-/// An archive holding one stored entry at [`AT`], with `contents` in it. Stored
-/// so the entry's allocation is its length, keeping every patch below a patch.
+/// An archive holding one stored entry at [`AT`]: stored so the allocation is
+/// the entry's length, keeping every patch below a patch.
 fn archive_holding(contents: &[u8]) -> Vec<u8> {
     let owned = contents.to_vec();
     let mut out = Cursor::new(Vec::new());
@@ -83,8 +79,7 @@ enum Path {
     Patch,
     /// `rpf_core::rebuild` — the whole archive is written again.
     Rebuild,
-    /// `rpf_core::rewrite` — the same, cascading through nesting; the one both
-    /// frontends commit through.
+    /// `rpf_core::rewrite` — the same, cascading through nesting.
     Rewrite,
 }
 
@@ -142,8 +137,6 @@ fn contents_of(bytes: &[u8]) -> Vec<u8> {
     archive.extract(&mut file, index).expect("reads back")
 }
 
-/// Two targets and two payloads: a guard covering `RBF` and not `PSO` would
-/// pass a suite that only ever asked about `RBF`.
 #[test]
 fn a_tokenised_entry_refuses_a_textual_payload() {
     for held in [Encoding::Rbf, Encoding::Pso] {
@@ -200,9 +193,6 @@ fn an_allowed_encoding_change_writes_the_payload() {
     }
 }
 
-/// Every write that was allowed before is allowed still, including the two a
-/// careless rule catches by symmetry: a tokenised payload into a textual entry,
-/// and into a tokenised entry of the other kind.
 #[test]
 fn every_other_pair_is_taken() {
     let all = [
@@ -234,9 +224,6 @@ fn every_other_pair_is_taken() {
     }
 }
 
-/// A metadata entry keeps no record of what it used to hold, so once an
-/// overridden write is taken the archive is a sound archive holding XML and a
-/// bare `verify` has nothing to say about it.
 #[test]
 fn an_overridden_write_is_sound_afterwards_and_verify_cannot_see_it() {
     let after = written(
@@ -260,8 +247,6 @@ fn an_overridden_write_is_sound_afterwards_and_verify_cannot_see_it() {
     assert!(walked.outcome().is_ok());
 }
 
-/// The per-entry contents checksum a manifest records is the only thing that
-/// catches an overridden write afterwards.
 #[test]
 fn a_recorded_checksum_is_what_catches_an_overridden_write() {
     let before = archive_holding(&payload(Some(Encoding::Rbf)));
@@ -294,8 +279,6 @@ fn a_recorded_checksum_is_what_catches_an_overridden_write() {
     }
 }
 
-/// A payload that announces nothing is taken, whatever the entry holds:
-/// `Encoding::of` answers `None`, and `None` contradicts no entry.
 #[test]
 fn a_payload_announcing_nothing_is_taken() {
     for held in [Encoding::Rbf, Encoding::Pso] {
@@ -340,8 +323,6 @@ fn a_created_entry_is_not_judged_against_an_entry_that_is_not_there() {
     assert_eq!(bytes, payload(Some(Encoding::Xml)));
 }
 
-/// `allows` is the commit's own resolution run early and thrown away, so a rule
-/// it does not apply is a refusal arriving at the save rather than the edit.
 #[test]
 fn allows_refuses_what_a_commit_would_refuse() {
     let mut file = Cursor::new(archive_holding(&payload(Some(Encoding::Pso))));
@@ -396,9 +377,6 @@ fn deflated_holding(contents: &[u8]) -> Vec<u8> {
     out.into_inner()
 }
 
-/// A deflated `RBF` payload begins with a deflate stream and not with `RBF0`,
-/// so a rule reading the stored bytes would find no encoding and take every
-/// write.
 #[test]
 fn a_deflated_entry_is_judged_by_what_it_inflates_to() {
     let mut file = Cursor::new(deflated_holding(&payload(Some(Encoding::Rbf))));
@@ -459,9 +437,6 @@ fn nesting(contents: &[u8]) -> Vec<u8> {
 
 const THROUGH: &str = "inner.rpf/data/thing.ymt";
 
-/// The refusal must name the path the caller spelled: `split` re-keys a nested
-/// change to the path within the archive it lands in, which does not resolve in
-/// the archive the caller named.
 #[test]
 fn a_nested_entry_is_refused_under_the_path_the_caller_spelled() {
     for allowed in [false, true] {

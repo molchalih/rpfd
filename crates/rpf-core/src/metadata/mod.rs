@@ -1,11 +1,4 @@
 //! What a payload announces itself to be, from its leading bytes.
-//!
-//! The names of the metadata encodings and the signatures that pick one out.
-//! Nothing here reads an extension.
-//!
-//! Resource `Meta` is deliberately not one of [`Encoding`]'s variants: the
-//! entry table's resource bit is the only truth, and the magic that confirms it
-//! sits at offset `0x10`, past [`Encoding::HEAD_LEN`], as [`meta::MAGIC`].
 
 pub mod hash;
 pub mod meta;
@@ -17,24 +10,18 @@ pub mod view;
 /// The `RBF` magic: bytes 0..3 of a tokenised binary XML file.
 pub const MAGIC_RBF: [u8; 4] = *b"RBF0";
 
-/// The `PSO` magic: bytes 0..3 of a `PSO` file, which are the tag of its first
-/// section rather than a header of its own.
+/// The `PSO` magic: bytes 0..3 of a `PSO` file, the tag of its first section.
 pub const MAGIC_PSO: [u8; 4] = *b"PSIN";
 
-/// The UTF-8 byte-order mark, which a plain XML payload may carry before its
-/// first `<`.
+/// The UTF-8 byte-order mark a plain XML payload may carry before its first `<`.
 pub const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 /// What an entry's payload announces itself to be.
-///
-/// There is no resource variant: a resource is a fact about the entry, not its
-/// bytes, so [`crate::Classification`] and not this type is what a caller asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Encoding {
     /// Plain XML.
     Xml,
-    /// Text that is not XML, judged over [`Encoding::HEAD_LEN`] bytes and no
-    /// further.
+    /// Text that is not XML, judged over `Encoding::HEAD_LEN` bytes.
     Text,
     /// `RBF`, tokenised binary XML.
     Rbf,
@@ -43,12 +30,10 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    /// How many bytes of a payload [`Encoding::of`] is given: four times the
-    /// longest signature, and never the whole payload.
+    /// Bytes of a payload `of` inspects: four times the longest signature.
     pub const HEAD_LEN: usize = 16;
 
-    /// This encoding's name, in the one spelling everything reports it in;
-    /// a listing row's `"encoding"` field carries it on the wire.
+    /// This encoding's name, in the spelling everything reports it in.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -59,11 +44,7 @@ impl Encoding {
         }
     }
 
-    /// What an entry holding this encoding refuses of a payload announcing
-    /// `offered`, or `None` when it takes it.
-    ///
-    /// A tokenised encoding does not take a textual one; what comes back is
-    /// the encoding refused.
+    /// The encoding among `offered` this one refuses, or `None` when it takes it.
     #[must_use]
     pub const fn refuses(self, offered: Option<Self>) -> Option<Self> {
         match (self, offered) {
@@ -72,13 +53,7 @@ impl Encoding {
         }
     }
 
-    /// The encoding these leading bytes announce, or `None` when they announce
-    /// none.
-    ///
-    /// `head` is the first [`Encoding::HEAD_LEN`] bytes of the payload, or all
-    /// of it when it is shorter — passing a padded buffer instead of what was
-    /// read turns a short text payload into unknown binary. Fewer bytes than a
-    /// signature is an answer, not an error; `None` is unknown binary.
+    /// The encoding these leading bytes announce; `head` must be the true prefix, not padded.
     #[must_use]
     pub fn of(head: &[u8]) -> Option<Self> {
         if head.starts_with(&MAGIC_RBF) {
@@ -98,12 +73,6 @@ impl Encoding {
     }
 }
 
-/// Whether these bytes open an XML tag: optional ASCII whitespace, `<`, then a
-/// byte a tag can begin with.
-///
-/// Leading whitespace is allowed, and the byte after `<` is checked so that a
-/// binary payload beginning `0x3c` by chance is not read as XML. A tag name
-/// beginning with a non-ASCII byte is not admitted.
 fn opens_a_tag(body: &[u8]) -> bool {
     let opened = trimmed(body);
     opened
@@ -112,7 +81,6 @@ fn opens_a_tag(body: &[u8]) -> bool {
         .is_some_and(|byte| begins_a_tag_name(*byte))
 }
 
-/// `body` without its leading ASCII whitespace.
 fn trimmed(body: &[u8]) -> &[u8] {
     let mut rest = body;
     while let Some((first, tail)) = rest.split_first() {
@@ -124,20 +92,14 @@ fn trimmed(body: &[u8]) -> &[u8] {
     rest
 }
 
-/// Whether a byte may follow `<` at the start of an XML document: a name-start
-/// character, or the `?` and `!` that open a declaration, a comment or a
-/// doctype.
 const fn begins_a_tag_name(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':' | b'?' | b'!')
 }
 
-/// Whether a byte is ASCII whitespace, in the four spellings a payload uses.
 const fn is_space(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
-/// Whether a byte belongs to text: printable ASCII, or one of the three
-/// whitespace controls. The window matters as much as the predicate.
 const fn is_text(byte: u8) -> bool {
     byte.is_ascii_graphic() || is_space(byte)
 }
@@ -146,15 +108,12 @@ const fn is_text(byte: u8) -> bool {
 mod tests {
     use super::*;
 
-    /// A head of exactly the length the classifier is given, from a prefix,
-    /// filled out with bytes that name nothing on their own.
     fn head(prefix: &[u8]) -> Vec<u8> {
         let mut out = prefix.to_vec();
         out.resize(Encoding::HEAD_LEN, 0x00);
         out
     }
 
-    /// The same, filled out with text, for the cases about text.
     fn text_head(prefix: &[u8]) -> Vec<u8> {
         let mut out = prefix.to_vec();
         out.resize(Encoding::HEAD_LEN, b'A');
@@ -262,7 +221,6 @@ mod tests {
 
     #[test]
     fn no_head_of_any_shape_panics() {
-        // Every repeated byte at every length up to the window.
         for byte in 0..=u8::MAX {
             for len in 0..=Encoding::HEAD_LEN {
                 let bytes = vec![byte; len];

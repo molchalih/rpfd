@@ -1,10 +1,9 @@
 //! What a caller is told to do about a failure, beyond what the failure says.
 //!
-//! Both frontends render through this one function, so the daemon says what the
-//! command line says. Two things are added: a path spelled with `\` is respelt
-//! with the separator, and a refusal with a switch behind it names the switch.
+//! Both frontends render through here, so the daemon and the command line agree.
 
 use rpf_core::Error;
+use serde_json::{Value, json};
 
 use crate::exit::Failure;
 
@@ -23,11 +22,19 @@ pub fn render(failure: &Failure) -> String {
     failure.to_string()
 }
 
-/// The way through a refusal that has one, in the caller's own vocabulary.
-///
-/// Only [`Error::WrongEncoding`] has one. [`rpf_core::NoWrite::NoInverse`]
-/// deliberately has none: nothing here derives the archive's forward transform,
-/// so naming a command as the way through would be a lie.
+/// The object a failure is answered with: code, sentence, and the failure's own
+/// symbol.
+pub fn object(code: i64, message: &str, reason: &str) -> Value {
+    json!({ "code": code, "message": message, "data": { "reason": reason } })
+}
+
+/// The object for a failure the command line is about to exit on.
+pub fn failed(failure: &Failure) -> Value {
+    object(failure.code() as i64, &render(failure), failure.name())
+}
+
+/// The way through a refusal that has one. [`rpf_core::NoWrite::NoInverse`] has
+/// none: nothing here derives the archive's forward transform.
 fn remedy(failure: &Failure) -> Option<&'static str> {
     match *failure {
         Failure::Container(Error::WrongEncoding { .. }) => {
@@ -37,12 +44,8 @@ fn remedy(failure: &Failure) -> Option<&'static str> {
     }
 }
 
-/// The path the caller asked for with `\` read as the separator, or `None` when
-/// the failure is not one a separator explains.
-///
-/// Only [`Error::NotFound`], because only there did the path come from the
-/// caller. [`Error::BadPath`]'s path came out of the archive, and respelling it
-/// would be advice to rename somebody else's entry.
+/// The caller's path with `\` read as the separator. Only [`Error::NotFound`],
+/// whose path came from the caller rather than out of the archive.
 fn respelling(failure: &Failure) -> Option<String> {
     let Failure::Container(Error::NotFound { ref path, .. }) = *failure else {
         return None;
@@ -80,8 +83,6 @@ mod tests {
 
     #[test]
     fn only_the_separators_are_respelt_and_every_component_survives() {
-        // What is offered is the same path read the other way, not a `\`
-        // swept out of the name.
         assert_eq!(
             respelling(&not_found("x64\\dlcpacks\\mp\\dlc.rpf")).as_deref(),
             Some("x64/dlcpacks/mp/dlc.rpf"),
@@ -101,8 +102,6 @@ mod tests {
 
     #[test]
     fn a_name_the_archive_holds_a_backslash_in_is_not_respelt() {
-        // The `\` came from the archive rather than from the caller, so there
-        // is nothing to suggest.
         let failure = Failure::Container(Error::BadPath {
             path: "x64\\evil.txt".to_owned(),
             reason: "has a component holding \\, which is a separator on Windows",
@@ -111,7 +110,6 @@ mod tests {
         assert_eq!(render(&failure), failure.to_string());
     }
 
-    /// A refusal with a way through names it, in the spelling a caller passes.
     #[test]
     fn a_refusal_with_a_switch_behind_it_names_the_switch() {
         let failure = Failure::Container(Error::WrongEncoding {
@@ -132,12 +130,8 @@ mod tests {
         );
     }
 
-    /// The encrypted-write refusal: nothing is offered, because there is
-    /// nothing to offer.
     #[test]
     fn the_encrypted_refusal_that_has_no_way_through_offers_none() {
-        // Nothing here derives the transform, and no command changes that:
-        // offering one would be a lie.
         let ng = Failure::Container(Error::CannotWriteEncrypted {
             tag: 0x0FEF_FFFF,
             reason: rpf_core::NoWrite::NoInverse,
@@ -155,7 +149,6 @@ mod tests {
         );
     }
 
-    /// And nothing else grows one: the sentence is the failure's own.
     #[test]
     fn a_refusal_with_no_switch_behind_it_is_rendered_unchanged() {
         let failure = Failure::Container(Error::WrongKind {

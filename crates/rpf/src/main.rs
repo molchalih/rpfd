@@ -1,5 +1,4 @@
-//! Command-line frontend. Holds no archive knowledge: everything it does, it
-//! does through `rpf-core`.
+//! Command-line frontend over `rpf-core`.
 
 mod advice;
 mod commands;
@@ -23,11 +22,6 @@ struct Cli {
     /// Keep extracted key material here rather than in the platform's
     /// configuration directory, and look for it here when opening an encrypted
     /// archive.
-    ///
-    /// Global, and it has to be: it is the one way to keep several game
-    /// installs apart, and an archive command that could not name the cache
-    /// would be unable to open what `rpf keys extract --cache-dir` had just
-    /// found.
     #[arg(long, global = true, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -67,6 +61,10 @@ enum Command {
         /// the XML view where there is one and the bytes where there is not.
         #[arg(long = "as", value_name = "VIEW", default_value = "raw")]
         view: commands::ViewArg,
+        /// Write the payload to this file rather than to standard output, and
+        /// report the path and the length instead of the bytes.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
     },
     /// Replace one entry, or create it, cascading through nesting.
     Put {
@@ -141,8 +139,7 @@ enum Command {
     },
     /// Serve JSON-RPC over standard input and output, one object per line.
     Serve {
-        /// Required, and the only transport there is. Named so that adding
-        /// another later does not change what this invocation means.
+        /// Required, and the only transport there is.
         #[arg(long)]
         stdio: bool,
     },
@@ -152,8 +149,7 @@ enum Command {
         archive: PathBuf,
         /// An extracted tree of this archive, whose manifest records what each
         /// entry's contents should be. Without it a stored entry's bytes are
-        /// checked against nothing, because the archive declares nothing about
-        /// them.
+        /// checked against nothing.
         #[arg(long, value_name = "TREE")]
         against: Option<PathBuf>,
     },
@@ -186,8 +182,7 @@ enum KeysCommand {
     Invalidate,
 }
 
-/// What `--overwrite`, or the wire's `overwrite`, means to an extraction, so
-/// that the flag and the wire parameter cannot come to mean two things.
+/// What `--overwrite`, and the wire's `overwrite`, mean to an extraction.
 const fn existing(overwrite: bool) -> commands::Existing {
     if overwrite {
         commands::Existing::Overwrite
@@ -214,7 +209,8 @@ fn main() -> ExitCode {
             ref archive,
             ref path,
             view,
-        } => commands::cat(archive, path, view.into(), cache),
+            ref out,
+        } => commands::cat(archive, path, view.into(), out.as_deref(), cache, cli.json),
         Command::Put {
             ref archive,
             ref path,
@@ -273,8 +269,22 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::from(Code::Ok as u8),
         Err(failure) => {
-            eprintln!("rpf: {}", advice::render(&failure));
+            report(&failure, cli.json);
             ExitCode::from(failure.code() as u8)
         }
+    }
+}
+
+/// Says what stopped the command: one JSON object under `--json`, the rendered
+/// sentence otherwise.
+///
+/// Both go to standard error: standard output carries the answer and nothing
+/// else, and a command can already have written part of it.
+fn report(failure: &exit::Failure, json: bool) {
+    if json {
+        let object = serde_json::to_string_pretty(&advice::failed(failure)).unwrap_or_default();
+        eprintln!("{object}");
+    } else {
+        eprintln!("rpf: {}", advice::render(failure));
     }
 }

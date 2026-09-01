@@ -1,24 +1,15 @@
 //! Seeing a long write happen, and stopping one.
-//!
-//! Progress and cancellation are one seam because they are one question, asked
-//! at the same moment: how far are we, and should we carry on.
 
-/// How far a long write has got.
-///
-/// Reported once per entry written. A cascading rebuild counts the archive
-/// being written now rather than the whole cascade.
+/// How far a long write has got, reported once per entry written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step<'a> {
-    /// The entry just written, by path within the archive being written; a
-    /// scan over a source that has no entries names the material it seeks.
+    /// The entry just written, or the material a scan is seeking.
     pub path: &'a str,
-    /// How many units of work are done, this one included: entries written, or
-    /// blocks of a source scanned.
+    /// How many units of work are done so far, this one included.
     pub done: u32,
     /// How many there are in total; a scan that stops early names fewer.
     pub total: u32,
-    /// How many bytes have been written so far, the header and entry table
-    /// included — or, for a scan, how many have been read.
+    /// How many bytes have been written, or for a scan, read so far.
     pub bytes: u64,
 }
 
@@ -27,15 +18,11 @@ pub struct Step<'a> {
 pub enum Flow {
     /// Keep going.
     Continue,
-    /// Stop; the write fails with [`crate::Error::Cancelled`] and the sink is
-    /// left however far it got.
+    /// Stop; the write fails and the sink is left however far it got.
     Stop,
 }
 
-/// Something watching a long write.
-///
-/// The method is called between entries, so a cancellation lands only at the
-/// end of the entry in flight.
+/// Something watching a long write, called between entries.
 pub trait Watch {
     /// One entry has been written. Returns whether to write the next.
     fn step(&mut self, step: Step<'_>) -> Flow;
@@ -51,8 +38,7 @@ impl Watch for Unwatched {
     }
 }
 
-/// So that a caller holding a `&mut W` can pass it on to a nested rebuild
-/// without giving it away.
+/// Lets a caller holding `&mut W` pass it to a nested rebuild without giving it away.
 impl<W: Watch + ?Sized> Watch for &mut W {
     fn step(&mut self, step: Step<'_>) -> Flow {
         (**self).step(step)

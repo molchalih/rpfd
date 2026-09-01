@@ -1,9 +1,5 @@
 //! In-place patching: what it writes, what it leaves alone, and what it
-//! refuses before writing anything. The files are compared byte for byte
-//! before and after, and every difference must fall inside the payload being
-//! replaced or its own entry row.
-//!
-//! Corpus-free: each test builds the archive it needs.
+//! refuses before writing anything.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -184,8 +180,6 @@ fn a_patch_that_does_not_fit_writes_nothing_at_all() {
 
 #[test]
 fn one_edit_that_does_not_fit_holds_back_the_ones_that_do() {
-    // Patching a set one at a time can apply two and then discover the third
-    // will not fit, which is not what a commit promises.
     let before = archive_bytes();
     let mut file = Cursor::new(before.clone());
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -265,8 +259,7 @@ fn several_edits_are_applied_together() {
 
 #[test]
 fn two_edits_that_claim_the_same_bytes_are_refused() {
-    // The inner edit would land in a nested archive the outer edit has just
-    // replaced wholesale, so the two writes overlap: a refusal, not corruption.
+    // The inner edit lands in a nested archive the outer edit replaces wholesale.
     let inner = archive_bytes();
     let files = vec![FileSpec {
         path: "x64/inner.rpf".to_owned(),
@@ -350,8 +343,6 @@ fn patching_through_nesting_leaves_every_ancestor_untouched() {
     patches.apply(&mut file).expect("applies");
 
     let after = file.into_inner();
-    // Every change is inside the nested archive's own payload; the outer
-    // header, entry table, names blob and row are untouched.
     for position in differences(&before, &after) {
         assert!(
             position >= nested_at as usize && position < (nested_at + nested_len) as usize,
@@ -400,23 +391,20 @@ fn a_resource_entry_refuses_a_payload_that_is_not_one() {
     assert!(matches!(plan, Plan::Fits(_)), "got {plan:?}");
 }
 
-/// Largest value the entry table's 24-bit compressed-size field holds. Spelled
-/// out rather than imported: a test that took the limit from the code it checks
-/// would agree with whatever that code came to believe.
+/// Largest value the entry table's 24-bit compressed-size field holds, spelled
+/// out rather than imported from the code under test.
 const MAX_SIZE_24: u64 = 0x00FF_FFFF;
 
-/// An `RSC7` payload one byte too large for that field. Only the first sixteen
-/// bytes have to be a header: the size check comes before anything looks at the
-/// deflate stream.
+/// An `RSC7` payload one byte too large for that field; only the first sixteen
+/// bytes have to be a header, as the size check comes first.
 fn oversized_resource() -> Vec<u8> {
     let mut out = resource(0xAA);
     out.resize(usize::try_from(MAX_SIZE_24).expect("64-bit host") + 1, 0);
     out
 }
 
-/// An archive holding one resource, with room after it for a payload far larger
-/// than the entry can describe: in a cramped entry the payload would be refused
-/// for not fitting, hiding whether the size check ran at all.
+/// One resource with room after it for a payload larger than the entry can
+/// describe, so a refusal cannot come from a cramped entry instead.
 fn roomy_resource_archive() -> Vec<u8> {
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
@@ -440,8 +428,7 @@ fn roomy_resource_archive() -> Vec<u8> {
     bytes
 }
 
-/// The field a saturated resource's row carries; the payload's extent is the
-/// room to the next payload, not this value.
+/// The field a saturated resource's row carries.
 fn saturated_field(archive: &Archive, path: &str) -> Option<u64> {
     let index = archive.find(path).ok()?;
     match archive.entry(index).ok()?.kind {
@@ -452,9 +439,8 @@ fn saturated_field(archive: &Archive, path: &str) -> Option<u64> {
 
 #[test]
 fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_truncating() {
-    // A payload past the 24-bit field is written whole with the row carrying
-    // `MAX_SIZE_24`, the saturation sentinel; the low 24 bits of this length
-    // are zero, which would read back as a stored entry.
+    // The low 24 bits of this length are zero, which would read back as a stored
+    // entry if the row were truncated rather than saturated.
     let payload = oversized_resource();
     let before = roomy_resource_archive();
     let mut file = Cursor::new(before.clone());
@@ -489,8 +475,7 @@ fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_trunc
             .1,
         allocation
     );
-    // The extent runs past the payload into the entry's room, so the payload is
-    // the prefix of what `extract` hands back.
+    // The extent runs into the entry's room, so the payload is only a prefix.
     let index = archive.find("art.yft").expect("resolves");
     let mut back = Vec::new();
     archive
@@ -507,8 +492,6 @@ fn a_resource_too_large_for_its_size_field_writes_the_sentinel_rather_than_trunc
 
 #[test]
 fn a_build_and_a_patch_write_the_same_sentinel_for_an_oversized_resource() {
-    // The two write paths apply one rule to new contents; what matters here is
-    // that they agree, not the verdict itself.
     let payload = oversized_resource();
     let files = vec![FileSpec {
         path: "art.yft".to_owned(),
@@ -533,14 +516,11 @@ fn a_build_and_a_patch_write_the_same_sentinel_for_an_oversized_resource() {
     );
 }
 
-/// Largest a resource's `RSC7` header is, and the least a resource payload can
-/// be. Spelled out rather than imported, for [`MAX_SIZE_24`]'s reason.
+/// The least a resource payload can be, spelled out for [`MAX_SIZE_24`]'s reason.
 const RESOURCE_HEADER_LEN: usize = 16;
 
-/// A payload with the right magic and a truncated header is not a resource: the
-/// flags at offsets 8 and 12 are the ones the entry row carries, so a short
-/// header is an entry whose flags would be invented. The read is a `take(16)`,
-/// so the guard goes inert if its comparison is turned around.
+/// The flags at offsets 8 and 12 are the ones the entry row carries, so a short
+/// header would be an entry whose flags were invented.
 #[test]
 fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
     let mut truncated = b"RSC7".to_vec();
@@ -591,17 +571,15 @@ fn a_build_and_a_patch_refuse_a_resource_shorter_than_its_header() {
     );
 }
 
-/// A plan prints what it will do and never the bytes it will write: `Patches`
-/// has a hand-written `Debug` because a payload is megabytes and the type shows
-/// up in failure messages.
+/// `Patches` has a hand-written `Debug` because a payload is megabytes and the
+/// type shows up in failure messages.
 #[test]
 fn a_plan_prints_what_it_will_do_and_never_the_bytes() {
     let before = archive_bytes();
     let mut file = Cursor::new(before);
     let archive = Archive::open(&mut file, &rpf_core::Unlock::unkeyed()).expect("parses");
 
-    // One repeated byte: `Debug` for a byte slice writes decimal, and 0xC7 is
-    // 199.
+    // `Debug` for a byte slice writes decimal, and 0xC7 is 199.
     let replacement = vec![0xC7_u8; 400];
     let plan = rpf_core::plan(
         &mut file,

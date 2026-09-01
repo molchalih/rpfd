@@ -1,11 +1,4 @@
-//! What to look for in a game executable: the SHA-1 digest of each value.
-//!
-//! There is no key in this file. A digest names a block of bytes in the user's
-//! own installation; it does not yield one.
-//!
-//! Ported from `CodeWalker.Core/GameFiles/Utils/GTAKeys.cs`, copyright (c) 2015
-//! Neodymium, MIT. [`LAUNCHER_AES_KEY`] comes instead from
-//! `Disquse/RGLExtractor`'s `aes.go` (MIT), whose `aesKeyHash` is this digest.
+//! Values ported from `CodeWalker` (c) 2015 Neodymium, MIT, and `Disquse/RGLExtractor`'s `aes.go`.
 
 use super::ANCHOR_DIGEST_LEN;
 

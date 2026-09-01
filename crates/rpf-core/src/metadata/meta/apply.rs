@@ -1,17 +1,4 @@
 //! The XML read back, and applied to the file it was written from.
-//!
-//! A resource `Meta` carries page slack, padding and bytes no walk reaches that
-//! are not zero, none of it in the document and none of it inventable, so this
-//! direction edits the file it came from rather than rebuilding it.
-//!
-//! The walk is [`super::render`]'s read backwards: the same tables, blocks and
-//! addresses, in the same order. No block moves, no pointer is rewritten, no
-//! page is re-allocated; a value that no longer fits, an array of a different
-//! length, or a different member list is a refusal.
-//!
-//! [`Applier::put`] checks both properties that make "the same addresses" a
-//! claim: every write is bounded by the block the value lives in, and two
-//! elements writing one address must agree on what goes there.
 
 use quick_xml::{
     Reader, XmlVersion,
@@ -32,18 +19,9 @@ use crate::{
     },
 };
 
-/// How the lanes of a vector are separated.
 const LANE_SEPARATOR: char = ',';
 
-/// Reads the XML [`super::render`] wrote and applies it to the payload it was
-/// written from.
-///
-/// # Errors
-///
-/// [`Error::BadMeta`] if `payload` contradicts itself, [`Error::UnsupportedMeta`]
-/// if it carries a type code this build does not name, and
-/// [`Error::NotMetaXml`] if `document` is not XML or does not describe this
-/// payload.
+/// Reads the XML `render` wrote and applies it to the payload it came from.
 pub(super) fn write(
     payload: &[u8],
     system_len: usize,
@@ -90,22 +68,17 @@ pub(super) fn write(
     Ok(applier.edited)
 }
 
-/// One element of the document: its name, its one reserved attribute, and its
-/// children. Every element [`super::render`] writes has exactly one.
+/// One element of the document: its name, its one reserved attribute, and its children.
 #[derive(Debug)]
 struct Node {
-    /// Where in the document it opened.
     position: u64,
-    /// Its element name.
     tag: String,
-    /// Its reserved attribute's word, with [`RESERVED_PREFIX`] removed.
+    /// Its reserved attribute's word, with the reserved prefix removed.
     word: String,
-    /// That attribute's value.
     value: String,
     children: Vec<Node>,
 }
 
-/// Reads the document into the tree it describes.
 fn read_tree(document: &[u8]) -> Result<Node> {
     let mut reader = Reader::from_reader(document);
     reader.config_mut().expand_empty_elements = true;
@@ -179,12 +152,10 @@ fn read_tree(document: &[u8]) -> Result<Node> {
     root.ok_or_else(|| at(&reader, NotMetaXml::Empty))
 }
 
-/// Whether a character is XML whitespace, and so may be indentation.
 fn is_space(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
-/// Reads an opening tag into the node it stands for.
 fn opening(start: &BytesStart<'_>, position: u64) -> std::result::Result<Node, NotMetaXml> {
     let tag = start.name().into_inner().to_owned();
     let mut reserved: Option<(String, String)> = None;
@@ -221,22 +192,17 @@ fn opening(start: &BytesStart<'_>, position: u64) -> std::result::Result<Node, N
     })
 }
 
-/// The walk in progress: the payload it reads and the copy it writes.
 #[derive(Debug)]
 struct Applier<'a, 'b> {
-    /// The original payload, parsed: every address, count and pointer comes
-    /// from here, so an edit cannot move the walk.
+    /// The original payload, parsed: every address, count and pointer comes from here.
     values: Values<'a, 'b>,
-    /// The copy the values go into.
     edited: Vec<u8>,
-    /// Which bytes of it an element has already written, one flag per byte: a
-    /// file may point at one value twice.
+    /// Which bytes of it an element has already written, one flag per byte.
     written: Vec<bool>,
     names: &'b Dictionary,
 }
 
 impl<'a> Applier<'a, '_> {
-    /// Applies one structure instance.
     fn structure(
         &mut self,
         name: u32,
@@ -347,7 +313,6 @@ impl<'a> Applier<'a, '_> {
         }
     }
 
-    /// Applies what a pointer landed on.
     fn target(&mut self, landing: Spot<'a>, tag: &str, node: &Node, depth: usize) -> Result<()> {
         match landing.block.tag {
             BlockTag::Structure(name) => self.structure(name, landing, tag, node, depth),
@@ -370,8 +335,7 @@ impl<'a> Applier<'a, '_> {
         }
     }
 
-    /// Applies an array of either layout: `items.count` items from
-    /// `items.base`.
+    /// Applies an array of either layout: `items.count` items from `items.base`.
     fn items(
         &mut self,
         field: Field<'a>,
@@ -403,19 +367,9 @@ impl<'a> Applier<'a, '_> {
     }
 }
 
-/// The writes: each bounded by the block the value lives in, and no two of them
-/// disagreeing over one address.
+/// The writes: each bounded by its block, and no two disagreeing over one address.
 impl<'a> Applier<'a, '_> {
-    /// Writes `bytes` at `spot`.
-    ///
-    /// Bounded by the block's own declared length, not by `edited` — bounding
-    /// against the whole payload is no bound at all — and a second write to an
-    /// address is accepted only when it writes the same bytes.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::DataRange`] for the first, and
-    /// [`NotMetaXml::Aliased`] for the second.
+    /// Writes `bytes` at `spot`, refusing to disagree with a prior write to the same address.
     fn put(&mut self, spot: Spot<'a>, bytes: &[u8], node: &Node) -> Result<()> {
         let address = spot.address();
         let gone = || bad(address, Malformed::DataRange);
@@ -446,8 +400,7 @@ impl<'a> Applier<'a, '_> {
         Ok(())
     }
 
-    /// Writes a counted value into the `room` bytes it has, and answers how
-    /// many it wrote. Nothing past the value is touched.
+    /// Writes a counted value into the `room` bytes it has, answering how many it wrote.
     fn put_value(
         &mut self,
         landing: Spot<'a>,
@@ -470,9 +423,7 @@ impl<'a> Applier<'a, '_> {
         Ok(len)
     }
 
-    /// Writes a NUL-terminated string into the `room` bytes it has, answering
-    /// a new length only when the caller has to record one; `was` is how long
-    /// the string already there is.
+    /// Writes a NUL-terminated string, answering a new length only when one must be recorded.
     fn put_text(
         &mut self,
         landing: Spot<'a>,
@@ -497,8 +448,7 @@ impl<'a> Applier<'a, '_> {
         Ok(Some(len))
     }
 
-    /// Rewrites the count a shortened value leaves behind: `count1` describes
-    /// the bytes, and `count2` is the allocation's capacity and is left alone.
+    /// Rewrites the count a shortened value leaves behind.
     fn put_count(&mut self, spot: Spot<'a>, len: u32, node: &Node) -> Result<()> {
         let stored = u16::try_from(len).map_err(|_| unreadable(node))?;
         self.put(spot.step(COUNT_AT)?, &stored.to_le_bytes(), node)
@@ -565,8 +515,7 @@ impl<'a> Applier<'a, '_> {
     }
 }
 
-/// A member of no structure, standing for the one value a typed data block
-/// holds.
+/// A member of no structure, standing for the one value a typed data block holds.
 fn typed(code: u8) -> Member {
     Member {
         name: 0,
@@ -578,9 +527,7 @@ fn typed(code: u8) -> Member {
     }
 }
 
-/// How many bytes a value may be written into: the `store` its form gives it,
-/// and never less than the `was` bytes already there, so a payload that arrives
-/// overfull is still writable back unchanged.
+/// How many bytes a value may be written into: never less than `was` bytes.
 fn room(store: u32, was: usize) -> u32 {
     store.max(u32::try_from(was).unwrap_or(u32::MAX))
 }
@@ -618,8 +565,7 @@ fn expect(node: &Node, tag: &str, word: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks the value of an element's reserved attribute, where the mapping fixes
-/// it: a structure's own type, and an array's layout.
+/// Checks the value of an element's reserved attribute.
 fn expect_value(node: &Node, wanted: &str) -> Result<()> {
     if node.value != wanted {
         return Err(Error::NotMetaXml {
@@ -633,8 +579,7 @@ fn expect_value(node: &Node, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks that a null pointer is still written down as one, under the type
-/// word the value would have had.
+/// Checks that a null pointer is still written down as one.
 fn expect_null(node: &Node, tag: &str, word: &str) -> Result<()> {
     expect(node, tag, NULL)?;
     expect_value(node, word)
@@ -659,8 +604,6 @@ fn expect_children(node: &Node, wanted: usize) -> Result<&[Node]> {
 mod tests {
     use super::{Error, NotMetaXml, read_tree};
 
-    /// Text between elements that is not whitespace is a document this
-    /// mapping does not write, and is answered rather than dropped.
     #[test]
     fn text_between_elements_that_is_not_whitespace_is_refused() {
         let error = read_tree(b"<a meta:x=\"y\">not-blank</a>").expect_err("stray text is refused");
@@ -676,8 +619,6 @@ mod tests {
         );
     }
 
-    /// Text that is only whitespace is the indentation the render writes, and
-    /// is not content.
     #[test]
     fn text_between_elements_that_is_only_whitespace_is_accepted() {
         read_tree(b"<a meta:x=\"y\">  \n\t\r  </a>").expect("pure whitespace is not content");

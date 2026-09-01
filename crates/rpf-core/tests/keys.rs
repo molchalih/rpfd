@@ -1,10 +1,7 @@
-//! Key extraction: what a source is asked for, and what it answers. The
-//! corpus-free part runs everywhere; `RPF_GAME_EXE` gates what the game
-//! executables carry, and `RPF_GAME_IMAGE` a memory image of a running game,
-//! the only place the NG material has been found in the clear.
-//!
-//! Every part asserts on counts, digests and offsets and never on a key, and
-//! nothing extracted is written where the repository can reach it.
+//! Key extraction. The corpus-free part runs everywhere; `RPF_GAME_EXE` gates
+//! the game executables, and `RPF_GAME_IMAGE` a memory image of a running game,
+//! the only place the NG material has been found in the clear. Every part
+//! asserts on counts, digests and offsets, never on a key.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -34,8 +31,7 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Reports a skip, naming the test and what it would have read;
-/// `RPF_REQUIRE_GAME_EXE` turns the skip into a failure.
+/// Reports a skip; `RPF_REQUIRE_GAME_EXE` turns it into a failure.
 fn skip<T>(test: &str, reason: &str) -> Option<T> {
     assert!(
         env::var_os("RPF_REQUIRE_GAME_EXE").is_none(),
@@ -111,8 +107,6 @@ fn a_source_carrying_nothing_is_refused_by_name_and_by_count() {
 
 #[test]
 fn a_failure_says_which_value_was_missing_and_never_what_it_holds() {
-    // Rendered rather than matched: the rendering is what reaches a bug report,
-    // and it is the path a key would leak down.
     let refused = Keys::extract(&mut Cursor::new(vec![0_u8; 1 << 16]), &mut Unwatched)
         .expect_err("a buffer of zeroes carries no key material");
     let message = refused.to_string();
@@ -135,8 +129,8 @@ fn a_failure_says_which_value_was_missing_and_never_what_it_holds() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn an_executable_carrying_one_value_is_told_which_one_it_is_short_of() {
-    // The half-found case, on the only input that produces it: a real
-    // executable cut off after the first of its two values.
+    // The only input that produces the half-found case: a real executable cut
+    // off after the first of its two values.
     let test = "an_executable_carrying_one_value_is_told_which_one_it_is_short_of";
     let Some(path) = executable(test, "GTA5.exe") else {
         return;
@@ -170,7 +164,6 @@ fn an_executable_carrying_one_value_is_told_which_one_it_is_short_of() {
 
 #[test]
 fn an_unrecognised_executable_is_not_the_callers_fault_to_fix() {
-    // The file is intact and this build is what cannot read it.
     let refused = Keys::extract(&mut Cursor::new(vec![0_u8; 4096]), &mut Unwatched)
         .expect_err("nothing is in an empty buffer");
     assert_eq!(refused.category(), Category::Unsupported);
@@ -205,8 +198,6 @@ impl Watch for Counting {
 
 #[test]
 fn an_extraction_can_be_watched_and_stopped_from_outside_the_crate() {
-    // A watcher can be passed from outside the crate, which is where the
-    // frontends and the NG survey are.
     let mut watching = Counting {
         steps: 0,
         named: None,
@@ -254,8 +245,6 @@ fn stopped_category() -> Category {
 
 #[test]
 fn the_lengths_are_the_ones_the_format_uses() {
-    // The lengths are format facts, defined once; reading them back is what
-    // stops a definition drifting silently.
     assert_eq!(AES_KEY_LEN, 32, "AES-256 takes a 32-byte key");
     assert_eq!(HASH_LUT_LEN, 256, "the NG hash lookup table is 256 bytes");
     assert_eq!(
@@ -328,8 +317,6 @@ fn the_enhanced_executable_carries_the_material() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn an_extracted_key_never_prints_itself() {
-    // A derived `Debug` is one way a key leaves this machine. The check is
-    // against the key's own rendering, so nothing here says a key.
     let test = "an_extracted_key_never_prints_itself";
     let Some(path) = executable(test, "GTA5.exe") else {
         return;
@@ -353,8 +340,7 @@ fn an_extracted_key_never_prints_itself() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn legacy_and_enhanced_share_one_key_at_two_offsets() {
-    // The key is the same value in both builds and only its address moved, so
-    // the Enhanced flag selects a file name, not a key.
+    // Only the address moved, so the Enhanced flag selects a file name, not a key.
     let test = "legacy_and_enhanced_share_one_key_at_two_offsets";
     let (Some(legacy), Some(enhanced)) = (
         measure(test, "GTA5.exe"),
@@ -381,9 +367,8 @@ fn legacy_and_enhanced_share_one_key_at_two_offsets() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn no_executable_here_carries_the_ng_material() {
-    // About executables and only about executables: the file on disk carries
-    // none of the NG values, though a memory image of the running game carries
-    // all 373. Hashing 373 anchors over three executables takes about three
+    // The file on disk carries none of the 373 NG values; only a memory image
+    // does. Hashing 373 anchors over three executables takes about three
     // minutes unoptimised, hence the gate.
     let test = "no_executable_here_carries_the_ng_material";
     for name in ["GTA5.exe", "GTA5_Enhanced.exe", "RDR2.exe"] {
@@ -402,8 +387,7 @@ fn no_executable_here_carries_the_ng_material() {
     }
 }
 
-/// The memory image the NG material is in, or `None` with a reason on stderr;
-/// `RPF_GAME_IMAGE` names the image file itself.
+/// The image named by `RPF_GAME_IMAGE`, or `None` with a reason on stderr.
 fn game_image(test: &str) -> Option<PathBuf> {
     let Some(named) = env::var_os("RPF_GAME_IMAGE") else {
         return skip_image(test, "RPF_GAME_IMAGE is not set");
@@ -429,7 +413,7 @@ fn skip_image<T>(test: &str, reason: &str) -> Option<T> {
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE is not set")]
 fn a_memory_image_of_the_running_game_carries_the_ng_material() {
     // 101 expanded keys and 272 decrypt tables, each identified by the SHA-1 of
-    // its own bytes, so a match is its own proof and nothing here holds a value.
+    // its own bytes, so a match is its own proof.
     let test = "a_memory_image_of_the_running_game_carries_the_ng_material";
     let Some(path) = game_image(test) else {
         return;
@@ -478,9 +462,8 @@ fn a_memory_image_of_the_running_game_carries_the_ng_material() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn the_launcher_executable_carries_a_second_aes_key_no_game_executable_has() {
-    // The value is there, it is not the RAGE key, and no game executable
-    // carries it — so an archive tagged `0x0FFFFFF7` is not the RAGE key under a
-    // second name.
+    // The value is not the RAGE key, so an archive tagged `0x0FFFFFF7` is not
+    // the RAGE key under a second name.
     let test = "the_launcher_executable_carries_a_second_aes_key_no_game_executable_has";
     let Some(path) = executable(test, "Launcher.exe") else {
         return;
@@ -509,14 +492,11 @@ fn the_launcher_executable_carries_a_second_aes_key_no_game_executable_has() {
         material.keys().aes_key_offset(),
     );
 
-    // `Material` derives its `Debug`, so the hand-written one below it is the
-    // only thing between a key and a log line.
     for (what, rendered) in [
         ("LauncherKey", format!("{launcher:?}")),
         ("Material", format!("{material:?}")),
     ] {
-        // The rendering is never in the message: printing it to report a leak
-        // would be the leak.
+        // The rendering never goes in the message: printing it would be the leak.
         assert!(
             !rendered.contains(&format!("{:?}", launcher.key())),
             "{what} renders the launcher key"
@@ -612,9 +592,8 @@ fn the_ng_material_never_prints_itself() {
 #[test]
 #[cfg_attr(no_game_image, ignore = "RPF_GAME_IMAGE is not set")]
 fn ng_material_extracted_from_an_image_reads_back_from_the_cache() {
-    // The entry has to survive the round trip value for value and in order: the
-    // index into the expanded keys is chosen by the name and length of what is
-    // decrypted, so a rotation would be well-formed and decrypt nothing.
+    // Order matters: the index into the expanded keys is chosen by the name and
+    // length of what is decrypted, so a rotation decrypts nothing.
     let test = "ng_material_extracted_from_an_image_reads_back_from_the_cache";
     let Some(path) = game_image(test) else {
         return;
@@ -672,8 +651,8 @@ fn the_platform_cache_is_an_absolute_directory_of_this_tool_s_own() {
         "{} is relative, so the cache would follow the working directory",
         cache.directory().display()
     );
-    // Below the configuration directory rather than being it: otherwise a later
-    // configuration file sits inside what `keys invalidate` empties.
+    // Below the configuration directory rather than being it, or a later
+    // configuration file would sit inside what `keys invalidate` empties.
     assert_eq!(
         cache.directory().file_name().and_then(|name| name.to_str()),
         Some("keys"),
@@ -694,8 +673,6 @@ fn the_platform_cache_is_an_absolute_directory_of_this_tool_s_own() {
 
 #[test]
 fn a_caller_can_enumerate_and_empty_the_cache_without_knowing_how_it_names_files() {
-    // A frontend that worked out for itself which files under the directory are
-    // entries would count anything that happens to be there.
     let directory = tempfile::tempdir().expect("a temporary directory");
     let absent = directory.path().join("never-written");
     let cache = Cache::at(&absent);
@@ -724,8 +701,7 @@ fn a_caller_can_enumerate_and_empty_the_cache_without_knowing_how_it_names_files
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn material_extracted_from_an_executable_reads_back_from_the_cache() {
-    // The cache goes in a temporary directory rather than the platform one, so
-    // running the suite does not populate the machine's own cache.
+    // A temporary directory, so the suite does not populate the machine's cache.
     let test = "material_extracted_from_an_executable_reads_back_from_the_cache";
     let Some(path) = executable(test, "GTA5.exe") else {
         return;

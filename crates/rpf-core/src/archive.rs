@@ -1,7 +1,4 @@
-//! The parsed table of contents of one archive, and reads against it.
-//!
-//! [`Archive`] holds the table of contents and never the source, so a nested
-//! archive is another one parsed at a different base over the same source.
+//! The parsed table of contents of one archive; nested archives parse again at a different base.
 
 use std::{
     collections::HashMap,
@@ -23,11 +20,9 @@ use crate::{
     metadata::Encoding,
 };
 
-/// How deep anything in this container is walked before it is refused: policy
-/// rather than a format limit, bounding the directory tree and nesting alike.
+/// How deep anything in this container may be walked before it is refused.
 pub const MAX_DEPTH: u32 = 32;
 
-/// Seeks and fills `buf`, reporting where it was when it failed.
 fn read_exact_at<R: Read + Seek>(src: &mut R, offset: u64, buf: &mut [u8]) -> Result<()> {
     src.seek(SeekFrom::Start(offset))
         .map_err(|source| Error::Io { offset, source })?;
@@ -35,8 +30,7 @@ fn read_exact_at<R: Read + Seek>(src: &mut R, offset: u64, buf: &mut [u8]) -> Re
         .map_err(|source| Error::Io { offset, source })
 }
 
-/// Reads `len` bytes at `offset` into a fresh buffer; the caller must have
-/// bounds-checked `len` first, since here it becomes an allocation.
+/// Reads `len` bytes at `offset` into a fresh buffer; the caller must bounds-check `len` first.
 fn read_vec_at<R: Read + Seek>(src: &mut R, offset: u64, len: u64) -> Result<Vec<u8>> {
     let len = usize::try_from(len).map_err(|_| Error::OutOfBounds {
         region: "payload",
@@ -49,40 +43,22 @@ fn read_vec_at<R: Read + Seek>(src: &mut R, offset: u64, len: u64) -> Result<Vec
     Ok(buf)
 }
 
-/// Where a resource's deflate stream was found, and what inflating it from
-/// there produced: the whole of what [`Archive::resource_stream`] settles.
 struct Boundary {
-    /// Offset of the stream's first byte, inside the archive.
     at: u64,
-    /// Length of the stream: the payload's extent less the header in front of
-    /// it.
     len: u64,
-    /// The transform the stream is under, which the probe recovered along with
-    /// the boundary.
     cipher: Option<Cipher>,
-    /// What the entry's flag words declare the contents to be, and what the
-    /// probe confirmed the stream inflates to.
     expected: u64,
-    /// What the probe's own inflate found, for a caller checking the entry
-    /// rather than reading it.
     payload: Payload,
 }
 
-/// A resource entry taken apart, as [`Archive::resource_unframed`] answers it:
-/// the three facts a converted write needs, none of them askable alone.
 pub(crate) struct Unframed {
-    /// The opaque bytes in front of the deflate stream, as they sit on disk —
-    /// sixteen or twenty-four of them ([`RESOURCE_HEADER_LENS`]).
+    /// The opaque bytes before the deflate stream: sixteen or twenty-four (`RESOURCE_HEADER_LENS`).
     pub(crate) prefix: Vec<u8>,
-    /// What the stream inflates to: the length the entry's flag words declare.
     pub(crate) contents: Vec<u8>,
-    /// Whether the stream was found under the archive's own transform.
     pub(crate) sealed: bool,
 }
 
-/// What a read of one entry found out about the payload it came out of;
-/// `declared` and `used` are both the payload's, and differ without anything
-/// having failed, since a deflate stream carries its own end.
+/// What one entry's read found about its payload; `declared` and `used` can differ without failing.
 pub(crate) struct Payload {
     entry: u32,
     len: u64,
@@ -91,16 +67,10 @@ pub(crate) struct Payload {
 }
 
 impl Payload {
-    /// How many bytes the entry holds.
     pub(crate) const fn len(&self) -> u64 {
         self.len
     }
 
-    /// Whether the stream reached the end of the payload it was given.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::TrailingBytes`], with both lengths.
     pub(crate) fn checked(&self) -> Result<()> {
         if self.used < self.declared {
             return Err(Error::TrailingBytes {
@@ -113,7 +83,6 @@ impl Payload {
     }
 }
 
-/// A seek target from a base and a signed offset.
 fn shift(base: u64, delta: i64) -> io::Result<u64> {
     let target = if delta < 0 {
         base.checked_sub(delta.unsigned_abs())
@@ -123,21 +92,16 @@ fn shift(base: u64, delta: i64) -> io::Result<u64> {
     target.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek out of range"))
 }
 
-/// A failure of the source, on its way out through a [`Read`].
 fn source_failed(at: u64, source: io::Error) -> io::Error {
     Error::Io { offset: at, source }.into_io()
 }
 
-/// A window on the source: `len` bytes from `at`, addressed from its own start.
-/// Every read is clamped to it, so an overrunning stream cannot read past the
-/// entry it belongs to.
 #[derive(Debug)]
 struct Region<S> {
     src: S,
     at: u64,
     len: u64,
     pos: u64,
-    /// Whether `src` is where the next read wants it.
     positioned: bool,
 }
 
@@ -173,8 +137,7 @@ impl<S: Read + Seek> Read for Region<S> {
             .read(window)
             .map_err(|source| source_failed(at, source))?;
         if read == 0 {
-            // The window is inside the archive's declared extent, so these
-            // bytes exist unless the file is shorter than the archive says.
+            // UnexpectedEof here means the file is shorter than the archive declares.
             return Err(source_failed(at, io::ErrorKind::UnexpectedEof.into()));
         }
         self.pos = self.pos.saturating_add(u64::try_from(read).unwrap_or(0));
@@ -195,27 +158,19 @@ impl<S: Read + Seek> Seek for Region<S> {
     }
 }
 
-/// A region read through a block transform. No chaining, so a block is
-/// decrypted where it is read and only one is held; `len` is kept because the
-/// sub-block tail is left untransformed.
+/// A region decrypted one block at a time through a transform; the sub-block tail stays plain.
 #[derive(Debug)]
 struct Decrypting<R> {
     src: R,
     cipher: Cipher,
-    /// How long the transformed region is, so the tail is known in advance.
     len: u64,
-    /// How much of the region has been pulled out of `src`.
     consumed: u64,
-    /// The block being handed out.
     block: [u8; CIPHER_BLOCK_LEN],
-    /// How much of `block` holds bytes.
     filled: usize,
-    /// How much of `block` has been handed out.
     taken: usize,
 }
 
 impl<R: Read + Seek> Decrypting<R> {
-    /// A region of `len` bytes, decrypted as it is read.
     const fn new(src: R, cipher: Cipher, len: u64) -> Self {
         Self {
             src,
@@ -228,14 +183,11 @@ impl<R: Read + Seek> Decrypting<R> {
         }
     }
 
-    /// Where the next byte handed out comes from, in the region's own terms.
     fn position(&self) -> u64 {
         let held = u64::try_from(self.filled.saturating_sub(self.taken)).unwrap_or(0);
         self.consumed.saturating_sub(held)
     }
 
-    /// Reads the next block, decrypting it unless it is the sub-block tail;
-    /// `filled` is left at zero at the end of the region.
     fn fill(&mut self) -> io::Result<()> {
         self.filled = 0;
         self.taken = 0;
@@ -289,8 +241,6 @@ impl<R: Read + Seek> Read for Decrypting<R> {
 }
 
 impl<R: Read + Seek> Seek for Decrypting<R> {
-    /// Seeks within the transformed region, landing inside the block that holds
-    /// the target.
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let target = match to {
             SeekFrom::Start(at) => at,
@@ -312,17 +262,13 @@ impl<R: Read + Seek> Seek for Decrypting<R> {
     }
 }
 
-/// A payload's bytes, past whatever transform the archive is under.
 #[derive(Debug)]
 enum Plain<S> {
-    /// Stored in the clear.
     Clear(Region<S>),
-    /// Decrypted a block at a time as it is read.
     Keyed(Decrypting<Region<S>>),
 }
 
 impl<S: Read + Seek> Plain<S> {
-    /// A window on the source, through `cipher` when there is one.
     fn new(src: S, at: u64, len: u64, cipher: Option<Cipher>) -> Self {
         let region = Region::new(src, at, len);
         match cipher {
@@ -331,7 +277,6 @@ impl<S: Read + Seek> Plain<S> {
         }
     }
 
-    /// How many bytes of the window have been read.
     fn pos(&self) -> u64 {
         match *self {
             Self::Clear(ref region) => region.pos,
@@ -358,53 +303,28 @@ impl<S: Read + Seek> Seek for Plain<S> {
     }
 }
 
-/// No transform: the **file** form of a resource, and the first candidate the
-/// **contents** form tries.
-///
-/// Passthrough hands the payload back as it sits on disk, transformed or not.
-/// It says nothing about the contents: some resources are under the archive's
-/// own transform, so the clear is where the contents form starts, not ends.
 const RESOURCE_IS_IN_THE_CLEAR: Option<Cipher> = None;
 
-/// Which of the two forms an entry is read in. They differ for a resource and
-/// only for a resource: its file is the `RSC7` header and body as they sit on
-/// disk, its contents what that body inflates to.
 #[derive(Debug, Clone, Copy)]
 enum Form {
-    /// The file it is outside the archive. [`Archive::extracted`].
     File,
-    /// What the file means, with no container framing left on it.
-    /// [`Archive::read`].
     Contents,
 }
 
-/// How an entry's bytes come out of its payload.
 #[derive(Debug)]
 enum Stream<S> {
-    /// As they sit on disk, past the archive's transform.
     Stored(Plain<S>),
-    /// Inflated as they are read, with the transform under the decompressor:
-    /// the archive deflated and then encrypted, so this reverses that order.
     Deflated(flate2::bufread::DeflateDecoder<BufReader<Plain<S>>>),
 }
 
 /// One entry as a stream of the bytes it is made of, in either framing.
-///
-/// A length that does not match the entry's is [`Error::LengthMismatch`] at the
-/// end of the read, and every failure carries the [`Error`] it really was
-/// ([`Error::carried`]).
 #[derive(Debug)]
 pub struct Extracted<S> {
     entry: u32,
-    /// Where the bytes this yields begin in the source.
     at: u64,
-    /// How many bytes the entry says this yields in full.
     len: u64,
-    /// How many it has yielded.
     pos: u64,
-    /// How many have actually come out of the decompressor: behind
-    /// [`Extracted::pos`] by whatever a forward seek passed over. Zero for a
-    /// stored stream, whose source seeks.
+    /// Bytes out of the decompressor, behind `Extracted::pos` by any forward seek.
     inflated: u64,
     /// How many bytes on disk the entry gives the stream.
     declared: u64,
@@ -412,7 +332,6 @@ pub struct Extracted<S> {
 }
 
 impl<S: Read + Seek> Extracted<S> {
-    /// A payload read as it sits on disk, through `cipher` if there is one.
     fn stored(entry: u32, src: S, at: u64, len: u64, cipher: Option<Cipher>) -> Self {
         Self {
             entry,
@@ -425,7 +344,6 @@ impl<S: Read + Seek> Extracted<S> {
         }
     }
 
-    /// A deflated payload, inflated to the `expected` length the entry claims.
     fn deflated(
         entry: u32,
         src: S,
@@ -459,21 +377,16 @@ impl<S: Read + Seek> Extracted<S> {
         self.len == 0
     }
 
-    /// How many bytes on disk the entry gives the stream, and how many the
-    /// stream occupied — meaningful once it has been read to the end.
+    /// Bytes on disk given to the stream, and how many it used; meaningful once read to the end.
     fn extent(&self) -> (u64, u64) {
         let used = match self.stream {
             Stream::Stored(ref plain) => plain.pos(),
-            // What the decompressor took, not what it was handed: that is where
-            // the stream ends.
+            // What the decompressor took, not what it was handed, is where the stream ends.
             Stream::Deflated(ref decoder) => decoder.total_in(),
         };
         (self.declared, used)
     }
 
-    /// How much to reserve for [`Extracted::whole`]: a stored payload's length
-    /// is bounds-checked and sizes an allocation, a deflated payload's is only
-    /// what the entry claims and caps the read instead.
     fn reserve(&self) -> usize {
         match self.stream {
             Stream::Stored(_) => usize::try_from(self.len).unwrap_or_default(),
@@ -481,11 +394,6 @@ impl<S: Read + Seek> Extracted<S> {
         }
     }
 
-    /// The whole of it, in memory.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the stream fails with, as the [`Error`] it really was.
     fn whole(&mut self) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(self.reserve());
         let at = self.at;
@@ -494,18 +402,11 @@ impl<S: Read + Seek> Extracted<S> {
         Ok(out)
     }
 
-    /// All of it, kept nowhere, and how many bytes that was.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the stream fails with, as the [`Error`] it really was.
     fn drained(&mut self) -> Result<u64> {
         let at = self.at;
         io::copy(self, &mut io::sink()).map_err(|source| Error::recovered(at, source))
     }
 
-    /// Puts a deflated stream back at its start, which means inflating it
-    /// again from there.
     fn restart(&mut self) -> io::Result<()> {
         if let Stream::Deflated(ref mut decoder) = self.stream {
             decoder.reset_data();
@@ -516,9 +417,7 @@ impl<S: Read + Seek> Extracted<S> {
         Ok(())
     }
 
-    /// Inflates into `buf`, one byte past what the entry promises at most, so
-    /// an over-long payload is caught rather than truncated. The bound is over
-    /// [`Extracted::inflated`], which a forward seek does not move.
+    /// Inflates into `buf`, capped one byte past the declared length to catch an over-long payload.
     fn inflate(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let (entry, expected) = (self.entry, self.len);
         let limit = expected.checked_add(1).ok_or_else(|| {
@@ -547,8 +446,6 @@ impl<S: Read + Seek> Extracted<S> {
         Ok(read)
     }
 
-    /// Inflates and discards whatever a forward seek passed over, bounded by
-    /// the entry's length; a short stream leaves the position where it stopped.
     fn catch_up(&mut self) -> io::Result<()> {
         let target = self.pos.min(self.len);
         let mut discarded = [0_u8; 8 * 1024];
@@ -566,8 +463,6 @@ impl<S: Read + Seek> Extracted<S> {
     }
 }
 
-/// A failure out of the decompressor, unless it is the source's own coming
-/// back through it.
 fn inflating(entry: u32, source: io::Error) -> io::Error {
     match Error::carried(source) {
         Ok(carried) => carried.into_io(),
@@ -584,15 +479,12 @@ impl<S: Read + Seek> Read for Extracted<S> {
         let read = match self.stream {
             Stream::Stored(ref mut plain) => plain.read(buf)?,
             Stream::Deflated(_) => {
-                // Whatever a forward seek passed over is inflated here, at the
-                // read that needs it.
+                // Whatever a forward seek passed over is inflated here, at the read that needs it.
                 self.catch_up()?;
                 self.inflate(buf)?
             }
         };
 
-        // Both checks are the deflated stream's: a stored payload ends where
-        // its window does.
         if read == 0 {
             if self.pos < expected {
                 return Err(Error::LengthMismatch {
@@ -618,10 +510,7 @@ impl<S: Read + Seek> Read for Extracted<S> {
 }
 
 impl<S: Read + Seek> Seek for Extracted<S> {
-    /// Seeks within the entry, whose length is known without reading it. A
-    /// deflated stream has no position but the one it has inflated to, so
-    /// backwards restarts it and forwards only moves the position — which keeps
-    /// a measuring seek to the end from inflating anything.
+    /// Seeks within the entry; a deflated stream restarts backward, moves forward for free.
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let target = match to {
             SeekFrom::Start(at) => at,
@@ -637,8 +526,6 @@ impl<S: Read + Seek> Seek for Extracted<S> {
         if target < self.pos {
             self.restart()?;
         }
-        // Forward costs nothing: the position moves, the decompressor stays,
-        // and `catch_up` inflates the gap at the read that needs it.
         self.pos = target;
         Ok(target)
     }
@@ -651,13 +538,8 @@ pub struct Archive {
     len: u64,
     version: Version,
     encryption: u32,
-    /// How many archives this one sits inside, counted against [`MAX_DEPTH`].
     depth: u32,
-    /// What opened this archive and what opens the archives nested in it,
-    /// normalised at parse so a cache is consulted once rather than per read.
     unlock: Unlock,
-    /// The transform this archive's own payloads are under, or `None` when it
-    /// is not encrypted; `Some` implies the material for it is in `unlock`.
     scheme: Option<Scheme>,
     entries: Vec<Entry>,
     names: Names,
@@ -666,27 +548,18 @@ pub struct Archive {
 
 impl Archive {
     /// Parses the archive that begins at `base` and runs for `len` bytes.
-    ///
-    /// `len` is the archive's own extent — for a nested archive the size of the
-    /// entry that holds it — and every offset inside is checked against it.
-    ///
     /// # Errors
-    ///
-    /// [`Error::NotAnArchive`], [`Error::UnsupportedVersion`],
-    /// [`Error::NeedsKey`], [`Error::WrongKey`], and the bounds variants for a
-    /// header describing regions that do not fit.
+    /// Fails if the header is unrecognised, the key is wrong or missing, or a region does not fit.
     pub fn parse<R: Read + Seek>(
         src: &mut R,
         base: u64,
         len: u64,
         unlock: &Unlock,
     ) -> Result<Self> {
-        // Parsed by name rather than through a holder: nested inside nothing.
         Self::parse_nested(src, base, len, 0, unlock)
     }
 
-    /// [`Archive::parse`], told how many archives it already sits inside, which
-    /// is the caller's to supply because it is not in the bytes.
+    /// `Archive::parse`, told how deep it already sits, since that is not in the bytes.
     fn parse_nested<R: Read + Seek>(
         src: &mut R,
         base: u64,
@@ -709,8 +582,8 @@ impl Archive {
             encryption,
         } = read_header(src, base)?;
 
-        // Decided before any of the layout below is believed, so an archive
-        // nobody can open says so rather than being called malformed.
+        // Decided before the layout is believed, so an unopenable archive says so rather than
+        // looking malformed.
         let opening = opening_for(version, encryption, unlock)?;
 
         let table_at = version.header_len();
@@ -729,8 +602,7 @@ impl Archive {
             len: table_len,
             archive_len: len,
         })?;
-        // Checked first, so a header claiming more entries than the file can
-        // hold names the entry table rather than the blob.
+        // Checked first, so too many entries names the entry table, not the names blob.
         if names_at > len {
             return Err(Error::OutOfBounds {
                 region: "entry table",
@@ -763,8 +635,7 @@ impl Archive {
             u64::from(names_len),
         )?;
 
-        // Decrypted before a single row is decoded. The key is chosen by this
-        // archive's own name and length, both of which the caller supplied.
+        // Decrypted before a row is decoded; keyed by this archive's own name and length.
         let (unlock, scheme) = match opening {
             None => (unlock.clone(), None),
             Some(opening) => decrypt_table_of_contents(
@@ -779,7 +650,6 @@ impl Archive {
 
         let entries = parse_entries(version, &table, entry_count)?;
 
-        // Located once, here, so that `name` has nothing left to find.
         let names = Names::parse(version, names_blob, &entries)?;
 
         let parents = parse_parents(&entries)?;
@@ -799,10 +669,8 @@ impl Archive {
     }
 
     /// Parses the archive occupying the whole of `src`.
-    ///
     /// # Errors
-    ///
-    /// As [`Archive::parse`], plus [`Error::Io`] if the length cannot be found.
+    /// As `Archive::parse`, plus `Error::Io` if the length cannot be found.
     pub fn open<R: Read + Seek>(src: &mut R, unlock: &Unlock) -> Result<Self> {
         let len = src
             .seek(SeekFrom::End(0))
@@ -834,21 +702,15 @@ impl Archive {
         self.encryption
     }
 
-    /// Which transform this archive's bytes were under, or `None` when it is
-    /// not encrypted. A name, never a key.
+    /// Which transform this archive's bytes were under, or `None` when it is not encrypted.
     #[must_use]
     pub fn scheme(&self) -> Option<&'static str> {
         self.scheme.map(Scheme::named)
     }
 
-    /// Whether this archive can be written back at all: an unencrypted one can,
-    /// and so can one whose transform this build can run forwards over the
-    /// material it was opened with ([`Scheme::seals`]).
-    ///
+    /// Whether this archive can be written back at all.
     /// # Errors
-    ///
-    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] for a
-    /// transform this build cannot run forwards, which no flag overrides.
+    /// Fails for a transform this build cannot run forwards; no flag overrides that.
     pub fn writable(&self) -> Result<()> {
         match self.scheme {
             None => Ok(()),
@@ -860,17 +722,9 @@ impl Archive {
         }
     }
 
-    /// What re-encrypts this archive's own bytes, or `None` when it is not
-    /// encrypted.
-    ///
-    /// A [`Sealer`] rather than a finished seal because an NG key is chosen by
-    /// the region's own name and length. Entry rows are resealed one at a time,
-    /// so a version whose row is not one aligned cipher block is refused.
-    ///
+    /// What re-encrypts this archive's own bytes, or `None` when it is not encrypted.
     /// # Errors
-    ///
-    /// As [`Archive::writable`], and [`Error::WrongKey`] for an encrypted
-    /// archive with no material in hand.
+    /// As `Archive::writable`, and `Error::WrongKey` with no material in hand.
     pub fn seal(&self) -> Result<Option<Sealer>> {
         self.writable()?;
         let Some(scheme) = self.scheme else {
@@ -899,9 +753,6 @@ impl Archive {
             })
     }
 
-    /// The archive's own name, which is half of what its table of contents and
-    /// names blob are keyed by: the name it was opened under, and the one a
-    /// rebuild renames back over rather than the scratch file's.
     pub(crate) fn keyed_name(&self) -> &str {
         self.unlock.name()
     }
@@ -919,10 +770,8 @@ impl Archive {
     }
 
     /// One entry by index.
-    ///
     /// # Errors
-    ///
-    /// [`Error::NoSuchEntry`] if the index is past the end.
+    /// `Error::NoSuchEntry` if the index is past the end.
     pub fn entry(&self, index: u32) -> Result<&Entry> {
         let at = usize::try_from(index)
             .ok()
@@ -934,22 +783,15 @@ impl Archive {
     }
 
     /// One entry's own name, without its parents.
-    ///
     /// # Errors
-    ///
-    /// [`Error::NoSuchEntry`] past the end, [`Error::BadName`] for a name that
-    /// is not UTF-8.
+    /// `Error::NoSuchEntry` past the end, `Error::BadName` for non-UTF-8.
     pub fn name(&self, index: u32) -> Result<&str> {
         self.names.at(index)
     }
 
-    /// The full path of an entry from the archive root, the root itself being
-    /// the empty string. The walk up the parent map needs no guard: every child
-    /// index is greater than its parent's, so each step decreases.
-    ///
+    /// The full path of an entry from the archive root; the root itself is the empty string.
     /// # Errors
-    ///
-    /// [`Error::NoSuchEntry`] if the index, or any ancestor, is past the end.
+    /// `Error::NoSuchEntry` if the index, or any ancestor, is past the end.
     pub fn path(&self, index: u32) -> Result<String> {
         let mut parts = Vec::new();
         let mut at = index;
@@ -970,14 +812,9 @@ impl Archive {
         Ok(parts.join("/"))
     }
 
-    /// Refuses an archive in which two children of one directory fold to one
-    /// name, leaving the second unreachable by any spelling of its path. Such
-    /// an archive is legal in the format, so what is refused is turning it into
-    /// a tree rather than parsing it.
-    ///
+    /// Refuses an archive in which two children of one directory fold to one name.
     /// # Errors
-    ///
-    /// As `Archive::one_name_twice` and [`Archive::path`].
+    /// As `Archive::one_name_twice` and `Archive::path`.
     pub fn check_names(&self) -> Result<()> {
         let mut seen: HashMap<(u32, String), u32> = HashMap::new();
         for index in 0..count_of(&self.entries) {
@@ -989,7 +826,6 @@ impl Archive {
                     index,
                     entry_count: count_of(&self.entries),
                 })?;
-            // The root is nobody's child, so it has no sibling to collide with.
             let Some(parent) = parent else { continue };
             if let Some(first) = seen.insert((parent, folded(self.name(index)?)), index) {
                 return Err(self.one_name_twice(first, index)?);
@@ -998,14 +834,6 @@ impl Archive {
         Ok(())
     }
 
-    /// The refusal for two children of one directory that are one name here,
-    /// returned rather than raised so its two callers spell it one way.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NameCollision`] for two spellings of one name,
-    /// [`Error::BadPath`] for one name carried by two entries, and as
-    /// [`Archive::path`].
     fn one_name_twice(&self, first: u32, second: u32) -> Result<Error> {
         let path = self.path(second)?;
         if self.name(first)? != self.name(second)? {
@@ -1022,18 +850,14 @@ impl Archive {
         Ok(Error::BadPath { path, reason })
     }
 
-    /// How an entry is named in a failure: its path from this archive's root,
-    /// or `entry N` when the tree does not resolve far enough to give it one.
     fn named(&self, index: u32) -> String {
         self.path(index)
             .unwrap_or_else(|_| format!("entry {index}"))
     }
 
     /// The indices of a directory's children.
-    ///
     /// # Errors
-    ///
-    /// [`Error::WrongKind`] if the entry is not a directory.
+    /// `Error::WrongKind` if the entry is not a directory.
     pub fn children(&self, index: u32) -> Result<std::ops::Range<u32>> {
         let entry = self.entry(index)?;
         match entry.kind {
@@ -1059,9 +883,7 @@ impl Archive {
         }
     }
 
-    /// Where an entry's payload begins, and how long its row says it is, with
-    /// nothing checked — read literally, so that placing a saturated entry's
-    /// neighbours cannot ask [`Archive::payload_span`] back.
+    /// Where a payload begins and how long its row declares it, read literally, nothing checked.
     fn declared_span(&self, index: u32) -> Result<(u64, u64)> {
         let entry = self.entry(index)?;
         let (block, on_disk) = match entry.kind {
@@ -1078,8 +900,7 @@ impl Archive {
                 uncompressed_len,
                 ..
             } => {
-                // Compressed size zero means stored, and then the other field
-                // carries the real length.
+                // Compressed size zero means stored; the other field then carries the real length.
                 let len = if compressed_len == 0 {
                     uncompressed_len
                 } else {
@@ -1087,9 +908,8 @@ impl Archive {
                 };
                 (block, u64::from(len))
             }
-            // No stored sentinel: a resource's two trailing words are both
-            // page flags, so one declaring zero has no length to recover and is
-            // refused for being smaller than its own `RSC7` header.
+            // A resource has no such sentinel: both trailing words are flags, so zero is just
+            // too small for its own `RSC7` header.
             EntryKind::Resource {
                 block,
                 compressed_len,
@@ -1108,10 +928,7 @@ impl Archive {
         Ok((relative, on_disk))
     }
 
-    /// Whether this entry's compressed-size field has run out of room to
-    /// describe its own payload: the field is 24 bits and saturates to a
-    /// sentinel, so believing it hands the inflater a truncated stream. Only a
-    /// resource is asked; a binary entry says it with the zero sentinel instead.
+    /// Whether this entry's 24-bit compressed-size field saturated; its extent isn't in the row.
     fn size_field_saturated(&self, index: u32) -> Result<bool> {
         Ok(matches!(
             self.entry(index)?.kind,
@@ -1120,8 +937,6 @@ impl Archive {
         ))
     }
 
-    /// How many bytes a payload beginning at `relative` has before the next one
-    /// begins, over what the rows declare rather than what they mean.
     fn room_from(&self, index: u32, relative: u64) -> u64 {
         let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         let mut end = self.len;
@@ -1139,14 +954,10 @@ impl Archive {
         end.saturating_sub(relative)
     }
 
-    /// Where an entry's payload begins in the source, and how long it is,
-    /// bounds-checked against this archive's own extent. The length is the
-    /// row's, except where the row could not hold it: a resource whose size
-    /// field has saturated takes the room its neighbours leave it.
+    /// A saturated resource's length is the gap to its neighbour: table order, a monotonic cursor.
     fn payload_span(&self, index: u32) -> Result<(u64, u64)> {
         let (relative, declared) = self.declared_span(index)?;
-        // A payload lies after the names blob. Without this floor an entry at
-        // block 0 reads the table of contents back as file contents.
+        // Without this floor, an entry at block 0 reads the table of contents as file contents.
         let floor = self.version.payload_floor(
             u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
             u64::try_from(self.names.blob().len()).unwrap_or(u64::MAX),
@@ -1189,10 +1000,8 @@ impl Archive {
     }
 
     /// The payload extent of every file entry, relative to this archive's base.
-    ///
     /// # Errors
-    ///
-    /// As [`Archive::entry`], and the bounds variants.
+    /// As `Archive::entry`, and the bounds variants.
     pub fn payload_extents(&self) -> Result<Vec<(u32, u64, u64)>> {
         let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         let mut out = Vec::new();
@@ -1206,20 +1015,11 @@ impl Archive {
         Ok(out)
     }
 
-    /// How many bytes an entry's payload may occupy without moving.
-    ///
-    /// Room a caller may write into, so it stops at the first byte any other
-    /// payload claims from this one's start onwards, not at the next to begin
-    /// strictly later: an entry sharing or straddling this start makes the
-    /// answer zero, which [`crate::patch::plan`] rests on.
-    ///
+    /// Bytes an entry's payload may occupy without moving; straddling this start gives zero.
     /// # Errors
-    ///
-    /// As [`Archive::payload_extents`], plus [`Error::NoSuchEntry`] or
-    /// [`Error::WrongKind`] for an index that is not a file here.
+    /// As `Archive::payload_extents`, plus `Error::NoSuchEntry` or `Error::WrongKind`.
     pub fn allocation(&self, index: u32) -> Result<u64> {
-        // Resolved before the extents are searched, so an index that is not an
-        // entry at all says so rather than looking like the wrong kind.
+        // Resolved first, so a bad index says so rather than looking like the wrong kind.
         let (absolute, _) = self.payload_span(index)?;
         let start = absolute.saturating_sub(self.base);
 
@@ -1237,19 +1037,15 @@ impl Archive {
     }
 
     /// Where an entry's payload begins, absolutely, and how long it is now.
-    ///
     /// # Errors
-    ///
-    /// As [`Archive::payload_extents`].
+    /// As `Archive::payload_extents`.
     pub fn payload_at(&self, index: u32) -> Result<(u64, u64)> {
         self.payload_span(index)
     }
 
     /// Where this entry's row begins in the source.
-    ///
     /// # Errors
-    ///
-    /// [`Error::NoSuchEntry`] if the index is past the end.
+    /// `Error::NoSuchEntry` if the index is past the end.
     pub fn row_at(&self, index: u32) -> Result<u64> {
         let _ = self.entry(index)?;
         let offset = self
@@ -1265,35 +1061,14 @@ impl Archive {
         Ok(offset)
     }
 
-    /// Reads an entry's **contents**: what the file means, with no container
-    /// framing left on it.
-    ///
-    /// A binary entry inflates to its declared length; a resource has its
-    /// 16-byte `RSC7` header removed and the remainder inflated. A payload
-    /// whose stream ends early still reads back, and [`crate::Verified`]
-    /// reports the bytes after it as trailing.
-    ///
+    /// Reads an entry's **contents**: what the file means, with no container framing left on it.
     /// # Errors
-    ///
-    /// [`Error::WrongKind`] for a directory, the bounds variants, and
-    /// [`Error::Inflate`] or [`Error::LengthMismatch`] for a payload that does
-    /// not decompress as promised.
+    /// `Error::WrongKind` for a directory, `Error::Inflate` or `Error::LengthMismatch` otherwise.
     pub fn read<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Vec<u8>> {
         self.opened(src, index, Form::Contents)?.whole()
     }
 
-    /// One **resource** taken apart the way a converted write has to put it
-    /// back together: the opaque bytes in front of its stream, what the stream
-    /// inflates to, and whether the payload sits under the archive's transform.
-    ///
-    /// All three come from one probe, so a caller cannot read the contents
-    /// under a key and write them back without one. The prefix is never
-    /// decrypted and crosses verbatim.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::WrongKind`] for an entry that is not a resource, and as
-    /// [`Archive::read`].
+    /// A resource split into the three facts a converted write needs; the prefix crosses verbatim.
     pub(crate) fn resource_unframed<R: Read + Seek>(
         &self,
         src: &mut R,
@@ -1323,19 +1098,7 @@ impl Archive {
         })
     }
 
-    /// The archive's own transform as a payload of the **resource** entry at
-    /// `index` needs it, in both directions: one seam takes a payload apart and
-    /// the other puts what it produced back under the same transform.
-    ///
-    /// `in_hand` is the length of a payload the caller holds, `None` the
-    /// entry's own; it keys the cipher, because the NG key index is a function
-    /// of the payload's length on disk. The sealer is `None` only for a
-    /// transform this build cannot run forwards, which the write refuses.
-    ///
-    /// # Errors
-    ///
-    /// As [`Archive::name`], and whatever [`Archive::seal`] refuses with other
-    /// than the write's own missing inverse.
+    /// The archive's transform for this resource; `in_hand` is its length, needed by the NG key.
     pub(crate) fn resource_transform(
         &self,
         index: u32,
@@ -1353,21 +1116,14 @@ impl Archive {
         Ok((self.resource_cipher(index, len)?, sealer.map(Arc::new)))
     }
 
-    /// The archive's own encryption tag, which a refusal to write one names.
     #[must_use]
     pub(crate) const fn encryption_tag(&self) -> u32 {
         self.encryption
     }
 
-    /// [`Archive::read`] for a caller checking an entry rather than using it:
-    /// only what the read learned about the payload comes back.
-    ///
-    /// # Errors
-    ///
-    /// As [`Archive::read`].
+    /// `Archive::read` for a caller checking, not using, an entry; only what it learned comes back.
     pub(crate) fn read_back<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Payload> {
-        // The probe that recovers a resource's boundary already answers
-        // everything this reports; going through `opened` would inflate twice.
+        // The boundary probe already answers this; going through `opened` would inflate twice.
         if let EntryKind::Resource { .. } = self.entry(index)?.kind {
             return self.resource_stream(src, index).map(|found| found.payload);
         }
@@ -1382,19 +1138,7 @@ impl Archive {
         })
     }
 
-    /// Where a resource's deflate stream begins inside its payload, and what
-    /// inflating it from there found.
-    ///
-    /// The header length is neither declared nor derivable — offsets 8 and 12
-    /// are both flag words, and entries with identical flags begin at 16 and at
-    /// 24 ([`RESOURCE_HEADER_LENS`]) — so a candidate is accepted when the
-    /// stream there inflates to exactly the length the flag words give. The
-    /// transform is recovered the same way, every boundary in the clear first.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ResourceTooSmall`] for a payload no candidate fits inside, and
-    /// otherwise whatever the **first** candidate failed with.
+    /// Where a resource's stream begins: 16 or 24 bytes, whichever inflates to the flags' length.
     fn resource_stream<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Boundary> {
         let (offset, on_disk) = self.payload_span(index)?;
         let EntryKind::Resource {
@@ -1415,8 +1159,7 @@ impl Archive {
             entry: index,
             compressed_len,
         };
-        // A saturated size field bounds nothing, so there is no shortfall to
-        // report against it: the payload's end is then the stream's own.
+        // Saturated bounds nothing to report a shortfall against; the payload ends with the stream.
         let saturated = self.size_field_saturated(index)?;
         let mut first: Option<Error> = None;
 
@@ -1460,11 +1203,6 @@ impl Archive {
         Err(first.unwrap_or(too_small))
     }
 
-    /// The archive's own transform, keyed for this **resource** payload, or
-    /// `None` where this build holds nothing to key it with.
-    ///
-    /// The key is chosen by the payload's length on disk, the opposite of the
-    /// binary-entry rule, as [`Version::resource_key_len`] gives it.
     fn resource_cipher(&self, index: u32, on_disk: u64) -> Result<Option<Cipher>> {
         let Some(scheme) = self.scheme else {
             return Ok(None);
@@ -1476,24 +1214,13 @@ impl Archive {
         Ok(Cipher::new(scheme, material, self.name(index)?, len))
     }
 
-    /// One entry as a stream of the file it is **outside the archive**: the
-    /// streaming form of [`Archive::extract`], which never holds the entry.
-    /// `src` is taken by value, so nothing else may read it until the stream
-    /// is dropped.
-    ///
+    /// `Archive::extract`'s streaming form, never held in memory.
     /// # Errors
-    ///
-    /// [`Error::WrongKind`] for a directory, [`Error::ResourceTooSmall`] for a
-    /// resource that cannot hold its own header, and the bounds variants.
+    /// `Error::WrongKind` for a directory, `Error::ResourceTooSmall` if it can't hold its header.
     pub fn extracted<S: Read + Seek>(&self, src: S, index: u32) -> Result<Extracted<S>> {
         self.opened(src, index, Form::File)
     }
 
-    /// The transform one entry's payload is under, if it is under one.
-    ///
-    /// A binary entry is under the archive's transform exactly when its own
-    /// per-entry encryption field says so. A resource has no such field and is
-    /// not asked here; [`Archive::resource_cipher`] reads instead.
     fn payload_cipher(&self, index: u32, contents_len: u32) -> Result<Cipher> {
         let scheme = self.scheme.ok_or(Error::NeedsKey {
             tag: self.encryption,
@@ -1508,7 +1235,6 @@ impl Archive {
         Cipher::new(scheme, material, name, u64::from(contents_len)).ok_or_else(wrong)
     }
 
-    /// The one place a payload becomes a stream, in either framing (§3).
     fn opened<S: Read + Seek>(&self, src: S, index: u32, form: Form) -> Result<Extracted<S>> {
         let (offset, on_disk) = self.payload_span(index)?;
         let entry = self.entry(index)?;
@@ -1520,8 +1246,6 @@ impl Archive {
                 wanted: "file",
             }),
 
-            // Compression decides a binary entry, and one answer serves both
-            // framings: outside the archive it is what it means.
             EntryKind::Binary {
                 compressed_len,
                 uncompressed_len,
@@ -1563,8 +1287,7 @@ impl Archive {
                         RESOURCE_IS_IN_THE_CLEAR,
                     ))
                 }
-                // The probe already settled the start, length, transform and
-                // expected extent, so nothing here recomputes them.
+                // The probe already settled start, length, transform, and extent.
                 Form::Contents => {
                     let mut src = src;
                     let found = self.resource_stream(&mut src, index)?;
@@ -1581,30 +1304,16 @@ impl Archive {
         }
     }
 
-    /// Reads an entry as the **file it is outside the archive**.
-    ///
-    /// The difference from [`Archive::read`] is resources: this keeps the
-    /// 16-byte `RSC7` header and leaves the body deflated, so an entry we
-    /// cannot interpret round-trips byte for byte.
-    ///
+    /// Reads an entry as the file outside the archive; unlike `read`, a resource stays deflated.
     /// # Errors
-    ///
-    /// As [`Archive::read`].
+    /// As `Archive::read`.
     pub fn extract<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Vec<u8>> {
         self.extracted(src, index)?.whole()
     }
 
-    /// What an entry is, and what its payload announces itself to be.
-    ///
-    /// A resource is read off the entry's resource bit and its payload never
-    /// touched, since a Rockstar resource payload does not begin with `RSC7`.
-    /// Everything else is decided by the first [`Encoding::HEAD_LEN`] bytes of
-    /// the contents, inflated, and a payload that cannot be read at all is
-    /// [`Classification::Binary`].
-    ///
+    /// What an entry is; a resource is read off the entry's resource bit, its payload untouched.
     /// # Errors
-    ///
-    /// As [`Archive::entry`].
+    /// As `Archive::entry`.
     pub fn classify<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Classification> {
         match self.entry(index)?.kind {
             EntryKind::Directory { .. } => Ok(Classification::Directory),
@@ -1619,9 +1328,6 @@ impl Archive {
         }
     }
 
-    /// The first [`Encoding::HEAD_LEN`] bytes of an entry's contents, and how
-    /// many of them there were — without the count a caller reads the zero
-    /// filler as content. Short by any means is short rather than an error.
     fn head<R: Read + Seek>(&self, src: &mut R, index: u32) -> ([u8; Encoding::HEAD_LEN], usize) {
         let mut head = [0_u8; Encoding::HEAD_LEN];
         let Ok(mut contents) = self.extracted(&mut *src, index) else {
@@ -1640,13 +1346,9 @@ impl Archive {
         (head, got)
     }
 
-    /// Whether an entry's payload begins with the `RSC7` magic. Not a
-    /// classifier: in a Rockstar archive this answers `false` on every resource
-    /// there is, and the entry's resource bit is the only truth.
-    ///
+    /// Whether an entry's payload begins with the `RSC7` magic; a real resource payload never does.
     /// # Errors
-    ///
-    /// As [`Archive::read`] for the bounds cases.
+    /// As `Archive::read` for the bounds cases.
     pub fn payload_is_resource<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<bool> {
         let (offset, on_disk) = self.payload_span(index)?;
         if on_disk < 4 {
@@ -1657,14 +1359,9 @@ impl Archive {
         Ok(magic == MAGIC_RSC7)
     }
 
-    /// Finds an entry by path **within this archive**, not descending into any
-    /// archive nested in it. Matching is [`same_name`] and the empty path is
-    /// the root directory.
-    ///
+    /// Finds an entry by path within this archive, not descending into any nested archive.
     /// # Errors
-    ///
-    /// [`Error::NotFound`] naming the component that failed, a mid-path
-    /// component that is not a directory included.
+    /// `Error::NotFound` naming the component that failed.
     pub fn find(&self, path: &str) -> Result<u32> {
         let mut current = 0_u32;
         for segment in path.split('/').filter(|s| !s.is_empty()) {
@@ -1678,16 +1375,6 @@ impl Archive {
         Ok(current)
     }
 
-    /// The child of `parent` with this name, or `None` if `parent` is not a
-    /// directory or has no such child.
-    ///
-    /// Ambiguity is refused rather than resolved: folding case, two children
-    /// can answer to one spelling, and this is the only resolution the
-    /// patch-in-place path goes through.
-    ///
-    /// # Errors
-    ///
-    /// As [`Archive::one_name_twice`] when more than one child answers.
     pub(crate) fn child_named(&self, parent: u32, name: &str) -> Result<Option<u32>> {
         let Ok(children) = self.children(parent) else {
             return Ok(None);
@@ -1705,16 +1392,9 @@ impl Archive {
         Ok(found)
     }
 
-    /// Finds an entry by a path that may address **through** nested archives,
-    /// returning the archive that holds it and the index within it.
-    ///
-    /// The descent is driven by position, not extension: a component resolving
-    /// to a file with components still to come is opened as an archive.
-    ///
+    /// Finds an entry by a path that may cross nested archives; returns the archive and index.
     /// # Errors
-    ///
-    /// [`Error::NotFound`] for a component that does not resolve, and as
-    /// [`Archive::parse`] for a nested archive that does not open.
+    /// `Error::NotFound` for a component that does not resolve, and as `Archive::parse`.
     pub fn locate<R: Read + Seek>(&self, src: &mut R, path: &str) -> Result<(Self, u32)> {
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let mut archive = self.clone();
@@ -1744,14 +1424,9 @@ impl Archive {
         Ok((archive, current))
     }
 
-    /// Parses an archive nested inside this one: the payload is another archive
-    /// whose offsets are relative to its own base. The only way nesting depth
-    /// grows, and bounded by [`MAX_DEPTH`].
-    ///
+    /// Parses an archive nested inside this one's payload; the only way nesting depth grows.
     /// # Errors
-    ///
-    /// As [`Archive::parse`], plus [`Error::WrongKind`] for a directory and
-    /// [`Error::TooDeep`] past [`MAX_DEPTH`] levels of nesting.
+    /// As `Archive::parse`, plus `Error::WrongKind` for a directory and `Error::TooDeep`.
     pub fn open_nested<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Self> {
         let (offset, on_disk) = self.payload_span(index)?;
         let depth = self.depth.checked_add(1).ok_or(Error::TooDeep {
@@ -1759,16 +1434,11 @@ impl Archive {
             depth: u32::MAX,
             limit: MAX_DEPTH,
         })?;
-        // A nested archive's key is chosen by its own name and length, so the
-        // material carries over and the name does not.
+        // A nested archive's key is its own name; material carries over, the name does not.
         let unlock = self.unlock.renamed(self.name(index)?);
         Self::parse_nested(src, offset, on_disk, depth, &unlock)
     }
 
-    /// The transform of an archive nested in this entry's payload, decided from
-    /// the header alone so that an archive nobody here can open is still
-    /// answered. `None` for a payload that is not an archive, or is one of a
-    /// version this build does not read.
     pub(crate) fn nested_transform<R: Read + Seek>(
         &self,
         src: &mut R,
@@ -1784,54 +1454,36 @@ impl Archive {
         })
     }
 
-    /// The archive nested in an entry's payload, or `None` when the payload is
-    /// not one — an unreadable version included, which [`Archive::locate`]
-    /// names instead. Depth is the exception: swallowing it would report a
-    /// truncated listing as a complete one.
-    ///
+    /// The archive nested in an entry's payload, or `Nested::None` when it is not one.
     /// # Errors
-    ///
-    /// [`Error::TooDeep`] past [`MAX_DEPTH`] levels of nesting, and nothing
-    /// else.
+    /// `Error::TooDeep` past `MAX_DEPTH` levels of nesting, and nothing else.
     pub fn nested_at<R: Read + Seek>(&self, src: &mut R, index: u32) -> Result<Nested> {
         match self.open_nested(src, index) {
             Ok(nested) => Ok(Nested::Open(Box::new(nested))),
             Err(error @ Error::TooDeep { .. }) => Err(error),
-            // The archive is there and this build cannot open it; answering
-            // "not an archive" would depend on what a key cache holds.
+            // "Not an archive" here would depend on what a key cache holds.
             Err(error) if error.category() == Category::NeedsKey => Ok(Nested::Locked(error)),
             Err(_) => Ok(Nested::None),
         }
     }
 }
 
-/// What the archive nested in an entry's payload is under, as a caller that
-/// must not move it needs it: three answers, because "nothing here to protect"
-/// and "under something nobody here has identified" are opposite facts and a
-/// rename that confuses them moves an archive out from under its key.
+/// What an archive nested in a payload is under, for a caller that must not move it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NestedTransform {
-    /// The nested archive is not encrypted, so nothing in it is keyed by
-    /// anything.
     Open,
-    /// It is under a transform this build names.
     Known {
         /// Its own encryption tag.
         tag: u32,
-        /// What that tag names.
         scheme: Scheme,
     },
-    /// It carries a tag this build does not define, so what keys it is unknown
-    /// and its name is treated as part of it.
     Unknown {
         /// The tag as it stands, which a refusal names.
         tag: u32,
     },
 }
 
-/// What one entry is, and which of the two sources said so:
-/// [`Classification::Resource`] comes from the entry table and every other
-/// variant from the payload's leading bytes, and no value can mix the two.
+/// What one entry is: `Classification::Resource` comes from the entry table, others from its bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Classification {
     /// A directory. It has no payload to classify.
@@ -1845,8 +1497,7 @@ pub enum Classification {
 }
 
 impl Classification {
-    /// The encoding the payload announced, or `None` for a directory, a
-    /// resource, and a binary entry nothing recognised.
+    /// The encoding announced, or `None` for a directory, resource, or unrecognised binary entry.
     #[must_use]
     pub const fn encoding(self) -> Option<Encoding> {
         match self {
@@ -1856,27 +1507,19 @@ impl Classification {
     }
 }
 
-/// What sniffing an entry's payload for a nested archive found: "no archive
-/// here" and "one this build could not open" are different facts a walk reports
-/// differently. [`Nested::None`] still covers a version this build has no codec
-/// for, since raising that would fail on a file that merely begins `RPF3`.
+/// What sniffing an entry's payload for a nested archive found.
 #[derive(Debug)]
 pub enum Nested {
-    /// The payload is not an archive, or is one of a version this build does
-    /// not read.
+    /// The payload is not an archive, or is a version this build does not read.
     None,
     /// An archive, open. Boxed because it is much the larger arm.
     Open(Box<Archive>),
-    /// An archive whose header this build read and whose table of contents it
-    /// could not decrypt, carrying the reason so a report can name it.
+    /// An archive this build could read the header of but not decrypt, carrying the reason.
     Locked(Error),
 }
 
-/// Reads the header at `base`, or says why those bytes are not one; leaves the
-/// source wherever the read ended, since every read after it seeks for itself.
 fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
-    // A file too short to hold the longest header is not an archive rather
-    // than an i/o failure.
+    // A file too short to hold the longest header is not an archive, not an i/o failure.
     src.seek(SeekFrom::Start(base))
         .map_err(|source| Error::Io {
             offset: base,
@@ -1896,45 +1539,29 @@ fn read_header<R: Read + Seek>(src: &mut R, base: u64) -> Result<Header> {
         filled = filled.saturating_add(read);
     }
 
-    // The tag is read here and acted on in `decrypt_table_of_contents`, the
-    // only place holding the material for it.
     Header::read(bytes.get(0..filled).unwrap_or_default(), base)
 }
 
-/// Whether these bytes begin with a root directory row: the one check that says
-/// a table of contents was decrypted with the right key, since entry 0 is always
-/// the root and its marker is a word no file entry can produce.
+/// Whether these bytes begin with a root directory row: the check that the right key decrypts them.
 fn is_root_directory(version: Version, table: &[u8]) -> bool {
     version
         .decode_row(table)
         .is_some_and(|entry| entry.is_directory())
 }
 
-/// What is going to decrypt an archive's table of contents, decided from the
-/// header alone. An unencrypted archive touches no key material at all.
 struct Opening {
     /// The tag it was decided from, which a failure has to name.
     tag: u32,
-    /// The transform that tag names.
     scheme: Scheme,
     /// Every material that could run that transform, in the order to try them.
     candidates: Vec<Arc<Material>>,
 }
 
-/// Which material is going to be tried, before a byte of layout is believed:
-/// an archive nobody here can open must say so rather than be reported as
-/// malformed because its entry table does not fit.
-///
-/// # Errors
-///
-/// [`Error::NeedsKey`] when the archive is encrypted and no material is
-/// available, a tag no transform is named for included.
 fn opening_for(version: Version, tag: u32, unlock: &Unlock) -> Result<Option<Opening>> {
     if version.is_open(tag) {
         return Ok(None);
     }
-    // A tag this build has no transform for is `NeedsKey` whatever is in the
-    // cache: the material that would open it is not material anyone has.
+    // A tag this build has no transform for is `NeedsKey` whatever is in the cache.
     let Some(scheme) = version.scheme(tag) else {
         return Err(Error::NeedsKey { tag });
     };
@@ -1949,13 +1576,6 @@ fn opening_for(version: Version, tag: u32, unlock: &Unlock) -> Result<Option<Ope
     }))
 }
 
-/// Decrypts an archive's table of contents and names blob in place, answering
-/// the [`Unlock`] the archive keeps and the transform its payloads are under.
-///
-/// # Errors
-///
-/// [`Error::WrongKey`] when none of the material decrypts the table of contents
-/// into one.
 fn decrypt_table_of_contents(
     version: Version,
     len: u64,
@@ -1971,8 +1591,7 @@ fn decrypt_table_of_contents(
     } = opening;
     let tried = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
 
-    // The row a key is judged by, read once. `None` is a header claiming no
-    // entries, and then there is nothing for a key to be right about.
+    // `None` is a header claiming no entries, so there is nothing for a key to be right about.
     let root_row: Option<[u8; CIPHER_BLOCK_LEN]> = table.get(..CIPHER_BLOCK_LEN).map(|first| {
         let mut probe = [0_u8; CIPHER_BLOCK_LEN];
         probe.copy_from_slice(first);
@@ -2002,12 +1621,10 @@ fn decrypt_table_of_contents(
     })
 }
 
-/// How many entries, saturating rather than truncating.
 fn count_of(entries: &[Entry]) -> u32 {
     u32::try_from(entries.len()).unwrap_or(u32::MAX)
 }
 
-/// Splits the entry table into rows, at the stride its version gives them.
 fn parse_entries(version: Version, table: &[u8], entry_count: u32) -> Result<Vec<Entry>> {
     let row_len = version.row_len();
     let stride = usize::try_from(row_len).unwrap_or(usize::MAX);
@@ -2031,14 +1648,7 @@ fn parse_entries(version: Version, table: &[u8], entry_count: u32) -> Result<Vec
     Ok(entries)
 }
 
-/// Builds the child-to-parent map, and with it establishes that the entries are
-/// a forest at all.
-///
-/// Three checks, each a crash downstream if missing: the child range fits the
-/// table; every child comes after the directory claiming it, which makes the
-/// parent map well founded for `Archive::path`'s unguarded walk; and no entry
-/// is claimed twice, or the children relation becomes a lattice while the
-/// single-valued parent map still looks ordinary.
+/// Builds the child-to-parent map, verifying a well-founded forest with no entry claimed twice.
 fn parse_parents(entries: &[Entry]) -> Result<Vec<Option<u32>>> {
     let total = count_of(entries);
     let mut parents = vec![None; entries.len()];
@@ -2088,8 +1698,6 @@ fn parse_parents(entries: &[Entry]) -> Result<Vec<Option<u32>>> {
     Ok(parents)
 }
 
-/// Refuses a tree deeper than [`MAX_DEPTH`], in one forward pass — cheap only
-/// because every entry's parent has a smaller index and is already measured.
 fn check_depth(parents: &[Option<u32>]) -> Result<()> {
     let mut depth: Vec<u32> = Vec::with_capacity(parents.len());
     for parent in parents {
@@ -2116,31 +1724,24 @@ fn check_depth(parents: &[Option<u32>]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! The streaming transform, over a key of zeros.
-    //!
-    //! Nothing here checks a cipher value: only that the streaming and buffered
-    //! forms answer the same bytes at every read size and from every offset.
 
     use std::io::Cursor;
 
     use super::*;
     use crate::format::{crypto::AesKey, rpf7};
 
-    /// Bytes no block arithmetic could accidentally agree with.
     fn bytes(len: usize) -> Vec<u8> {
         (0..len)
             .map(|index| u8::try_from(index.wrapping_mul(7).wrapping_add(3) & 0xFF).unwrap_or(0))
             .collect()
     }
 
-    /// The buffered answer: what `Cipher::apply` makes of the same bytes.
     fn buffered(source: &[u8]) -> Vec<u8> {
         let mut expected = source.to_vec();
         Cipher::over_zeros().apply(&mut expected);
         expected
     }
 
-    /// A stream over `source`, decrypting the whole of it.
     fn streaming(source: &[u8]) -> Decrypting<Region<Cursor<Vec<u8>>>> {
         let len = u64::try_from(source.len()).unwrap_or(0);
         Decrypting::new(
@@ -2171,7 +1772,6 @@ mod tests {
     fn a_short_read_hands_out_the_same_bytes_as_a_long_one() {
         use std::io::Read as _;
 
-        // A caller asking for one byte at a time crosses every block boundary.
         for len in LENGTHS {
             let source = bytes(len);
             let expected = buffered(&source);
@@ -2195,8 +1795,6 @@ mod tests {
     fn a_seek_lands_on_the_byte_it_names_from_any_offset() {
         use std::io::{Read as _, Seek as _, SeekFrom};
 
-        // The block holding the target is read and the remainder handed out
-        // from inside it; an off-by-one there reads an entry from a block away.
         for len in LENGTHS {
             let source = bytes(len);
             let expected = buffered(&source);
@@ -2221,8 +1819,7 @@ mod tests {
     fn a_seek_back_and_forth_stays_on_the_same_bytes() {
         use std::io::{Read as _, Seek as _, SeekFrom};
 
-        // `SeekFrom::Current` is computed from the position a partly-drained
-        // block reports, not from what was pulled out of the source.
+        // `SeekFrom::Current` uses the position a partly-drained block reports, not bytes pulled.
         let source = bytes(200);
         let expected = buffered(&source);
         let mut stream = streaming(&source);
@@ -2251,7 +1848,6 @@ mod tests {
     fn the_tail_a_stream_hands_out_is_the_tail_the_archive_wrote() {
         use std::io::Read as _;
 
-        // A sub-block tail is handed out exactly as it sits.
         let source = bytes(CIPHER_BLOCK_LEN.saturating_add(5));
         let mut whole = Vec::new();
         streaming(&source)
@@ -2269,7 +1865,6 @@ mod tests {
         );
     }
 
-    /// An archive over `entries`, every name resolving to the empty string.
     fn unnamed_archive(
         entries: Vec<Entry>,
         len: u64,
@@ -2292,7 +1887,6 @@ mod tests {
         }
     }
 
-    /// A stored binary entry with a sixteen-byte payload at `block`.
     fn binary_at(block: u32) -> Entry {
         Entry {
             name_offset: 0,
@@ -2305,7 +1899,6 @@ mod tests {
         }
     }
 
-    /// An empty directory, for a slot `room_from` is asked to skip over.
     fn empty_directory() -> Entry {
         Entry {
             name_offset: 0,
@@ -2365,7 +1958,6 @@ mod tests {
     fn a_seek_to_a_filled_block_boundary_does_not_read_past_it() {
         use std::io::{Seek as _, SeekFrom};
 
-        // A seek to the boundary must land without needing the block after it.
         let source = bytes(CIPHER_BLOCK_LEN);
         let full = u64::try_from(CIPHER_BLOCK_LEN.saturating_mul(2)).unwrap_or(0);
         let region = Region::new(Cursor::new(source), 0, full);
@@ -2415,7 +2007,6 @@ mod tests {
         assert!(tail.is_empty());
     }
 
-    /// A source that counts the bytes handed out of it.
     struct Counted<S> {
         inner: S,
         read: std::rc::Rc<std::cell::Cell<u64>>,
@@ -2443,9 +2034,8 @@ mod tests {
     fn a_deflated_entry_answers_its_length_without_inflating_it() {
         use std::io::{Read as _, Seek as _, Write as _};
 
-        // `build::store` measures the payload with `seek(SeekFrom::End(0))` and
-        // rewinds, so a forward seek must inflate nothing: the length is what
-        // the entry declares, not what the bytes say.
+        // `build::store` measures via `seek(SeekFrom::End(0))` then rewinds, so a forward seek
+        // must inflate nothing.
         let plain = bytes(64 * 1024);
         let mut encoder =
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
@@ -2602,7 +2192,6 @@ mod tests {
         assert_eq!(archive.named(1), "hello");
     }
 
-    /// A reader that hands out at most `step` bytes per call.
     struct Throttled<R> {
         inner: R,
         step: usize,

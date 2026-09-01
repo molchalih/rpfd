@@ -1,9 +1,6 @@
-//! Differential test: our reader against the committed oracle fixture, which
-//! the reference implementation produced. Agreeing with it does not prove an
-//! archive is understood; disagreeing proves something is wrong.
-//!
-//! No game data is tracked: archives are located through `RPF_CORPUS`, and with
-//! it unset every test here is `#[ignore]`d rather than passing quietly.
+//! Differential test: our reader against the committed oracle fixture the
+//! reference implementation produced. No game data is tracked: archives are
+//! located through `RPF_CORPUS`, and with it unset every test is `#[ignore]`d.
 #![allow(
     clippy::expect_used,
     clippy::arithmetic_side_effects,
@@ -26,8 +23,7 @@ use sha2::{Digest, Sha256};
 const FIXTURE: &str = "../../fixtures/rmrp_bp16_meringls63amg24.json";
 const RELATIVE_ARCHIVE: &str = "rmrp_bp16_meringls63amg24/dlc.rpf";
 
-/// Whether a name is a nested archive; `name` is already lower-cased by both
-/// callers.
+/// Whether a name is a nested archive; `name` is already lower-cased.
 #[allow(
     clippy::case_sensitive_file_extension_comparisons,
     reason = "name is lower-cased"
@@ -42,8 +38,7 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// Reports a skip, naming the test that is skipping and what it would have
-/// read; `RPF_REQUIRE_CORPUS` turns a skip into a failure.
+/// Reports a skip; `RPF_REQUIRE_CORPUS` turns a skip into a failure.
 fn skip<T>(test: &str, reason: &str) -> Option<T> {
     assert!(
         env::var_os("RPF_REQUIRE_CORPUS").is_none(),
@@ -120,10 +115,8 @@ fn row(archive: &Archive, index: u32) -> BTreeMap<String, Value> {
 }
 
 /// Walks this archive and every archive nested in it, collecting entry tables
-/// and leaf-file checksums.
-///
-/// Paths mirror the oracle's quirk: it walks entries linearly and skips
-/// directory records, so a file's path carries no directory component.
+/// and leaf-file checksums. Paths mirror the oracle's quirk: it skips directory
+/// records, so a file's path carries no directory component.
 fn collect<R: Read + Seek>(
     src: &mut R,
     archive: &Archive,
@@ -251,8 +244,6 @@ fn paths_carry_their_directories() {
         .map(|i| archive.path(i).expect("path builds"))
         .collect();
 
-    // The root is the empty string; everything else is rooted at it. These are
-    // the directory components the oracle's own walk throws away.
     assert_eq!(paths.first().map(String::as_str), Some(""));
     assert!(paths.iter().any(|p| p == "data/vehicles.meta"), "{paths:?}");
     assert!(
@@ -292,8 +283,7 @@ fn the_resource_bit_agrees_with_the_payload_magic() {
     assert!(checked > 0, "no entries were checked");
 }
 
-/// Every file entry, read as contents rather than as an extracted file — the
-/// path `extract` short-circuits for resources, and the only one that runs the
+/// Reads contents rather than extracting: the only path that runs the
 /// header-stripping and the page-flag length check.
 #[test]
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
@@ -359,9 +349,8 @@ fn read_all<R: Read + Seek>(
     }
 }
 
-/// Every resource of the sample, extracted and packed back, keeps the row it
-/// had. All 20 carry their own `RSC7` header, so this says nothing about
-/// whether the manifest field carried the flag words.
+/// All 20 carry their own `RSC7` header, so this says nothing about whether the
+/// manifest field carried the flag words.
 #[test]
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn every_resource_of_the_sample_packs_back_with_the_row_it_had() {
@@ -502,9 +491,8 @@ fn a_single_path_addresses_through_nested_archives() {
 #[test]
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn the_summary_reproduces_the_measured_slack() {
-    // Subtracting the header, the entry table, the names blob and every payload
-    // from `dlc.rpf`'s own length leaves 79,345,460 bytes; counting only the
-    // header and the payloads overstates it by 320.
+    // Header, entry table, names blob and every payload subtracted from
+    // `dlc.rpf`'s own length leave 79,345,460 bytes.
     let Some((path, _)) = corpus_archive("the_summary_reproduces_the_measured_slack") else {
         return;
     };
@@ -522,8 +510,7 @@ fn the_summary_reproduces_the_measured_slack() {
 #[test]
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn every_entry_of_the_sample_reads_back() {
-    // 27 files over the 3 archives. Also where a resource whose deflate stream
-    // did not end exactly at its payload would surface.
+    // 27 files over the 3 archives.
     let Some((path, _)) = corpus_archive("every_entry_of_the_sample_reads_back") else {
         return;
     };
@@ -549,8 +536,7 @@ fn every_entry_of_the_sample_reads_back() {
 #[cfg_attr(no_corpus, ignore = "no RPF_CORPUS: the sample archive is not tracked")]
 fn the_sample_verifies_against_a_manifest_of_itself() {
     // The manifest describes the outer archive — 7 files of the 11 entries —
-    // while `verify` walks 27 across the three. The other 20 are covered
-    // transitively: a nested `.rpf` is one entry, checksummed whole.
+    // while `verify` walks 27 across the three; a nested `.rpf` is one entry.
     let Some((path, _)) = corpus_archive("the_sample_verifies_against_a_manifest_of_itself") else {
         return;
     };
@@ -576,8 +562,7 @@ fn the_sample_verifies_against_a_manifest_of_itself() {
     assert!(named.is_empty(), "entries did not read back: {named:?}");
     assert_eq!((verified.checked, verified.contents_checked), (27, 7));
 
-    // The recorded value is what `sha256sum` prints for the file `extract`
-    // writes, not an internal encoding of it.
+    // The recorded value is what `sha256sum` prints for the extracted file.
     let (spec, index) = rpf_core::specs_of(&archive)
         .expect("specs")
         .into_iter()

@@ -22,6 +22,7 @@ assert.notStrictEqual(STREAM_FIRST_SOURCE, SOURCE, "the NATIVES_FIRST switch mov
 // The DLC model must never reach the streamer: requesting it kills this build.
 const DLC_HASH = 3292967587;
 const STOCK_HASH = 2515846680;
+const DLC_CONTROL_HASH = 222222222;
 
 // A stub of the client API. `natives` maps each model-info call to a value to
 // return, or a function that may throw or end the run.
@@ -59,7 +60,11 @@ function harness(natives, source) {
         },
         gui: { chat: { push: () => {} } },
         game: {
-            joaat: (name) => (name === "volga5" ? 3292967587 : 2515846680),
+            joaat: (name) => {
+                if (name === "vesta") return DLC_HASH;
+                if (name === "avarus") return DLC_CONTROL_HASH;
+                return STOCK_HASH;
+            },
             streaming: {
                 requestModel: nativeCall("requestModel"),
                 hasModelLoaded: nativeCall("hasModelLoaded"),
@@ -147,16 +152,17 @@ const cycle = (sent, model, index) => {
         getVehicleClassFromName: 1,
     });
     h.join();
-    h.run(8000);
+    h.run(20000);
 
     assert.deepStrictEqual(events(h.sent), [
-        "rpf:joined model=volga5 hash=3292967587",
+        "rpf:joined model=vesta hash=3292967587",
         "rpf:probe stage=pre_natives",
         "rpf:probe stage=post_cdimage in_cdimage=true",
         "rpf:acceptance in_cdimage=true class=1",
         ...cycle(h.sent, "adder", 0),
-        ...cycle(h.sent, "volga5", 1),
-    ], "the class line comes first, then the stock control, then the pack's model");
+        ...cycle(h.sent, "avarus", 1),
+        ...cycle(h.sent, "vesta", 2),
+    ], "class, then the nested-only question, then stock / absent / the pack's model");
     assert.ok(polls >= 3, "the streamer was asked once per poll interval");
 
     // The stock model is asked FIRST and the pack's own second: a death on the
@@ -170,8 +176,11 @@ const cycle = (sent, model, index) => {
         DLC_HASH,
         "the pack's own model is asked last",
     );
+    const cdimage = h.calls.filter((c) => c.name === "isModelInCdimage");
+    assert.deepStrictEqual(cdimage.map((c) => c.hash), [DLC_HASH],
+        "in_cdimage is asked about the pack's own model and nothing else");
     for (const call of h.calls) {
-        if (call.name === "isModelInCdimage" || call.name === "getVehicleClassFromName") {
+        if (call.name === "getVehicleClassFromName") {
             assert.strictEqual(call.hash, DLC_HASH, call.name + " must ask about the DLC model");
         }
     }
@@ -186,10 +195,10 @@ const cycle = (sent, model, index) => {
         getVehicleClassFromName: 7,
     });
     h.join();
-    h.run(30000);
+    h.run(45000);
 
     const streamed = only(h.sent, "rpf:streamed");
-    assert.strictEqual(streamed.length, 2, "each model reports once at the ceiling");
+    assert.strictEqual(streamed.length, 3, "each model reports once at the ceiling");
     for (const s2 of streamed) {
         assert.strictEqual(s2.args[1], "model_loaded=false");
         const waited = Number(s2.args[2].split("=")[1]);
@@ -197,13 +206,13 @@ const cycle = (sent, model, index) => {
     }
     assert.deepStrictEqual(
         streamed.map((s2) => s2.args[0]),
-        ["model=adder", "model=volga5"],
-        "the stock model first, the pack's own second",
+        ["model=adder", "model=avarus", "model=vesta"],
+        "stock first, the Rockstar DLC control second, the pack's own last",
     );
     assert.deepStrictEqual(
         events(h.sent).slice(0, 4),
         [
-            "rpf:joined model=volga5 hash=3292967587",
+            "rpf:joined model=vesta hash=3292967587",
             "rpf:probe stage=pre_natives",
             "rpf:probe stage=post_cdimage in_cdimage=true",
             "rpf:acceptance in_cdimage=true class=7",
@@ -276,15 +285,16 @@ const cycle = (sent, model, index) => {
         getVehicleClassFromName: 1,
     });
     h.join();
-    h.runTimers(6000);
+    h.runTimers(20000);
 
     assert.deepStrictEqual(events(h.sent), [
-        "rpf:joined model=volga5 hash=3292967587",
+        "rpf:joined model=vesta hash=3292967587",
         "rpf:probe stage=pre_natives",
         "rpf:probe stage=post_cdimage in_cdimage=true",
         "rpf:acceptance in_cdimage=true class=1",
         ...cycle(h.sent, "adder", 0),
-        ...cycle(h.sent, "volga5", 1),
+        ...cycle(h.sent, "avarus", 1),
+        ...cycle(h.sent, "vesta", 2),
     ], "setTimeout alone drives the whole sequence");
 }
 
@@ -298,12 +308,13 @@ const cycle = (sent, model, index) => {
         getVehicleClassFromName: 1,
     }, STREAM_FIRST_SOURCE);
     h.join();
-    h.run(8000);
+    h.run(20000);
 
     assert.deepStrictEqual(events(h.sent), [
-        "rpf:joined model=volga5 hash=3292967587",
+        "rpf:joined model=vesta hash=3292967587",
         ...cycle(h.sent, "adder", 0),
-        ...cycle(h.sent, "volga5", 1),
+        ...cycle(h.sent, "avarus", 1),
+        ...cycle(h.sent, "vesta", 2),
         "rpf:probe stage=pre_natives",
         "rpf:probe stage=post_cdimage in_cdimage=true",
         "rpf:acceptance in_cdimage=true class=1",
@@ -320,7 +331,7 @@ for (const [name, natives] of [
 ]) {
     const h = harness(Object.assign({ requestModel: undefined }, natives));
     h.join();
-    h.run(20000);
+    h.run(45000);
     assert.ok(
         h.sent.length >= 2,
         `"${name}" reported only ${h.sent.length} line(s); silence after joining is the one outcome that must be impossible`,

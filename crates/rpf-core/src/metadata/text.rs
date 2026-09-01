@@ -1,23 +1,13 @@
-//! The XML text, names and numbers both metadata encodings write: how a byte
-//! string becomes XML text, how a float is spelled so it reads back to the same
-//! bits, and what counts as a name.
-//!
-//! Values are bytes and XML text is characters, so the escape is byte-exact and
-//! escapes everything XML would otherwise normalise. It is canonical, which
-//! makes [`decode`] of [`encode`] the identity on every byte string.
+//! The XML text, names and numbers both encodings write; `decode` of `encode` is the identity.
 
-/// The escape character, and the one character that always escapes itself.
 const ESCAPE: char = '\\';
 
-/// A space at either end of the text, escaped so a text node made only of
-/// whitespace is unambiguously indentation and never a blob.
+/// A space at either end of the text, escaped so it's never mistaken for a blob.
 const SPACE: u8 = b' ';
 
-/// How an escaped space is written.
 const ESCAPED_SPACE: &str = "\\x20";
 
-/// Writes `bytes` as XML text: valid UTF-8, with no character XML has to
-/// normalise and no space at either end.
+/// Writes `bytes` as XML text: valid UTF-8, with no space at either end.
 pub(crate) fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     let mut body = bytes;
@@ -35,7 +25,7 @@ pub(crate) fn encode(bytes: &[u8]) -> String {
     out
 }
 
-/// [`encode`] without the leading and trailing space rule.
+/// `encode` without the leading and trailing space rule.
 fn encode_body(out: &mut String, bytes: &[u8]) {
     let mut rest = bytes;
     while !rest.is_empty() {
@@ -65,7 +55,6 @@ fn encode_body(out: &mut String, bytes: &[u8]) {
     }
 }
 
-/// Appends `text`, escaping the characters that cannot be literal.
 fn push_text(out: &mut String, text: &str) {
     for character in text.chars() {
         if literal(character) {
@@ -87,26 +76,17 @@ fn push_byte(out: &mut String, byte: u8) {
     out.push(nibble(byte & 0x0F));
 }
 
-/// The hex digit for the low four bits of `value`.
 fn nibble(value: u8) -> char {
     char::from_digit(u32::from(value & 0x0F), 16).unwrap_or('0')
 }
 
-/// Whether a character may appear literally in the XML.
-///
-/// Not the escape character, not `0x7F` (legal XML but invisible), and nothing
-/// outside XML 1.0's `Char` production — which excludes tab, newline and
-/// carriage return, all three of which XML rewrites.
 fn literal(character: char) -> bool {
     character != ESCAPE
         && character != '\u{7f}'
         && matches!(character, '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..)
 }
 
-/// Reads back what [`encode`] wrote.
-///
-/// Returns `None` if `text` carries a backslash that does not begin `\\` or
-/// `\xNN` — an escape this never writes, which a hand edit can still produce.
+/// Reads back what `encode` wrote; `None` if an escape is not `\\` or `\xNN`.
 pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len());
     let mut rest = text;
@@ -130,12 +110,10 @@ pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// A float written as its raw bits, for the values whose shortest decimal does
-/// not read back to the same bits.
+/// A float written as its raw bits, for values whose decimal doesn't round-trip.
 const BITS_PREFIX: &str = "0x";
 
-/// A float, as the shortest decimal that reads back to the same bits, falling
-/// back to the bits themselves when no decimal does.
+/// A float, as the shortest decimal that reads back to the same bits.
 pub(crate) fn float(number: f32) -> String {
     let shortest = format!("{number:?}");
     if shortest.parse::<f32>().map(f32::to_bits) == Ok(number.to_bits()) {
@@ -145,7 +123,7 @@ pub(crate) fn float(number: f32) -> String {
     }
 }
 
-/// Reads back the float [`float`] wrote.
+/// Reads back the float `float` wrote.
 pub(crate) fn unfloat(text: &str) -> Option<f32> {
     match text.strip_prefix(BITS_PREFIX) {
         Some(bits) => u32::from_str_radix(bits, 16).ok().map(f32::from_bits),
@@ -153,8 +131,7 @@ pub(crate) fn unfloat(text: &str) -> Option<f32> {
     }
 }
 
-/// Whether `text` is an XML name of the shape this layer writes: a subset of
-/// XML 1.0's `Name`, ASCII only, starting with a letter, `_` or `:`.
+/// Whether `text` is an XML name this layer writes: ASCII, starting with a letter, `_` or `:`.
 pub(crate) fn is_xml_name(text: &str) -> bool {
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
@@ -170,7 +147,6 @@ mod tests {
 
     #[test]
     fn a_shipped_blob_shows_its_own_trailing_nul() {
-        // A trailing NUL is part of the blob, never stripped.
         assert_eq!(encode(b"DES_gasstation01\0"), "DES_gasstation01\\x00");
         assert_eq!(encode(b"DES_gasstation01"), "DES_gasstation01");
     }

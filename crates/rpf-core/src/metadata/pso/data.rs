@@ -1,6 +1,4 @@
 //! Reading a value out of the `PSIN` section, bounds-checked against it.
-//!
-//! One owner for the reads both directions of the conversion make.
 
 use super::{
     bad,
@@ -16,24 +14,19 @@ const POINTER_BLOCK: u32 = 0xFFF;
 /// How far the item offset sits above the block id.
 const POINTER_OFFSET_SHIFT: u32 = 12;
 
-/// The item offset's own width once shifted down: 20 bits, so at most 1 MiB per
-/// block.
+/// The item offset's own width once shifted down: 20 bits.
 const POINTER_OFFSET: u32 = 0x000F_FFFF;
 
 /// The block a pointer names, and where in the data section it lands.
 pub(super) type Landing<'a> = Option<(&'a Block, u32)>;
 
-/// The `PSIN` section and the block table that addresses it.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Data<'a> {
-    /// The `PSIN` section, header included: block offsets are relative to it.
     pub(super) section: &'a [u8],
-    /// The block table every pointer resolves through.
     pub(super) blocks: &'a Blocks,
 }
 
 impl<'a> Data<'a> {
-    /// `len` bytes at `address`, checked against the data section.
     pub(super) fn bytes(&self, address: u32, len: u32) -> Result<&'a [u8]> {
         let gone = || bad(u64::from(address), Malformed::DataRange);
         let at = usize::try_from(address).map_err(|_| gone())?;
@@ -61,12 +54,7 @@ impl<'a> Data<'a> {
             .ok_or_else(|| bad(u64::from(address), Malformed::DataRange))
     }
 
-    /// A pointer, as the block it names and the address it lands at.
-    ///
-    /// A pointer is 32 bits in the first dword — block id in the low 12, item
-    /// offset in the next 20 — and the second word carries nothing. Block id 0
-    /// is null; anything else must resolve, and an offset at or past the
-    /// block's length is refused.
+    /// A pointer, as the block it names and the address it lands at; block id 0 is null.
     pub(super) fn block_pointer(&self, address: u32) -> Result<Landing<'a>> {
         let word = self.word(address)?;
         let id = word & POINTER_BLOCK;
@@ -83,13 +71,11 @@ impl<'a> Data<'a> {
         Ok(Some((block, landed)))
     }
 
-    /// Where a pointer lands, without its block.
     pub(super) fn pointer(&self, address: u32) -> Result<Option<u32>> {
         Ok(self.block_pointer(address)?.map(|(_, landed)| landed))
     }
 }
 
-/// `bytes` up to its first NUL.
 pub(super) fn until_nul(bytes: &[u8]) -> &[u8] {
     bytes
         .iter()
@@ -107,7 +93,6 @@ pub(super) fn step(base: u32, index: u32, stride: u32) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// A block table naming one block, id 1, covering the whole section.
     fn one_block(section_len: u32) -> Blocks {
         let mut table = Vec::from(*b"PMAP");
         table.extend_from_slice(&0u32.to_be_bytes()); // section length, unread here

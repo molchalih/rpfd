@@ -1,32 +1,15 @@
-//! The `RSC7` resource payload, and the arithmetic that reads its flags.
-//!
-//! A resource is not the container: `RSC7` is what a `.yft` or a `.ytd` is, and
-//! an entry of an `RPF7` archive carries a copy of its two flag words.
+//! The `RSC7` resource payload, and the arithmetic that reads its two flag words.
 
-/// Resource payload magic, at the start of the payload of any entry whose
-/// resource bit is set.
+/// Magic at the start of a resource payload, present whenever the entry's resource bit is set.
 pub const MAGIC_RSC7: [u8; 4] = *b"RSC7";
 
-/// Length of the `RSC7` header itself, and the shortest header a resource
-/// payload can carry.
-///
-/// A resource entry's compressed size includes these bytes, so its deflate
-/// stream is that many bytes shorter and starts that far into the payload. The
-/// floor rather than the answer: [`RESOURCE_HEADER_LENS`] is the set that
-/// occurs.
+/// Length of the `RSC7` header, and the shortest header length a resource payload can carry.
 pub const RESOURCE_HEADER_LEN: u64 = 16;
 
-/// The header lengths a resource's deflate stream has been measured to begin
-/// at, shortest first.
-///
-/// Nothing declares which one a payload carries and nothing derives it — two
-/// entries with identical flags and declared length begin at 16 and at 24 — so
-/// `Archive::resource_stream` recovers the boundary by reading.
+/// Header lengths a resource's deflate stream may begin at; the reader probes 16 vs. 24.
 pub const RESOURCE_HEADER_LENS: [u64; 2] = [RESOURCE_HEADER_LEN, 24];
 
-/// Number of pages described by one of a resource's two flag words, which
-/// [`size_from_flags`] scales to a byte count. A resource entry carries no
-/// uncompressed size; offsets 8 and 12 are both flag words.
+/// Page count encoded in one of a resource's two flag words (offsets 8 and 12 are both flags).
 #[must_use]
 #[expect(
     clippy::arithmetic_side_effects,
@@ -46,8 +29,7 @@ pub const fn page_count(flags: u32) -> u32 {
         + (((flags >> 4) & 0x1) << 8)
 }
 
-/// Byte count described by one of a resource's two flag words: the low nibble
-/// selects the base page size and the rest gives the page count.
+/// Byte count from a resource flag word: low nibble is the base page size, rest is page count.
 #[must_use]
 #[expect(
     clippy::arithmetic_side_effects,
@@ -71,9 +53,7 @@ pub const fn resource_len(system_flags: u32, graphics_flags: u32) -> u64 {
     size_from_flags(system_flags) + size_from_flags(graphics_flags)
 }
 
-/// The `RSC7` header's version field, derived from the two flag words: the top
-/// nibble of each, system high and graphics low. A rebuild therefore has
-/// nothing extra to preserve.
+/// `RSC7` version, derived from the top nibble of each flag word (system high, graphics low).
 #[must_use]
 pub const fn resource_version(system_flags: u32, graphics_flags: u32) -> u32 {
     (((system_flags >> 28) & 0xF) << 4) | ((graphics_flags >> 28) & 0xF)
@@ -83,8 +63,6 @@ pub const fn resource_version(system_flags: u32, graphics_flags: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// The two flag words of every measured resource, and the length its
-    /// payload inflated to.
     const MEASURED: &[(u32, u32, u64)] = &[
         (0xA000_0011, 0x2000_0000, 262_144),
         (0xA000_0091, 0x2000_0000, 327_680),
@@ -98,7 +76,6 @@ mod tests {
         (0xA000_0042, 0x2000_0000, 524_288),
         (0xA000_0012, 0x2000_0000, 524_288),
         (0xA104_02C6, 0x2000_0000, 20_185_088),
-        // The one entry whose graphics half carries the payload.
         (0x0002_0000, 0xD102_0008, 3_153_920),
     ];
 
@@ -113,37 +90,24 @@ mod tests {
         }
     }
 
-    /// What each of a flag word's 32 bits is worth in pages.
-    ///
-    /// Every bit, not one per field: a table with one entry per term pins where
-    /// each field begins and leaves its width unpinned. The low nibble is the
-    /// base page size and the high one is the version, so neither is worth any
-    /// pages — listed rather than left out, because a mask that grew would take
-    /// its pages from exactly there.
     const PAGE_BITS: &[(u32, u32)] = &[
-        // 0..=3: the base page size, `0x200 << (f & 0xF)`.
         (0, 0),
         (1, 0),
         (2, 0),
         (3, 0),
-        // 4: `((f >> 4) & 0x01) << 8`.
         (4, 256),
-        // 5..=6: `((f >> 5) & 0x03) << 7`.
         (5, 128),
         (6, 256),
-        // 7..=10: `((f >> 7) & 0x0F) << 6`.
         (7, 64),
         (8, 128),
         (9, 256),
         (10, 512),
-        // 11..=16: `((f >> 11) & 0x3F) << 5`.
         (11, 32),
         (12, 64),
         (13, 128),
         (14, 256),
         (15, 512),
         (16, 1_024),
-        // 17..=23: `((f >> 17) & 0x7F) << 4`.
         (17, 16),
         (18, 32),
         (19, 64),
@@ -151,21 +115,16 @@ mod tests {
         (21, 256),
         (22, 512),
         (23, 1_024),
-        // 24..=27: four single bits, worth 8, 4, 2 and 1.
         (24, 8),
         (25, 4),
         (26, 2),
         (27, 1),
-        // 28..=31: the version nibble, which a page count does not read.
         (28, 0),
         (29, 0),
         (30, 0),
         (31, 0),
     ];
 
-    /// Checked bit by bit rather than against measured resources alone, which
-    /// reach neither bit 26 nor bit 25 and only part of the three multi-bit
-    /// fields: a term that is always zero cannot be told from a wrong one.
     #[test]
     fn every_page_count_bit_is_worth_what_the_format_says() {
         for &(bit, pages) in PAGE_BITS {
@@ -173,9 +132,6 @@ mod tests {
         }
     }
 
-    /// The fields are disjoint: a mask reaching one bit too far would give that
-    /// bit two homes, which only the sum of the parts notices. That sum is also
-    /// the bound `page_count`'s overflow reason states.
     #[test]
     fn the_page_count_fields_are_disjoint() {
         let mut word = 0_u32;
@@ -191,8 +147,6 @@ mod tests {
 
     #[test]
     fn graphics_half_of_a_model_is_empty() {
-        // 0x20000000 sets no page-count bit, so it describes zero bytes rather
-        // than one base-sized page.
         assert_eq!(page_count(0x2000_0000), 0);
         assert_eq!(size_from_flags(0x2000_0000), 0);
     }
@@ -205,8 +159,6 @@ mod tests {
 
     #[test]
     fn version_is_carried_by_the_flag_words() {
-        // Both values fall out of the top nibbles, so the header's version
-        // field is redundant with the flags.
         assert_eq!(resource_version(0xA104_02C6, 0x2000_0000), 162);
         assert_eq!(resource_version(0xA000_0011, 0x2000_0000), 162);
         assert_eq!(resource_version(0x0002_0000, 0xD102_0008), 13);
@@ -222,8 +174,6 @@ mod tests {
 
     #[test]
     fn the_magic_is_not_reversed_the_way_its_container_is() {
-        // `RSC7` reads as itself on disk while `RPF7` reads as `7FPR`;
-        // inverting this one finds no resource at all.
         assert_eq!(MAGIC_RSC7, [b'R', b'S', b'C', b'7']);
     }
 }

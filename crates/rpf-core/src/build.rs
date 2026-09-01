@@ -1,7 +1,4 @@
-//! Writing an archive.
-//!
-//! Layout is computed before any payload is touched, payloads are then streamed
-//! out in one pass, and the header and entry table are filled in afterwards.
+//! Writing an archive: layout first, payloads stream in one pass, then header and table fill in.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -47,10 +44,7 @@ pub enum FileKind {
         /// The per-entry encryption field.
         encryption: u32,
     },
-    /// An `RSC7` resource, written through untouched.
-    ///
-    /// `declared` supplies the row's two flag words when the payload carries no
-    /// `RSC7` header of its own; without either it is [`Error::NotAResource`].
+    /// An `RSC7` resource, written through untouched; `declared` supplies flags when it has none.
     Resource {
         /// The flag words to record when the payload does not carry its own.
         declared: Option<ResourceFlags>,
@@ -68,9 +62,6 @@ pub struct ResourceFlags {
     pub graphics: u32,
 }
 
-/// A flag word as anything outside the archive spells it: `0x` and eight
-/// lower-case hexadecimal digits, refused rather than padded at any other
-/// width because a dropped digit is a resource of another length and version.
 mod flag_word {
     use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
 
@@ -124,14 +115,11 @@ pub struct Report {
     pub len: u64,
 }
 
-/// A directory in the tree being assembled.
 #[derive(Default)]
 struct Dir {
     /// Children by name, in the ascending name order the format stores them in.
     children: BTreeMap<String, Child>,
-    /// Each child's name folded the way readers compare it, mapping to the one
-    /// spelling that took it: two children differing only in case are one name
-    /// at runtime, and the second is unreachable.
+    /// Each folded name maps to the spelling that took it; a second collision is unreachable.
     folded: HashMap<String, String>,
 }
 
@@ -141,7 +129,6 @@ enum Child {
     File(usize),
 }
 
-/// `name` appended to the path of the directory it sits in, root included.
 fn joined(at: &str, name: &str) -> String {
     if at.is_empty() {
         name.to_owned()
@@ -150,9 +137,6 @@ fn joined(at: &str, name: &str) -> String {
     }
 }
 
-/// The child of `dir` that `name` would resolve to, or `None` if the name is
-/// free; `at` is the path of `dir` itself, empty for the root. Fails when a
-/// child is there under a different spelling of the same folded name.
 fn taken(dir: &Dir, at: &str, name: &str) -> Result<Option<Child>> {
     let Some(exact) = dir.folded.get(&folded(name)) else {
         return Ok(None);
@@ -166,7 +150,6 @@ fn taken(dir: &Dir, at: &str, name: &str) -> Result<Option<Child>> {
     Ok(dir.children.get(exact).copied())
 }
 
-/// Records `name` as taken within the directory at `parent`.
 fn claim(arena: &mut [Dir], parent: usize, path: &str, name: &str, child: Child) -> Result<()> {
     let dir = arena.get_mut(parent).ok_or(Error::BadPath {
         path: path.to_owned(),
@@ -177,9 +160,6 @@ fn claim(arena: &mut [Dir], parent: usize, path: &str, name: &str, child: Child)
     Ok(())
 }
 
-/// Resolves one path component to the directory it names, creating it if the
-/// name is free; `path` is the whole path being added and `at` is the path of
-/// `parent`, and a refusal names whichever of the two it is about.
 fn descend(
     arena: &mut Vec<Dir>,
     parent: usize,
@@ -207,7 +187,6 @@ fn descend(
     }
 }
 
-/// An entry with its position decided but its payload not yet written.
 enum Planned {
     Dir {
         name: String,
@@ -228,7 +207,6 @@ impl Planned {
     }
 }
 
-/// Rounds `value` up to the next multiple of the version's block unit.
 fn align_up(version: Version, value: u64) -> Option<u64> {
     let block = version.block_len();
     let over = value.checked_rem(block)?;
@@ -238,8 +216,7 @@ fn align_up(version: Version, value: u64) -> Option<u64> {
     value.checked_add(block.checked_sub(over)?)
 }
 
-/// Refuses a path that would put an entry deeper than [`MAX_DEPTH`], which is
-/// what `Archive::parse` will walk; `segments` is the entry's depth.
+/// Refuses a path deeper than `MAX_DEPTH`, which is what `Archive::parse` will walk.
 fn check_path_depth(segments: usize) -> Result<()> {
     let depth = u32::try_from(segments).unwrap_or(u32::MAX);
     if depth > MAX_DEPTH {
@@ -252,12 +229,9 @@ fn check_path_depth(segments: usize) -> Result<()> {
     Ok(())
 }
 
-/// Builds the directory tree, returning the arena and the root's id.
 fn plan_tree(files: &[FileSpec], directories: &[String]) -> Result<Vec<Dir>> {
     let mut arena: Vec<Dir> = vec![Dir::default()];
 
-    // Directories named outright, so that one holding no files still survives a
-    // round trip; files create their own parents below.
     for directory in directories {
         name::check_tree(directory)?;
         let segments: Vec<&str> = directory.split('/').collect();
@@ -303,8 +277,7 @@ fn plan_tree(files: &[FileSpec], directories: &[String]) -> Result<Vec<Dir>> {
     Ok(arena)
 }
 
-/// Assigns entry indices breadth-first: each directory's children occupy one
-/// contiguous run, and the runs appear in the order the directories do.
+/// Assigns entry indices breadth-first, each directory's children in one contiguous run.
 fn plan_entries(arena: &[Dir]) -> Result<Vec<Planned>> {
     let mut planned = vec![Planned::Dir {
         name: String::new(),
@@ -359,15 +332,12 @@ fn plan_entries(arena: &[Dir]) -> Result<Vec<Planned>> {
     Ok(planned)
 }
 
-/// Bytes one payload can be read from, in full, from its start — seekable
-/// because `store` rereads one whose deflated form did not pay for itself.
+/// Bytes one payload reads from, in full, from its start; seekable because `store` may reread it.
 pub trait Payload: Read + Seek {}
 
 impl<T: Read + Seek> Payload for T {}
 
-/// Where [`build`] takes each payload from, at the moment it writes it: asked
-/// once per file, in entry-table order, and the answer may borrow what it is
-/// read out of, which is why this is a trait rather than a closure.
+/// Where `build` takes each payload from; a trait not a closure since the answer may borrow it.
 pub trait Fetch {
     /// One payload, borrowing this source for as long as it is read.
     type Payload<'a>: Payload
@@ -375,9 +345,7 @@ pub trait Fetch {
         Self: 'a;
 
     /// The payload for `path`.
-    ///
     /// # Errors
-    ///
     /// Whatever the source cannot answer for that path.
     fn payload(&mut self, path: &str) -> Result<Self::Payload<'_>>;
 }
@@ -397,29 +365,18 @@ where
     }
 }
 
-/// One payload as it went into the archive, and the fields describing it;
-/// `compressed_len` is left wide so that [`file_row`] refuses a value that will
-/// not fit rather than quietly cutting it down here.
+/// One written payload, plus fields; `compressed_len` is wide so overflow errors, never truncates.
 pub(crate) struct Written {
-    /// What the row's compressed-size field describes: the deflated length, or
-    /// zero for a payload stored as it came.
+    /// What the compressed-size field describes: deflated length, or zero for a stored payload.
     pub(crate) compressed_len: u64,
-    /// The fields the payload's own form decides.
     pub(crate) content: Content,
-    /// The payload's length — what the entry addresses, and what the next
-    /// payload's position is measured from.
+    /// The payload's length: what the entry addresses, and the next payload is measured from.
     pub(crate) len: u64,
-    /// How far past the payload's start anything was written, which exceeds
-    /// `len` where an abandoned deflate stream was overwritten and zeroed.
+    /// How far past the payload's start was written; past `len` is a zeroed abandoned stream.
     pub(crate) reached: u64,
 }
 
-/// Whether a payload written as `kind` goes under the archive's own transform.
-///
-/// The mirror of what the reader takes it out from. A binary entry follows its
-/// own per-entry encryption field; a resource answers `false` because it
-/// crosses this writer as the payload it sits on disk as, so sealing it here
-/// would double-encrypt an already-sealed one.
+/// Whether `kind` goes under the transform; a resource answers `false` regardless of the tag.
 pub(crate) const fn is_sealed(version: Version, kind: FileKind) -> bool {
     match kind {
         FileKind::Binary { encryption, .. } => !version.entry_is_open(encryption),
@@ -427,34 +384,24 @@ pub(crate) const fn is_sealed(version: Version, kind: FileKind) -> bool {
     }
 }
 
-/// Where a payload's bytes go, and the transform they go under: a block at a
-/// time from the payload's own start, with a tail shorter than a block carried
-/// through as it stands, which is sound because no transform chains blocks.
+/// Where a payload's bytes go: a block at a time from its own start, with a short tail as-is.
 enum Sink<'a, W> {
-    /// Straight through.
     Clear(&'a mut W),
-    /// Through the archive's seal.
     Sealed(Sealing<'a, W>),
 }
 
-/// The sealing half of a [`Sink`].
 struct Sealing<'a, W> {
     out: &'a mut W,
     seal: &'a Seal,
-    /// Where this payload begins in `out`, which is where its blocks are
-    /// counted from.
+    /// Where this payload begins in `out`, which is where its blocks are counted from.
     start: u64,
-    /// The block being filled.
     block: [u8; CIPHER_BLOCK_LEN],
-    /// How much of it is filled.
     filled: usize,
-    /// Whether the payload has ended, after which bytes are slack and go
-    /// through as they are.
+    /// Whether the payload has ended, after which bytes are slack and go through as they are.
     past: bool,
 }
 
 impl<'a, W: Write + Seek> Sink<'a, W> {
-    /// A sink at `start`, sealed when `seal` is `Some`.
     fn new(out: &'a mut W, seal: Option<&'a Seal>, start: u64) -> Self {
         match seal {
             None => Self::Clear(out),
@@ -469,12 +416,7 @@ impl<'a, W: Write + Seek> Sink<'a, W> {
         }
     }
 
-    /// Ends the payload, idempotently: a tail shorter than a block goes out as
-    /// it stands, and anything written afterwards is slack rather than payload.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Io`] from the sink.
+    /// Ends the payload, idempotently: a short tail goes out as-is, anything after is slack.
     fn ends(&mut self) -> Result<()> {
         let Self::Sealed(ref mut sealing) = *self else {
             return Ok(());
@@ -531,8 +473,7 @@ impl<W: Write + Seek> Write for Sink<'_, W> {
 }
 
 impl<W: Write + Seek> Seek for Sink<'_, W> {
-    /// Seeks the sink under it, abandoning any partly-filled block; a
-    /// destination that is not a block boundary of this payload is refused.
+    /// Seeks the sink under it; a destination off this payload's block boundary is refused.
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         let sealing = match *self {
             Self::Clear(ref mut out) => return out.seek(to),
@@ -552,18 +493,12 @@ impl<W: Write + Seek> Seek for Sink<'_, W> {
     }
 }
 
-/// The name an entry carries in the names blob: the last `/`-separated segment
-/// of its path, backslashes being name bytes rather than separators.
+/// The name an entry carries: the last `/`-separated path segment; backslashes are name bytes.
 pub(crate) fn entry_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The storage rule an existing entry carries, as the [`FileKind`] that spells
-/// it for a write.
-///
-/// # Errors
-///
-/// [`Error::WrongKind`] for a directory, which has no payload to store.
+/// The storage rule an entry carries, as the `FileKind` for a write; errors for a directory.
 pub(crate) fn kind_of(path: &str, entry: &Entry) -> Result<FileKind> {
     match entry.kind {
         EntryKind::Directory { .. } => Err(Error::WrongKind {
@@ -598,7 +533,6 @@ pub(crate) fn kind_of(path: &str, entry: &Entry) -> Result<FileKind> {
     }
 }
 
-/// Copies the rest of `src` into `out`, reporting how many bytes moved.
 fn copy_all<S, W>(src: &mut S, out: &mut W, at: u64) -> Result<u64>
 where
     S: Read,
@@ -607,7 +541,6 @@ where
     std::io::copy(src, out).map_err(|source| Error::Io { offset: at, source })
 }
 
-/// The uncompressed length as the entry's field has to hold it.
 fn uncompressed_len(path: &str, len: u64) -> Result<u32> {
     u32::try_from(len).map_err(|_| Error::FieldOverflow {
         path: path.to_owned(),
@@ -617,18 +550,7 @@ fn uncompressed_len(path: &str, len: u64) -> Result<u32> {
     })
 }
 
-/// Applies a storage rule to one file, streaming it from `src` into `out` at
-/// wherever `out` is now.
-///
-/// The one implementation of the rule, holding nothing larger than a copy
-/// buffer and reading `src` from its start. The seal is keyed from this
-/// payload's own name and its contents' length, because an NG key index is
-/// `(hash(name) + length + 61) % 101`.
-///
-/// # Errors
-///
-/// [`Error::NotAResource`], [`Error::FieldOverflow`] for contents too long for
-/// the entry's fields, and [`Error::Io`] from either side.
+/// Applies a storage rule to a file streamed `src` to `out`; the seal keys on name and length.
 pub(crate) fn store<S, W>(
     version: Version,
     path: &str,
@@ -667,8 +589,6 @@ where
         } => {
             let len = copy_all(src, &mut sink, start)?;
             Ok(Written {
-                // Stored: the compressed-size field carries the sentinel zero
-                // and the real length goes with the contents.
                 compressed_len: 0,
                 content: Content::Binary {
                     uncompressed_len: uncompressed_len(path, len)?,
@@ -683,16 +603,10 @@ where
             encryption,
         } => store_deflated(version, path, encryption, src, &mut sink, start),
     }?;
-    // The payload ends here whatever form it took, so its tail shorter than a
-    // block goes out as it stands.
     sink.ends()?;
     Ok(written)
 }
 
-/// [`store`] for a resource: written through untouched, with the flag words its
-/// row will declare taken from the payload's own `RSC7` header when it has one
-/// and from `declared` when it has not — a Rockstar resource payload never
-/// begins with `RSC7`, so `declared` is often the only source there is.
 fn store_resource<S, W>(
     path: &str,
     declared: Option<ResourceFlags>,
@@ -704,8 +618,6 @@ where
     S: Payload,
     W: Write + Seek,
 {
-    // Read before anything goes out, so a payload too short to be a resource is
-    // refused with nothing written for it.
     let mut head = Vec::new();
     (&mut *src)
         .take(RESOURCE_HEADER_LEN)
@@ -755,8 +667,6 @@ where
     })
 }
 
-/// [`store`] for a payload offered to the compressor, including the case where
-/// the compressor does not earn its place.
 fn store_deflated<S, W>(
     version: Version,
     path: &str,
@@ -786,8 +696,6 @@ where
         encryption,
     };
 
-    // Deflating has to pay for itself and fit the field, whose width is the
-    // version's, so the seam is asked rather than a limit written here.
     if deflated < plain && version.holds_compressed_len(deflated) {
         return Ok(Written {
             compressed_len: deflated,
@@ -797,8 +705,6 @@ where
         });
     }
 
-    // It did not pay. The plain bytes go over the speculative stream and what
-    // is left of it past them is zeroed.
     out.seek(SeekFrom::Start(start))
         .map_err(|source| Error::Io {
             offset: start,
@@ -811,9 +717,8 @@ where
     let len = copy_all(src, out, start)?;
     let reached = deflated.max(len);
     let overhang = reached.saturating_sub(len);
-    // The zeroing past `len` is slack rather than payload, so the seal ends
-    // here; sealing the padding too would leave the payload's last bytes in a
-    // block a reader that stops at `len` never decrypts.
+    // The zeroing past `len` is slack, not payload; sealing it too would leave the payload's
+    // last bytes in a block a reader that stops at `len` never decrypts.
     out.ends()?;
     if overhang > 0 {
         copy_all(&mut std::io::repeat(0).take(overhang), out, start)?;
@@ -826,31 +731,14 @@ where
     })
 }
 
-/// The tree as it will be written: the files as specified, the entries they
-/// became, and the name offset of each.
 struct Layout<'a> {
     version: Version,
     files: &'a [FileSpec],
     planned: &'a [Planned],
     name_offsets: &'a [u32],
-    /// The archive's own forward transform, where it has one. One seal per
-    /// payload is minted from it, keyed by that entry's own name and length.
     sealed: Option<Sealed<'a>>,
 }
 
-/// Writes every payload at its aligned position, returning the entry rows and
-/// the offset one past the last byte actually written — zero when nothing was.
-///
-/// `cursor` enters at the first payload's offset and leaves at the archive's
-/// end; the second value is the high-water mark of the writes themselves, which
-/// only a write with bytes in it moves.
-///
-/// Payloads go out in entry-table order at a cursor that only advances, and a
-/// resource longer than the 24-bit compressed-size field depends on it: it
-/// states its extent nowhere, and the reader recovers it as the room from this
-/// payload's start to the next payload's.
-///
-/// `watch` is stepped once per file written, and can stop the write.
 fn write_payloads<W, F>(
     out: &mut W,
     layout: &Layout<'_>,
@@ -874,6 +762,9 @@ where
     let mut done = 0_u32;
     let mut end = 0_u64;
 
+    // Payloads go out in table order at a cursor that only advances; a resource whose size
+    // saturates the 24-bit field states its extent nowhere, so the reader recovers it as the
+    // gap to the next payload, which holds only because of this ordering.
     for (index, entry) in planned.iter().enumerate() {
         let name_offset = name_offsets.get(index).copied().unwrap_or_default();
 
@@ -899,13 +790,9 @@ where
         let mut payload = fetch.payload(&spec.path)?;
         let written = store(version, &spec.path, spec.kind, sealed, &mut payload, out)?;
 
-        // Built after the payload, because a streamed payload's length is not
-        // known until it has been streamed.
         let block = at.checked_div(version.block_len()).unwrap_or(u64::MAX);
         let row = file_row(version, &spec.path, name_offset, block, &written)?;
 
-        // Only a write that put bytes somewhere moves the high-water mark: an
-        // empty payload leaves the sink exactly as long as it was.
         if written.reached > 0 {
             end = at.saturating_add(written.reached);
         }
@@ -933,17 +820,9 @@ where
     Ok((rows, end))
 }
 
-/// Writes an archive containing `files`, taking each one's contents from
-/// `fetch` at the moment it is written.
-///
-/// `fetch` is asked once per file, in entry-table order, for a reader over that
-/// path's payload, and the bytes go straight through to `out`.
-///
+/// Writes an archive containing `files`, taking contents from `fetch` as each is written.
 /// # Errors
-///
-/// [`Error::BadPath`] for a path that cannot become entries,
-/// [`Error::NotAResource`], [`Error::FieldOverflow`] when a value will not fit
-/// the format's field, and [`Error::Io`] from the sink or from `fetch`.
+/// `BadPath` for an unwritable path, `NotAResource`/`FieldOverflow`, `Io` from sink or fetch.
 pub fn build<W, F>(
     out: &mut W,
     version: Version,
@@ -959,25 +838,16 @@ where
     build_under(out, Under::open(version), files, directories, fetch, watch)
 }
 
-/// What an archive is written as: its version, its encryption tag, and the
-/// transform that tag names where it names one — one value, so that a tag can
-/// never be passed without the transform it claims.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Under<'a> {
-    /// The version the archive is written at.
     version: Version,
-    /// The tag the header carries.
     tag: u32,
-    /// The forward transform, or `None` for an archive written in the clear.
     sealer: Option<&'a Sealer>,
-    /// The name the archive will be read back under, half of what its table of
-    /// contents and its names blob are keyed by: empty for one written in the
-    /// clear, and for a rebuild the original's name, not the scratch file's.
+    /// Empty when unsealed; for a rebuild, the original's name, not the scratch file's.
     name: &'a str,
 }
 
 impl<'a> Under<'a> {
-    /// Written in the clear, at this version's "not encrypted" tag.
     pub(crate) const fn open(version: Version) -> Self {
         Self {
             version,
@@ -987,8 +857,6 @@ impl<'a> Under<'a> {
         }
     }
 
-    /// Written under `tag`'s transform, into a file that will be read back
-    /// under `name`.
     pub(crate) const fn sealed(
         version: Version,
         tag: u32,
@@ -1004,29 +872,18 @@ impl<'a> Under<'a> {
     }
 }
 
-/// A forward transform and the tag a refusal to run it names; [`Sealed::of`] is
-/// the only way to obtain a [`Seal`] inside a write.
+/// A forward transform and the tag a refusal names; `Sealed::of` is the only way to get a `Seal`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Sealed<'a> {
-    /// The archive's forward transform.
     sealer: &'a Sealer,
-    /// The tag the header carries, which a refusal names.
     tag: u32,
 }
 
 impl<'a> Sealed<'a> {
-    /// The transform for an archive carrying `tag`.
     pub(crate) const fn new(sealer: &'a Sealer, tag: u32) -> Self {
         Self { sealer, tag }
     }
 
-    /// The seal for one region, keyed by the name and length of what is written
-    /// into it.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::CannotWriteEncrypted`] with [`NoWrite::NoInverse`] where the
-    /// material holds no key at the index that name and length chose.
     pub(crate) fn of(self, name: &str, len: u64) -> Result<Seal> {
         self.sealer
             .seal(name, len)
@@ -1037,14 +894,7 @@ impl<'a> Sealed<'a> {
     }
 }
 
-/// [`build`], with what the archive's own bytes go under: each region the tag
-/// covers is sealed from its own start, the header stays in the clear, and the
-/// table is sealed row by row, which is sound only where a row is one aligned
-/// cipher block of it.
-///
-/// # Errors
-///
-/// As [`build`].
+/// `build`, sealed under `under`: each region seals from its own start, the header stays clear.
 pub(crate) fn build_under<W, F>(
     out: &mut W,
     under: Under<'_>,
@@ -1078,7 +928,6 @@ where
     let names_len = u32::try_from(names_blob.len()).unwrap_or(u32::MAX);
 
     let table_len = u64::from(entry_count).saturating_mul(version.row_len());
-    // The same sum `Archive` checks every payload offset against.
     let floor = version.payload_floor(u64::from(entry_count), u64::from(names_len));
     let mut cursor = align_up(version, floor).ok_or(Error::FieldOverflow {
         path: String::new(),
@@ -1096,16 +945,13 @@ where
     };
     let (rows, payload_end) = write_payloads(out, &layout, &mut cursor, &mut fetch, watch)?;
 
-    // Keyed by the archive's own name and its finished length, which is why it
-    // is minted after the payloads: the length it had before picks a different
-    // one of the 101 NG keys.
+    // Keyed by the archive's own name and finished length, so it is minted after the payloads.
     let regions = match sealed {
         None => None,
         Some(sealed) => Some(sealed.of(name, cursor)?),
     };
     let regions = regions.as_ref();
 
-    // The header, the table and the names, now that every offset is known.
     out.seek(SeekFrom::Start(0))
         .map_err(|source| Error::Io { offset: 0, source })?;
     let header = Header {
@@ -1129,8 +975,6 @@ where
             source,
         })?;
     }
-    // The names blob is a region of its own, sealed from its start and not from
-    // the table's.
     let mut names_blob = names_blob;
     if let Some(seal) = regions {
         seal.apply(&mut names_blob);
@@ -1140,9 +984,6 @@ where
         source,
     })?;
 
-    // Pad to the last block so the archive's length matches what the entries
-    // describe, forwards from the last byte any payload wrote — or from the
-    // names blob when none did — and never backwards from `cursor`.
     let written_to = payload_end.max(floor);
     // Under one block by construction, so the conversion cannot lose anything.
     let pad = usize::try_from(cursor.saturating_sub(written_to)).unwrap_or_default();
@@ -1170,13 +1011,6 @@ where
     })
 }
 
-/// One file's row, from a path, a name offset, a block and a written payload.
-///
-/// # Errors
-///
-/// [`Error::FieldOverflow`] for a value the row cannot represent, and
-/// [`Error::ArchiveTooLarge`] for a payload laid out past what the version
-/// addresses.
 pub(crate) fn file_row(
     version: Version,
     path: &str,
@@ -1195,15 +1029,9 @@ pub(crate) fn file_row(
     )
 }
 
-/// The specification that would rebuild an archive as it stands, paired with
-/// the entry index each file came from; the storage choice is read off the
-/// original, but deflate is not deterministic, so a rebuild preserves contents
-/// rather than bytes.
-///
+/// The spec to rebuild an archive as it stands, paired with each file's entry index.
 /// # Errors
-///
-/// As [`Archive::path`], [`Error::BadPath`] for a name [`name::check_tree`]
-/// refuses, and [`Error::NameCollision`] as [`Archive::check_names`].
+/// `BadPath` for a name `check_tree` refuses, `NameCollision` for a case-folding clash.
 pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
     archive.check_names()?;
     let count = u32::try_from(archive.entries().len()).unwrap_or(u32::MAX);
@@ -1221,13 +1049,9 @@ pub fn specs_of(archive: &Archive) -> Result<Vec<(FileSpec, u32)>> {
     Ok(out)
 }
 
-/// Every directory in an archive, by path, root excluded, so that one holding
-/// no files is not lost through a rebuild.
-///
+/// Every directory in an archive, by path, root excluded, so an empty one survives a rebuild.
 /// # Errors
-///
-/// As [`Archive::path`], [`Error::BadPath`] for a name [`name::check_tree`]
-/// refuses, and [`Error::NameCollision`] as [`Archive::check_names`].
+/// `BadPath` for a name `check_tree` refuses, `NameCollision` for a case-folding clash.
 pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
     archive.check_names()?;
     let count = u32::try_from(archive.entries().len()).unwrap_or(u32::MAX);
@@ -1242,18 +1066,9 @@ pub fn directories_of(archive: &Archive) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Rebuilds `archive` into `out` with `changes` applied to what it holds,
-/// taking each payload from the source except where `overrides` supplies one.
-///
-/// An override is the file as it exists outside the archive, keyed by the entry
-/// index it replaces so that it survives a rename; anything it does not cover
-/// is streamed out of `src`. The rebuilt archive is written at the version the
-/// original was read at: a rebuild is not a conversion.
-///
+/// Rebuilds `archive` into `out` with `changes`, at the version read; not a conversion.
 /// # Errors
-///
-/// As `edit::tree_of` for a change that cannot be made, as [`build`], plus the
-/// read errors for payloads taken from the source.
+/// As `edit::tree_of` for an invalid change, as `build`, plus read errors from the source.
 pub fn rebuild<'p, R, W>(
     src: &mut R,
     archive: &Archive,
@@ -1268,13 +1083,9 @@ where
 {
     let tree = edit::tree_of(&mut *src, archive, changes)?;
     let files = tree.files();
-    // Asked once for the whole rebuild: the entry table, the names blob and
-    // every payload that carries the field go under the same transform.
     let sealer = archive.seal()?;
     let under = match sealer {
         None => Under::open(archive.version()),
-        // The name the archive was opened under, not the scratch file this is
-        // written into: a rebuild renames over the original.
         Some(ref sealer) => Under::sealed(
             archive.version(),
             archive.encryption(),
@@ -1293,18 +1104,13 @@ where
     build_under(out, under, &files, &tree.directories, fetch, watch)
 }
 
-/// Where a [`rebuild`] takes each payload from: an override the caller
-/// supplied, contents a change carries, or the archive itself — the last of
-/// which borrows the archive's source for as long as it is read.
 struct FromArchive<'a, R> {
     src: &'a mut R,
     archive: &'a Archive,
     changes: &'a Changes,
-    /// Where each file of the rebuilt tree gets its bytes, by the path it will
-    /// be written at.
+    /// Where each file of the rebuilt tree gets its bytes, by the path it will be written at.
     sources: BTreeMap<&'a str, &'a edit::Source>,
-    /// Taken by value, and each one moved out as its entry is written: an
-    /// override may be a whole rebuilt ancestor.
+    /// Taken by value, moved out as its entry is written: an override may be a rebuilt ancestor.
     overrides: BTreeMap<u32, Box<dyn Payload + 'a>>,
 }
 
@@ -1335,19 +1141,9 @@ impl<R: Read + Seek> Fetch for FromArchive<'_, R> {
     }
 }
 
-/// Rebuilds `archive` into `out` with a set of changes, cascading through
-/// nesting.
-///
-/// Changes are grouped by the archive they land in, so several inside one
-/// nested archive rebuild it once, and each rebuilt ancestor goes to
-/// [`Scratch`] space rather than being assembled in memory. A [`Step`] counts
-/// the archive being written now rather than the whole nesting, and two changes
-/// that resolve to one entry are refused however they spell it.
-///
+/// Rebuilds `archive` into `out` with changes, cascading through nesting into `Scratch` space.
 /// # Errors
-///
-/// [`Error::NotFound`], [`Error::NotAnArchive`], [`Error::Overlapping`] for two
-/// changes that resolve to one entry, and as [`rebuild`].
+/// `NotFound`, `NotAnArchive`, `Overlapping` for changes resolving to one entry, and as `rebuild`.
 pub fn rewrite<R, W, S>(
     src: &mut R,
     archive: &Archive,
@@ -1366,8 +1162,6 @@ where
     let mut overrides: BTreeMap<u32, Box<dyn Payload>> = BTreeMap::new();
     for (index, group) in nested {
         let holder = archive.open_nested(src, index)?;
-        // The ancestor is rebuilt into scratch space and handed on as a reader
-        // over it, never a `Vec`.
         let mut sink = scratch.create()?;
         rewrite(src, &holder, &group.changes, &mut sink, scratch, watch)
             .map_err(|failure| edit::respelled(failure, &group.spellings))?;
@@ -1377,13 +1171,9 @@ where
     rebuild(src, archive, &here, out, overrides, watch)
 }
 
-/// Whether this set can be committed as it stands, writing none of it: the
-/// resolution [`rewrite`] performs, run and thrown away at every level of the
-/// nesting, so a refusal only a row builder raises is not among its answers.
-///
+/// Whether this set can be committed as it stands, writing nothing: `rewrite`'s own resolution.
 /// # Errors
-///
-/// As [`rewrite`], less what only a build raises.
+/// As `rewrite`, less what only a build raises.
 pub fn resolves<R>(src: &mut R, archive: &Archive, changes: &Changes) -> Result<()>
 where
     R: Read + Seek,
@@ -1399,8 +1189,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    //! What an archive written under a transform is, with no key material
-    //! anywhere: the transform is real and the key is thirty-two zero bytes.
 
     use std::{
         cell::Cell,
@@ -1425,8 +1213,6 @@ mod tests {
         watch::Unwatched,
     };
 
-    /// The zero-key AES forward transform, and the [`Unlock`] that opens what
-    /// it wrote.
     fn zeroed(named: &str) -> (Sealer, Unlock) {
         let material = Arc::new(Material::over_zeros());
         let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_AES).expect("AES");
@@ -1434,8 +1220,6 @@ mod tests {
         (sealer, Unlock::held(material, named))
     }
 
-    /// Files whose lengths straddle the cipher block: shorter than one, exactly
-    /// one, and one with a tail — plus one that deflates.
     fn contents() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("short.bin", vec![b'a'; 7]),
@@ -1448,28 +1232,23 @@ mod tests {
         ]
     }
 
-    /// The same, as what to write.
     fn specs() -> Vec<FileSpec> {
         contents()
             .iter()
             .map(|(path, _)| FileSpec {
                 path: (*path).to_owned(),
-                // Stored for the first three, so the payload on disk is the
-                // contents; the fourth exercises the deflate fallback.
                 kind: FileKind::Binary {
                     storage: if path.contains(".txt") {
                         Storage::Deflate
                     } else {
                         Storage::Stored
                     },
-                    // 1: under the archive's own transform.
                     encryption: 1,
                 },
             })
             .collect()
     }
 
-    /// Builds that archive, sealed or not, and answers its bytes.
     fn built(under: Under<'_>) -> Vec<u8> {
         let held = contents();
         let mut out = Cursor::new(Vec::new());
@@ -1519,8 +1298,6 @@ mod tests {
 
     #[test]
     fn the_header_is_in_the_clear_and_the_entry_table_is_not() {
-        // The tag is in the clear because it is what says there is a transform;
-        // the row after it is not.
         let (forward, _) = zeroed("sealed.rpf");
         let sealed = built(Under::sealed(
             Version::Rpf7,
@@ -1554,7 +1331,6 @@ mod tests {
 
     #[test]
     fn a_sealed_archive_does_not_open_without_a_key() {
-        // "It opens with the key" says nothing unless it does not open without.
         let (sealer, _) = zeroed("sealed.rpf");
         let bytes = built(Under::sealed(
             Version::Rpf7,
@@ -1572,20 +1348,16 @@ mod tests {
 
     #[test]
     fn an_ng_tag_seals_only_where_the_material_derives_the_transform() {
-        // The NG arm asks the material: the rounds derive from the decrypt
-        // tables and from nothing else.
         let empty = Material::over_zeros();
         assert!(!Scheme::Ng.seals(Some(&empty)));
         assert!(!Scheme::Ng.seals(None));
         assert!(Sealer::new(Scheme::Ng, &empty).is_none());
         assert!(Seal::new(Scheme::Ng, &empty, "a.bin", 16).is_none());
 
-        // And it seals where the tables are there.
         let held = synthetic::ng_material(0x51EA_1000);
         assert!(Scheme::Ng.seals(Some(&held)));
         assert!(Sealer::new(Scheme::Ng, &held).is_some());
 
-        // The AES arm is not a question about material: the key is the tag's.
         for tag in [rpf7::ENCRYPTION_AES, rpf7::ENCRYPTION_AES_LAUNCHER] {
             let scheme = Version::Rpf7.scheme(tag).expect("an AES tag");
             assert!(scheme.seals(None), "{tag:#010x} does not seal");
@@ -1593,7 +1365,6 @@ mod tests {
         }
     }
 
-    /// The synthetic NG transform, and the [`Unlock`] that opens what it wrote.
     fn ng_zeroed(named: &str) -> (Sealer, Unlock) {
         let material = Arc::new(synthetic::ng_material(0x0DE1_2A55));
         let scheme = Version::Rpf7.scheme(rpf7::ENCRYPTION_NG).expect("NG");
@@ -1603,8 +1374,6 @@ mod tests {
 
     #[test]
     fn an_ng_archive_is_written_and_opens_again_with_every_entry_intact() {
-        // A build that sealed the table under the wrong key does not open; one
-        // that sealed a payload wrong opens and hands back rubbish.
         let (sealer, unlock) = ng_zeroed("written.rpf");
         let bytes = built(Under::sealed(
             Version::Rpf7,
@@ -1633,8 +1402,6 @@ mod tests {
 
     #[test]
     fn an_ng_archive_does_not_open_without_the_material_that_wrote_it() {
-        // Also the claim that the bytes went out under the transform rather
-        // than in the clear under an NG tag.
         let (sealer, _) = ng_zeroed("written.rpf");
         let bytes = built(Under::sealed(
             Version::Rpf7,
@@ -1650,8 +1417,6 @@ mod tests {
         );
     }
 
-    /// An NG archive of one file, written under the name it will be found at,
-    /// which for a nested archive is part of what keys its table of contents.
     fn ng_inner(named: &str, holding: &str, contents: &[u8]) -> Vec<u8> {
         let (sealer, _) = ng_zeroed(named);
         let held = contents.to_vec();
@@ -1674,8 +1439,6 @@ mod tests {
         out.into_inner()
     }
 
-    /// An NG archive holding that one as an entry of its own, in the clear and
-    /// stored, which is the only form a nested archive is read in.
     fn ng_outer(named: &str, at: &str, inner: &[u8]) -> (Vec<u8>, Unlock) {
         let (sealer, unlock) = ng_zeroed(named);
         let mut out = Cursor::new(Vec::new());
@@ -1697,8 +1460,6 @@ mod tests {
         (out.into_inner(), unlock)
     }
 
-    /// What the nested archive at `at` holds at `holding`, read through both
-    /// tables of contents.
     fn through_nested(bytes: Vec<u8>, unlock: &Unlock, at: &str, holding: &str) -> Result<Vec<u8>> {
         let mut src = Cursor::new(bytes);
         let archive = Archive::open(&mut src, unlock)?;
@@ -1710,12 +1471,8 @@ mod tests {
 
     #[test]
     fn a_nested_ng_archive_is_not_renamed_out_from_under_its_own_key() {
-        // An NG archive's table of contents is keyed by the name its holder
-        // files it under, and it crosses a rebuild as opaque bytes, so renaming
-        // the entry re-keys nothing inside it and is refused.
         let inner = ng_inner("inner.rpf", "note.txt", b"held inside");
         let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
-        // The fixture is the case it claims to be.
         assert_eq!(
             through_nested(bytes.clone(), &unlock, "inner.rpf", "note.txt")
                 .expect("the nested archive opens as it stands"),
@@ -1748,8 +1505,6 @@ mod tests {
 
     #[test]
     fn a_nested_ng_archive_moves_between_directories_and_still_opens() {
-        // An NG key is a function of the entry's name and not of its path, so a
-        // move that keeps the name changes nothing inside the payload.
         let inner = ng_inner("inner.rpf", "note.txt", b"held inside");
         let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
         let mut src = Cursor::new(bytes);
@@ -1772,15 +1527,10 @@ mod tests {
         );
     }
 
-    /// An encryption tag no build here defines, in an otherwise well-formed
-    /// `RPF7` header; `Version::scheme` answers `None` for it as it does for
-    /// [`rpf7::ENCRYPTION_OPEN`], and the two mean opposite things.
     const UNKNOWN_TAG: u32 = 0x0BAD_5EA1;
 
     #[test]
     fn a_nested_archive_under_an_unrecognised_tag_is_not_renamed_either() {
-        // A rename asks the nested header what transform it is under, and an
-        // unrecognised tag must not answer the `None` an open archive does.
         let mut inner = ng_inner("inner.rpf", "note.txt", b"held inside");
         inner[12..16].copy_from_slice(&UNKNOWN_TAG.to_le_bytes());
         let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
@@ -1809,8 +1559,6 @@ mod tests {
 
     #[test]
     fn a_nested_unencrypted_archive_is_renamed_freely() {
-        // An unencrypted nested archive is keyed by nothing, so its name is not
-        // part of what it is.
         let mut out = Cursor::new(Vec::new());
         crate::build(
             &mut out,
@@ -1870,8 +1618,6 @@ mod tests {
 
     #[test]
     fn a_nested_ng_archive_is_not_respelled_out_from_under_its_own_key_either() {
-        // The NG name hash folds case through the material's own lookup table,
-        // so only a byte-for-byte identical name is not a rename.
         let inner = ng_inner("inner.rpf", "note.txt", b"held inside");
         let (bytes, unlock) = ng_outer("outer.rpf", "inner.rpf", &inner);
         let mut src = Cursor::new(bytes);
@@ -1896,8 +1642,6 @@ mod tests {
         // at a different length picks a different key; the sizes below are
         // asserted to move the index rather than assumed to.
         let (sealer, unlock) = ng_zeroed("resized.rpf");
-        // 48 and 49 move the payload's key alone; 700 also moves the archive
-        // past a block boundary, re-keying the table and the names blob.
         let sizes = [48_usize, 49, 700];
         assert_ne!(
             sealer.seal("grows.bin", 48).and_then(|s| s.key_index()),
@@ -1958,8 +1702,6 @@ mod tests {
 
     #[test]
     fn a_resource_payload_is_never_written_through_the_transform() {
-        // A resource crosses in passthrough form with no per-entry field to
-        // tell the read side a transform needs undoing.
         let (sealer, unlock) = zeroed("resource.rpf");
         let mut resource = vec![0_u8; usize::try_from(RESOURCE_HEADER_LEN).expect("fits")];
         resource[..4].copy_from_slice(&MAGIC_RSC7);
@@ -2002,8 +1744,6 @@ mod tests {
         );
     }
 
-    /// A writer that counts the flushes it receives, so a `Write` impl that
-    /// forwards to it can be told apart from one that swallows the call.
     struct Counting {
         inner: Cursor<Vec<u8>>,
         flushes: Cell<u32>,
@@ -2053,8 +1793,6 @@ mod tests {
 
     #[test]
     fn a_sealed_sink_seeks_only_to_its_own_block_boundaries() {
-        // `store_deflated`'s fallback seeks back to the payload's own start,
-        // always a block boundary; nothing past another target would decrypt.
         let seal = Seal::over_zeros();
         let start = 16_u64;
         let mut inner = Cursor::new(vec![0_u8; 64]);

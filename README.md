@@ -3,38 +3,54 @@
 # rpf
 
 A dependency-light Rust toolchain for reading, editing and rebuilding RPF7
-archives — the `dlc.rpf` files RAGE Multiplayer servers hand to their clients,
-and the archives Grand Theft Auto V ships.
-
-`rpf` is a command-line binary with no runtime prerequisite. The same code runs
-as a JSON-RPC daemon, and a VS Code extension uses it to open files inside an
-archive as ordinary files.
+archives — the `dlc.rpf` files RAGE Multiplayer and FiveM servers hand to their
+clients, and the archives Grand Theft Auto V ships. One command-line binary with
+no runtime prerequisite; the same code serves JSON-RPC, which a VS Code
+extension uses to open entries as ordinary files.
 
 ## What it does
 
 - Lists, reads, writes, adds, removes and renames entries, addressing through
-  archives nested inside archives with a single path.
-- Opens and writes back encrypted archives, both the AES and the NG transform.
-- Converts the three binary metadata encodings — `RBF`, `PSO` and the
+  nested archives with a single path, encrypted or not.
+- Converts the binary metadata encodings — `RBF`, `PSO` and the
   resource-embedded `Meta` — to XML, and reads the XML back into the entry.
-- Patches an edit in place when the new payload fits where the entry sits, and
-  rebuilds the archive when it does not. It says which of the two it did.
-- Extracts an archive to a directory tree, packs a tree back into an archive,
-  and verifies an archive against the checksums the extraction recorded.
-- Reports as JSON on every command, and answers the same objects over
-  JSON-RPC.
+- Patches in place when the new payload fits, rebuilds when it does not, and
+  says which it did.
+- Extracts to a directory tree, packs a tree back, verifies against the
+  checksums the extraction recorded.
+- Reports as JSON on every command, and answers the same objects over JSON-RPC.
+
+## Formats
+
+| Version | Variant | Used by | Support |
+|---|---|---|---|
+| RPF7 | `OPEN`, unencrypted | RAGE MP and FiveM server packs | Read, write |
+| RPF7 | AES-256, `0x0FFFFFF9` | GTA V, nested archives such as `des_*` and `script_*` | Read, write — key from the game executable |
+| RPF7 | AES-256, `0x0FFFFFF7` | Rockstar Games Launcher | Read, write — key from `Launcher.exe` |
+| RPF7 | NG, `0x0FEFFFFF` | GTA V Legacy and Enhanced, every top-level archive: 179 of 179 each | Read, write — both need a memory image |
+| RPF8 | — | Red Dead Redemption 2 | Not supported; its codec is Oodle |
+| RPF6 | — | Red Dead Redemption, 2010 and 2023 | Not supported |
+| RPF4 | — | Max Payne 3 | Not supported |
+| RPF3 | — | GTA IV audio, Midnight Club: LA | Not supported |
+| RPF2 | — | GTA IV, main archives | Not supported |
+| RPF0 | — | Table Tennis | Not supported |
+
+Pre-RPF7 attributions are read from other implementations, not measured here;
+`docs/rpf-format.md` records them and where those implementations disagree.
+Every non-RPF7 version is recognised by its magic word and refused by number.
+
+Encryption is per entry as well as per archive: the tag covers the table of
+contents and the names blob, and each entry's row says whether its own payload
+is under the transform.
 
 ## Installing
 
-There is no published release yet, so build from source. The Rust toolchain is
-pinned in `rust-toolchain.toml`; nothing else is needed.
+No published release yet. The toolchain is pinned in `rust-toolchain.toml`.
 
 ```
 git clone <this repository> && cd rpf
 cargo build --release          # target/release/rpf
 ```
-
-Put `target/release/rpf` somewhere on your `PATH`.
 
 ## Usage
 
@@ -55,8 +71,8 @@ resource  -          262144  x64/vehiclemods/meringls63amg24_mods.rpf/meringls63
 ...
 ```
 
-Read a binary metadata entry as XML. The second column of a listing says what
-an entry holds; `pso`, `rbf` and `meta` entries have an XML view:
+The second column says what an entry holds; `pso`, `rbf` and `meta` entries have
+an XML view:
 
 ```
 $ rpf cat --as xml des_hosp_ceil2.rpf des_hosp_ceil2.ytyp
@@ -70,29 +86,25 @@ $ rpf cat --as xml des_hosp_ceil2.rpf des_hosp_ceil2.ytyp
       <hash_6C1523E4 pso:uint="0"/>
       <hash_D9EF8236 pso:float3="-2.80584, -2.95097, 0.0"/>
       <hash_E78AA618 pso:float3="2.80584, 2.95097, 3.0961"/>
-      <hash_E6E17F14 pso:string.counted="DES_Hosp_Ceil2"/>
-      <hash_75D215A1 pso:string.counted="DES_Hosp_Ceil2_txd"/>
 ...
 ```
 
 `rpf put --as xml` takes an edited document and writes it back in the entry's
-own encoding. Ask first what a write would cost, then make it:
+own encoding. Ask what a write would cost, then make it:
 
 ```
 $ rpf put dlc.rpf data/vehicles.meta edited.meta --dry-run
-would patch 1637 bytes in place at 2048 (room for 2048)
+would patch 1632 bytes in place at 2048 (room for 2048)
 
 $ rpf put dlc.rpf data/vehicles.meta edited.meta
-patched 1637 bytes in place at 2048 (room for 2048)
+patched 1632 bytes in place at 2048 (room for 2048)
 ```
 
-Adding, removing or renaming an entry moves every offset after the header, so
-those always rebuild — `put --create`, `rm`, `mv` and `mkdir` say so before
-they start. A rebuild is atomic: it writes a scratch file beside the archive
-and replaces the original in one step.
+`put --create`, `rm`, `mv` and `mkdir` move every offset after the header, so
+they always rebuild and say so first. A rebuild is atomic: a scratch file beside
+the archive replaces the original in one step.
 
-Take an archive apart, build it back, and check the result against what the
-extraction recorded:
+Take an archive apart, build it back, check the result:
 
 ```
 $ rpf extract dlc.rpf tree/
@@ -106,65 +118,79 @@ $ rpf verify rebuilt.rpf --against tree/
 20 entries carry no recorded checksum: an entry inside a nested archive is covered by the checksum of the entry that holds it
 ```
 
-Every reporting command also takes `--json`.
+Every reporting command takes `--json`. `rpf --help` lists the rest, and
+`clients/agent/README.md` is the page for driving the tool from a program: the
+JSON shapes, what each exit code means for a caller, the failure object `--json`
+answers with, and `cat --out` for a payload nobody is going to read.
 
-## Encrypted archives
+## Key material
 
-An AES-encrypted archive needs the RAGE AES-256 key and the NG hash lookup
-table. An NG-encrypted archive needs 373 values beyond those. **No key material
-is bundled here, and none ever will be.** It is found in your own game
-installation, identified by the hash of each value's own bytes, and cached
-under the hash of the file it came from:
+**No key material is bundled here, and none ever will be.** It comes from your
+own installation. An executable carries the AES key and the hash lookup table,
+which is everything an AES archive needs:
 
 ```
-$ rpf keys extract /path/to/GTA5.exe
-source      /path/to/GTA5.exe
+$ rpf keys extract GTA5.exe
+source      GTA5.exe
 sha256      677e4e355cfbdb13273b1d992407e3c261b3a108dc4dd5c8a0c4c1da651802e5
 found in    this source
 aes key     32 bytes at 0x1e34c98
 hash lut    256 bytes at 0x1b7bcc0
 ng material not in this source (an executable never carries it; it is in the clear only in a memory image of a running game)
-cache       /Users/you/Library/Application Support/rpf/keys
+cache       ./keys
 ```
 
-No command prints a key: what is reported is offsets, lengths, counts and
-paths. Once material is cached, every command that opens an archive finds it —
-there is no flag to pass. `--cache-dir` names a different cache, which is how
-several installations are kept apart.
+`Launcher.exe` reports a `launcher` line as well: that is the second AES key,
+and no game executable carries it.
 
-The AES material is in the game executable. The NG material is not: on disk it
-is transformed, and it is in the clear only in the loaded image of a running
-game, so extracting it means pointing `rpf keys extract` at a memory image or a
-process dump rather than at the executable. An executable that carries no NG
-material is not an error, and everything outside the NG archives opens without
-it.
+The NG expanded keys and decrypt tables are in the clear only in a memory image
+of a running game, so `rpf keys extract <memory image>` is the only source of
+them — and therefore the only route to reading or writing an NG archive. How to
+obtain such an image is out of scope here.
+
+```
+$ rpf keys cache
+cache   ./keys
+entries 1
+```
+
+The cache holds one entry per source file, under the hash of that file. Material
+is identified by the hash of each value's own bytes; no command prints a key,
+only offsets, lengths, counts and paths. Once cached, every command that opens
+an archive finds it — no flag to pass. `--cache-dir` names another cache, and is
+the one way to keep several installations apart; it is global, so every command
+that opens an archive takes it too. `rpf keys invalidate` empties a cache.
+
+An NG archive opened without a memory image fails rather than guessing:
+
+```
+$ rpf ls dlc.rpf
+rpf: archive is encrypted (tag 0x0fefffff); no key material available
+```
 
 ## The daemon
 
 `rpf serve --stdio` speaks JSON-RPC over standard input and output, one object
-per line. It answers everything the binary does, holds edits in a buffer until
-`commit`, reports the progress of a long rebuild as notifications, and can be
-cancelled mid-rebuild.
+per line. It answers everything the binary does, holds edits until `commit`, and
+reports a long rebuild's progress as cancellable notifications.
 
 ```
 $ echo '{"jsonrpc":"2.0","id":1,"method":"open","params":{"path":"/tmp/dlc.rpf"}}' | rpf serve --stdio
-{"id":1,"jsonrpc":"2.0","result":{"entries":11,"handle":1,"len":144504832,"path":"/tmp/dlc.rpf"}}
+{"id":1,"jsonrpc":"2.0","result":{"entries":11,"handle":1,"len":144504832,"path":"/private/tmp/dlc.rpf"}}
 ```
 
 ## The editor extension
 
-`clients/vscode` mounts an archive as a workspace folder. Files below it open,
-edit and save like any other file, an archive nested inside one is a folder
-inside a folder, and the archive itself is written by one explicit act — with a
-preview of whether that act would patch or rebuild. It holds no format
-knowledge of its own; everything it does it asks the daemon for.
-`clients/vscode/README.md` has the details.
+`clients/vscode` mounts an archive as a workspace folder: files below it open,
+edit and save like any other, a nested archive is a folder inside a folder, and
+the archive itself is written by one explicit act, previewed as patch or
+rebuild. See `clients/vscode/README.md`.
 
 ## Exit codes
 
 Stable, so a caller can classify a failure without reading the message. The
-daemon reports the same numbers as a JSON-RPC `error.code`, alongside a
-symbolic `error.data.reason`.
+daemon reports the same numbers as a JSON-RPC `error.code`, alongside a symbolic
+`error.data.reason`.
 
 | Code | Meaning |
 |---|---|
@@ -188,20 +214,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all
 ```
 
-The test suite needs no game data and passes without it, skipping what it
-cannot reach. Four environment variables point it at real data, and each has a
-companion that turns its own skips into failures:
-
-| Variable | Names |
-|---|---|
-| `RPF_CORPUS` | a directory of `.rpf` archives |
-| `RPF_GAME_EXE` | a directory of game executables, for key extraction |
-| `RPF_GAME_IMAGE` | one memory image of a running game, the only source NG material is found in |
-| `RPF_METADATA` | a directory of metadata payloads already out of their archives, written by `tools/metadata-dump` |
-
-```
-RPF_CORPUS=/path/to/corpus RPF_REQUIRE_CORPUS=1 cargo test --all
-```
+The suite needs no game data and passes without it, skipping what it cannot
+reach. Four variables point it at real data: `RPF_CORPUS` at a directory of
+archives, `RPF_GAME_EXE` at a directory of game executables, `RPF_GAME_IMAGE` at
+one memory image of a running game, and `RPF_METADATA` at metadata payloads
+already out of their archives, as `tools/metadata-dump` writes them. Each has a
+companion — `RPF_REQUIRE_CORPUS` and its three siblings — that turns its own
+skips into failures.
 
 ## Licence
 

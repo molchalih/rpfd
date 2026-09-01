@@ -1,6 +1,4 @@
 //! The stdio daemon: warm state, buffered edits, one rebuild per commit.
-//!
-//! Corpus-free — these build their own archives, as the command-line tests do.
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -27,7 +25,6 @@ mod common;
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
 /// How long anything here waits on the daemon before the wait is a failure.
-/// Finite, because a wait that cannot fail can only spin.
 const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A bound on one wait, naming what the wait is for. [`Deadline::check`] fails
@@ -208,8 +205,7 @@ fn make_colliding_archive(at: &Path) -> Vec<u8> {
     out
 }
 
-/// Where one entry's payload sits and how much room it has, read from the
-/// archive so that a report about them can be checked against something else.
+/// Where one entry's payload sits and how much room it has.
 fn spans(at: &Path, inside: &str) -> (u64, u64) {
     let mut file = fs::File::open(at).expect("archive opens");
     let archive =
@@ -219,8 +215,7 @@ fn spans(at: &Path, inside: &str) -> (u64, u64) {
     (payload_at, archive.allocation(index).expect("allocation"))
 }
 
-/// Feeds every request in, and returns the responses. Progress arrives as
-/// notifications, which carry no `id`, and a client reads past them.
+/// Feeds every request in, and returns the responses.
 fn talk(requests: &[Value]) -> Vec<Value> {
     narrated(requests).0
 }
@@ -239,8 +234,7 @@ fn narrated(requests: &[Value]) -> (Vec<Value>, Vec<Value>) {
     drive(daemon(), requests)
 }
 
-/// As [`talk`], with the daemon started in `cwd`, so a request can name an
-/// archive by a relative path.
+/// As [`talk`], with the daemon started in `cwd`.
 fn talk_in(cwd: &Path, requests: &[Value]) -> Vec<Value> {
     let mut daemon = daemon();
     daemon.current_dir(cwd);
@@ -288,7 +282,6 @@ fn edits_are_buffered_until_commit_and_then_applied_at_once() {
         json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
             "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"replaced")}}),
         json!({"jsonrpc":"2.0","id":3,"method":"pending","params":{"handle":1}}),
-        // A read of a buffered path returns what was written, not what is on disk.
         json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
             "handle":1,"path":"data/greeting.txt"}}),
         json!({"jsonrpc":"2.0","id":5,"method":"commit","params":{"handle":1}}),
@@ -320,8 +313,6 @@ fn edits_are_buffered_until_commit_and_then_applied_at_once() {
 
     assert_eq!(by_id(5)["result"]["committed"], json!(1));
 
-    // After the commit the warm state describes the archive that is now on
-    // disk, so the same read no longer reports a pending buffer.
     let after_commit = by_id(6);
     assert_eq!(after_commit["result"]["pending"], json!(false));
     let bytes = BASE64
@@ -422,8 +413,6 @@ fn a_resource_entry_takes_a_payload_its_own_archive_produced() {
 
 #[test]
 fn a_resource_entry_refuses_a_payload_too_short_to_be_one() {
-    // A payload that cannot hold a resource header cannot be written into a
-    // resource entry, whatever it begins with. Exit 6 on both frontends.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_rockstar_archive(&archive);
@@ -443,7 +432,6 @@ fn a_resource_entry_refuses_a_payload_too_short_to_be_one() {
         answer(&responses, 3)
     );
 
-    // And the command line says the same thing with the same number.
     let short = dir.path().join("short.bin");
     fs::write(&short, b"short").expect("writable");
     let refused = Command::new(RPF)
@@ -469,8 +457,6 @@ fn unknown_methods_and_handles_are_refused_not_ignored() {
 
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"nonsense","params":{}}),
-        // A handle that was never opened is not a malformed request: it is a
-        // well-formed one this daemon declines.
         json!({"jsonrpc":"2.0","id":2,"method":"read","params":{"handle":99,"path":"x"}}),
         json!({"jsonrpc":"2.0","id":3,"method":"open","params":{}}),
         json!({"jsonrpc":"2.0","id":4,"method":"read","params":{"handle":"one","path":"x"}}),
@@ -490,8 +476,6 @@ fn unknown_methods_and_handles_are_refused_not_ignored() {
 
 #[test]
 fn a_line_that_is_not_a_request_is_answered_with_a_null_id() {
-    // Which is what `"id": null` is reserved for: there was no id to echo,
-    // because there was no request.
     let responses = talk(&[
         json!("not an object at all"),
         json!({"jsonrpc":"2.0","id":2,"params":{}}),
@@ -512,8 +496,6 @@ fn incompressible(len: u32) -> Vec<u8> {
 
 #[test]
 fn a_commit_that_fits_patches_in_place() {
-    // The whole point: an edit that fits costs the bytes of the edit, not the
-    // bytes of the archive.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -579,8 +561,6 @@ fn a_commit_that_cannot_fit_rebuilds_instead() {
 
 #[test]
 fn an_edit_that_does_not_fit_holds_back_one_that_does() {
-    // Both edits land, and they land the same way: a commit is all of it or
-    // none of it, never two patched and one rebuilt on top.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     let resource = make_archive(&archive);
@@ -613,8 +593,6 @@ fn an_edit_that_does_not_fit_holds_back_one_that_does() {
 
 #[test]
 fn a_commit_can_be_told_to_rebuild_even_when_it_could_patch() {
-    // A patch is not crash-atomic and a rebuild is. A caller that wants the
-    // stronger guarantee has to be able to ask for it.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -632,15 +610,12 @@ fn a_commit_can_be_told_to_rebuild_even_when_it_could_patch() {
 
 #[test]
 fn a_dry_run_commit_reports_what_it_would_do_and_keeps_the_edits() {
-    // An editor asking "what does saving cost" must not lose the buffer by
-    // asking, and must not have to guess which of the two ways it will go.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
     let archive_str = archive.display().to_string();
     let before = fs::read(&archive).expect("readable");
-    // Read from the archive rather than believed from the answer: an editor
-    // deciding whether to save acts on the numbers.
+    // Read from the archive rather than believed from the answer.
     let (at, allocation) = spans(&archive, "data/greeting.txt");
 
     let responses = talk(&[
@@ -648,7 +623,6 @@ fn a_dry_run_commit_reports_what_it_would_do_and_keeps_the_edits() {
         json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
             "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"replaced")}}),
         json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"dry_run":true}}),
-        // The buffer survives, so the real commit can still follow.
         json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
     ]);
 
@@ -705,8 +679,6 @@ fn a_dry_run_commit_says_when_it_would_rebuild_and_why() {
 
 #[test]
 fn a_rebuild_reports_progress_as_notifications() {
-    // The objects carry no id, so a client reading for its own response reads
-    // past them.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -716,8 +688,7 @@ fn a_rebuild_reports_progress_as_notifications() {
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
         json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
             "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"replaced")}}),
-        // Rebuild rather than patch, because a patch writes the bytes of one
-        // edit and has nothing worth reporting.
+        // Rebuild rather than patch: a patch has nothing worth reporting.
         json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"rebuild":true}}),
     ]);
 
@@ -732,12 +703,9 @@ fn a_rebuild_reports_progress_as_notifications() {
         let params = &notification["params"];
         assert_eq!(params["handle"], json!(1));
         assert_eq!(params["total"], json!(2), "{notification}");
-        // Nothing was dropped: this client read everything the daemon sent.
         assert_eq!(params["skipped"], json!(0), "{notification}");
     }
 
-    // Every entry is accounted for, in order, and named: a path asserted only as
-    // "a string" would let every notification carry the same one.
     let steps: Vec<(u64, &str)> = notifications
         .iter()
         .map(|n| {
@@ -756,8 +724,6 @@ fn a_rebuild_reports_progress_as_notifications() {
 
 #[test]
 fn a_dry_run_commit_told_to_rebuild_says_so_and_keeps_the_edits() {
-    // The one dry-run branch that answers without calling `plan`: nothing
-    // computes the answer, and an answer nothing computes is one nothing checks.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -791,7 +757,6 @@ fn a_dry_run_commit_told_to_rebuild_says_so_and_keeps_the_edits() {
 
 #[test]
 fn a_cancel_with_nothing_running_is_answered_not_stored() {
-    // Storing it would cancel the next commit, which nobody asked for.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -882,8 +847,7 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
         writeln!(stdin, "{request}").expect("writable");
     }
 
-    // Keep asking until the commit answers. The interval is short enough that
-    // the flag is set within one entry of the rebuild starting.
+    // Short enough that the flag is set within one entry of the rebuild starting.
     let deadline = Deadline::on("the cancelled commit to answer");
     let mut commit = None;
     while commit.is_none() {
@@ -943,8 +907,6 @@ fn make_bulk_archive(at: &Path, entries: u32, payload: usize) {
     .expect("builds");
 }
 
-/// A change that collides only with another buffered change is refused when it
-/// is offered, rather than accepted and failed at the commit.
 #[test]
 fn a_change_that_collides_only_with_a_buffered_one_is_refused_when_it_is_offered() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1008,8 +970,7 @@ fn a_change_that_collides_only_with_a_buffered_one_is_refused_when_it_is_offered
     assert!(paths.contains(&"info/greeting.txt"), "{paths:?}");
 }
 
-/// A removal in the same session frees the path a rename moves onto: removals
-/// are applied before renames, so a replacing rename can be assembled.
+/// Removals are applied before renames, so a replacing rename can be assembled.
 #[test]
 fn a_removal_in_the_same_session_frees_the_path_a_rename_moves_onto() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1046,8 +1007,7 @@ fn a_removal_in_the_same_session_frees_the_path_a_rename_moves_onto() {
     );
 }
 
-/// A second change of another kind at one path is refused rather than quietly
-/// replacing the first: a change set holds one change per path.
+/// A change set holds one change per path.
 #[test]
 fn a_second_change_of_another_kind_at_one_path_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1095,8 +1055,6 @@ fn a_second_change_of_another_kind_at_one_path_is_refused() {
     assert_eq!(bytes, b"twice", "the second save is what the buffer holds");
 }
 
-/// `forget` takes one buffered change back and says what is left, so
-/// withdrawing a gesture costs no `discard` and no replay of the rest.
 #[test]
 fn one_buffered_change_can_be_taken_back_without_discarding_the_rest() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1145,8 +1103,6 @@ fn one_buffered_change_can_be_taken_back_without_discarding_the_rest() {
     assert_ne!(fs::read(&archive).expect("readable"), before);
 }
 
-/// Withdrawing a rename lets the path be changed again: the buffer holds one
-/// change per path and had no way to take one away.
 #[test]
 fn a_rename_taken_back_frees_the_path_for_another_change() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1190,8 +1146,7 @@ fn a_rename_taken_back_frees_the_path_for_another_change() {
     assert!(paths.contains(&"second.yft"), "{paths:?}");
 }
 
-/// A buffered structural change does not turn every later write into a walk of
-/// the entry table, which over thousands of buffered writes is quadratic.
+/// Over thousands of buffered writes, a walk of the entry table per write is quadratic.
 #[test]
 fn writes_beside_a_buffered_removal_do_not_each_walk_the_entry_table() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1225,8 +1180,6 @@ fn writes_beside_a_buffered_removal_do_not_each_walk_the_entry_table() {
         4000,
         "not every write was buffered",
     );
-    // And the one write the removal really does reach is refused, which is the
-    // whole reason the question is asked.
     let reached = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
             "path": archive.display().to_string()}}),
@@ -1243,8 +1196,6 @@ fn writes_beside_a_buffered_removal_do_not_each_walk_the_entry_table() {
     );
 }
 
-/// Every error object carries the failure's own name beside its number, so a
-/// client tells `AlreadyExists` from every other refusal sharing code 6.
 #[test]
 fn an_error_names_the_failure_beside_the_number() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1257,7 +1208,6 @@ fn an_error_names_the_failure_beside_the_number() {
         // Two refusals that share exit 6 and have nothing else in common.
         json!({"jsonrpc":"2.0","id":2,"method":"mkdir","params":{"handle":1,"path":"data"}}),
         json!({"jsonrpc":"2.0","id":3,"method":"delete","params":{"handle":1,"path":"data"}}),
-        // And one that is not a refusal at all.
         json!({"jsonrpc":"2.0","id":4,"method":"read","params":{"handle":1,"path":"nowhere"}}),
         json!({"jsonrpc":"2.0","id":5,"method":"nonesuch","params":{}}),
     ]);
@@ -1275,6 +1225,34 @@ fn an_error_names_the_failure_beside_the_number() {
 }
 
 #[test]
+fn a_failure_is_the_same_object_on_both_frontends() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("agreeing.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"read","params":{"handle":1,"path":"nowhere"}}),
+    ]);
+    let daemon = answer(&responses, 2)["error"].clone();
+
+    let output = Command::new(RPF)
+        .args(["--json", "cat", &archive_str, "nowhere"])
+        .output()
+        .expect("binary runs");
+    let command_line: Value =
+        serde_json::from_slice(&output.stderr).expect("one JSON object on standard error");
+
+    assert_eq!(command_line, daemon, "the frontends have drifted");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "and the code is the object's"
+    );
+}
+
+#[test]
 fn a_second_session_on_one_archive_is_refused_rather_than_detected_later() {
     // Two sessions on one archive: the first rebuilds and every offset moves,
     // while the second still holds the entry table it parsed at open.
@@ -1287,12 +1265,9 @@ fn a_second_session_on_one_archive_is_refused_rather_than_detected_later() {
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
         json!({"jsonrpc":"2.0","id":2,"method":"open","params":{"path": archive_str}}),
-        // The first session goes on working, and rebuilds.
         json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
             "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(&big)}}),
         json!({"jsonrpc":"2.0","id":4,"method":"commit","params":{"handle":1}}),
-        // Closing it releases the claim, and the next session sees what the
-        // commit left.
         json!({"jsonrpc":"2.0","id":5,"method":"close","params":{"handle":1}}),
         json!({"jsonrpc":"2.0","id":6,"method":"open","params":{"path": archive_str}}),
         json!({"jsonrpc":"2.0","id":7,"method":"read","params":{
@@ -1323,8 +1298,6 @@ fn a_second_session_on_one_archive_is_refused_rather_than_detected_later() {
 
 #[test]
 fn a_claim_is_on_the_archive_and_not_on_the_spelling_of_its_path() {
-    // A claim that could be walked around by writing the same path differently
-    // would be no claim at all, and each of these is a path a client sends.
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path().canonicalize().expect("canonical temp dir");
     make_archive(&root.join("test.rpf"));
@@ -1499,8 +1472,6 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
 
 #[test]
 fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
-    // The job is registered for exactly as long as there is something to name:
-    // left registered, a later cancel marks a commit that nobody is running.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1681,8 +1652,6 @@ fn a_broken_standard_output_is_reported_rather_than_swallowed() {
 
 #[test]
 fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
-    // A rebuild reporting progress to a client that has gone away stops itself;
-    // reporting that onward as a cancellation would blame the caller for it.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     make_bulk_archive(&archive, 4000, 1024);
@@ -1735,8 +1704,7 @@ fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
 
 #[test]
 fn a_request_with_no_id_is_a_notification_and_is_not_answered() {
-    // JSON-RPC forbids answering one, and `"id": null` is what a parse error
-    // means. Answering with it made the two indistinguishable.
+    // JSON-RPC forbids answering one, and `"id": null` is what a parse error means.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1763,7 +1731,6 @@ fn a_request_with_no_id_is_a_notification_and_is_not_answered() {
 
 #[test]
 fn progress_can_be_turned_off_for_one_commit() {
-    // A 3000-entry archive is 3000 lines a client may have no use for.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -1796,8 +1763,6 @@ fn a_cancel_parameter_that_is_ill_typed_is_refused_not_read_as_absent() {
         json!({"jsonrpc":"2.0","id":5,"method":"cancel","params":{"handel":2}}),
         json!({"jsonrpc":"2.0","id":6,"method":"cancel","params":"not-an-object"}),
         json!({"jsonrpc":"2.0","id":7,"method":"cancel","params":{"handle":[2]}}),
-        // Well typed, and still answered: naming nothing means "whatever is
-        // running", and nothing is.
         json!({"jsonrpc":"2.0","id":8,"method":"cancel","params":{"handle":2}}),
         json!({"jsonrpc":"2.0","id":9,"method":"cancel","params":{}}),
         json!({"jsonrpc":"2.0","id":10,"method":"cancel"}),
@@ -1824,8 +1789,6 @@ fn a_cancel_parameter_that_is_ill_typed_is_refused_not_read_as_absent() {
 
 #[test]
 fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
-    // A rebuild running on handle 1, a cancel aimed at handle 2, and the handle
-    // not of a type the daemon read.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("big.rpf");
     let files: Vec<FileSpec> = (0..16)
@@ -1953,8 +1916,7 @@ fn read_slowly(
 
 #[test]
 fn an_answer_bigger_than_the_grace_survives_standard_input_ending() {
-    // Standard input ends the moment the last request is read, long before the
-    // answer to it is written: a fixed grace cut the response off mid-object.
+    // Standard input ends long before the answer to the last request is written.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("one.rpf");
     make_bulk_archive(&archive, 1, 512 * 1024);
@@ -2009,8 +1971,7 @@ fn an_answer_bigger_than_the_grace_survives_standard_input_ending() {
     assert_eq!(bytes, vec![0_u8; 512 * 1024], "the entry came back wrong");
 }
 
-/// The resident size of a running process, in kilobytes. `ps`, because the
-/// question is what the operating system is holding for the daemon.
+/// The resident size of a running process, in kilobytes.
 #[cfg(unix)]
 fn resident_kilobytes(pid: u32) -> u64 {
     let reported = Command::new("ps")
@@ -2065,8 +2026,7 @@ fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
         );
     }
 
-    // Everything is still owed, and arrives once the client reads again: an
-    // answer may wait, and may never be dropped.
+    // An answer may wait, and may never be dropped.
     let drain = std::thread::spawn(move || {
         let mut objects = Vec::new();
         for line in std::io::BufReader::new(stdout).lines() {
@@ -2109,7 +2069,6 @@ fn a_second_name_for_one_file_is_the_same_archive() {
             "path": archive.display().to_string()}}),
         json!({"jsonrpc":"2.0","id":2,"method":"open","params":{
             "path": alias.display().to_string()}}),
-        // Closing the first releases the claim, and the second name opens.
         json!({"jsonrpc":"2.0","id":3,"method":"close","params":{"handle":1}}),
         json!({"jsonrpc":"2.0","id":4,"method":"open","params":{
             "path": alias.display().to_string()}}),
@@ -2265,8 +2224,7 @@ fn a_session_still_holds_its_archive_after_its_own_rebuild() {
 
 #[test]
 fn close_on_a_handle_that_was_never_open_is_refused() {
-    // A close of a handle nobody opened must not report a claim released: every
-    // other method answers code 6 for the same handle.
+    // Every other method answers code 6 for the same handle.
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"close","params":{"handle":99}}),
         json!({"jsonrpc":"2.0","id":2,"method":"pending","params":{"handle":99}}),
@@ -2383,8 +2341,6 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         "the daemon is holding {resident} KB of cancel answers echoing an id written once"
     );
     assert!(status.success(), "the daemon exited with {status}");
-    // The cancels named a handle that is not running, so the commit ran to the
-    // end — and its own answer still carries the id the client sent.
     let committed = objects
         .iter()
         .find(|object| object["id"] == json!(huge))
@@ -2521,7 +2477,6 @@ fn a_client_that_never_reads_does_not_hold_the_daemon_open_for_ever() {
             writeln!(stdin, "{request}").expect("writable");
         }
     }
-    // Standard output is held open, and never read from.
     let started = std::time::Instant::now();
     let mut exited = false;
     while started.elapsed() < std::time::Duration::from_secs(60) {
@@ -2559,8 +2514,6 @@ fn cli_json(args: &[&str]) -> Value {
 
 #[test]
 fn the_daemon_answers_info_and_verify_as_the_command_line_does() {
-    // Anything one frontend can do the other must be able to do; both of these
-    // lived in the binary, out of reach of a client that has only the daemon.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2600,8 +2553,6 @@ fn the_daemon_answers_info_and_verify_as_the_command_line_does() {
 
 #[test]
 fn verify_names_the_entry_that_did_not_read_back_and_still_answers() {
-    // A failing verify is a finding, not a failure of the call. The command line
-    // exits 4 because a process has one bit to say it with.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2639,8 +2590,7 @@ fn verify_names_the_entry_that_did_not_read_back_and_still_answers() {
         "{verified}"
     );
 
-    // Both entries reported themselves on the way past, the failing one included:
-    // `done` counts it, so leaving it out would be a gap in the client's count.
+    // `done` counts the failing entry too, or the client's count has a gap.
     let named: Vec<&str> = notifications
         .iter()
         .filter_map(|n| n["params"]["path"].as_str())
@@ -2693,7 +2643,6 @@ fn a_write_to_a_name_two_entries_answer_to_is_refused() {
         );
     }
 
-    // Nothing was buffered, so there is nothing for the commit to write.
     assert_eq!(
         answer(&responses, 3)["result"]["unchanged"],
         json!(true),
@@ -2708,8 +2657,6 @@ fn a_write_to_a_name_two_entries_answer_to_is_refused() {
 
 #[test]
 fn the_daemon_respells_a_backslashed_path_exactly_as_the_command_line_does() {
-    // What the binary tells a caller about the separator, the daemon tells them
-    // too, or the two frontends have diverged.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2810,16 +2757,13 @@ fn info_addresses_a_nested_archive_as_the_command_line_does() {
     assert_eq!(nested["path"], answer(&responses, 1)["result"]["path"]);
     assert_ne!(nested["len"], whole["len"], "the outer is not the inner");
 
-    // A directory is not an archive, and saying so is a refusal rather than a
-    // malformed archive.
+    // A directory is not an archive, and saying so is a refusal.
     let refusal = answer(&responses, 4);
     assert_eq!(refusal["error"]["code"], json!(6), "{refusal}");
 }
 
 #[test]
 fn opening_a_path_that_continues_past_an_archive_is_refused() {
-    // The same complaint the command line makes, with the same number: an
-    // in-archive path spelled as a filesystem one is not the disk misbehaving.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, _) = make_nested(dir.path());
     let through = outer_path.join("x64").join("inner.rpf");
@@ -2837,8 +2781,6 @@ fn opening_a_path_that_continues_past_an_archive_is_refused() {
 
 #[test]
 fn list_and_ls_report_the_same_rows_through_the_same_nesting() {
-    // Both frontends read the rows out of `rpf-core`, so a row that differs
-    // between them means the walk has been written twice.
     let dir = tempfile::tempdir().expect("temp dir");
     let (outer_path, _) = make_nested(dir.path());
     let outer = outer_path.display().to_string();
@@ -2877,8 +2819,7 @@ fn list_and_ls_report_the_same_rows_through_the_same_nesting() {
 
 #[test]
 fn the_daemon_extracts_and_packs_as_the_command_line_does() {
-    // A tree is a path on the daemon's own filesystem, the same thing `open`'s
-    // path already is.
+    // A tree is a path on the daemon's own filesystem, as `open`'s path is.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -2925,8 +2866,6 @@ fn the_daemon_extracts_and_packs_as_the_command_line_does() {
         );
     }
 
-    // The strongest form of the claim: the two frontends produced the same
-    // archive out of their own trees, byte for byte.
     assert_eq!(
         fs::read(&daemon_packed).expect("readable"),
         fs::read(&cli_packed).expect("readable"),
@@ -2951,7 +2890,6 @@ fn packing_over_an_archive_a_session_holds_is_refused() {
             "handle":1,"into": tree, "progress": false}}),
         json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
             "from": tree, "archive": archive_str, "progress": false}}),
-        // Released, and then the same pack is allowed.
         json!({"jsonrpc":"2.0","id":4,"method":"close","params":{"handle":1}}),
         json!({"jsonrpc":"2.0","id":5,"method":"pack","params":{
             "from": tree, "archive": archive_str, "progress": false}}),
@@ -2978,8 +2916,7 @@ fn packing_over_an_archive_a_session_holds_is_refused() {
 
 #[test]
 fn extract_and_pack_report_progress_as_notifications() {
-    // Writing every entry out to a tree is unbounded work in the same way a
-    // rebuild is. A `pack` has no handle, so its notifications carry none.
+    // A `pack` has no handle, so its notifications carry none.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3054,8 +2991,6 @@ fn extracting_from_a_session_with_buffered_edits_is_refused_and_names_them() {
         "a refused extraction created part of a tree"
     );
 
-    // Discarding them is one of the two ways out, and the same request is then
-    // the ordinary one.
     let recovered = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive}}),
         json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
@@ -3123,11 +3058,9 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
     );
 }
 
-// Key material: three methods with no handle, because there is no archive
-// open. An executable and a cache are paths on the daemon's own filesystem.
+// Key material: three methods with no handle, because there is no archive open.
 
-/// Reports a skip, naming the test, the gate that was not there, and what it
-/// would have read. `RPF_REQUIRE_<GATE>` makes that gate's absence a failure.
+/// Reports a skip; `RPF_REQUIRE_<GATE>` makes that gate's absence a failure.
 fn skip<T>(test: &str, gate: &str, reason: &str) -> Option<T> {
     let required = format!("RPF_REQUIRE_{}", gate.trim_start_matches("RPF_"));
     assert!(
@@ -3155,8 +3088,7 @@ fn executable(test: &str, name: &str) -> Option<std::path::PathBuf> {
     }
 }
 
-/// The memory image the NG material is extracted from, or a loud skip. A gate
-/// of its own, because no executable carries that material.
+/// The memory image the NG material is extracted from, or a loud skip.
 fn game_image(test: &str) -> Option<std::path::PathBuf> {
     let Some(named) = std::env::var_os("RPF_GAME_IMAGE") else {
         return skip(test, "RPF_GAME_IMAGE", "RPF_GAME_IMAGE is not set");
@@ -3193,8 +3125,6 @@ fn hex(bytes: &[u8]) -> String {
 
 #[test]
 fn the_daemon_answers_every_keys_command_the_binary_does() {
-    // If `rpf` can do it and `serve --stdio` cannot, the logic is in the wrong
-    // crate.
     let dir = tempfile::tempdir().expect("temp dir");
     let source = dir.path().join("not-a-game.exe");
     fs::write(&source, vec![0_u8; 1 << 16]).expect("writable");
@@ -3216,8 +3146,6 @@ fn the_daemon_answers_every_keys_command_the_binary_does() {
         json!({"jsonrpc":"2.0","id":4,"method":"keys.cache","params":{"cache": at}}),
     ]);
 
-    // The same number the command line exits with: an intact file, and the part
-    // that is missing is here.
     let refused = answer(&responses, 1);
     assert_eq!(refused["error"]["code"], json!(9), "{refused}");
     assert!(
@@ -3248,8 +3176,6 @@ fn a_keys_method_says_which_parameter_it_wanted() {
 #[test]
 #[cfg_attr(no_executables, ignore = "RPF_GAME_EXE is not set")]
 fn the_daemon_reports_offsets_and_never_a_key() {
-    // The key is read in this process and every line the daemon wrote is searched
-    // for it — as base64 especially, which is how payloads travel this wire.
     let test = "the_daemon_reports_offsets_and_never_a_key";
     let Some(path) = executable(test, "GTA5.exe") else {
         return;
@@ -3309,8 +3235,7 @@ fn the_daemon_reports_offsets_and_never_a_key() {
 
 #[test]
 fn the_daemon_verifies_against_a_tree_as_the_command_line_does() {
-    // `against` is a path on the daemon's own filesystem, the same thing `open`'s
-    // `path`, `extract`'s `into` and `pack`'s `from` already are.
+    // `against` is a path on the daemon's own filesystem, as `open`'s `path` is.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3337,8 +3262,6 @@ fn the_daemon_verifies_against_a_tree_as_the_command_line_does() {
     assert_eq!(verified["against"], json!(tree), "{verified}");
     assert_eq!(verified["problems"], json!([]), "{verified}");
 
-    // And without one, the number is zero and the field that says why is null,
-    // so a client cannot read the zero as a result.
     let alone = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
         json!({"jsonrpc":"2.0","id":2,"method":"verify","params":{"handle":1,"progress":false}}),
@@ -3350,8 +3273,7 @@ fn the_daemon_verifies_against_a_tree_as_the_command_line_does() {
 
 #[test]
 fn a_byte_changed_inside_a_stored_entry_is_a_finding_on_the_wire_too() {
-    // The archive says nothing about a stored entry's bytes, so this is the one
-    // failure only a manifest can see. Still an answer rather than an error.
+    // The archive says nothing about a stored entry's bytes, so only a manifest sees this.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3390,8 +3312,6 @@ fn a_byte_changed_inside_a_stored_entry_is_a_finding_on_the_wire_too() {
 
 #[test]
 fn a_tree_of_another_archive_is_refused_on_the_wire_as_it_is_on_the_command_line() {
-    // Refused rather than answered with nothing checked, and with the exit code
-    // the command line uses, so the two do not answer one mistake with two.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
@@ -3489,8 +3409,6 @@ fn listed(archive: &str) -> Vec<String> {
         .collect()
 }
 
-/// `write` with `create` adds an entry the archive did not hold, and `commit`
-/// rebuilds for it.
 #[test]
 fn a_created_entry_is_buffered_and_committed() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3500,8 +3418,7 @@ fn a_created_entry_is_buffered_and_committed() {
 
     let responses = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
-        // Without `create` it is still not found, which is what it has always
-        // been.
+        // Without `create` it is still not found.
         json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
             "handle":1,"path":"data/added.txt","bytes": BASE64.encode(b"new")}}),
         json!({"jsonrpc":"2.0","id":3,"method":"write","params":{
@@ -3517,7 +3434,6 @@ fn a_created_entry_is_buffered_and_committed() {
 
     assert!(answer(&responses, 2)["error"].is_object(), "{responses:?}");
     assert_eq!(answer(&responses, 3)["result"]["pending"], json!(1));
-    // A read of the buffered path answers what was written, before it exists.
     assert_eq!(answer(&responses, 4)["result"]["pending"], json!(true));
 
     let committed = answer(&responses, 5);
@@ -3544,8 +3460,6 @@ fn a_created_entry_is_buffered_and_committed() {
     assert!(listed(&archive_str).contains(&"data/added.txt".to_owned()));
 }
 
-/// `delete` buffers a removal, and a directory that holds something needs
-/// saying so — the same rule the command line has.
 #[test]
 fn delete_buffers_a_removal_and_asks_before_taking_children() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3591,8 +3505,6 @@ fn delete_buffers_a_removal_and_asks_before_taking_children() {
     assert_eq!(rows, vec!["art.yft".to_owned()], "{rows:?}");
 }
 
-/// `rename` moves an entry, and refuses a destination the archive already
-/// holds rather than destroying it.
 #[test]
 fn rename_moves_an_entry_and_refuses_an_occupied_name() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3629,8 +3541,7 @@ fn rename_moves_an_entry_and_refuses_an_occupied_name() {
     assert!(!rows.contains(&"art.yft".to_owned()), "{rows:?}");
 }
 
-/// `mkdir` adds a directory that holds nothing, which a rebuild would
-/// otherwise lose: `build` derives parents from file paths and cannot see one.
+/// `build` derives directories from file paths, so an empty one is otherwise lost.
 #[test]
 fn mkdir_adds_a_directory_and_refuses_one_that_is_there() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3651,8 +3562,6 @@ fn mkdir_adds_a_directory_and_refuses_one_that_is_there() {
     assert!(listed(&archive_str).contains(&"empty".to_owned()));
 }
 
-/// A dry run reports the change as what it is rather than as a payload that
-/// would not fit, and writes nothing.
 #[test]
 fn a_dry_run_names_the_structural_change_it_would_make() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3676,13 +3585,10 @@ fn a_dry_run_names_the_structural_change_it_would_make() {
         json!([{"path": "art.yft", "structural": "removes an entry"}]),
         "{planned}",
     );
-    // The change is still buffered, and nothing was written.
     assert_eq!(answer(&responses, 4)["result"]["paths"], json!(["art.yft"]));
     assert_eq!(fs::read(&archive).expect("readable"), before, "it wrote");
 }
 
-/// Every structural method resolves the change when it is offered, so a client
-/// is told at the moment it can still act on it rather than at the commit.
 #[test]
 fn a_structural_change_is_refused_when_it_is_offered() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3708,8 +3614,7 @@ fn a_structural_change_is_refused_when_it_is_offered() {
 
 // --- What `list` answers, and how a caller reads it -------------------------
 
-/// `list` of a file answers that one entry, which makes it a `stat`: the
-/// tie-break is the row's `path` against the one that was asked for.
+/// `list` of a file answers that one entry, which makes it a `stat`.
 #[test]
 fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3724,7 +3629,6 @@ fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
         json!({"jsonrpc":"2.0","id":3,"method":"list","params":{"handle":1,"path":"data"}}),
     ]);
 
-    // The file: one row, whose path is the one asked for.
     let file = answer(&responses, 2)["result"]
         .as_array()
         .expect("an array")
@@ -3747,8 +3651,7 @@ fn list_of_a_file_answers_that_entry_and_a_caller_can_tell() {
     );
 }
 
-/// A row says what the payload announces itself to be, and a resource row says
-/// nothing: its payload is never read, so `null` is not "nothing was found".
+/// A resource's payload is never read, so a `null` encoding is not "nothing was found".
 #[test]
 fn a_list_row_says_what_the_payload_announces_and_a_resource_says_nothing() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3784,8 +3687,7 @@ fn a_list_row_says_what_the_payload_announces_and_a_resource_says_nothing() {
     assert_eq!(row("data")["encoding"], Value::Null);
 }
 
-/// A row's `path` is the whole in-archive path, not a name, so a client that
-/// joined it onto the path it asked for would build the prefix twice.
+/// A row's `path` is the whole in-archive path, not a name.
 #[test]
 fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3812,7 +3714,6 @@ fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
         rows.iter().all(|path| path.starts_with("x64/inner.rpf/")),
         "a row must carry the whole path: {rows:?}",
     );
-    // And each of them addresses: a client uses a row's path as it stands.
     let first = rows.first().expect("at least one entry").clone();
     let read = talk(&[
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": outer}}),
@@ -3834,8 +3735,6 @@ fn a_list_row_carries_the_whole_path_it_was_addressed_from() {
     );
 }
 
-/// The wire refuses a non-empty target the way the command line does, and takes
-/// the same way through. Both, or neither.
 #[test]
 fn extract_over_a_target_that_holds_something_is_refused_on_the_wire_too() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3869,8 +3768,6 @@ fn extract_over_a_target_that_holds_something_is_refused_on_the_wire_too() {
     assert_eq!(answer(&responses, 4)["result"]["files"], json!(2));
 }
 
-/// A listing is the archive on disk — nothing changes there until `commit` —
-/// and `read` is the one method that prefers what was buffered.
 #[test]
 fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3904,12 +3801,9 @@ fn a_listing_is_the_archive_on_disk_and_a_read_is_not() {
         "a buffered addition is not in the listing either: {rows:?}",
     );
 
-    // And `read` is the exception: what was written comes back before it is
-    // anywhere on disk.
     let read = answer(&responses, 5);
     assert_eq!(read["result"]["pending"], json!(true), "{read}");
 
-    // `pending` is what a client confirms its own view against.
     assert_eq!(
         answer(&responses, 6)["result"]["paths"],
         json!(["added.txt", "art.yft"]),
@@ -3965,8 +3859,6 @@ fn talk_homed(home: &Path, requests: &[Value]) -> Vec<Value> {
     ignore = "RPF_CORPUS and RPF_GAME_IMAGE must both be set"
 )]
 fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
-    // What `rpf put` can do over an NG archive, `serve --stdio` can do, and the
-    // archive it left is opened by a second daemon from the bytes on disk.
     let test = "the_wire_writes_into_an_ng_archive_and_it_opens_again";
     let Some(archive) = corpus(test, NG_ARCHIVE) else {
         return;
@@ -4034,8 +3926,6 @@ fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
-    // What `rpf put` can do over an AES archive, `serve --stdio` can do, and the
-    // archive it left is opened by a second daemon from the bytes on disk.
     let test = "the_wire_writes_into_an_aes_archive_and_it_opens_again";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -4100,8 +3990,7 @@ fn the_wire_writes_into_an_aes_archive_and_it_opens_again() {
     ignore = "RPF_CORPUS and RPF_GAME_EXE must both be set"
 )]
 fn the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with() {
-    // `rpf ls --cache-dir D` opens it, so `serve --stdio` must. The flag is on
-    // the process rather than on every method that opens an archive.
+    // The flag is on the process rather than on every method that opens an archive.
     let test = "the_daemon_opens_an_encrypted_archive_from_the_cache_it_was_started_with";
     let Some(archive) = corpus(test, AES_ARCHIVE) else {
         return;
@@ -4237,8 +4126,7 @@ fn the_daemon_packs_a_tree_extracted_from_an_archive_holding_no_resource() {
     assert_eq!(opened["result"]["entries"], json!(118), "{opened}");
     let repacked = answer(&responses, 4);
     assert!(repacked["result"].is_object(), "{repacked}");
-    // Against what the source archive answered rather than a fixed count: whether
-    // a packed tree reproduces the entry count is `build`'s question.
+    // Against what the source archive answered rather than a fixed count.
     let reopened = answer(&responses, 5);
     assert!(reopened["result"].is_object(), "{reopened}");
     assert_eq!(
@@ -4372,8 +4260,6 @@ fn a_write_of_text_into_a_tokenised_metadata_entry_is_refused_at_the_commit() {
     }
 }
 
-/// A dry run reports the refusal the real commit makes, whichever way it is
-/// told to go: a dry run is a prediction rather than an estimate.
 #[test]
 fn a_dry_run_told_to_rebuild_reports_the_refusal_the_commit_would_make() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4390,8 +4276,6 @@ fn a_dry_run_told_to_rebuild_reports_the_refusal_the_commit_would_make() {
                 "bytes": BASE64.encode(b"<CVehicleModelInfo />")}}),
             json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{
                 "handle":1,"rebuild": rebuild,"dry_run":true}}),
-            // And the buffer survives a refused dry run, so the client can fix
-            // the edit rather than re-send it.
             json!({"jsonrpc":"2.0","id":4,"method":"pending","params":{"handle":1}}),
         ]);
         let refused = answer(&responses, 3);
@@ -4451,8 +4335,6 @@ fn force_does_not_let_text_into_a_tokenised_metadata_entry() {
     }
 }
 
-/// `read` answers the view it was asked for and names which view it gave, so a
-/// client that asked for `"auto"` need not guess whether it was converted.
 #[test]
 fn read_answers_the_view_it_was_asked_for_and_names_what_the_entry_holds() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4481,8 +4363,7 @@ fn read_answers_the_view_it_was_asked_for_and_names_what_the_entry_holds() {
             );
             assert_eq!(read["result"]["len"], json!(document.len()), "{read}");
         }
-        // The default is what every client sent before this existed: the
-        // entry's own bytes, with the encoding now named beside them.
+        // The default is the entry's own bytes, with the encoding named beside them.
         let raw = answer(&responses, 4);
         assert_eq!(raw["result"]["as"], json!("raw"), "{raw}");
         assert_eq!(raw["result"]["encoding"], json!(encoding), "{raw}");
@@ -4494,8 +4375,6 @@ fn read_answers_the_view_it_was_asked_for_and_names_what_the_entry_holds() {
     }
 }
 
-/// A document written back is converted, buffered, read back as the document,
-/// and committed with no override: a client must see its own pending edit.
 #[test]
 fn a_document_is_written_back_read_back_and_committed_as_the_entrys_encoding() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4543,8 +4422,6 @@ fn a_document_is_written_back_read_back_and_committed_as_the_entrys_encoding() {
     }
 }
 
-/// Converting is not a way round the encoding guard: as bytes the document is
-/// refused, and as a document it lands as the entry's tokenised payload.
 #[test]
 fn a_document_is_refused_as_bytes_and_taken_as_a_document_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4593,8 +4470,6 @@ fn a_document_is_refused_as_bytes_and_taken_as_a_document_on_the_wire() {
     );
 }
 
-/// A payload that is not a document is offered to the entry as it is: `"auto"`
-/// must not refuse a write that `"raw"` takes.
 #[test]
 fn auto_offers_a_payload_that_is_not_a_document_exactly_as_it_is() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4621,7 +4496,6 @@ fn auto_offers_a_payload_that_is_not_a_document_exactly_as_it_is() {
     );
 }
 
-/// An entry with no XML view refuses one, and says so under its own name.
 #[test]
 fn an_entry_with_no_xml_view_refuses_one_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4669,8 +4543,6 @@ fn an_entry_with_no_xml_view_refuses_one_on_the_wire() {
     );
 }
 
-/// A view name the wire does not have is a parameter failure, and names the
-/// three it does.
 #[test]
 fn a_view_the_wire_does_not_name_is_refused_as_a_parameter() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4719,8 +4591,6 @@ fn make_meta_archive(at: &Path, flags: rpf_core::ResourceFlags) {
     .expect("builds");
 }
 
-/// A resource carrying `Meta` reads as XML, takes a document back, reads the
-/// buffered document back, and commits; `"encoding"` stays `null` throughout.
 #[test]
 fn a_resource_meta_is_read_and_written_as_xml_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4829,8 +4699,6 @@ fn a_buffered_resource_whose_header_contradicts_its_row_has_no_view() {
         json!("NoXmlView"),
         "a buffer read against a boundary its own header denies: {refused}"
     );
-    // `auto` hands the bytes back rather than a document, which is what it
-    // answers for every entry with no view.
     let raw = answer(&responses, 4);
     assert_eq!(raw["result"]["as"], json!("raw"), "{raw}");
     assert_eq!(
@@ -4859,8 +4727,7 @@ fn talk_with_cache(cache: &Path, requests: &[Value]) -> Vec<Value> {
     drive(daemon, requests).0
 }
 
-/// A buffered converted write into a **keyed** resource reads back as its own
-/// document: what is buffered is the payload as it will sit on disk, keyed.
+/// What is buffered is the payload as it will sit on disk, keyed.
 #[test]
 fn a_keyed_resource_reads_its_own_buffered_edit_back_as_xml() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4911,8 +4778,6 @@ fn a_keyed_resource_reads_its_own_buffered_edit_back_as_xml() {
     );
 }
 
-/// A second `auto` write over a buffered converted write into a **keyed**
-/// resource edits the payload rather than becoming it, asserted on disk.
 #[test]
 fn a_second_auto_write_over_a_keyed_resource_does_not_land_the_document_as_the_payload() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -4959,7 +4824,6 @@ fn a_second_auto_write_over_a_keyed_resource_does_not_land_the_document_as_the_p
         "the document was written into the resource entry as its payload",
     );
     assert_ne!(payload, common::META_DOCUMENT.as_bytes());
-    // And the edit that was offered is the one the entry now carries.
     let names = rpf_core::Dictionary::default();
     let viewed = rpf_core::view::read(
         &mut file,
@@ -4978,8 +4842,6 @@ fn a_second_auto_write_over_a_keyed_resource_does_not_land_the_document_as_the_p
     );
 }
 
-/// A resource whose payload cannot be taken apart refuses an `auto` write of a
-/// document rather than letting the document become the payload.
 #[test]
 fn an_auto_write_of_a_document_into_an_unreadable_resource_is_refused() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5030,8 +4892,6 @@ fn an_auto_write_of_a_document_into_an_unreadable_resource_is_refused() {
     );
 }
 
-/// The three refusals a `Meta` earns, with nothing written: no view at all, a
-/// row declaring the boundary elsewhere, and a document it cannot take.
 #[test]
 fn a_meta_refuses_a_wrong_boundary_and_a_document_it_cannot_take() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5070,8 +4930,6 @@ fn a_meta_refuses_a_wrong_boundary_and_a_document_it_cannot_take() {
         json!("NotMetaXml"),
         "{refused}"
     );
-    // Nothing was buffered, so the commit has nothing to write and the file is
-    // byte for byte what it was.
     let committed = answer(&responses, 6);
     assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
     assert_eq!(
@@ -5081,8 +4939,6 @@ fn a_meta_refuses_a_wrong_boundary_and_a_document_it_cannot_take() {
     );
 }
 
-/// A resource that is not a `Meta` still has no view, and `"auto"` still hands
-/// back its bytes — which is nearly every resource there is.
 #[test]
 fn a_resource_that_is_not_a_meta_still_has_no_xml_view() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5113,8 +4969,7 @@ fn a_resource_that_is_not_a_meta_still_has_no_xml_view() {
     );
 }
 
-/// A resource entry does not take a document; asserted over the bytes a raw
-/// read gives back, since the length that landed was the document's own.
+/// Asserted over the bytes a raw read gives back: the length that landed was the document's own.
 #[test]
 fn an_auto_write_of_a_document_into_a_resource_is_refused_on_the_wire() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -5141,7 +4996,6 @@ fn an_auto_write_of_a_document_into_a_resource_is_refused_on_the_wire() {
         refused["result"].is_null(),
         "the document was buffered: {refused}"
     );
-    // Nothing was buffered, so the commit has nothing to write.
     let committed = answer(&responses, 3);
     assert_eq!(committed["result"]["committed"], json!(0), "{committed}");
     let after = answer(&responses, 4);

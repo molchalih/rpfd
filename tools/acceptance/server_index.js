@@ -17,6 +17,12 @@ mp.events.add("rpf:probe", (player, stage, detail) => {
     line(`probe ${stage}${detail === undefined ? "" : " " + detail}`);
 });
 
+// A name that exists only inside the pack's nested archive: whether the
+// streaming index holds it says whether that archive reaches the index at all.
+mp.events.add("rpf:nested", (player, model, inCdimage) => {
+    line(`nested ${model} ${inCdimage}`);
+});
+
 mp.events.add("rpf:streamed", (player, model, modelLoaded, waited) => {
     line(`streamed ${model} ${modelLoaded} ${waited}`);
 });

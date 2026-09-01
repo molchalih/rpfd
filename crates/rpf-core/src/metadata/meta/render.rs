@@ -1,14 +1,4 @@
 //! The walk from the root block, and the XML it writes.
-//!
-//! Driven by the file's own three tables and nothing else; no builtin schema.
-//! Every element carries exactly one reserved `meta:` attribute whose name is
-//! its type and whose value is its value, a structure carries `meta:struct`
-//! naming its own type, and an array's items are `<meta:item>`. `meta:` is a
-//! name prefix and deliberately not a namespace.
-//!
-//! Every read is bounds-checked against its block, and the walk carries a depth
-//! ceiling, a node budget and an output budget: the block graph is
-//! attacker-chosen and can name a cycle or a diamond.
 
 use quick_xml::escape::escape;
 
@@ -22,53 +12,35 @@ use crate::{
     metadata::{hash::Dictionary, text},
 };
 
-/// The word an array item is written under.
 pub(super) const ITEM: &str = "item";
 
-/// The word a null pointer is written under. Its value is the type word the
-/// value would have had.
 pub(super) const NULL: &str = "null";
 
-/// The word a structure is written under, in both of the places one is named:
-/// on the element of a structure, where its value is that structure's own name,
-/// and as the value of `meta:null` for a pointer that is null.
 pub(super) const STRUCT: &str = "struct";
 
-/// The word an array is written under.
 pub(super) const ARRAY: &str = "array";
 
-/// The layout of an array that lives behind a pointer: the pointer, a length
-/// and a capacity.
+/// The layout of an array that lives behind a pointer.
 pub(super) const COUNTED: &str = "counted";
 
 /// The layout of an array that lives in the member's own bytes.
 pub(super) const INLINE: &str = "inline";
 
-/// The word a string is written under.
 pub(super) const TEXT: &str = "string";
 
-/// How far each level of nesting is indented.
 const INDENT: &str = "  ";
 
-/// An array as both directions see it: which of the two layouts it is, where
-/// its items are, and how many there are.
+/// An array as both directions see it: its layout, base, and item count.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Items<'a> {
-    /// The word the layout is written under: [`COUNTED`] or [`INLINE`].
+    /// The word the layout is written under: `COUNTED` or `INLINE`.
     pub(super) layout: &'static str,
     /// Where the first item is, or `None` when there is none.
     pub(super) base: Option<Spot<'a>>,
-    /// How many items there are.
     pub(super) count: u32,
 }
 
 /// Reads a resource `Meta` payload and writes the XML that describes it.
-///
-/// # Errors
-///
-/// [`crate::Error::BadMeta`] when the file contradicts itself, and
-/// [`crate::Error::UnsupportedMeta`] when it is well formed and carries a
-/// member type code outside the 23 this build names.
 pub(super) fn write(payload: &[u8], system_len: usize, names: &Dictionary) -> Result<Vec<u8>> {
     let meta = super::parse(payload, system_len)?;
     let root = *meta.root();
@@ -102,7 +74,6 @@ pub(super) fn write(payload: &[u8], system_len: usize, names: &Dictionary) -> Re
     Ok(writer.out.into_bytes())
 }
 
-/// The walk in progress.
 #[derive(Debug)]
 struct Writer<'a, 'b> {
     /// The file, and the reads every value needs of it.
@@ -124,7 +95,6 @@ struct Place {
 }
 
 impl Place {
-    /// The root's place.
     const fn root() -> Self {
         Self {
             depth: 0,
@@ -132,7 +102,6 @@ impl Place {
         }
     }
 
-    /// One level in.
     const fn inside(self) -> Self {
         Self {
             depth: self.depth.saturating_add(1),
@@ -140,8 +109,7 @@ impl Place {
         }
     }
 
-    /// One level deeper, at the same indent: a pointer hop is a level of the
-    /// walk and not of the document, so only the ceiling moves.
+    /// One level deeper, at the same indent, for a pointer hop.
     const fn deeper(self) -> Self {
         Self {
             depth: self.depth.saturating_add(1),
@@ -151,7 +119,6 @@ impl Place {
 }
 
 impl<'a> Writer<'a, '_> {
-    /// Writes one structure instance as an element named `tag`.
     fn structure(&mut self, name: u32, spot: Spot<'a>, tag: &str, place: Place) -> Result<()> {
         let structure = *self
             .values
@@ -180,8 +147,7 @@ impl<'a> Writer<'a, '_> {
         Ok(())
     }
 
-    /// Where a member's value is, once it has been checked to lie inside the
-    /// structure that declares it.
+    /// Where a member's value is, checked to lie inside its structure.
     fn field(&self, structure: Structure<'a>, member: Member, spot: Spot<'a>) -> Result<Spot<'a>> {
         let field = Field {
             member,
@@ -246,7 +212,6 @@ impl<'a> Writer<'a, '_> {
         }
     }
 
-    /// Writes what a pointer landed on, whose type is the landing block's tag.
     fn target(&mut self, landing: Spot<'a>, tag: &str, place: Place) -> Result<()> {
         match landing.block.tag {
             BlockTag::Structure(name) => self.structure(name, landing, tag, place),
@@ -270,8 +235,7 @@ impl<'a> Writer<'a, '_> {
         }
     }
 
-    /// Writes an array of either layout: `items.count` items from
-    /// `items.base`.
+    /// Writes an array of either layout: `items.count` items from `items.base`.
     fn items(&mut self, field: Field<'a>, tag: &str, items: Items<'a>, place: Place) -> Result<()> {
         let attributes = attribute(&reserved(ARRAY), items.layout);
         let (Some(base), true) = (items.base, items.count != 0) else {
@@ -331,8 +295,7 @@ impl<'a> Writer<'a, '_> {
     }
 }
 
-/// A member of no structure, standing for the one value a typed data block
-/// holds, since such a block has no member record to read.
+/// A member of no structure, standing for the one value a typed data block holds.
 fn typed(code: u8) -> Member {
     Member {
         name: 0,
@@ -344,7 +307,6 @@ fn typed(code: u8) -> Member {
     }
 }
 
-/// One reserved attribute, as it is written.
 fn attribute(name: &str, value: &str) -> String {
     format!(" {name}=\"{}\"", escape(value))
 }
@@ -355,8 +317,7 @@ pub(super) fn reserved(word: &str) -> String {
 }
 
 impl Writer<'_, '_> {
-    /// Charges one element against the ceilings, from [`Writer::empty`] and
-    /// [`Writer::open`], which between them write every element.
+    /// Charges one element against the ceilings.
     fn spend(&mut self, place: Place) -> Result<()> {
         if place.depth > MAX_DEPTH {
             return Err(bad(0, Malformed::TooDeep));
@@ -373,7 +334,6 @@ impl Writer<'_, '_> {
         Ok(())
     }
 
-    /// Writes `depth` levels of indentation.
     fn indent(&mut self, depth: usize) {
         for _ in 0..depth {
             self.out.push_str(INDENT);
@@ -408,7 +368,7 @@ impl Writer<'_, '_> {
         Ok(())
     }
 
-    /// Writes the closing tag of an element [`Writer::open`] has charged for.
+    /// Writes the closing tag of an element `open` has charged for.
     fn close(&mut self, tag: &str, place: Place) {
         self.indent(place.indent);
         self.out.push_str("</");

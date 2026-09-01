@@ -1,8 +1,4 @@
 //! Where extracted key material is kept between runs, and what invalidates it.
-//!
-//! Keyed by the SHA-256 of the executable it came from, so a game update cannot
-//! reuse the previous install's material. Entries live in the user's own
-//! configuration directory, never in this repository.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -22,63 +18,37 @@ use crate::error::{Error, Result};
 /// Length of the digest an executable is identified by, in bytes.
 pub const SOURCE_DIGEST_LEN: usize = 32;
 
-/// This application's directory, below the platform's configuration root.
 const APPLICATION: &str = "rpf";
 
-/// The cache's own directory, below [`APPLICATION`], so that clearing the cache
-/// cannot reach a configuration file kept beside it.
 const KEYS: &str = "keys";
 
-/// What a cache file is called, after its source's digest.
 const SUFFIX: &str = ".keys";
 
-/// What a store that has not finished calls the file it is writing.
 const TEMPORARY: &str = ".tmp";
 
-/// The first bytes of a cache file, so that a file of some other kind under the
-/// same name is not read as one.
 const MAGIC: [u8; 8] = *b"RPFKEYS\0";
 
-/// The layout version of a cache file. A file of another schema is a miss, not
-/// a failure: a cache is disposable and re-extraction is the correct answer.
-///
-/// An optional half appended in a shape the declared length tells apart does
-/// not need a new schema, since an older entry still reads back as what it is.
 const SCHEMA: u32 = 2;
 
-/// Offset of the payload within a cache file.
 const PAYLOAD_AT: usize = 48;
 
-/// Length of the payload of an entry holding only what every source carries:
-/// the two values and the two offsets they were at.
+/// Length of the payload every source carries: the two values and their offsets.
 const BASE_LEN: usize = AES_KEY_LEN.saturating_add(HASH_LUT_LEN).saturating_add(16);
 
-/// How much longer an entry is when it also holds the NG material: the expanded
-/// keys, the decrypt tables, and the two offsets they were at.
+/// How much longer an entry is when it also holds the NG material.
 const NG_LEN: usize = NG_EXPANDED_KEY_COUNT
     .saturating_mul(NG_EXPANDED_KEY_LEN)
     .saturating_add(NG_DECRYPT_TABLE_COUNT.saturating_mul(NG_DECRYPT_TABLE_LEN))
     .saturating_add(16);
 
-/// How much longer an entry is when it also holds the launcher's own AES key:
-/// the key, and the offset it was at.
 const LAUNCHER_LEN: usize = AES_KEY_LEN.saturating_add(8);
 
-/// The payload length of an entry that holds the launcher key and no NG
-/// material, which is what `Launcher.exe` produces.
 const WITH_LAUNCHER_LEN: usize = BASE_LEN.saturating_add(LAUNCHER_LEN);
 
-/// The payload length of an entry that also holds the NG material.
-///
-/// The length is the discriminator: an entry is one of exactly four shapes, and
-/// a declared length that is none of them is not an entry this build wrote.
 const WITH_NG_LEN: usize = BASE_LEN.saturating_add(NG_LEN);
 
-/// The payload length of an entry holding both optional halves.
 const WITH_BOTH_LEN: usize = WITH_NG_LEN.saturating_add(LAUNCHER_LEN);
 
-/// Which optional halves an entry of this declared payload length carries, or
-/// `None` when no entry this build writes is that long.
 const fn shape(len: usize) -> Option<(bool, bool)> {
     match len {
         BASE_LEN => Some((false, false)),
@@ -89,24 +59,14 @@ const fn shape(len: usize) -> Option<(bool, bool)> {
     }
 }
 
-/// The SHA-256 of a game executable, which is what a cache entry is keyed by.
-///
-/// A digest, never key material: this identifies the file the material came
-/// from and says nothing about the material.
+/// The SHA-256 of a game executable, which is what a cache entry is keyed by; never a key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SourceDigest([u8; SOURCE_DIGEST_LEN]);
 
 impl SourceDigest {
-    /// Digests a source whole, from its start.
-    ///
-    /// It rewinds first, which is why it asks for [`Seek`]: a scan leaves the
-    /// source where its last read ended, and digesting from there would give
-    /// every source the digest of nothing and so one shared cache key.
-    ///
+    /// Digests a source whole, rewinding first so a partly-read source hashes the same.
     /// # Errors
-    ///
-    /// [`Error::Io`] if the source cannot be rewound or read, naming how far it
-    /// got.
+    /// An I/O error if the source cannot be rewound or read.
     pub fn of<S: Read + Seek>(source: &mut S) -> Result<Self> {
         source.rewind().map_err(io)?;
         let mut hasher = Sha256::new();
@@ -135,7 +95,6 @@ impl SourceDigest {
         Ok(Self(hasher.finalize().into()))
     }
 
-    /// The digest a lower-case hexadecimal name spells, if it spells one.
     fn from_hex(text: &str) -> Option<Self> {
         if text.len() != SOURCE_DIGEST_LEN.checked_mul(2)? {
             return None;
@@ -170,9 +129,7 @@ impl SourceDigest {
 /// A directory holding extracted key material, one file per source executable.
 #[derive(Clone, Debug)]
 pub struct Cache {
-    /// Where the files are.
     directory: PathBuf,
-    /// A directory this cache kept its entries in before, and still clears.
     superseded: Option<PathBuf>,
 }
 
@@ -192,13 +149,6 @@ impl Cache {
         root(HOST, &Environment::of_this_process()).map(Self::below)
     }
 
-    /// The cache below an application configuration directory.
-    ///
-    /// Entries go in a `keys` subdirectory so that a configuration file beside
-    /// them is not inside the thing an invalidation empties.
-    ///
-    /// [`Cache::clear`] still sweeps the configuration directory itself, where
-    /// entries once lived: nothing is migrated, but nothing is left either.
     fn below(application: PathBuf) -> Self {
         Self {
             directory: application.join(KEYS),
@@ -212,15 +162,9 @@ impl Cache {
         &self.directory
     }
 
-    /// The material extracted from the executable with this digest, if it is
-    /// cached.
-    ///
-    /// A file that is absent, of another schema, truncated, or failing its own
-    /// checksum is a miss rather than a failure: extraction overwrites it.
-    ///
+    /// The material extracted from the executable with this digest, if cached.
     /// # Errors
-    ///
-    /// [`Error::Io`] if the directory exists and the file cannot be read.
+    /// An I/O error if the directory exists and the file cannot be read.
     pub fn load(&self, source: &SourceDigest) -> Result<Option<Material>> {
         let path = self.path_for(source);
         let bytes = match fs::read(&path) {
@@ -236,16 +180,9 @@ impl Cache {
         Ok(decode(&bytes))
     }
 
-    /// Writes material to the cache under its source's digest, replacing
-    /// whatever was there.
-    ///
-    /// Written beside its destination and renamed onto it, so an entry is never
-    /// half-written. On a Unix it is created readable by its owner alone,
-    /// because it holds a key.
-    ///
+    /// Writes material to the cache, renamed atomically into place; owner-only on Unix.
     /// # Errors
-    ///
-    /// [`Error::Io`] if the directory cannot be created or the file written.
+    /// An I/O error if the directory cannot be created or the file written.
     pub fn store(&self, source: &SourceDigest, material: &Material) -> Result<()> {
         fs::create_dir_all(&self.directory).map_err(io)?;
 
@@ -263,19 +200,9 @@ impl Cache {
         fs::rename(&temporary, &destination).map_err(io)
     }
 
-    /// The sources this cache holds material for.
-    ///
-    /// One digest per entry, in whatever order the directory reads back. A file
-    /// this cache did not write is not an entry, by the same naming rule
-    /// [`Cache::store`] uses.
-    ///
-    /// A directory that is not there holds no entries, and asking must not
-    /// create one. An entry is recognised by its name and not read, so whether
-    /// it is usable is [`Cache::load`]'s answer.
-    ///
+    /// The sources this cache holds material for, one digest per entry.
     /// # Errors
-    ///
-    /// [`Error::Io`] if the directory exists and cannot be read.
+    /// An I/O error if the directory exists and cannot be read.
     pub fn entries(&self) -> Result<Vec<SourceDigest>> {
         let mut entries = Vec::new();
         for (_, held) in ours_in(&self.directory)? {
@@ -286,15 +213,9 @@ impl Cache {
         Ok(entries)
     }
 
-    /// Every material this cache holds, in a stable order.
-    ///
-    /// Read in digest order rather than in directory order, so which entry
-    /// opens an archive is the same answer on two runs. An entry that fails its
-    /// own checksum is a miss and is simply not here.
-    ///
+    /// Every material this cache holds, in digest order for a stable result.
     /// # Errors
-    ///
-    /// [`Error::Io`] if the directory exists and an entry cannot be read.
+    /// An I/O error if the directory exists and an entry cannot be read.
     pub fn materials(&self) -> Result<Vec<Material>> {
         let mut sources = self.entries()?;
         sources.sort_unstable_by_key(SourceDigest::hex);
@@ -307,19 +228,9 @@ impl Cache {
         Ok(held)
     }
 
-    /// Removes everything this cache wrote, and says how many files that was.
-    ///
-    /// Whole rather than one entry at a time: "take the key material off this
-    /// machine" cannot leave another install's behind.
-    ///
-    /// Removes entries and any temporary a store left behind, leaving every
-    /// other file and subdirectory alone; an empty or absent cache is `0`. The
-    /// platform cache also sweeps the directory it superseded, so the count can
-    /// exceed what [`Cache::entries`] reported.
-    ///
+    /// Removes everything this cache wrote; the platform cache also sweeps its predecessor.
     /// # Errors
-    ///
-    /// [`Error::Io`] if a directory cannot be read or a file cannot be removed.
+    /// An I/O error if a directory cannot be read or a file cannot be removed.
     pub fn clear(&self) -> Result<usize> {
         let mut removed = 0_usize;
         for directory in std::iter::once(&self.directory).chain(self.superseded.as_ref()) {
@@ -331,22 +242,17 @@ impl Cache {
         Ok(removed)
     }
 
-    /// The file the material from this source is kept in.
     fn path_for(&self, source: &SourceDigest) -> PathBuf {
         self.directory.join(format!("{}{SUFFIX}", source.hex()))
     }
 }
 
-/// What a file under a cache directory is, when it is one of the cache's own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Held {
-    /// A cache entry, keyed by the digest its name spells.
     Entry(SourceDigest),
-    /// A temporary left by a store that did not finish.
     Temporary,
 }
 
-/// What a file name means to this cache, or `None` if it means nothing.
 fn held(name: &str) -> Option<Held> {
     let (digest, rest) = name.split_once(SUFFIX)?;
     let source = SourceDigest::from_hex(digest)?;
@@ -359,7 +265,6 @@ fn held(name: &str) -> Option<Held> {
     }
 }
 
-/// This cache's own files in a directory, each with what it is.
 fn ours_in(directory: &Path) -> Result<Vec<(PathBuf, Held)>> {
     let reading = match fs::read_dir(directory) {
         Ok(reading) => reading,
@@ -380,18 +285,11 @@ fn ours_in(directory: &Path) -> Result<Vec<(PathBuf, Held)>> {
     Ok(found)
 }
 
-/// Wraps a filesystem failure, which has no offset to report.
 fn io(source: std::io::Error) -> Error {
     Error::Io { offset: 0, source }
 }
 
-/// Creates a cache file readable by its owner alone, at creation.
-///
-/// The mode goes on the `open` call, never on a `set_permissions` after it: a
-/// Unix permission check happens at `open`, so a file created `0644` and
-/// narrowed afterwards is readable by anyone inside that window, and the key
-/// bytes are written after. A stale temporary is removed rather than reopened,
-/// which would inherit its mode.
+/// Readable by its owner alone: the mode is set at `open`, before any key bytes are written.
 #[cfg(unix)]
 fn create_private(path: &Path) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -405,13 +303,11 @@ fn create_private(path: &Path) -> Result<fs::File> {
         .map_err(io)
 }
 
-/// Creates the file off Unix, where there is no mode to set. See the Unix arm.
 #[cfg(not(unix))]
 fn create_private(path: &Path) -> Result<fs::File> {
     fs::File::create(path).map_err(io)
 }
 
-/// The bytes of a cache file holding this material.
 fn encode(material: &Material) -> Vec<u8> {
     let keys = material.keys();
     let mut payload = Vec::with_capacity(WITH_BOTH_LEN);
@@ -442,8 +338,6 @@ fn encode(material: &Material) -> Vec<u8> {
     out
 }
 
-/// The material in a cache file, or `None` if it is not one this build wrote:
-/// the declared payload length says which of the four shapes the entry is.
 fn decode(bytes: &[u8]) -> Option<Material> {
     if bytes.get(..MAGIC.len())? != MAGIC {
         return None;
@@ -471,8 +365,7 @@ fn decode(bytes: &[u8]) -> Option<Material> {
         lut,
         lut_at,
     };
-    // In the order the payload lays them out, so each bound is read against the
-    // one before it.
+    // In the order the payload lays them out, so each bound reads against the last.
     let launcher = if has_launcher {
         Some(decode_launcher(payload)?)
     } else {
@@ -491,7 +384,6 @@ fn decode(bytes: &[u8]) -> Option<Material> {
     Some(Material::restored(keys, ng, launcher))
 }
 
-/// The launcher key of a payload that declared itself long enough to hold one.
 fn decode_launcher(payload: &[u8]) -> Option<LauncherKey> {
     let key_end = BASE_LEN.checked_add(AES_KEY_LEN)?;
     let key: [u8; AES_KEY_LEN] = payload.get(BASE_LEN..key_end)?.try_into().ok()?;
@@ -501,8 +393,6 @@ fn decode_launcher(payload: &[u8]) -> Option<LauncherKey> {
     ))
 }
 
-/// The NG half of a payload long enough to hold one, beginning at `starts_at`,
-/// which is past the launcher key where the entry carries one.
 fn decode_ng(payload: &[u8], starts_at: usize) -> Option<NgKeys> {
     let tables_start =
         starts_at.checked_add(NG_EXPANDED_KEY_COUNT.checked_mul(NG_EXPANDED_KEY_LEN)?)?;
@@ -517,31 +407,22 @@ fn decode_ng(payload: &[u8], starts_at: usize) -> Option<NgKeys> {
     NgKeys::restored(expanded, tables, expanded_at, tables_at)
 }
 
-/// Four bytes at `at`, if they are there.
 fn word(bytes: &[u8], at: usize) -> Option<[u8; 4]> {
     bytes.get(at..at.checked_add(4)?)?.try_into().ok()
 }
 
-/// Eight bytes at `at`, if they are there.
 fn long(bytes: &[u8], at: usize) -> Option<[u8; 8]> {
     bytes.get(at..at.checked_add(8)?)?.try_into().ok()
 }
 
-/// The three shapes a configuration directory takes.
-///
-/// Named rather than `#[cfg]`-ed at each use, so all three are live code on
-/// every platform and [`root`] can be tested for all three from any of them.
+/// The three shapes a config directory takes; not `#[cfg]`-ed, so `root` tests all three.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Platform {
-    /// `$XDG_CONFIG_HOME`, or `$HOME/.config`.
     Xdg,
-    /// `$HOME/Library/Application Support`.
     Apple,
-    /// `%APPDATA%`.
     Windows,
 }
 
-/// The platform this build runs on.
 const HOST: Platform = if cfg!(windows) {
     Platform::Windows
 } else if cfg!(target_os = "macos") {
@@ -550,19 +431,14 @@ const HOST: Platform = if cfg!(windows) {
     Platform::Xdg
 };
 
-/// The environment variables a configuration directory is derived from.
 #[derive(Clone, Default, Debug)]
 struct Environment {
-    /// `$HOME`.
     home: Option<OsString>,
-    /// `$XDG_CONFIG_HOME`.
     xdg_config_home: Option<OsString>,
-    /// `%APPDATA%`.
     appdata: Option<OsString>,
 }
 
 impl Environment {
-    /// This process's own environment.
     fn of_this_process() -> Self {
         Self {
             home: std::env::var_os("HOME"),
@@ -572,17 +448,11 @@ impl Environment {
     }
 }
 
-/// Whether `$XDG_CONFIG_HOME` names an absolute path by the specification's
-/// rule, which is a leading `/`.
-///
-/// Not `Path::is_absolute`, which answers for the host: on Windows that calls
-/// `/elsewhere/config` relative and the XDG arm falls through to `$HOME`.
+/// Absolute by the spec's rule (a leading `/`), not `Path::is_absolute`'s host rule.
 fn xdg_absolute(configured: &OsStr) -> bool {
     configured.as_encoded_bytes().first() == Some(&b'/')
 }
 
-/// The cache directory for a platform and an environment, if that environment
-/// says where it is.
 fn root(platform: Platform, environment: &Environment) -> Option<PathBuf> {
     let base = match platform {
         Platform::Xdg => match environment.xdg_config_home.as_ref() {
@@ -613,7 +483,6 @@ mod tests {
         NG_DECRYPT_TABLE_LEN, NG_EXPANDED_KEY_COUNT, NG_EXPANDED_KEY_LEN, NgKeys,
     };
 
-    /// Fixed byte patterns and offsets, never key material.
     fn keys_at(aes_at: u64) -> Keys {
         Keys {
             aes: [0x11; AES_KEY_LEN],
@@ -623,13 +492,10 @@ mod tests {
         }
     }
 
-    /// An entry of the shape every source produces: no NG material and no
-    /// launcher key.
     fn material() -> Material {
         Material::restored(keys_at(0x1234_5678), None, None)
     }
 
-    /// The shape only the launcher's own executable produces.
     fn material_with_launcher() -> Material {
         Material::restored(
             keys_at(0x1234_5678),
@@ -638,7 +504,6 @@ mod tests {
         )
     }
 
-    /// An entry of the other shape, which only a memory image produces.
     fn material_with_ng() -> Material {
         let expanded = vec![0x33; NG_EXPANDED_KEY_COUNT * NG_EXPANDED_KEY_LEN];
         let tables = vec![0x44; NG_DECRYPT_TABLE_COUNT * NG_DECRYPT_TABLE_LEN];
@@ -647,7 +512,6 @@ mod tests {
         Material::restored(keys_at(0x1234_5678), Some(ng), None)
     }
 
-    /// The shape a source carrying both halves would produce.
     fn material_with_both() -> Material {
         let expanded = vec![0x33; NG_EXPANDED_KEY_COUNT * NG_EXPANDED_KEY_LEN];
         let tables = vec![0x44; NG_DECRYPT_TABLE_COUNT * NG_DECRYPT_TABLE_LEN];
@@ -666,7 +530,6 @@ mod tests {
 
     #[test]
     fn the_source_digest_is_sha256_of_the_whole_source() {
-        // The empty string's SHA-256, checkable against anything else.
         assert_eq!(
             digest_of(b"").hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -702,8 +565,6 @@ mod tests {
 
     #[test]
     fn the_launcher_key_survives_the_file_format_and_keeps_its_position() {
-        // The shapes are told apart by length, so an older entry reads back
-        // without a launcher key rather than silently acquiring one.
         let written = encode(&material_with_launcher());
         let read = decode(&written).expect("a file this build wrote reads back");
         let source = material_with_launcher();
@@ -719,8 +580,6 @@ mod tests {
 
     #[test]
     fn an_entry_holding_both_halves_reads_both_back_in_order() {
-        // The launcher key sits between the base and the NG material, so the
-        // second is only read right if the first was measured.
         let written = encode(&material_with_both());
         let read = decode(&written).expect("a file this build wrote reads back");
         let source = material_with_both();
@@ -741,14 +600,10 @@ mod tests {
         );
     }
 
-    /// The last round the NG material is indexed by, so the test above reaches
-    /// the far end of the payload.
     const NG_ROUNDS_LAST: usize = crate::keys::NG_ROUNDS - 1;
 
     #[test]
     fn the_ng_material_survives_the_file_format_and_keeps_its_positions() {
-        // The index into the 373 values is how a key is chosen, so a rotation
-        // would decrypt nothing while looking well formed.
         let written = encode(&material_with_ng());
         let read = decode(&written).expect("a file this build wrote reads back");
         let source = material_with_ng();
@@ -786,8 +641,6 @@ mod tests {
 
     #[test]
     fn the_four_shapes_of_an_entry_are_told_apart_by_their_declared_length() {
-        // The length is the discriminator, so a payload claiming a longer shape
-        // than it carries is a miss rather than a short read.
         assert_eq!(encode(&material()).len(), PAYLOAD_AT + BASE_LEN);
         assert_eq!(encode(&material_with_ng()).len(), PAYLOAD_AT + WITH_NG_LEN);
         assert_eq!(
@@ -910,8 +763,6 @@ mod tests {
 
     #[test]
     fn every_material_a_cache_holds_is_a_candidate_it_offers() {
-        // An empty answer is `Error::NeedsKey`, so a cache holding the material
-        // and reported as empty sends an automation after a key it has.
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
 
@@ -953,9 +804,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_cache_file_is_private_from_the_moment_it_exists() {
-        // The mode a file is *created* with is the property that matters: a
-        // Unix permission check happens at `open`, and the key bytes are
-        // written after.
         use std::os::unix::fs::PermissionsExt as _;
 
         use super::create_private;
@@ -972,7 +820,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_stale_temporary_does_not_lend_its_mode_to_the_next_one() {
-        // Reopening a leftover file would inherit whatever mode it had.
         use std::os::unix::fs::PermissionsExt as _;
 
         use super::create_private;
@@ -995,8 +842,6 @@ mod tests {
 
     #[test]
     fn a_source_is_digested_whole_however_it_was_left() {
-        // A scan leaves the source where its last read ended, so the digest
-        // rewinds rather than hashing nothing.
         use std::io::Read as _;
 
         let bytes = b"an executable, or near enough".to_vec();
@@ -1036,8 +881,6 @@ mod tests {
 
     #[test]
     fn the_platform_cache_keeps_its_entries_below_the_configuration_directory() {
-        // A configuration file beside the entries must not be inside the thing
-        // an invalidation empties.
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::below(directory.path().to_path_buf());
         assert_eq!(cache.directory(), directory.path().join(KEYS));
@@ -1045,8 +888,6 @@ mod tests {
 
     #[test]
     fn clearing_the_platform_cache_reaches_the_place_entries_used_to_live() {
-        // Material at the old location is not migrated, but it is still
-        // removed: an invalidation cannot except a location.
         let application = tempfile::tempdir().unwrap();
         let cache = Cache::below(application.path().to_path_buf());
         let old = digest_of(b"a build cached before the move");
@@ -1080,8 +921,6 @@ mod tests {
 
     #[test]
     fn a_cache_in_a_named_directory_supersedes_nothing_and_touches_no_parent() {
-        // Only the platform cache sweeps a superseded directory: a named one
-        // must not reach outside what it was given.
         let parent = tempfile::tempdir().unwrap();
         let source = digest_of(b"one build");
         let above = parent.path().join(format!("{}{SUFFIX}", source.hex()));
@@ -1155,8 +994,6 @@ mod tests {
 
     #[test]
     fn a_temporary_from_a_store_that_did_not_finish_is_cleared_too() {
-        // It holds the same payload an entry does, mode and all, so leaving it
-        // would leave key material on disk.
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
         let source = digest_of(b"one build");
@@ -1222,8 +1059,6 @@ mod tests {
 
     #[test]
     fn a_relative_xdg_variable_is_ignored_rather_than_joined() {
-        // Joining a relative value would put the cache below whatever working
-        // directory the caller happened to be in.
         let relative = environment("/home/p", Some("config"), None);
         assert_eq!(
             root(Platform::Xdg, &relative).unwrap(),
@@ -1233,8 +1068,6 @@ mod tests {
 
     #[test]
     fn the_xdg_rule_is_a_leading_slash_and_not_the_host_s_idea_of_absolute() {
-        // Asserted against the rule rather than through `root`, which is only
-        // ever wrong on one platform.
         assert!(xdg_absolute(std::ffi::OsStr::new("/elsewhere/config")));
         assert!(!xdg_absolute(std::ffi::OsStr::new("C:\\config")));
         assert!(!xdg_absolute(std::ffi::OsStr::new("config")));
@@ -1253,9 +1086,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_unix_that_says_where_home_is_finds_a_platform_cache() {
-        // On a Unix both configuration roots are reached through `$HOME`, so a
-        // `$HOME` that is set makes `None` the wrong answer. `expect` rather
-        // than a skip: a skip gated on the function under test always passes.
         let home =
             std::env::var_os("HOME").expect("a Unix that can run cargo test says where $HOME is");
         assert!(!home.is_empty(), "$HOME is set to nothing");
@@ -1298,8 +1128,6 @@ mod tests {
         }
     }
 
-    /// A source that answers `EINTR` before each of its first `left` reads and
-    /// its own bytes after that.
     struct Interrupting {
         inner: Cursor<Vec<u8>>,
         left: usize,
@@ -1321,7 +1149,6 @@ mod tests {
         }
     }
 
-    /// A source that hands over `head` and then fails once, permanently.
     struct Failing {
         head: Vec<u8>,
         at: usize,
@@ -1372,8 +1199,6 @@ mod tests {
 
     #[test]
     fn a_digest_of_a_source_that_fails_says_how_far_it_got() {
-        // A truncated read must not become a digest of a prefix, which would be
-        // a cache key for a file nobody has.
         let head: Vec<u8> = (0..1_000_u32)
             .map(|i| u8::try_from(i % 251).unwrap())
             .collect();
@@ -1393,9 +1218,6 @@ mod tests {
 
     #[test]
     fn an_entry_that_cannot_be_read_is_a_failure_and_not_a_miss() {
-        // Only an absence is a miss. An entry that is there and cannot be read
-        // would otherwise re-scan a 47 MB executable on every command in
-        // silence.
         let parent = tempfile::tempdir().unwrap();
         let scratch = parent.path().join("cache");
         let cache = Cache::at(&scratch);
@@ -1403,7 +1225,6 @@ mod tests {
 
         assert!(cache.load(&digest).expect("absent is a miss").is_none());
 
-        // Present and unreadable: no platform calls a directory `NotFound`.
         let path = cache.path_for(&digest);
         fs::create_dir_all(&path).expect("a directory where the entry goes");
         match cache.load(&digest) {
@@ -1420,9 +1241,6 @@ mod tests {
 
     #[test]
     fn a_cache_directory_that_is_a_file_is_a_failure_and_not_an_empty_cache() {
-        // A directory that is not there holds nothing; anything else that stops
-        // it being read is a failure, or a `clear` would report success over
-        // key material it never removed.
         let parent = tempfile::tempdir().unwrap();
         let scratch = parent.path().join("cache");
 
@@ -1430,8 +1248,6 @@ mod tests {
         assert!(cache.entries().expect("absent holds nothing").is_empty());
         assert!(!scratch.exists(), "asking created the cache directory");
 
-        // A plain file where the directory goes: no platform calls that
-        // `NotFound`.
         fs::write(&scratch, b"not a directory").expect("a file where the directory goes");
         match cache.entries() {
             Err(Error::Io { source, .. }) => {

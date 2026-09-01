@@ -1,8 +1,7 @@
-//! What a walk over a whole archive holds at once, measured as peak live heap
-//! bytes by a counting global allocator installed for this test binary alone.
-//!
-//! One `#[test]` in the binary on purpose: the counter is process-global, and a
-//! second test running beside it would be measured into the first.
+//! Peak live heap over a whole-archive walk, measured by a counting global
+//! allocator installed for this test binary alone. One `#[test]` in the binary
+//! on purpose: the counter is process-global, so a second test would be
+//! measured into the first.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -68,13 +67,11 @@ fn stored(path: &str) -> FileSpec {
     }
 }
 
-/// How big each entry of the nested archive is: small, so that the arm measures
-/// the ancestor rather than the largest single entry.
+/// Small on purpose, so the arm measures the ancestor rather than one entry.
 const ENTRY_LEN: usize = 64 * 1024;
 
-/// An outer archive holding a nested one of `entries` files, and the length of
-/// that nested archive, which is stored rather than deflated so its length in
-/// the outer archive is its own.
+/// An outer archive holding a nested one of `entries` files, and that nested
+/// archive's length; it is stored rather than deflated, so the length is its own.
 fn nested(dir: &Path, entries: usize) -> (PathBuf, u64) {
     let inner_path = dir.join(format!("inner-{entries}.rpf"));
     let mut inner_specs: Vec<FileSpec> = (0..entries)
@@ -168,7 +165,6 @@ fn cascade<S: Scratch>(outer: &Path, into: &Path, scratch: &mut S) -> usize {
 }
 
 const SMALL_PAYLOAD: usize = 2 * 1024 * 1024;
-/// The larger, four times [`SMALL_PAYLOAD`].
 const LARGE_PAYLOAD: usize = 8 * 1024 * 1024;
 
 fn carrying(len: usize) -> rpf_core::Changes {
@@ -182,8 +178,8 @@ fn carrying(len: usize) -> rpf_core::Changes {
     )
 }
 
-/// The change is built before the baseline is taken, so what is measured is
-/// what the rebuild adds to the payload the caller already holds.
+/// The change is built before the baseline, so only what the rebuild adds to
+/// the caller's payload is measured.
 fn carried<S: Scratch>(outer: &Path, into: &Path, len: usize, scratch: &mut S) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -235,8 +231,8 @@ fn carried_and_held<S: Scratch>(outer: &Path, into: &Path, len: usize, scratch: 
 }
 
 /// An archive holding one entry of `len` bytes and one small one, and that
-/// entry's length. Stored rather than deflated, so a compressible payload does
-/// not end up measuring the compressor.
+/// entry's length. Stored rather than deflated, so the compressor is not
+/// what gets measured.
 fn one_large_entry(dir: &Path, len: usize) -> (PathBuf, u64) {
     let path = dir.join(format!("large-{len}.rpf"));
     let specs = [stored("bulk.bin"), stored("note.txt")];
@@ -285,8 +281,8 @@ fn rebuild(outer: &Path, into: &Path) -> usize {
     peak.saturating_sub(baseline)
 }
 
-/// Reads one entry of `outer` into memory, and answers the same peak: the
-/// instrument for the entry arm, whose peak must grow with the entry.
+/// The instrument for the entry arm: reads one entry whole, so its peak must
+/// grow with the entry.
 fn held_whole(outer: &Path) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -314,8 +310,8 @@ fn verified(outer: &Path) -> usize {
     peak.saturating_sub(baseline)
 }
 
-/// The manifest is derived before the peak is reset, so what is measured is the
-/// walk rather than the derivation.
+/// The manifest is derived before the peak is reset, so the walk is measured
+/// rather than the derivation.
 fn verified_against(outer: &Path) -> usize {
     let mut src = fs::File::open(outer).expect("opens");
     let archive = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -369,16 +365,14 @@ fn a_rebuild_and_a_verify_hold_neither_the_ancestor_nor_the_entry() {
          streamed to scratch {streamed_small} -> {streamed_large} (+{streamed})"
     );
 
-    // The instrument: an in-memory cascade holds the ancestor, so its peak has
-    // to grow by at least as much as the ancestor did.
     assert!(
         u64::try_from(held).unwrap_or(0) >= ancestor_growth,
         "an in-memory cascade grew by only {held} for an ancestor {ancestor_growth} larger, \
          so the measurement is not seeing the ancestor at all"
     );
 
-    // An eighth of the ancestor's growth is a wide margin on purpose: a rebuild
-    // that held the ancestor whole would grow by the whole of it.
+    // An eighth is a wide margin on purpose: holding the ancestor whole would
+    // grow the peak by the whole of it.
     assert!(
         u64::try_from(streamed).unwrap_or(u64::MAX) < ancestor_growth / 8,
         "peak grew by {streamed} bytes for an ancestor {ancestor_growth} bytes larger"
@@ -442,10 +436,8 @@ fn a_rebuild_and_a_verify_hold_neither_the_ancestor_nor_the_entry() {
     payload_arm(dir.path(), &small, &mut on_disk);
 }
 
-/// The payload a change carries: a cascading rebuild splits a change set at
-/// every level, so an owned payload risks being held once per level.
-///
-/// Its own function only because the test above is at `too_many_lines`.
+/// The payload arm: a cascading rebuild splits a change set at every level, so
+/// an owned payload risks being held once per level.
 fn payload_arm(dir: &Path, outer: &Path, scratch: &mut OnDisk) {
     let payload_growth = (LARGE_PAYLOAD - SMALL_PAYLOAD) as u64;
 
@@ -486,15 +478,12 @@ fn payload_arm(dir: &Path, outer: &Path, scratch: &mut OnDisk) {
          added by the rebuild {added_small} -> {added_large} (+{added})"
     );
 
-    // The instrument: a caller holding the donor grows by the donor.
     assert!(
         u64::try_from(held).unwrap_or(0) >= payload_growth,
         "holding the payload grew the peak by only {held} for a payload \
          {payload_growth} larger, so the measurement is not seeing it at all"
     );
 
-    // A rebuild carries the caller's payload rather than copying it, at any
-    // depth, so what it adds does not grow with the payload.
     assert!(
         u64::try_from(added).unwrap_or(u64::MAX) < payload_growth / 8,
         "the rebuild added {added} bytes for a payload {payload_growth} bytes larger"

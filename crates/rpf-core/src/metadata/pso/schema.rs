@@ -1,12 +1,4 @@
-//! The block table and the embedded schema, as types that carry their own
-//! guarantees.
-//!
-//! Checked at construction: a block lies inside the data section, the root
-//! names a block, a structure's length is not negative, an array's element
-//! index names an `ARRAYINFO` member of its own structure, and a wrapped
-//! `dataOffset` has been recovered. Not checked: whether a referenced structure
-//! exists, because a `PSCH` legitimately describes structures the data never
-//! instantiates.
+//! The block table and the embedded schema, guarantees checked at construction.
 
 use std::collections::BTreeMap;
 
@@ -17,23 +9,19 @@ use super::{
 };
 use crate::error::Result;
 
-/// How long an `ATBINARYMAP` member is: two `u32`s followed by the same
-/// 16-byte counted pointer an `ATARRAY` uses.
+/// How long an `ATBINARYMAP` member is: two `u32`s then the counted pointer `ATARRAY` uses.
 pub(super) const MAP_LEN: u32 = 24;
 
 /// Where an `ATBINARYMAP`'s counted pointer sits inside it.
 pub(super) const MAP_POINTER_AT: u32 = 8;
 
-/// How long the 16-byte counted forms are: the pointer, then `count1:u16be`,
-/// `count2:u16be`, `unk:u32be`.
+/// How long the 16-byte counted forms are: pointer, `count1:u16be`, `count2:u16be`, `unk:u32be`.
 pub(super) const COUNTED_LEN: u32 = 16;
 
-/// Where the first of a counted form's two counts sits inside it: `count1` is
-/// the length, and it differs from the capacity for many strings.
+/// Where a counted form's length count (`count1`) sits inside it.
 pub(super) const COUNT_AT: u32 = 8;
 
-/// Where the second of a counted form's two counts sits inside it: `count2` is
-/// the capacity, which bounds a write rather than what a read answers.
+/// Where a counted form's capacity count (`count2`) sits inside it.
 pub(super) const CAPACITY_AT: u32 = 10;
 
 /// How long one `PMAP` entry is: `nameHash`, `offset`, `unknown_8h`, `length`.
@@ -48,30 +36,25 @@ const INDEX_LEN: usize = 8;
 /// How long one enum entry is: `entryNameHash` and `entryKey`.
 const ENUM_ENTRY_LEN: usize = 8;
 
-/// Where a structure entry's members begin: after the packed word, the
-/// structure length and `unk_Ch`.
+/// Where a structure entry's members begin: after the packed word, length and `unk_Ch`.
 const MEMBERS_AT: usize = 12;
 
 /// Where an enum entry's own entries begin: after its packed word.
 const ENUM_ENTRIES_AT: usize = 4;
 
-/// Where a `PSCH` section's index begins: after the tag, the length and the
-/// count.
+/// Where a `PSCH` section's index begins: after the tag, the length and the count.
 const INDEX_AT: usize = 12;
 
-/// Where a `PMAP` section's entries begin: after the tag, the length, the root
-/// id, the count and `unknown_Eh`.
+/// Where a `PMAP` section's entries begin: after the tag, length, root id, count and `unknown_Eh`.
 const BLOCKS_AT: usize = 16;
 
-/// How long a pointer is: 32 bits of block and offset, and a second word that
-/// carries nothing.
+/// How long a pointer is: 32 bits of block and offset, then a word that carries nothing.
 pub(super) const POINTER_LEN: u32 = 8;
 
 /// How long a hashed string is: the `u32` hash and nothing else.
 pub(super) const HASH_LEN: u32 = 4;
 
-/// How deep [`Schema::extent`] follows an inline array of an inline array: an
-/// element descriptor indexes the same member list and can point at itself.
+/// How deep `Schema::extent` follows an inline array of an inline array.
 const MAX_ELEMENT_NESTING: usize = 8;
 
 /// How far one wrap moves a `dataOffset`: the width of the `u16` field it is.
@@ -87,7 +70,6 @@ pub(super) struct Block {
     pub(super) length: u32,
 }
 
-/// The `PMAP` block table, with its root already resolved.
 #[derive(Debug, Clone)]
 pub(super) struct Blocks {
     entries: Vec<Block>,
@@ -95,13 +77,6 @@ pub(super) struct Blocks {
 }
 
 impl Blocks {
-    /// Reads the block table, checking every block against the data section.
-    /// Only the 16-byte header variant occurs, so an empty table is empty.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::BlockRange`] for an entry that is not inside `data_len`,
-    /// and [`Malformed::RootId`] when the root names no block.
     pub(super) fn read(section: &[u8], data_len: u32) -> Result<Self> {
         let root_id =
             section::i32(section, 8).ok_or_else(|| bad(8, Malformed::SectionTruncated))?;
@@ -137,7 +112,6 @@ impl Blocks {
     }
 }
 
-/// Reads one 16-byte `PMAP` entry and checks it against the data section.
 fn read_block(section: &[u8], base: usize, data_len: u32) -> Result<Block> {
     let at = u64::try_from(base).unwrap_or(u64::MAX);
     let truncated = || bad(at, Malformed::SectionTruncated);
@@ -157,7 +131,6 @@ fn read_block(section: &[u8], base: usize, data_len: u32) -> Result<Block> {
     })
 }
 
-/// How wide an enum or a bitset is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Width {
     /// Subtype 2, one byte.
@@ -169,7 +142,6 @@ pub(super) enum Width {
 }
 
 impl Width {
-    /// How many bytes it occupies.
     pub(super) const fn bytes(self) -> u32 {
         match self {
             Self::Eight => 1,
@@ -178,7 +150,6 @@ impl Width {
         }
     }
 
-    /// The width a subtype names, or `None` for one that is not a width.
     const fn of(subtype: u8) -> Option<Self> {
         match subtype {
             0 => Some(Self::ThirtyTwo),
@@ -189,7 +160,6 @@ impl Width {
     }
 }
 
-/// Which of the six `STRING` subtypes a member is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Text {
     /// Subtype 0, a fixed inline character array of this many bytes.
@@ -207,7 +177,6 @@ pub(super) enum Text {
 }
 
 impl Text {
-    /// The word the XML writes for it.
     pub(super) const fn word(self) -> &'static str {
         match self {
             Self::Member(_) => "string",
@@ -220,7 +189,6 @@ impl Text {
     }
 }
 
-/// Which of the three `STRUCT` subtypes a member is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Nested {
     /// Subtype 0, the structure inline at the member's own offset.
@@ -231,7 +199,6 @@ pub(super) enum Nested {
     SimplePointer,
 }
 
-/// Which of the six `ARRAY` subtypes a member is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Layout {
     /// Subtype 0, a 16-byte counted pointer.
@@ -242,15 +209,13 @@ pub(super) enum Layout {
     AtRangeArray,
     /// Subtype 4, the same again.
     Member,
-    /// Subtype 6, an 8-byte pointer with the count in `referenceKey >> 16`,
-    /// read from the layout rather than confirmed against a value.
+    /// Subtype 6, an 8-byte pointer with the count in `referenceKey >> 16`.
     PointerWithCount,
     /// Subtype `0x81`: inline, at a `dataOffset` that has wrapped past 16 bits.
     Wrapped,
 }
 
 impl Layout {
-    /// Whether the elements lie at the member's own offset.
     pub(super) const fn is_inline(self) -> bool {
         matches!(
             self,
@@ -258,7 +223,6 @@ impl Layout {
         )
     }
 
-    /// The word the XML writes for it.
     pub(super) const fn word(self) -> &'static str {
         match self {
             Self::AtArray => "atarray",
@@ -271,7 +235,6 @@ impl Layout {
     }
 }
 
-/// A fixed-width value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Scalar {
     Bool,
@@ -293,8 +256,7 @@ pub(super) enum Scalar {
 }
 
 impl Scalar {
-    /// How many bytes it occupies; a `VECTOR3` is sixteen carrying three
-    /// floats, not twelve.
+    /// How many bytes it occupies; a `VECTOR3` is 16, carrying three floats, not 12.
     pub(super) const fn bytes(self) -> u32 {
         match self {
             Self::Bool | Self::Char | Self::UChar => 1,
@@ -305,7 +267,6 @@ impl Scalar {
         }
     }
 
-    /// The word the XML writes for it.
     pub(super) const fn word(self) -> &'static str {
         match self {
             Self::Bool => "bool",
@@ -328,19 +289,13 @@ impl Scalar {
     }
 }
 
-/// What a member holds, with everything the schema can settle already settled.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Kind {
-    /// A fixed-width value that is its own description.
     Scalar(Scalar),
-    /// One of the six string forms.
     Text(Text),
-    /// A nested structure, inline or through a pointer.
     Nested(Nested),
-    /// An array. `element` indexes the `ARRAYINFO` member that describes one
-    /// element, and `count` is the schema's count for the inline forms.
+    /// An array; `element` indexes the `ARRAYINFO` member describing one element.
     Array {
-        /// How the elements are reached.
         layout: Layout,
         /// Which member of this structure describes one element.
         element: u16,
@@ -349,30 +304,21 @@ pub(super) enum Kind {
     },
     /// An enum, resolved through the file's own enum table.
     Enumerated {
-        /// How wide the stored value is.
         width: Width,
-        /// Which enum table names it.
         table: u32,
     },
-    /// A bitset, whose bits an enum names. Its `referenceKey` is
-    /// `(bitCount << 16) | memberIndex` through the `ARRAYINFO` indirection,
-    /// never an enum hash.
+    /// A bitset, whose bits an enum names via the `ARRAYINFO` indirection.
     Bits {
-        /// How wide the stored value is.
         width: Width,
-        /// Which enum table names its bits, when one does.
         table: Option<u32>,
     },
-    /// An `ATBINARYMAP`: a 24-byte header whose counted pointer lands on an
-    /// array of key/value structures.
+    /// An `ATBINARYMAP`: a 24-byte header pointing at key/value structures.
     Map,
 }
 
-/// One member of a structure.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Member {
-    /// Its name hash, or [`ARRAYINFO`] when it describes another member's
-    /// element type rather than a field.
+    /// Its name hash, or `ARRAYINFO` when it describes another member's element type.
     pub(super) name: u32,
     /// Its byte offset within the structure, wrapping already recovered.
     pub(super) offset: u32,
@@ -380,24 +326,18 @@ pub(super) struct Member {
 }
 
 impl Member {
-    /// Whether it describes another member's element type rather than a field.
     pub(super) const fn is_arrayinfo(&self) -> bool {
         self.name == ARRAYINFO
     }
 }
 
-/// One structure of the embedded schema.
 #[derive(Debug, Clone)]
 pub(super) struct Structure {
-    /// How long one instance is.
     pub(super) length: u32,
     /// Its members, in schema order, `ARRAYINFO` members included.
     pub(super) members: Vec<Member>,
 }
 
-/// A file's whole embedded schema: its structures and its enums. A name hash
-/// indexes what the entry at a `PSCH` offset holds rather than owning a copy,
-/// because several entries may name the same offset.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Schema {
     defined: Vec<Structure>,
@@ -406,30 +346,24 @@ pub(super) struct Schema {
     enums: BTreeMap<u32, usize>,
 }
 
-/// The entries already read, by the offset they were read from, so a repeated
-/// offset costs one map entry rather than another copy.
+/// The entries already read, by the offset each was read from.
 #[derive(Debug, Default)]
 struct Shared {
     structures: BTreeMap<usize, usize>,
     enums: BTreeMap<usize, usize>,
-    /// Where each structure in [`Schema::defined`] was read from, in the same
-    /// order, so that a refusal recovery makes can say which entry it is about.
+    /// Where each structure in `Schema::defined` was read from, in the same order.
     origins: Vec<u64>,
 }
 
 impl Schema {
-    /// The structure this name hash describes, or `None`.
     pub(super) fn structure(&self, name: u32) -> Option<&Structure> {
         self.defined.get(*self.structures.get(&name)?)
     }
 
-    /// Every value an enum table names, in key order; handed out whole because
-    /// resolving a rendered name back to a key needs the dictionary.
     pub(super) fn enum_table(&self, table: u32) -> Option<&BTreeMap<i32, u32>> {
         self.tables.get(*self.enums.get(&table)?)
     }
 
-    /// The name an enum table gives a stored value, or `None`.
     pub(super) fn enumerated(&self, table: u32, value: i32) -> Option<u32> {
         self.tables
             .get(*self.enums.get(&table)?)?
@@ -437,14 +371,6 @@ impl Schema {
             .copied()
     }
 
-    /// Reads a `PSCH` section, then resolves what needs the whole schema.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::SchemaEntry`] for an entry that does not resolve,
-    /// [`Malformed::Wrapped`] for a wrapped `dataOffset` the structure does not
-    /// settle, and [`Unsupported::DataType`] for a member type this build does
-    /// not decode.
     pub(super) fn read(section: &[u8]) -> Result<Self> {
         let count = section::u32(section, 8).ok_or_else(|| bad(8, Malformed::SectionTruncated))?;
         let count = usize::try_from(count).unwrap_or(0);
@@ -467,7 +393,6 @@ impl Schema {
         Ok(schema)
     }
 
-    /// Reads one `PSCH` entry: a structure, or an enum.
     fn read_entry(
         &mut self,
         section: &[u8],
@@ -510,14 +435,8 @@ impl Schema {
         }
     }
 
-    /// Puts every wrapped `dataOffset` back where it belongs.
-    ///
-    /// Bit 7 of the subtype marks a `dataOffset` wrapped past the 16 bits the
-    /// field has, without saying how many times; the multiple is recovered
-    /// uniquely by two constraints — the member begins at or after the end of
-    /// the one before it, and its own extent fits inside the structure. Needs
-    /// the whole schema, because a preceding member's extent may be an inline
-    /// array of a structure defined later in the index.
+    /// Puts every wrapped `dataOffset` back; needs the whole schema since a member's extent
+    /// can depend on a later structure.
     fn recover_wrapped_offsets(&mut self, origins: &[u64]) -> Result<()> {
         for slot in 0..self.defined.len() {
             let Some(structure) = self.defined.get(slot) else {
@@ -548,13 +467,7 @@ impl Schema {
         Ok(())
     }
 
-    /// The offset a wrapped member really has. Both constraints are monotone
-    /// in the multiple, so the first and last that fit are arithmetic.
-    ///
-    /// # Errors
-    ///
-    /// [`Malformed::Wrapped`] when no multiple fits, and when more than one
-    /// does — the recovery is only correct while the multiple is unique.
+    /// The offset a wrapped member really has, found via two monotone constraints.
     fn unwrapped(&self, structure: &Structure, index: usize, at: u64) -> Result<u32> {
         let refuse = || bad(at, Malformed::Wrapped);
         let step = u64::from(WRAP);
@@ -578,9 +491,7 @@ impl Schema {
         u32::try_from(recovered).map_err(|_| refuse())
     }
 
-    /// Where the member before `index` ends, the lowest offset the member at
-    /// `index` may have. One whose extent the schema does not settle
-    /// contributes its own offset, since 0 would satisfy any constraint.
+    /// Where the member before `index` ends: the lowest offset `index` may have.
     fn member_ends_at(&self, structure: &Structure, index: usize) -> u32 {
         structure
             .members
@@ -596,8 +507,6 @@ impl Schema {
             })
     }
 
-    /// How many bytes one instance of `member` occupies inside `owner`; `None`
-    /// when the schema does not settle it.
     pub(super) fn extent(&self, owner: &Structure, member: &Member, depth: usize) -> Option<u32> {
         if depth > MAX_ELEMENT_NESTING {
             return None;
@@ -621,7 +530,6 @@ impl Schema {
         }
     }
 
-    /// [`Schema::extent`] for the array forms.
     fn array_extent(
         &self,
         owner: &Structure,
@@ -642,7 +550,6 @@ impl Schema {
     }
 }
 
-/// Reads one structure entry and its members.
 fn read_structure(section: &[u8], offset: usize, packed: u32) -> Result<Structure> {
     let at = u64::try_from(offset).unwrap_or(u64::MAX);
     let count = usize::try_from(packed & 0xFFFF).unwrap_or(0);
@@ -685,8 +592,7 @@ fn read_member(section: &[u8], base: usize) -> Result<Raw> {
     })
 }
 
-/// Turns the raw members of one structure into checked ones, in two passes
-/// because an element index points at another member of the same list.
+/// Two passes: an index may point at a member not yet built in the first.
 fn resolve(raw: &[Raw], at: u64) -> Result<Vec<Member>> {
     let mut members = Vec::with_capacity(raw.len());
     for entry in raw {
@@ -708,7 +614,6 @@ fn resolve(raw: &[Raw], at: u64) -> Result<Vec<Member>> {
     Ok(members)
 }
 
-/// What a member's twelve bytes describe.
 fn kind_of(entry: &Raw, raw: &[Raw]) -> Result<Kind> {
     let refuse = || {
         unsupported(Unsupported::DataType {
@@ -751,7 +656,6 @@ fn kind_of(entry: &Raw, raw: &[Raw]) -> Result<Kind> {
     }
 }
 
-/// The string form a subtype names.
 fn text_of(subtype: u8, reference: u32) -> Option<Kind> {
     let text = match subtype {
         0 => Text::Member(u16::try_from(reference >> 16).ok()?),
@@ -765,7 +669,6 @@ fn text_of(subtype: u8, reference: u32) -> Option<Kind> {
     Some(Kind::Text(text))
 }
 
-/// The array form a subtype names, with its element index and its count.
 fn array_of(subtype: u8, reference: u32) -> Option<Kind> {
     let layout = match subtype {
         0 => Layout::AtArray,
@@ -783,7 +686,6 @@ fn array_of(subtype: u8, reference: u32) -> Option<Kind> {
     })
 }
 
-/// The bitset a subtype and a reference name.
 fn bits_of(subtype: u8, reference: u32, raw: &[Raw]) -> Option<Kind> {
     let width = Width::of(subtype)?;
     let index = u16::try_from(reference & 0xFFFF).ok()?;
@@ -797,7 +699,6 @@ fn bits_of(subtype: u8, reference: u32, raw: &[Raw]) -> Option<Kind> {
     Some(Kind::Bits { width, table })
 }
 
-/// Reads one enum entry into a value-to-name table.
 fn read_enum(section: &[u8], offset: usize, packed: u32) -> Result<BTreeMap<i32, u32>> {
     let at = u64::try_from(offset).unwrap_or(u64::MAX);
     let count = usize::try_from(packed & 0x00FF_FFFF).unwrap_or(0);
@@ -827,7 +728,6 @@ mod tests {
     use super::*;
     use crate::error::Error;
 
-    /// The twelve bytes of one `PSCH` member.
     fn member(name: u32, code: u8, subtype: u8, offset: u16, reference: u32) -> [u8; 12] {
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&name.to_be_bytes());
@@ -838,8 +738,6 @@ mod tests {
         bytes
     }
 
-    /// A `PSCH` section whose `names` index entries **all** name the one
-    /// structure that follows the index.
     fn psch(names: u32, members: &[[u8; 12]], length: i32) -> Vec<u8> {
         let count = usize::try_from(names).expect("a test count fits");
         let entry_at = INDEX_AT + count * INDEX_LEN;
@@ -868,18 +766,14 @@ mod tests {
         out
     }
 
-    /// The three members a wrapped `dataOffset` needs around it.
     fn wrapped_members() -> [[u8; 12]; 3] {
         [
-            // 16,384 `UINT`s inline at 0, so the member after it starts at
-            // 65,536 and multiple 0 cannot be the answer.
             member(1, 0x0D, 0x01, 0, (16_384 << 16) | 2),
             member(2, 0x0D, 0x81, 0, (1 << 16) | 2),
             member(ARRAYINFO, 0x06, 0x00, 0, 0),
         ]
     }
 
-    /// The `cause` of a refusal, or a panic naming what was got instead.
     fn cause(section: &[u8]) -> Malformed {
         match Schema::read(section) {
             Err(Error::BadPso { cause, .. }) => cause,
@@ -939,8 +833,6 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_exactly_one_multiple_fits_is_recovered() {
-        // The member before it ends at 65,536 and its own four bytes must fit
-        // inside a structure 70,000 bytes long, so multiple 1 is the only one.
         let section = psch(1, &wrapped_members(), 70_000);
         let schema = Schema::read(&section).expect("the multiple is unique");
         let structure = schema.structure(1).expect("the structure is defined");
@@ -949,8 +841,6 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_no_multiple_fits_is_refused_rather_than_left_as_it_lies() {
-        // 65,000 bytes is too short for any multiple to clear the member
-        // before it.
         assert_eq!(
             cause(&psch(1, &wrapped_members(), 65_000)),
             Malformed::Wrapped
@@ -959,8 +849,6 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_more_than_one_multiple_fits_is_refused_rather_than_guessed() {
-        // At 140,000 bytes both multiple 1 and 2 fit, so the recovery is not
-        // unique and taking the first would be a guess.
         assert_eq!(
             cause(&psch(1, &wrapped_members(), 140_000)),
             Malformed::Wrapped
@@ -969,8 +857,6 @@ mod tests {
 
     #[test]
     fn a_schema_of_nothing_but_duplicates_costs_its_own_size_and_not_more() {
-        // The bound is wall-clock and generous on purpose: it detects a copy
-        // that is quadratic in the input rather than linear.
         let members: Vec<[u8; 12]> = (0..2_750)
             .map(|index| member(index, 0x06, 0x00, 0, 0))
             .collect();
@@ -1018,8 +904,6 @@ mod tests {
 
     #[test]
     fn a_wrapped_offset_at_the_maximum_recoverable_multiple_is_accepted() {
-        // `MAX_WRAPS` is where `unwrapped` stops, not where it refuses: only a
-        // multiple past it is a refusal.
         let step = u64::from(WRAP);
         let after = step * u64::from(MAX_WRAPS);
         let length = u32::try_from(after).expect("fits a u32");
@@ -1133,8 +1017,6 @@ mod tests {
 
     #[test]
     fn bits_of_needs_both_the_arrayinfo_name_and_its_code() {
-        // A member is only a real `ARRAYINFO` description when both its name
-        // hash and its own type code say so.
         let described = Raw {
             name: ARRAYINFO,
             code: 0x00,

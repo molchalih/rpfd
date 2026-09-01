@@ -1,6 +1,5 @@
-//! `Archive::extract` answers an entry's bytes and `Archive::extracted`
-//! answers the same read as a stream: the same bytes, the same failures, and a
-//! rewind that gives the stream back from its start.
+//! `Archive::extracted` answers the same bytes, failures and rewinds as
+//! `Archive::extract`.
 #![allow(
     clippy::expect_used,
     clippy::panic,
@@ -18,8 +17,7 @@ use rpf_core::{
     Archive, Checksum, EntryKind, Error, FileKind, FileSpec, Storage, Unwatched, Version,
 };
 
-/// Bytes deflate cannot make smaller, so that the resource below is longer
-/// than the reads these tests do into it.
+/// Bytes deflate cannot make smaller.
 fn incompressible(len: usize) -> Vec<u8> {
     let mut state = 0x2545_F491_4F6C_DD1D_u64;
     (0..len)
@@ -32,9 +30,8 @@ fn incompressible(len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// A resource payload: an `RSC7` header for one 512-byte system page, then a
-/// deflate stream of exactly that much. The top nibble of each flag word is the
-/// header's version field and the rest decodes to the length.
+/// An `RSC7` header for one 512-byte system page, then a deflate stream of
+/// exactly that much; a flag word's top nibble is the version, the rest the length.
 fn resource() -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"RSC7");
@@ -90,8 +87,8 @@ fn archive() -> Vec<u8> {
     out
 }
 
-/// The whole of one entry, read through the stream a byte at a time — a stream
-/// correct only for one big read would still pass a `read_to_end`.
+/// One entry read a byte at a time: a stream correct only for one big read
+/// would still pass `read_to_end`.
 fn streamed(bytes: &[u8], archive: &Archive, index: u32) -> Vec<u8> {
     let mut src = Cursor::new(bytes);
     let mut stream = archive.extracted(&mut src, index).expect("opens");
@@ -140,8 +137,7 @@ fn a_streamed_entry_is_the_bytes_extract_answers() {
 
 #[test]
 fn a_digest_of_a_stream_is_the_digest_of_the_bytes() {
-    // What a resource digests to is its `RSC7` file — header and deflated body
-    // — not what that body inflates to.
+    // A resource digests to its `RSC7` file, not to what its body inflates to.
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
     let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -160,8 +156,6 @@ fn a_digest_of_a_stream_is_the_digest_of_the_bytes() {
 
 #[test]
 fn a_stream_read_again_from_its_start_is_the_same_stream() {
-    // `build` rewinds a payload whose deflate does not pay for itself and
-    // writes the plain bytes over the top.
     let bytes = archive();
     let mut src = Cursor::new(bytes.clone());
     let parsed = Archive::open(&mut src, &rpf_core::Unlock::unkeyed()).expect("parses");
@@ -212,13 +206,11 @@ fn a_stream_knows_where_its_end_is_without_reading_to_it() {
     }
 }
 
-/// The payload is longer than one piece of the forward-seek walk, so reaching
-/// the destination takes several passes rather than one.
+/// The payload is longer than one piece of the forward-seek walk.
 #[test]
 fn a_forward_seek_in_a_deflated_entry_lands_on_the_right_bytes() {
-    // Compressible, so `build` really does deflate it, and periodic with a
-    // period that is not a power of two, so no two offsets in the archive hold
-    // the same window of bytes by accident.
+    // Compressible so `build` deflates it; the period is not a power of two, so
+    // no two offsets hold the same window of bytes by accident.
     let plain: Vec<u8> = (0..96_000_u32).map(|byte| (byte % 251) as u8).collect();
     let files = vec![FileSpec {
         path: "long.bin".to_owned(),
@@ -264,8 +256,7 @@ fn a_forward_seek_in_a_deflated_entry_lands_on_the_right_bytes() {
 
 #[test]
 fn a_stream_carries_the_failure_it_really_had() {
-    // A `Read` can only fail with an `io::Error`, so the container failure
-    // travels inside one and must come back out.
+    // A `Read` fails only with an `io::Error`, so the real failure travels inside one.
     let mut bytes = archive();
     let parsed = Archive::open(
         &mut Cursor::new(bytes.clone()),
