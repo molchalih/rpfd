@@ -250,6 +250,7 @@ fn daemon() -> Command {
 
 /// Feeds every request in and sorts what came back: responses first.
 fn drive(mut daemon: Command, requests: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    let _deadline = Deadline::on("the daemon to answer every request and exit");
     let mut child = daemon
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1539,6 +1540,7 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
 
 #[test]
 fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
+    let _deadline = Deadline::on("the daemon to exit after its notifications");
     // Progress is dropped rather than queued without bound, so `skipped` counts
     // what was dropped since the last notification that got through.
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1607,6 +1609,7 @@ fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
 
 #[test]
 fn a_broken_standard_output_is_reported_rather_than_swallowed() {
+    let _deadline = Deadline::on("the daemon to exit on its broken standard output");
     // Enough cancels that the answers cannot all have been written into a pipe
     // nobody is reading, so the reading end closes on a write still in flight.
     let mut child = Command::new(RPF)
@@ -1652,6 +1655,7 @@ fn a_broken_standard_output_is_reported_rather_than_swallowed() {
 
 #[test]
 fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
+    let _deadline = Deadline::on("the rebuild to give up on its broken output");
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     make_bulk_archive(&archive, 4000, 1024);
@@ -1916,6 +1920,7 @@ fn read_slowly(
 
 #[test]
 fn an_answer_bigger_than_the_grace_survives_standard_input_ending() {
+    let _deadline = Deadline::on("the answer that outlasts standard input ending");
     // Standard input ends long before the answer to the last request is written.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("one.rpf");
@@ -1986,6 +1991,7 @@ fn resident_kilobytes(pid: u32) -> u64 {
 
 #[test]
 fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
+    let _deadline = Deadline::on("the daemon to exit once its answers are drained");
     // A queued response the worker never waits on grows without bound while the
     // client is behind. Zero-byte payloads, so each answer is still megabytes.
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2247,6 +2253,7 @@ fn close_on_a_handle_that_was_never_open_is_refused() {
 #[test]
 #[cfg(unix)]
 fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
+    let deadline = Deadline::on("the rebuild to start and the daemon to exit after it");
     // A cancel answer echoing the running job's `request` — an arbitrary value the
     // client wrote once — into an unbounded queue grows the daemon without bound.
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2296,7 +2303,6 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
     }
     // The rebuild writes into a temporary file beside the archive, so a second
     // file there is the rebuild having started; waited for rather than timed.
-    let waiting = std::time::Instant::now();
     while fs::read_dir(dir.path())
         .into_iter()
         .flatten()
@@ -2304,10 +2310,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         .count()
         < 2
     {
-        assert!(
-            waiting.elapsed() < std::time::Duration::from_secs(30),
-            "the rebuild never started"
-        );
+        deadline.check();
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     // Aimed at a handle that was never opened, so the rebuild goes on running

@@ -22,6 +22,24 @@ mod common;
 /// The binary under test, as cargo built it.
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
+/// How long a wait on a thread of this file's own may take before it is a failure.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Joins `handle` within [`PATIENCE`], failing rather than waiting for ever on
+/// the thread `what` names.
+#[track_caller]
+fn join_within<T>(handle: std::thread::JoinHandle<T>, what: &str) -> T {
+    let started = std::time::Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            started.elapsed() < PATIENCE,
+            "waited {PATIENCE:?} for {what}, and it never finished"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    handle.join().expect("the thread did not panic")
+}
+
 /// A small archive: two files, one in a directory, one stored and one deflated.
 fn make_archive(at: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut contents = BTreeMap::new();
@@ -3009,8 +3027,17 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
     assert!(made.success(), "mkfifo");
 
     let writing = fifo.clone();
+    let (wrote, written) = std::sync::mpsc::channel();
     let writer = std::thread::spawn(move || {
-        fs::write(&writing, b"through a pipe").expect("the pipe takes it");
+        let mut pipe = fs::OpenOptions::new()
+            .write(true)
+            .open(&writing)
+            .expect("the pipe opens");
+        let took = pipe.write_all(b"through a pipe");
+        // Sent while the write end is still open, so a test that sees nothing
+        // knows the thread is not past the pipe and reading it can only help.
+        let _ = wrote.send(());
+        took.expect("the pipe takes it");
     });
 
     let (code, out) = run(&[
@@ -3019,7 +3046,15 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
         "data/greeting.txt",
         &fifo.display().to_string(),
     ]);
-    writer.join().expect("the writer finishes");
+    if written.try_recv().is_err() {
+        // A `put` that gave up before opening the donor leaves the writing thread
+        // waiting in `open` for a reader that is never coming.
+        let releasing = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = fs::read(&releasing);
+        });
+    }
+    join_within(writer, "the writer");
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out));
 
     let (code, bytes) = run(&["cat", &archive.display().to_string(), "data/greeting.txt"]);
