@@ -45,6 +45,11 @@ target/
 mutants.out/
 **/*.rs.bk
 
+# Python bytecode, left beside the tools by any run of one. Named here for
+# `mutants.out/`'s reason: `git add -A` after a local run would carry it onto
+# a branch.
+__pycache__/
+
 # Node (editor client)
 node_modules/
 dist/

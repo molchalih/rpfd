@@ -22,25 +22,147 @@ die() { log "cost: $*"; exit 2; }
 
 samples() { printf '%s/samples.tsv' "$OUT"; }
 
-# One line of `real_seconds<TAB>max_rss_bytes<TAB>exit_code`. /usr/bin/time -l
-# is the source of the resident set; its own `real` is hundredths, which cannot
-# resolve a patch, so the wall clock is taken around the spawn instead.
+# What the two platforms spell differently. Each is probed rather than inferred
+# from `uname`, so a box with GNU coreutils on it is taken as it is found.
+TIME_BIN=
+TIME_FLAG=
+RSS_SCALE=
+STAT_FLAG=
+STAT_SIZE=
+STAT_STAMP=
+
+# `ru_maxrss` under -l is bytes on Darwin and kilobytes on the other BSDs, so
+# the unit is measured: no real resident set reads under 64 KiB in bytes.
+rss_scale_for_l() {
+    local reported
+    reported=$("$1" -l "$RPF" --version 2>&1 >/dev/null |
+        awk '/maximum resident set size/ { print $1; exit }')
+    case "$reported" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ "$reported" -lt 65536 ]; then printf '1024\n'; else printf '1\n'; fi
+}
+
+# A -v that answers in some other wording would leave every resident set at
+# zero and the sweep would finish and publish it, so the reading is required.
+answers_rss_v() {
+    "$1" -v "$RPF" --version 2>&1 >/dev/null |
+        grep -qE 'Maximum resident set size \(kbytes\):[[:space:]]*[0-9]+'
+}
+
+probe_time() {
+    local candidate scale
+    for candidate in /usr/bin/time /usr/bin/gtime "$(command -v gtime || true)"; do
+        [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+        if "$candidate" -l true >/dev/null 2>&1 && scale=$(rss_scale_for_l "$candidate"); then
+            TIME_BIN=$candidate TIME_FLAG=-l RSS_SCALE=$scale
+            return 0
+        fi
+        if "$candidate" -v true >/dev/null 2>&1 && answers_rss_v "$candidate"; then
+            TIME_BIN=$candidate TIME_FLAG=-v RSS_SCALE=1024
+            return 0
+        fi
+    done
+    return 1
+}
+
+# A size back, not merely a zero exit: a `stat` that succeeds and prints
+# something else corrupts the samples, and that surfaces after the whole sweep.
+answers_size() { case "$("$@" 2>/dev/null)" in '' | *[!0-9]*) return 1 ;; esac; }
+
+probe_stat() {
+    if answers_size stat -f %z "$HERE/cost.sh"; then
+        STAT_FLAG=-f STAT_SIZE=%z STAT_STAMP='%m %z %N'
+        return 0
+    fi
+    if answers_size stat -c %s "$HERE/cost.sh"; then
+        STAT_FLAG=-c STAT_SIZE=%s STAT_STAMP='%Y %s %n'
+        return 0
+    fi
+    return 1
+}
+
+size_of() { stat "$STAT_FLAG" "$STAT_SIZE" "$1"; }
+stamp_of() { stat "$STAT_FLAG" "$STAT_STAMP" "$1"; }
+
+cpu_brand() {
+    local brand=
+    if command -v sysctl >/dev/null 2>&1; then
+        brand=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+    fi
+    if [ -z "$brand" ] && [ -r /proc/cpuinfo ]; then
+        # `awk` reads the file itself. Through a pipe, a reader that stops at the
+        # first match kills the writer with SIGPIPE, which `pipefail` aborts on.
+        brand=$(awk '/^model name/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' /proc/cpuinfo)
+    fi
+    printf '%s\n' "${brand:-$(uname -m)}"
+}
+
+cpu_count() {
+    if command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu >/dev/null 2>&1; then
+        sysctl -n hw.ncpu
+    elif command -v nproc >/dev/null 2>&1; then
+        nproc
+    else
+        printf 'unknown\n'
+    fi
+}
+
+memory_bytes() {
+    if command -v sysctl >/dev/null 2>&1 && sysctl -n hw.memsize >/dev/null 2>&1; then
+        sysctl -n hw.memsize
+    elif [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/ { print $2 * 1024; exit }' /proc/meminfo
+    else
+        printf 'unknown\n'
+    fi
+}
+
+system_name() {
+    if command -v sw_vers >/dev/null 2>&1; then
+        printf '%s %s\n' "$(sw_vers -productName)" "$(sw_vers -productVersion)"
+    elif [ -r /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        printf '%s %s\n' "$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-${NAME:-$(uname -s)}}")" "$(uname -r)"
+    else
+        printf '%s %s\n' "$(uname -s)" "$(uname -r)"
+    fi
+}
+
+load_average() {
+    if command -v sysctl >/dev/null 2>&1 && sysctl -n vm.loadavg >/dev/null 2>&1; then
+        sysctl -n vm.loadavg
+    elif [ -r /proc/loadavg ]; then
+        cut -d' ' -f1-3 /proc/loadavg
+    else
+        printf 'unknown\n'
+    fi
+}
+
+# One line of `real_seconds<TAB>max_rss_bytes<TAB>exit_code`. `time`'s own
+# `real` is hundredths, which cannot resolve a patch at 7-9 ms, so the wall
+# clock is taken around the spawn instead.
 measure() {
     local out=$1 err=$2
     shift 2
-    python3 - "$out" "$err" "$@" <<'PY'
+    python3 - "$out" "$err" "$TIME_BIN" "$TIME_FLAG" "$RSS_SCALE" "$@" <<'PY'
 import re, subprocess, sys, time
 
-out, err, *cmd = sys.argv[1:]
+out, err, time_bin, time_flag, scale, *cmd = sys.argv[1:]
 with open(out, 'wb') as o, open(err, 'wb') as e:
     start = time.monotonic()
-    code = subprocess.call(['/usr/bin/time', '-l', *cmd], stdout=o, stderr=e)
+    code = subprocess.call([time_bin, time_flag, *cmd], stdout=o, stderr=e)
     real = time.monotonic() - start
+# BSD: "<n>  maximum resident set size", bytes. GNU: "Maximum resident set
+# size (kbytes): <n>". The scale the probe chose converts the second to bytes.
+patterns = (r'\s*(\d+)\s+maximum resident set size',
+            r'\s*Maximum resident set size \(kbytes\):\s*(\d+)')
 rss = 0
 for line in open(err, errors='replace'):
-    m = re.match(r'\s*(\d+)\s+maximum resident set size', line)
-    if m:
-        rss = int(m.group(1))
+    for pattern in patterns:
+        m = re.match(pattern, line)
+        if m:
+            rss = int(m.group(1)) * int(scale)
 print(f'{real:.6f}\t{rss}\t{code}')
 PY
 }
@@ -54,9 +176,8 @@ by_len = lambda e: e["len"]
 for e in sorted((e for e in files if ".rpf/" not in e["path"]), key=by_len)[:8]:
     print("outer", e["path"], sep="\t")
 inner = [e for e in files if ".rpf/" in e["path"]]
-# A binary entry first: `cat` of a resource answers its payload, which put --as
-# raw does not put back byte for byte, and the rebuilt archive gains a failing
-# entry that is the perturbation rather than the rebuild.
+# A binary entry first: cat of a resource answers its payload, which put --as
+# raw does not put back byte for byte, so the failure measured is the harness.
 for e in sorted(inner, key=lambda e: (e["kind"] != "binary", e["len"]))[:1]:
     print("inner", e["path"], sep="\t")
 '
@@ -116,7 +237,7 @@ run_op() {
         method=$(reported "$WORK/op.json" method)
         [ "$method" = "$expect" ] || die "$label $op took the $method path, not $expect"
         written=$(reported "$WORK/op.json" len)
-        record "$label" "$bytes" "$op" "$rep" "$real" "$rss" "$written" "$(stat -f %z "$subject")"
+        record "$label" "$bytes" "$op" "$rep" "$real" "$rss" "$written" "$(size_of "$subject")"
     done
     printf '%s\t%s\t%s\n' "$label" "$op" "$(verified "$subject")" >> "$OUT/verify.tsv"
 }
@@ -125,7 +246,7 @@ sweep_archive() {
     local original=$1
     local label bytes outer inner
     label=$(basename "$(dirname "$original")")/$(basename "$original")
-    bytes=$(stat -f %z "$original")
+    bytes=$(size_of "$original")
     log "== $label ($bytes bytes)"
 
     cp "$original" "$WORK/pristine.rpf"
@@ -154,13 +275,15 @@ floor() {
     done
 }
 
+# A leading ~ is the home directory; anything else relative resolves against the
+# checkout, so a generated subject's path does not name one machine.
 manifest_paths() {
     sed 's/#.*//' "$MANIFEST" | sed 's/[[:space:]]*$//' | grep -v '^$' |
-        sed "s|^~|$HOME|"
+        sed -e "s|^~|$HOME|" -e "s|^\([^/]\)|$HERE/../../\1|"
 }
 
 snapshot_originals() {
-    manifest_paths | while IFS= read -r p; do stat -f '%m %z %N' "$p"; done
+    manifest_paths | while IFS= read -r p; do stamp_of "$p"; done
 }
 
 report() {
@@ -207,7 +330,8 @@ sweep() {
     [ -x "$RPF" ] || die "no binary at $RPF; cargo build --release"
     [ -f "$MANIFEST" ] || die "no manifest at $MANIFEST"
     command -v python3 >/dev/null || die "python3 is the timing and reporting helper"
-    [ -x /usr/bin/time ] || die "/usr/bin/time -l is where the resident set comes from"
+    probe_time || die "no time(1) answering -l or -v; that is where the resident set comes from"
+    probe_stat || die "no stat(1) answering -f %z or -c %s"
 
     rm -rf "$OUT"
     mkdir -p "$WORK"
@@ -217,23 +341,24 @@ sweep() {
 
     {
         printf 'taken     : %s\n' "$(date '+%F %T %Z')"
-        printf 'host      : %s\n' "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
-        printf 'cores     : %s\n' "$(sysctl -n hw.ncpu)"
-        printf 'memory    : %s bytes\n' "$(sysctl -n hw.memsize)"
-        printf 'system    : %s %s\n' "$(sw_vers -productName)" "$(sw_vers -productVersion)"
+        printf 'host      : %s\n' "$(cpu_brand)"
+        printf 'cores     : %s\n' "$(cpu_count)"
+        printf 'memory    : %s bytes\n' "$(memory_bytes)"
+        printf 'system    : %s\n' "$(system_name)"
         printf 'binary    : %s\n' "$("$RPF" --version)"
         printf 'commit    : %s\n' "$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
         printf 'repeats   : %s\n' "$REPEATS"
-        printf 'load start: %s\n' "$(sysctl -n vm.loadavg)"
+        printf 'load start: %s\n' "$(load_average)"
     } > "$OUT/meta.txt"
 
     floor
     manifest_paths | while IFS= read -r p; do
-        [ -f "$p" ] || die "no archive at $p"
+        [ -f "$p" ] ||
+            die "no archive at $p; the generated subject is written by tools/cost/make-deflate-subject.sh"
         sweep_archive "$p"
     done
 
-    printf 'load end  : %s\n' "$(sysctl -n vm.loadavg)" >> "$OUT/meta.txt"
+    printf 'load end  : %s\n' "$(load_average)" >> "$OUT/meta.txt"
     snapshot_originals > "$OUT/originals.after"
     diff "$OUT/originals.before" "$OUT/originals.after" > "$OUT/originals.diff" ||
         die "an original archive changed while the run was in progress; results discarded"

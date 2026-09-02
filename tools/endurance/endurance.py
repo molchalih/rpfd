@@ -172,7 +172,7 @@ def patchable(daemon, handle, paths):
     return None
 
 
-def workload(daemon, path):
+def workload(daemon, path, name):
     """One archive, the entries a cycle touches in it, discovered from its listing."""
     handle = daemon.call("open", path=path)["handle"]
     try:
@@ -192,7 +192,7 @@ def workload(daemon, path):
         if edit is None:
             raise SystemExit(f"{path}: no entry a commit would patch in place")
         return {
-            "name": Path(path).name,
+            "name": name,
             "path": path,
             "small_reads": [row["path"] for row in top[:3]],
             "xml_read": xml_read,
@@ -201,6 +201,8 @@ def workload(daemon, path):
             "rename": next(row["path"] for row in top if row["path"] != edit),
             "rebuilds": 0,
             "digests": set(),
+            "cycles": 0,
+            "commits": Counter(),
         }
     finally:
         daemon.release(handle)
@@ -246,6 +248,20 @@ def cycle(daemon, work, index, commit, rebuild):
         return result
     finally:
         daemon.release(handle)
+
+
+def labelled(sources):
+    """Each source under the label it is reported and copied by, refusing two that share one."""
+    claimed = {}
+    for source in sources:
+        label = f"{source.parent.name}/{source.name}" if source.parent.name else source.name
+        if label in claimed:
+            raise SystemExit(
+                f"two archives are both {label}: {claimed[label]} and {source}. "
+                "One would overwrite the other and the run would measure one archive twice"
+            )
+        claimed[label] = source
+    return claimed
 
 
 def retained(pid):
@@ -339,22 +355,26 @@ def main():
     parser.add_argument("--binary", default=str(BINARY))
     args = parser.parse_args()
 
-    sources = [Path(p).expanduser() for p in args.archive] or [
+    given = args.archive or [
         Path.home() / "rpf-demo/test/test.rpf",
         Path.home() / "rpf-demo/test2/test2.rpf",
     ]
+    sources = [Path(p).expanduser().resolve() for p in given]
     for source in sources:
         if not source.is_file():
             parser.error(f"no archive at {source}")
     if not Path(args.binary).is_file():
         parser.error(f"no rpf binary at {args.binary}; cargo build --release")
 
+    subjects = labelled(sources)
+
     with tempfile.TemporaryDirectory(prefix="rpf-endurance-") as scratch:
         copies = []
-        for source in sources:
-            copy = Path(scratch) / source.name
+        for label, source in subjects.items():
+            copy = Path(scratch) / label
+            copy.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, copy)
-            copies.append(copy)
+            copies.append((label, copy))
 
         started_at = loadavg()
         daemon = Daemon(args.binary)
@@ -363,7 +383,7 @@ def main():
         sampler = Sampler(daemon.process.pid, args.interval)
         started = time.monotonic()
         try:
-            works = [workload(daemon, str(copy)) for copy in copies]
+            works = [workload(daemon, str(copy), label) for label, copy in copies]
             for work in works:
                 print(
                     f"  {work['name']}: edit {work['edit']}, xml {work['xml_read']},"
@@ -375,18 +395,17 @@ def main():
             commits = 0
             for index in range(args.cycles):
                 work = works[index % len(works)]
+                work["cycles"] += 1
                 sampler.mark(index)
                 commit = (index // len(works)) % 2 == 0
-                result = cycle(
-                    daemon,
-                    work,
-                    index,
-                    commit=commit,
-                    rebuild=commit and args.rebuild_every > 0 and commits % args.rebuild_every == 0,
-                )
+                made = sum(work["commits"].values())
+                rebuild = commit and args.rebuild_every > 0 and made % args.rebuild_every == 0
+                result = cycle(daemon, work, index, commit=commit, rebuild=rebuild)
                 if commit:
                     commits += 1
-                    methods[result.get("method", "unreported")] += 1
+                    method = result.get("method", "unreported")
+                    methods[method] += 1
+                    work["commits"][method] += 1
                 if (index + 1) % 25 == 0:
                     rss = sampler.samples[-1][1] if sampler.samples else "no"
                     print(f"  {index + 1} cycles, rss {rss} KB", file=sys.stderr)
@@ -401,6 +420,14 @@ def main():
         print(f"edits           {distinct} distinct payloads over {args.cycles} cycles")
         taken = ", ".join(f"{count} {name}" for name, count in sorted(methods.items()))
         print(f"commits         {taken or 'none'}")
+        print("per workload")
+        width = max((len(work["name"]) for work in works), default=0)
+        for work in works:
+            took = ", ".join(f"{count} {name}" for name, count in sorted(work["commits"].items()))
+            print(
+                f"  {work['name']:<{width}}  {work['cycles']} cycles,"
+                f" {len(work['digests'])} distinct payloads, {took or 'no commits'}"
+            )
         print(f"load avg        {started_at} to {loadavg()}")
         if held:
             print(f"vmmap           {held}")
