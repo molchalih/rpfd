@@ -93,11 +93,12 @@ jobs:
       #
       # **One number for all three platforms, and that is not an oversight.**
       # The tests that vary by platform are gated by `#[cfg]` — `unix`,
-      # `windows`, and `any(unix, windows)` for the two that carry DR-009's
-      # file identity — so where they do not apply they are not compiled at
-      # all rather than reported as ignored: they change the total the suite
-      # runs and not the count of corpus skips. Every corpus-gated test is
-      # unconditional. If that ever stops being true this step is what says so.
+      # `windows`, `any(unix, windows)` for the three that carry DR-009's file
+      # identity, and `target_os = "macos"` for the firmlink spelling — so
+      # where they do not apply they are not compiled at all rather than
+      # reported as ignored: they change the total the suite runs and not the
+      # count of corpus skips. Every corpus-gated test is unconditional. If that
+      # ever stops being true this step is what says so.
       #
       # `shell: bash` because the default on the Windows runner is PowerShell,
       # where none of this is even syntax. `pipefail` because bash's own default
