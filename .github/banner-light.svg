@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="200" viewBox="0 0 800 200" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace" role="img" aria-label="rpfd — scattered blocks pack into a tight archive">
+  <style>
+    @keyframes w1{0%{transform:translate(-52px,47px);opacity:.3}42%,68%{transform:translate(0,0);opacity:1}100%{transform:translate(-52px,47px);opacity:.3}}
+    @keyframes w2{0%{transform:translate(6px,-64px);opacity:.3}42%,68%{transform:translate(0,0);opacity:1}100%{transform:translate(6px,-64px);opacity:.3}}
+    @keyframes w3{0%{transform:translate(36px,50px);opacity:.3}42%,68%{transform:translate(0,0);opacity:1}100%{transform:translate(36px,50px);opacity:.3}}
+    @keyframes w4{0%{transform:translate(-69px,-12px);opacity:.3}42%,68%{transform:translate(0,0);opacity:1}100%{transform:translate(-69px,-12px);opacity:.3}}
+    @keyframes w5{0%{transform:translate(59px,-38px);opacity:.3}42%,68%{transform:translate(0,0);opacity:1}100%{transform:translate(59px,-38px);opacity:.3}}
+    @keyframes w6{0%{transform:translate(-18px,55px);opacity:.3}42%,68%{transform:translate(0,0);opacity:1}100%{transform:translate(-18px,55px);opacity:.3}}
+    .k1{animation:w1 4.1s ease-in-out infinite}
+    .k2{animation:w2 5.3s ease-in-out infinite .7s}
+    .k3{animation:w3 6.7s ease-in-out infinite 1.9s}
+    .k4{animation:w4 4.7s ease-in-out infinite 2.8s}
+    .k5{animation:w5 6.1s ease-in-out infinite 1.3s}
+    .k6{animation:w6 7.3s ease-in-out infinite .4s}
+    @media (prefers-reduced-motion:reduce){
+      .k1,.k2,.k3,.k4,.k5,.k6{animation:none}
+    }
+  </style>
+  <!-- The fallback `<img>` of the README's `<picture>` is this file, so it carries its own
+       ground: a renderer that ignores `<source>` and paints a dark page would otherwise show
+       near-black ink on near-black. On GitHub's light canvas the fill is the canvas colour. -->
+  <rect width="800" height="200" fill="#ffffff"/>
+  <g fill="#201d1a">
+    <rect class="k1" x="272" y="75" width="22" height="22" rx="3"/>
+    <rect class="k2" x="298" y="75" width="22" height="22" rx="3" fill="#a8501f"/>
+    <rect class="k3" x="324" y="75" width="22" height="22" rx="3"/>
+    <rect class="k4" x="272" y="101" width="22" height="22" rx="3"/>
+    <rect class="k5" x="298" y="101" width="22" height="22" rx="3"/>
+    <rect class="k6" x="324" y="101" width="22" height="22" rx="3" fill="#a8501f"/>
+  </g>
+  <text x="392" y="118" font-size="64" font-weight="600" fill="#201d1a">rpfd</text>
+</svg>

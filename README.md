@@ -1,4 +1,8 @@
-<img src=".github/banner.svg" alt="rpf" width="800">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/banner-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset=".github/banner-light.svg">
+  <img src=".github/banner-light.svg" alt="rpfd" width="800">
+</picture>
 
 A dependency-light Rust toolchain for reading, editing and rebuilding RPF7
 archives — the `dlc.rpf` files RAGE Multiplayer and FiveM servers hand to their

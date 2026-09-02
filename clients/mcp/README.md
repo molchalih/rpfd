@@ -175,7 +175,7 @@ archive outside the workspace stops being reachable, which is most of them.
 `tools/mcpb/` holds the manifest and the assembler; the `bundle` job in
 `.github/workflows/release.yml` runs it over the binaries the release already
 carries and attaches `rpf-vX.Y.Z.mcpb`. The same job renders
-`tools/mcpb/server.json` — the MCP registry entry for `io.github.molchalih/rpf`
+`tools/mcpb/server.json` — the MCP registry entry for `io.github.molchalih/rpfd`
 — with the tag's version, the asset's URL and its SHA-256, and attaches that
 too.
 
