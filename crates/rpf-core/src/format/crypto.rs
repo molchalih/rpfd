@@ -703,21 +703,14 @@ impl fmt::Debug for NgForward {
     }
 }
 
-/// Basis of a column's difference space, echelon form, or `None` if not eight-dimensional.
+/// Basis of a column's difference space, echelon form, or `None` if it is not
+/// eight-dimensional or the reduction refused to make progress.
 fn basis_of(table: &[u32; NG_TABLE_ENTRIES], base: u32) -> Option<[u32; NG_COLUMN_BITS]> {
     let mut slots = [0_u32; NG_WORD_BITS];
     let mut found = 0_usize;
     for entry in table {
-        let mut left = entry ^ base;
-        while left != 0 {
-            let at = usize::try_from(leading_bit(left)).ok()?;
-            let slot = slots.get_mut(at)?;
-            if *slot == 0 {
-                *slot = left;
-                found = found.checked_add(1)?;
-                break;
-            }
-            left ^= *slot;
+        if reduce_into(&mut slots, entry ^ base)? {
+            found = found.checked_add(1)?;
         }
         if found > NG_COLUMN_BITS {
             return None;
@@ -744,6 +737,29 @@ const fn leading_bit(word: u32) -> u32 {
         .saturating_sub(word.leading_zeros())
 }
 
+/// Reduces `vector` against `slots`, each of which holds a vector leading at its own index.
+/// `Some(true)` when it filled an empty slot, `Some(false)` when it reduced to zero, and `None`
+/// when a turn failed to lower the leading bit — which echelon form forbids and which would cycle.
+fn reduce_into(slots: &mut WordMap, vector: u32) -> Option<bool> {
+    let mut left = vector;
+    // Every turn clears the leading bit, so `at` falls and at most `NG_WORD_BITS` turns are left.
+    let mut ceiling = NG_WORD_BITS;
+    while left != 0 {
+        let at = usize::try_from(leading_bit(left)).ok()?;
+        if at >= ceiling {
+            return None;
+        }
+        ceiling = at;
+        let slot = slots.get_mut(at)?;
+        if *slot == 0 {
+            *slot = left;
+            return Some(true);
+        }
+        left ^= *slot;
+    }
+    Some(false)
+}
+
 /// Coordinates of `vector` in `basis` (echelon, descending leading bits), or `None` if outside it.
 fn coordinates_of(basis: &[u32; NG_COLUMN_BITS], vector: u32) -> Option<u8> {
     let mut left = vector;
@@ -762,20 +778,8 @@ fn rank_of(table: &[u32; NG_TABLE_ENTRIES], base: u32) -> usize {
     let mut slots = [0_u32; NG_WORD_BITS];
     let mut found = 0_usize;
     for entry in table {
-        let mut left = entry ^ base;
-        while left != 0 {
-            let Ok(at) = usize::try_from(leading_bit(left)) else {
-                break;
-            };
-            let Some(slot) = slots.get_mut(at) else {
-                break;
-            };
-            if *slot == 0 {
-                *slot = left;
-                found = found.saturating_add(1);
-                break;
-            }
-            left ^= *slot;
+        if reduce_into(&mut slots, entry ^ base) == Some(true) {
+            found = found.saturating_add(1);
         }
     }
     found
@@ -1465,6 +1469,117 @@ mod tests {
     }
 
     #[test]
+    fn a_slot_out_of_echelon_form_is_refused_rather_than_reduced_for_ever() {
+        // Two slots leading at the same bit: the pair hands the vector back and forth for ever.
+        let mut crossed = [0_u32; NG_WORD_BITS];
+        crossed[3] = 0x18;
+        crossed[4] = 0x18;
+        assert_eq!(reduce_into(&mut crossed, 0x08), None);
+
+        let mut slots = [0_u32; NG_WORD_BITS];
+        assert_eq!(reduce_into(&mut slots, 0x18), Some(true));
+        assert_eq!(slots[4], 0x18);
+        assert_eq!(
+            reduce_into(&mut slots, 0x18),
+            Some(false),
+            "already spanned"
+        );
+        assert_eq!(reduce_into(&mut slots, 0), Some(false), "nothing to reduce");
+        assert_eq!(
+            reduce_into(&mut slots, 0x1C),
+            Some(true),
+            "a new leading bit of its own"
+        );
+        assert_eq!(slots[2], 0x04);
+    }
+
+    #[test]
+    fn leading_bit_names_the_highest_set_bit_of_every_word_shape() {
+        // Differential against a scan the other way, over every low half and every high half.
+        for low in 0..=u32::from(u16::MAX) {
+            for word in [low, low << 16, (low << 16) | 0xFFFF, !low] {
+                assert_eq!(leading_bit(word), highest_set(word), "{word:#010x}");
+            }
+        }
+        assert_eq!(leading_bit(0), 0, "zero has no set bit and answers zero");
+        assert_eq!(leading_bit(1), 0);
+        assert_eq!(leading_bit(u32::MAX), 31);
+    }
+
+    #[test]
+    fn a_basis_is_an_echelon_form_of_the_same_span_over_a_drawn_corpus() {
+        let mut stream = Stream(0x0BAD_F00D);
+        let mut eight = 0_usize;
+        for draw in 0..CORPUS_TABLES {
+            let generators = draw % (NG_COLUMN_BITS + 1);
+            let corrupt = draw % 3;
+            let (table, base) = drawn_table(&mut stream, generators, corrupt);
+            let differences: Vec<u32> = table.iter().map(|entry| entry ^ base).collect();
+            let rank = reference_rank(&differences);
+
+            assert_eq!(rank_of(&table, base), rank, "draw {draw}");
+            let Some(basis) = basis_of(&table, base) else {
+                assert_ne!(
+                    rank, NG_COLUMN_BITS,
+                    "draw {draw}: an eight-dimensional refusal"
+                );
+                continue;
+            };
+            assert_eq!(
+                rank, NG_COLUMN_BITS,
+                "draw {draw}: a basis of the wrong dimension"
+            );
+            eight += 1;
+
+            // Echelon: every vector is nonzero and each leads strictly below the one before it.
+            for pair in basis.windows(2) {
+                let [above, below] = pair else { continue };
+                assert_ne!(*below, 0, "draw {draw}");
+                assert!(
+                    leading_bit(*above) > leading_bit(*below),
+                    "draw {draw}: not echelon"
+                );
+            }
+            // The same span, both ways round.
+            for difference in &differences {
+                assert!(coordinates_of(&basis, *difference).is_some(), "draw {draw}");
+            }
+            assert_eq!(reference_rank(&basis), NG_COLUMN_BITS, "draw {draw}");
+            let mut spanned = differences.clone();
+            spanned.extend_from_slice(&basis);
+            assert_eq!(
+                reference_rank(&spanned),
+                rank,
+                "draw {draw}: the basis left the span"
+            );
+        }
+        assert!(eight > 0, "no table in the corpus was eight-dimensional");
+    }
+
+    #[test]
+    fn the_reduction_answers_the_recorded_words_for_a_drawn_corpus() {
+        // Locks the answer itself: any change to the reduction that alters a result moves this.
+        let mut stream = Stream(0x0BAD_F00D);
+        let mut digest = 0_u64;
+        for draw in 0..CORPUS_TABLES {
+            let (table, base) = drawn_table(&mut stream, draw % (NG_COLUMN_BITS + 1), draw % 3);
+            digest = folded(
+                digest,
+                u32::try_from(rank_of(&table, base)).unwrap_or(u32::MAX),
+            );
+            match basis_of(&table, base) {
+                None => digest = folded(digest, 0xFFFF_FFFF),
+                Some(basis) => {
+                    for vector in basis {
+                        digest = folded(digest, vector);
+                    }
+                }
+            }
+        }
+        assert_eq!(digest, CORPUS_DIGEST);
+    }
+
+    #[test]
     fn the_solver_inverts_an_invertible_map_and_refuses_a_singular_one() {
         let mut stream = Stream(0x1234_5678);
         let mut inverted = 0_usize;
@@ -1675,6 +1790,75 @@ mod tests {
         assert!(rendered.contains("Ng"), "{rendered}");
         assert!(rendered.contains("round"), "{rendered}");
         assert!(!rendered.contains("00"), "{rendered}");
+    }
+
+    /// Tables drawn for the reduction corpus; the same draw feeds both tests that use it.
+    const CORPUS_TABLES: usize = 512;
+
+    const CORPUS_DIGEST: u64 = 0x7024_c8b9_592a_2287;
+
+    fn folded(digest: u64, word: u32) -> u64 {
+        digest
+            .rotate_left(7)
+            .wrapping_add(u64::from(word))
+            .wrapping_mul(0x0100_0000_01B3)
+    }
+
+    /// Highest set bit by a scan upwards, so it shares no arithmetic with `leading_bit`.
+    fn highest_set(word: u32) -> u32 {
+        let mut at = 0_u32;
+        for bit in 0..u32::BITS {
+            if word.wrapping_shr(bit) & 1 == 1 {
+                at = bit;
+            }
+        }
+        at
+    }
+
+    /// Rank over GF(2) by elimination from the top bit down, which is not how `rank_of` counts.
+    fn reference_rank(vectors: &[u32]) -> usize {
+        let mut rows: Vec<u32> = vectors.iter().copied().filter(|word| *word != 0).collect();
+        let mut rank = 0_usize;
+        for bit in (0..u32::BITS).rev() {
+            let set = |word: &u32| word.wrapping_shr(bit) & 1 == 1;
+            let Some(at) = rows.iter().position(set) else {
+                continue;
+            };
+            let pivot = rows.swap_remove(at);
+            for row in &mut rows {
+                if set(row) {
+                    *row ^= pivot;
+                }
+            }
+            rows.retain(|word| *word != 0);
+            rank = rank.saturating_add(1);
+        }
+        rank
+    }
+
+    /// A table whose differences from its first entry span `generators` dimensions, then `corrupt`
+    /// entries redrawn at random, which is what a table that is not a substitution looks like.
+    fn drawn_table(
+        stream: &mut Stream,
+        generators: usize,
+        corrupt: usize,
+    ) -> ([u32; NG_TABLE_ENTRIES], u32) {
+        let base = stream.next();
+        let images: [u32; NG_COLUMN_BITS] =
+            std::array::from_fn(|bit| if bit < generators { stream.next() } else { 0 });
+        let mut table = [base; NG_TABLE_ENTRIES];
+        for (value, slot) in table.iter_mut().enumerate() {
+            for (bit, image) in images.iter().enumerate() {
+                if value.wrapping_shr(u32::try_from(bit).unwrap_or(0)) & 1 == 1 {
+                    *slot ^= *image;
+                }
+            }
+        }
+        for _ in 0..corrupt {
+            let at = usize::try_from(stream.next()).unwrap_or(0) % NG_TABLE_ENTRIES;
+            table[at] = stream.next();
+        }
+        (table, base)
     }
 
     fn shifted_times(block: [u8; CIPHER_BLOCK_LEN], times: usize) -> [u8; CIPHER_BLOCK_LEN] {

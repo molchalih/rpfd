@@ -1220,27 +1220,10 @@ pub fn pack_from(
 }
 
 /// Where a tree will land, resolved as far as the filesystem already goes: the
-/// target may not exist yet, at any depth, so this walks up until something
-/// resolves and joins the rest back on.
+/// target may not exist yet, at any depth. A path nothing above resolves for
+/// does not name a place, and is refused rather than half-resolved.
 fn resolved_root(into: &Path) -> Result<PathBuf> {
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut here: &Path = into;
-    for _ in 0..=into.components().count() {
-        if let Ok(resolved) = fs::canonicalize(here) {
-            let mut root = resolved;
-            for name in tail.iter().rev() {
-                root.push(name);
-            }
-            return Ok(root);
-        }
-        let Some(name) = here.file_name() else { break };
-        tail.push(name);
-        here = match here.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-    }
-    Err(Failure::Refused {
+    install::resolved(into).ok_or_else(|| Failure::Refused {
         reason: format!(
             "{} does not name a directory to extract into",
             into.display()

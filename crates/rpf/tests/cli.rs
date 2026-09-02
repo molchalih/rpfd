@@ -3335,6 +3335,234 @@ fn a_directory_that_cannot_be_examined_is_the_uncertain_half_of_the_install_guar
     );
 }
 
+/// Which of two directories that cannot be examined a refusal names. The one
+/// nearest the archive is the one a caller can act on; the ascent records the
+/// first it meets and keeps it.
+#[cfg(unix)]
+#[test]
+fn the_nearer_of_two_directories_that_cannot_be_examined_is_the_one_named() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let upper = dir.path().join("upper");
+    let lower = upper.join("lower");
+    fs::create_dir_all(&lower).expect("creatable");
+    let archive = lower.join("test.rpf");
+    make_archive(&archive);
+    for directory in [&upper, &lower] {
+        std::os::unix::fs::symlink("GTA5.exe", directory.join("GTA5.exe")).expect("symlink");
+    }
+    let archive = archive.display().to_string();
+
+    let (code, object) = failure_json(&["rm", &archive, "stored.bin"]);
+    assert_eq!(code, 6, "{object}");
+    assert_eq!(
+        object["data"]["reason"],
+        serde_json::json!("UncertainInstall"),
+        "{object}",
+    );
+    let named = lower
+        .canonicalize()
+        .expect("canonical")
+        .display()
+        .to_string();
+    assert!(
+        object["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&named),
+        "the refusal must name {named}, the nearer of the two: {object}",
+    );
+}
+
+/// Both halves of the ascent's path resolution at once: a bare relative name,
+/// for an archive that is not there yet, from a working directory deep inside
+/// an installation. Either half alone resolves; only the crossing needs the
+/// working directory joined on before the ascent starts.
+#[test]
+fn a_bare_name_for_an_archive_not_there_yet_is_still_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("source.rpf");
+    make_archive(&source);
+    let tree = dir.path().join("tree");
+    assert_eq!(
+        run(&[
+            "extract",
+            &source.display().to_string(),
+            &tree.display().to_string(),
+        ])
+        .0,
+        0,
+        "extract",
+    );
+
+    let root = dir.path().join("Grand Theft Auto V");
+    let deep = root.join("mods/update/x64/dlcpacks");
+    fs::create_dir_all(&deep).expect("directories");
+    fs::write(root.join("GTA5.exe"), b"not really").expect("writable");
+    let packed = deep.join("dlc.rpf");
+    assert!(!packed.exists(), "the archive must not exist yet");
+
+    let (code, stderr) = run_err_in(
+        &deep,
+        &["--json", "pack", &tree.display().to_string(), "dlc.rpf"],
+    );
+    assert_eq!(
+        code, 6,
+        "a name that is not there yet is the same archive: {stderr:?}"
+    );
+    let object: serde_json::Value = serde_json::from_str(&stderr)
+        .map_err(|error| format!("{error}; standard error carried {stderr:?}"))
+        .expect("one JSON object on standard error");
+    assert_eq!(
+        object["data"]["reason"],
+        serde_json::json!("GameInstall"),
+        "{object}",
+    );
+    assert!(
+        object["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Grand Theft Auto V"),
+        "the refusal must name the installation: {object}",
+    );
+    assert!(!packed.exists(), "a refused pack writes nothing");
+}
+
+/// A tree `pack` can build from, extracted out of a fresh archive.
+fn packable_tree(dir: &Path) -> String {
+    let source = dir.join("source.rpf");
+    make_archive(&source);
+    let tree = dir.join("tree");
+    assert_eq!(
+        run(&[
+            "extract",
+            &source.display().to_string(),
+            &tree.display().to_string(),
+        ])
+        .0,
+        0,
+        "extract",
+    );
+    tree.display().to_string()
+}
+
+/// An installation with `deep` below its root, and a tree to pack from.
+fn installation_and_tree(dir: &Path) -> (std::path::PathBuf, String) {
+    let tree = packable_tree(dir);
+    let root = dir.join("Grand Theft Auto V");
+    let deep = root.join("mods/update/x64/dlcpacks");
+    fs::create_dir_all(&deep).expect("directories");
+    fs::write(root.join("GTA5.exe"), b"not really").expect("writable");
+    (deep, tree)
+}
+
+/// The refusal a `pack` answered with, as its code, its `reason` and the
+/// sentence it rendered.
+fn packed_from(working: &Path, tree: &str, archive: &str, force: bool) -> (i32, String, String) {
+    let mut args = vec!["--json", "pack", tree, archive];
+    if force {
+        args.push("--force");
+    }
+    let (code, stderr) = run_err_in(working, &args);
+    let object = serde_json::from_str::<serde_json::Value>(&stderr).unwrap_or_default();
+    let said = |at| {
+        object
+            .pointer(at)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    (code, said("/data/reason"), said("/message"))
+}
+
+/// A directory that is not there yet is not a reason to stop looking. The
+/// ascent resolved only the immediate parent once, so one absent intermediate
+/// left the path unresolved and walked the guard straight past the
+/// installation the working directory was already inside.
+#[test]
+fn an_absent_intermediate_directory_does_not_carry_a_pack_past_an_installation() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (deep, tree) = installation_and_tree(dir.path());
+    fs::create_dir(deep.join("sub2")).expect("directory");
+    assert!(!deep.join("sub").exists(), "sub must not exist yet");
+
+    for archive in ["dlc.rpf", "sub2/dlc.rpf", "sub/dlc.rpf"] {
+        let (code, reason, message) = packed_from(&deep, &tree, archive, false);
+        assert_eq!(
+            (code, reason.as_str()),
+            (6, "GameInstall"),
+            "{archive} is inside the installation whether or not its directory \
+             is: {message}",
+        );
+    }
+}
+
+/// The point of the ascent is that it is not bounded at one: however many
+/// directories on the way down are still to be created, what they are under is
+/// what decides.
+#[test]
+fn absent_directories_are_climbed_however_many_of_them_there_are() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let tree = packable_tree(dir.path());
+    let root = dir.path().join("Grand Theft Auto V");
+    fs::create_dir_all(&root).expect("directory");
+    fs::write(root.join("GTA5.exe"), b"not really").expect("writable");
+
+    let mut archive = String::new();
+    for _ in 0..5 {
+        archive.push_str("under/");
+    }
+    archive.push_str("dlc.rpf");
+    assert!(!root.join("under").exists(), "none of them exist yet");
+
+    let named = root
+        .canonicalize()
+        .expect("canonical")
+        .display()
+        .to_string();
+    let (code, reason, message) = packed_from(&root, &tree, &archive, false);
+    assert_eq!(
+        (code, reason.as_str()),
+        (6, "GameInstall"),
+        "{archive} is five absent directories inside the installation: {message}",
+    );
+    assert!(
+        message.contains(&named),
+        "the refusal must name {named} rather than whatever the ascent stopped \
+         on: {message}",
+    );
+}
+
+/// A guard that closes by refusing everything is not a fix: outside an
+/// installation the same shapes still pack, and inside one `--force` still
+/// overrides.
+#[test]
+fn the_install_guard_still_lets_through_what_it_always_did() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (deep, tree) = installation_and_tree(dir.path());
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).expect("directory");
+
+    let (code, _, message) = packed_from(&outside, &tree, "dlc.rpf", false);
+    assert_eq!(
+        code, 0,
+        "a pack outside an installation is nobody's business but the \
+         caller's: {message}",
+    );
+    assert!(outside.join("dlc.rpf").is_file(), "it wrote the archive");
+
+    let (code, _, message) = packed_from(&outside, &tree, "sub/dlc.rpf", false);
+    assert_eq!(
+        code, 7,
+        "an absent directory outside an installation is still only a missing \
+         directory, not a refusal: {message}",
+    );
+
+    fs::create_dir(deep.join("sub2")).expect("directory");
+    let (code, _, message) = packed_from(&deep, &tree, "sub2/dlc.rpf", true);
+    assert_eq!(code, 0, "--force still overrides the refusal: {message}");
+    assert!(deep.join("sub2/dlc.rpf").is_file(), "it wrote the archive");
+}
+
 // --- refusals that had never fired -----------------------------------------
 
 /// A view write against an entry the archive does not hold, and no `--create`:

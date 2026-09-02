@@ -39,8 +39,8 @@ pub enum Detected {
 /// examined is reported rather than passed over. [`Detected::Installation`]
 /// wins over [`Detected::Unexaminable`] wherever both are found.
 pub fn detect(path: &Path) -> Option<Detected> {
-    let resolved = resolve(path);
-    let mut current = resolved.parent()?;
+    let from = resolved(path).unwrap_or_else(|| path.to_path_buf());
+    let mut current = from.parent()?;
     let mut unexaminable: Option<PathBuf> = None;
     for _ in 0..MAX_ASCENT {
         match verdict(current) {
@@ -69,23 +69,32 @@ fn verdict(directory: &Path) -> Held {
 }
 
 /// `path` with the directories above it resolved, so ascending from it climbs
-/// the tree the name sits in.
+/// the tree the name sits in, or `None` when nothing on the way up resolves.
 ///
 /// A bare `dlc.rpf` would otherwise ascend once and stop, its parent being the
-/// empty path. The archive may not exist yet, so the directory is resolved
-/// rather than the file.
-fn resolve(path: &Path) -> PathBuf {
-    if let Ok(canonical) = fs::canonicalize(path) {
-        return canonical;
+/// empty path. Neither the archive nor any directory above it need exist yet,
+/// so the walk climbs until something resolves and joins the rest back on:
+/// stopping at the first absent directory leaves a path this cannot ascend,
+/// and an installation below it unseen.
+pub fn resolved(path: &Path) -> Option<PathBuf> {
+    let mut tail: Vec<&OsStr> = Vec::new();
+    let mut here: &Path = path;
+    for _ in 0..=path.components().count() {
+        if let Ok(found) = fs::canonicalize(here) {
+            let mut root = found;
+            for name in tail.iter().rev() {
+                root.push(name);
+            }
+            return Some(root);
+        }
+        let name = here.file_name()?;
+        tail.push(name);
+        here = match here.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
     }
-    let parent = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    match (fs::canonicalize(parent), path.file_name()) {
-        (Ok(canonical), Some(name)) => canonical.join(name),
-        _ => path.to_path_buf(),
-    }
+    None
 }
 
 /// Whether a name found on disk is the one being looked for.
@@ -165,7 +174,7 @@ fn of_path(path: &Path) -> Held {
 mod tests {
     use std::{ffi::OsStr, fs};
 
-    use super::{Detected, Held, detect, holds, is_named};
+    use super::{Detected, Held, detect, holds, is_named, resolved};
 
     /// An installation: an executable at the root, an archive below it.
     fn installation(root: &std::path::Path, executable: &str) -> std::path::PathBuf {
@@ -175,6 +184,26 @@ mod tests {
         let archive = deep.join("dlc.rpf");
         fs::write(&archive, b"not really").expect("writable");
         archive
+    }
+
+    #[test]
+    fn directories_that_are_not_there_yet_are_climbed_past_and_joined_back_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical");
+        let deep = root.join("a/b/c/d/e/dlc.rpf");
+
+        assert_eq!(
+            resolved(&deep),
+            Some(deep.clone()),
+            "five absent directories are still the path under the root",
+        );
+        fs::create_dir_all(root.join("a/b")).expect("directories");
+        assert_eq!(resolved(&deep), Some(deep), "and so are three");
+        assert_eq!(
+            resolved(std::path::Path::new("")),
+            None,
+            "nothing resolves for a path that names nothing",
+        );
     }
 
     #[test]
