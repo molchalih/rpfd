@@ -31,12 +31,16 @@ STAT_FLAG=
 STAT_SIZE=
 STAT_STAMP=
 
+# The whole report, in a variable. Through a pipe, a reader that stops at the
+# first match kills `time` with SIGPIPE, which `pipefail` aborts on.
+time_report() { { "$1" "$2" "$RPF" --version >/dev/null; } 2>&1; }
+
 # `ru_maxrss` under -l is bytes on Darwin and kilobytes on the other BSDs, so
 # the unit is measured: no real resident set reads under 64 KiB in bytes.
 rss_scale_for_l() {
-    local reported
-    reported=$("$1" -l "$RPF" --version 2>&1 >/dev/null |
-        awk '/maximum resident set size/ { print $1; exit }')
+    local report reported
+    report=$(time_report "$1" -l)
+    reported=$(awk '/maximum resident set size/ { print $1; exit }' <<< "$report")
     case "$reported" in
         '' | *[!0-9]*) return 1 ;;
     esac
@@ -46,8 +50,9 @@ rss_scale_for_l() {
 # A -v that answers in some other wording would leave every resident set at
 # zero and the sweep would finish and publish it, so the reading is required.
 answers_rss_v() {
-    "$1" -v "$RPF" --version 2>&1 >/dev/null |
-        grep -qE 'Maximum resident set size \(kbytes\):[[:space:]]*[0-9]+'
+    local report
+    report=$(time_report "$1" -v)
+    grep -qE 'Maximum resident set size \(kbytes\):[[:space:]]*[0-9]+' <<< "$report"
 }
 
 probe_time() {
