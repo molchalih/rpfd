@@ -190,6 +190,11 @@ mcp-publisher publish server.json
 
 Registry versions are immutable and there is no unpublish.
 
+An `mcpb` package carries its full download URL in `identifier` and must not
+carry `registryBaseUrl`. The published schema permits the field, so nothing in
+this tree catches it; the registry refuses the publish, which is how v0.2.0's
+entry was found wrong after the release had already built it.
+
 ## The six tools
 
 | Tool | What it does | Annotated |

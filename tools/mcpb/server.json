@@ -12,7 +12,6 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "registryBaseUrl": "https://github.com",
       "identifier": "https://github.com/molchalih/rpfd/releases/download/v0.0.0/rpf-v0.0.0.mcpb",
       "version": "0.0.0",
       "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
