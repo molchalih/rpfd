@@ -12,7 +12,7 @@
 
 use std::{
     fs,
-    io::{Cursor, Write as _},
+    io::{Cursor, Read as _, Write as _},
     path::Path,
     process::{Command, Stdio},
 };
@@ -21,6 +21,8 @@ use rpf_core::{FileKind, FileSpec, Storage, Unwatched};
 use serde_json::{Value, json};
 
 mod common;
+
+use crate::common::deadline::Deadline;
 
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
@@ -42,45 +44,14 @@ const TOOLS: [&str; 6] = [
     "rpf_verify",
 ];
 
-/// How long anything here waits on the server before the wait is a failure.
-const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// A bound on one wait, naming what the wait is for. The watchdog ends a
-/// process blocked inside a read.
-struct Deadline {
-    met: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Deadline {
-    fn on(what: &'static str) -> Self {
-        let met = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watching = std::sync::Arc::clone(&met);
-        std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            while started.elapsed() < PATIENCE {
-                if watching.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            if watching.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            let said = format!("waited {PATIENCE:?} for {what}, and it never arrived\n");
-            let mut stderr = std::io::stderr();
-            let _ = stderr.write_all(said.as_bytes());
-            let _ = stderr.flush();
-            std::process::abort();
-        });
-        Self { met }
-    }
-}
-
-impl Drop for Deadline {
-    fn drop(&mut self) {
-        self.met.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-}
+/// How many pages a listing that pages is allowed to take before the paging is
+/// the failure. The bound is on the loop rather than on the clock: a server
+/// whose pages stop making progress fails where it stopped and says how far it
+/// got, where an unbounded loop would run until the watchdog fires. The 901
+/// rows the paging test lists — 900 entries and the `data` directory holding
+/// them — come back in three pages, so this is eight times what correct
+/// behaviour needs and far under what one row a page would take.
+const PAGES_MOST: u64 = 25;
 
 /// An archive with one deflated file and one resource.
 fn make_archive(at: &Path) -> Vec<u8> {
@@ -146,6 +117,37 @@ fn make_wide_archive(at: &Path, names: &[String]) {
         &files,
         &[],
         |_: &str| Ok(Cursor::new(b"payload".to_vec())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+}
+
+/// An archive holding each named entry with the contents given, deflated.
+fn make_entries(at: &Path, entries: &[(String, Vec<u8>)]) {
+    let files: Vec<FileSpec> = entries
+        .iter()
+        .map(|(path, _)| FileSpec {
+            path: path.clone(),
+            kind: FileKind::Binary {
+                storage: Storage::Deflate,
+                encryption: 0,
+            },
+        })
+        .collect();
+    let held = entries.to_vec();
+    let mut out = fs::File::create(at).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |wanted: &str| {
+            let (_, contents) = held
+                .iter()
+                .find(|(path, _)| path == wanted)
+                .expect("every entry built is one that was named");
+            Ok(Cursor::new(contents.clone()))
+        },
         &mut Unwatched,
     )
     .expect("builds");
@@ -242,28 +244,43 @@ fn answer(responses: &[Value], id: u64) -> &Value {
 /// Feeds every line in and returns the exit code and the raw lines of standard
 /// output, so a test can assert on the bytes rather than on a parse of them.
 fn drive(lines: &[String]) -> (i32, Vec<String>) {
-    let _deadline = Deadline::on("the server to answer every request and exit");
+    let deadline = Deadline::on("the server to answer every request and exit");
+    // Discarded rather than piped: nothing here reads it, and a pipe nothing
+    // drains is a place the server can block once it is full.
     let mut child = Command::new(RPF)
         .args(["serve", "--mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("server starts");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        for line in lines {
-            writeln!(stdin, "{line}").expect("writable");
-        }
+    let (mut requesting, mut answers) = pipes(&mut child);
+    deadline.watching(child);
+    for line in lines {
+        writeln!(requesting, "{line}").expect("writable");
     }
-    let output = child.wait_with_output().expect("server exits");
+    drop(requesting);
+    let mut out = Vec::new();
+    let read = answers.read_to_end(&mut out);
+    let status = deadline.reap();
+    deadline.check();
+    read.expect("the server's output is readable");
     (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout)
+        status.and_then(|it| it.code()).unwrap_or(-1),
+        String::from_utf8_lossy(&out)
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(str::to_owned)
             .collect(),
+    )
+}
+
+/// Takes the two pipes off `child`, so the child itself can be handed to a
+/// deadline before anything is written to it.
+fn pipes(child: &mut std::process::Child) -> (std::process::ChildStdin, std::process::ChildStdout) {
+    (
+        child.stdin.take().expect("stdin"),
+        child.stdout.take().expect("stdout"),
     )
 }
 
@@ -1184,9 +1201,16 @@ fn a_listing_too_big_to_send_says_so_and_pages() {
     assert!(returned <= 1000, "no more than was asked for");
 
     // Paging reaches the end, and the pages add up to everything that matched.
+    let mut pages = 0_u64;
     let mut seen = 0_u64;
     let mut offset = 0_u64;
     loop {
+        pages = pages.saturating_add(1);
+        assert!(
+            pages <= PAGES_MOST,
+            "{total} rows must page out within {PAGES_MOST} pages; the first \
+             {PAGES_MOST} held {seen}"
+        );
         let page = talk(&[call(
             1,
             "rpf_list",
@@ -1253,13 +1277,23 @@ fn contents_are_answered_inline_only_where_they_are_small_text_and_never_truncat
         .iter()
         .find(|block| block["type"] == "resource_link")
         .expect("one resource_link");
+    let uri = link["uri"].as_str().unwrap_or_default();
     assert!(
-        link["uri"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("file://"),
-        "{link}"
+        uri.starts_with("file:///") && !uri.starts_with("file:////"),
+        "the authority is empty and the path keeps its own single slash: {link}"
     );
+    #[cfg(unix)]
+    {
+        let whole = fs::canonicalize(&out).expect("the file the contents went to");
+        let spelt = whole.to_str().expect("a temporary path spells as UTF-8");
+        assert!(
+            spelt
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte)),
+            "the URI below is pinned unescaped, so the path must need no escaping: {spelt}"
+        );
+        assert_eq!(uri, format!("file://{spelt}"), "{link}");
+    }
     let len = written["structuredContent"]["len"].as_u64().expect("len");
     assert_eq!(fs::metadata(&out).expect("written").len(), len);
     for block in blocks {
@@ -1290,7 +1324,7 @@ fn contents_are_answered_inline_only_where_they_are_small_text_and_never_truncat
 #[test]
 fn a_cancelled_request_is_answered_with_nothing_at_all() {
     let (dir, archive) = scratch();
-    let _deadline = Deadline::on("the server to stop the verify and go on serving");
+    let deadline = Deadline::on("the server to stop the verify and go on serving");
 
     let mut child = Command::new(RPF)
         .args(["serve", "--mcp"])
@@ -1298,8 +1332,9 @@ fn a_cancelled_request_is_answered_with_nothing_at_all() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("server starts");
+    let (mut stdin, mut answers) = pipes(&mut child);
+    deadline.watching(child);
     {
-        let stdin = child.stdin.as_mut().expect("stdin");
         // The cancel is written first so it is seen before the walk begins:
         // the reading thread answers it ahead of the queue.
         writeln!(
@@ -1321,15 +1356,20 @@ fn a_cancelled_request_is_answered_with_nothing_at_all() {
         )
         .expect("writable");
     }
-    let output = child.wait_with_output().expect("server exits");
+    drop(stdin);
+    let mut out = Vec::new();
+    let read = answers.read_to_end(&mut out);
+    let status = deadline.reap();
+    deadline.check();
+    read.expect("the server's output is readable");
     drop(dir);
 
     assert_eq!(
-        output.status.code(),
+        status.and_then(|it| it.code()),
         Some(0),
         "a clean end of input exits 0"
     );
-    let lines: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+    let lines: Vec<Value> = String::from_utf8_lossy(&out)
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str(line).expect("JSON"))
@@ -1361,20 +1401,24 @@ fn a_cancel_that_arrives_after_the_answer_does_not_suppress_it() {
 
 #[test]
 fn a_request_only_half_written_when_input_closes_leaves_nothing_partial_behind() {
-    let _deadline = Deadline::on("the server to exit on a truncated line");
+    let deadline = Deadline::on("the server to exit on a truncated line");
     let mut child = Command::new(RPF)
         .args(["serve", "--mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("server starts");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        write!(stdin, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"meth").expect("writable");
-    }
-    let output = child.wait_with_output().expect("server exits");
-    assert_eq!(output.status.code(), Some(0));
-    let written = String::from_utf8_lossy(&output.stdout);
+    let (mut stdin, mut answers) = pipes(&mut child);
+    deadline.watching(child);
+    write!(stdin, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"meth").expect("writable");
+    drop(stdin);
+    let mut out = Vec::new();
+    let read = answers.read_to_end(&mut out);
+    let status = deadline.reap();
+    deadline.check();
+    read.expect("the server's output is readable");
+    assert_eq!(status.and_then(|it| it.code()), Some(0));
+    let written = String::from_utf8_lossy(&out);
     for line in written.lines().filter(|line| !line.trim().is_empty()) {
         let parsed: Value = serde_json::from_str(line).expect("JSON");
         assert_eq!(parsed["error"]["code"], json!(-32700), "{line}");
@@ -1457,4 +1501,322 @@ fn a_badly_damaged_archive_reports_what_fits_and_how_many_there_were() {
         "the result carries at most a hundred: {report}"
     );
     assert_eq!(report["problems_total"], json!(140), "{report}");
+}
+
+#[test]
+fn the_revision_that_brought_structured_content_and_links_is_sent_both() {
+    let (dir, archive) = scratch();
+    let out = dir.path().join("art.bin");
+    let named = out.display().to_string();
+    let responses = talk(&[
+        handshake(1, "2025-06-18"),
+        plain(2, "tools/list", &json!({})),
+        plain(
+            3,
+            "tools/call",
+            &json!({
+                "name": "rpf_read",
+                "arguments": { "archive": archive, "path": "art.yft", "out": named },
+            }),
+        ),
+    ]);
+    drop(dir);
+
+    assert_eq!(
+        answer(&responses, 1)["result"]["protocolVersion"],
+        json!("2025-06-18"),
+        "the revision the rest of this test is about"
+    );
+
+    let first = &answer(&responses, 2)["result"]["tools"][0];
+    assert!(
+        first["title"].is_string(),
+        "a tool title arrived in 2025-06-18, so 2025-06-18 has one: {first}"
+    );
+    assert!(first["annotations"].is_object(), "{first}");
+
+    let result = &answer(&responses, 3)["result"];
+    assert_eq!(result["isError"], json!(false), "{result}");
+    assert!(
+        result["structuredContent"]["out"].is_string(),
+        "structuredContent arrived in 2025-06-18, so 2025-06-18 has it: {result}"
+    );
+    let blocks = result["content"].as_array().expect("content");
+    assert!(
+        blocks.iter().any(|block| block["type"] == "resource_link"),
+        "a resource_link arrived in 2025-06-18, so 2025-06-18 gets one: {result}"
+    );
+    for field in ["resultType", "ttlMs", "cacheScope", "_meta"] {
+        assert!(
+            result[field].is_null(),
+            "{field} is of the modern revision alone: {result}"
+        );
+    }
+}
+
+#[test]
+fn contents_over_the_inline_ceiling_are_refused_and_what_is_under_it_is_answered() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("text.rpf");
+    // 40 KiB is over the 32 KiB ceiling and 2 KiB is well under it, so neither
+    // side of this pair moves if the ceiling does.
+    let over = "the ceiling is thirty-two kibibytes, and this entry is past it.\n".repeat(640);
+    let under = "this entry is about two kibibytes, which is under the ceiling.\n".repeat(32);
+    // And one entry of exactly the ceiling, which the ceiling admits.
+    let exactly = "x".repeat(32 * 1024);
+    assert!(over.len() > 32 * 1024 && under.len() > 1024 && under.len() < 32 * 1024);
+    make_entries(
+        &archive,
+        &[
+            ("data/over.txt".to_owned(), over.clone().into_bytes()),
+            ("data/under.txt".to_owned(), under.clone().into_bytes()),
+            ("data/exactly.txt".to_owned(), exactly.clone().into_bytes()),
+        ],
+    );
+    let archive = archive.display().to_string();
+
+    let responses = talk(&[
+        call(
+            1,
+            "rpf_read",
+            &json!({ "archive": archive, "path": "data/over.txt" }),
+        ),
+        call(
+            2,
+            "rpf_read",
+            &json!({ "archive": archive, "path": "data/under.txt" }),
+        ),
+        call(
+            3,
+            "rpf_read",
+            &json!({ "archive": archive, "path": "data/exactly.txt" }),
+        ),
+    ]);
+
+    let refused = &answer(&responses, 1)["result"];
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(refused["structuredContent"]["code"], json!(6), "{refused}");
+    assert_eq!(
+        refused["structuredContent"]["data"]["reason"], "PayloadTooLarge",
+        "{refused}"
+    );
+
+    let answered = &answer(&responses, 2)["result"];
+    assert_eq!(answered["isError"], json!(false), "{answered}");
+    assert_eq!(
+        answered["structuredContent"]["inline"],
+        json!(true),
+        "{answered}"
+    );
+    assert_eq!(
+        answered["structuredContent"]["len"],
+        json!(under.len()),
+        "{answered}"
+    );
+    assert_eq!(
+        answered["content"][1]["text"],
+        json!(under),
+        "the whole of it, and none of it truncated"
+    );
+
+    let ceiling = &answer(&responses, 3)["result"];
+    assert_eq!(
+        ceiling["isError"],
+        json!(false),
+        "the ceiling is what is allowed, not the first thing refused: {ceiling}"
+    );
+    assert_eq!(
+        ceiling["structuredContent"]["len"],
+        json!(32 * 1024),
+        "{ceiling}"
+    );
+    assert_eq!(
+        ceiling["content"][1]["text"],
+        json!(exactly),
+        "the whole of it, and none of it truncated"
+    );
+}
+
+#[test]
+fn a_change_set_over_the_ceiling_is_refused_and_one_at_the_ceiling_is_not() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("many.rpf");
+    let names: Vec<String> = (0..300)
+        .map(|index| format!("data/e{index:03}.txt"))
+        .collect();
+    make_wide_archive(&archive, &names);
+    let archive = archive.display().to_string();
+
+    let removes = |how_many: usize| -> Value {
+        names
+            .iter()
+            .take(how_many)
+            .map(|path| json!({ "op": "remove", "path": path }))
+            .collect()
+    };
+
+    let responses = talk(&[
+        call(
+            1,
+            "rpf_apply",
+            &json!({ "archive": archive, "changes": removes(257) }),
+        ),
+        call(
+            2,
+            "rpf_plan",
+            &json!({ "archive": archive, "changes": removes(256) }),
+        ),
+    ]);
+
+    let refused = &answer(&responses, 1)["result"];
+    assert_eq!(refused["isError"], json!(true), "{refused}");
+    assert_eq!(refused["structuredContent"]["code"], json!(2), "{refused}");
+    assert!(
+        refused["structuredContent"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("at most 256"),
+        "the refusal names the bound the schema declares: {refused}"
+    );
+
+    let planned = &answer(&responses, 2)["result"];
+    assert_eq!(
+        planned["isError"],
+        json!(false),
+        "256 is the ceiling, not one over it: {planned}"
+    );
+    assert_eq!(
+        planned["structuredContent"]["structural"]
+            .as_array()
+            .expect("structural")
+            .len(),
+        256,
+        "{planned}"
+    );
+}
+
+#[test]
+fn a_write_through_the_xml_view_converts_the_document_it_is_given() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("meta.rpf");
+    make_entries(
+        &archive,
+        &[(
+            "data/thing.ymt".to_owned(),
+            common::rbf_payload(common::RBF_DOCUMENT),
+        )],
+    );
+    let archive = archive.display().to_string();
+    let from = dir.path().join("edited.xml");
+    fs::write(&from, common::RBF_EDITED).expect("writable");
+
+    let responses = talk(&[
+        call(
+            1,
+            "rpf_apply",
+            &json!({ "archive": archive, "changes": [{
+                "op": "write",
+                "path": "data/thing.ymt",
+                "from": from.display().to_string(),
+                "as": "xml",
+            }] }),
+        ),
+        call(
+            2,
+            "rpf_read",
+            &json!({ "archive": archive, "path": "data/thing.ymt", "as": "xml" }),
+        ),
+    ]);
+
+    let applied = &answer(&responses, 1)["result"];
+    assert_eq!(applied["isError"], json!(false), "{applied}");
+
+    let read = &answer(&responses, 2)["result"];
+    assert_eq!(read["isError"], json!(false), "{read}");
+    assert_eq!(read["structuredContent"]["as"], json!("xml"), "{read}");
+    assert_eq!(
+        read["content"][1]["text"],
+        json!(common::RBF_EDITED),
+        "the document was converted to the encoding the entry holds, not stored as XML: {read}"
+    );
+}
+
+#[test]
+fn a_request_cancelled_while_it_runs_is_answered_with_nothing_at_all() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("slow.rpf");
+    // Four thousand entries, which is a walk of a couple of hundred
+    // milliseconds against a cancel written every five.
+    let names: Vec<String> = (0..4000)
+        .map(|index| format!("data/entry{index:04}.txt"))
+        .collect();
+    make_deflated_entries(&archive, &names);
+    let archive = archive.display().to_string();
+
+    let deadline = Deadline::on("the server to drop the cancelled walk and answer what follows");
+    let mut child = Command::new(RPF)
+        .args(["serve", "--mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("server starts");
+    let (mut stdin, answers) = pipes(&mut child);
+    deadline.watching(child);
+
+    // The cancel is written over and over while the walk runs, because nothing
+    // on this connection says when it started: one that lands before the walk
+    // registers names nothing and is answered with nothing, and the next one
+    // is 5 ms behind it. The archive is wide enough that the walk lasts orders
+    // of magnitude longer than that gap.
+    let verify = call(1, "rpf_verify", &json!({ "archive": archive })).to_string();
+    let info = call(2, "rpf_info", &json!({ "archive": archive })).to_string();
+    let cancel =
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId": 1}})
+            .to_string();
+    let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelling = std::sync::Arc::clone(&answered);
+    let feeding = std::thread::spawn(move || {
+        writeln!(stdin, "{verify}").expect("writable");
+        writeln!(stdin, "{info}").expect("writable");
+        while !cancelling.load(std::sync::atomic::Ordering::Relaxed) {
+            writeln!(stdin, "{cancel}").expect("writable");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+
+    let mut lines = Vec::new();
+    let mut reading = std::io::BufReader::new(answers);
+    loop {
+        let mut line = String::new();
+        let read = std::io::BufRead::read_line(&mut reading, &mut line).expect("readable");
+        if read == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines.push(serde_json::from_str::<Value>(&line).expect("JSON"));
+        // The first answer is the whole result: whatever it is, nothing is
+        // still running, so the cancels stop and standard input closes.
+        answered.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Asserted before the writer is joined: a server that dies mid-run breaks
+    // the writer's pipe, and that panic would otherwise arrive instead of the
+    // assertion saying what came back.
+    assert_eq!(
+        lines.len(),
+        1,
+        "a cancelled request is answered with nothing, and the one after it is answered: {lines:?}"
+    );
+    assert_eq!(
+        lines[0]["id"],
+        json!(2),
+        "the answer that came back is the request that was not cancelled: {lines:?}"
+    );
+    assert!(lines[0]["result"].is_object(), "{lines:?}");
+
+    feeding.join().expect("the writer ends");
+    let status = deadline.reap().expect("server exits");
+    drop(dir);
+    assert_eq!(status.code(), Some(0), "a clean end of input exits 0");
 }

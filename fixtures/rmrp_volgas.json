@@ -1,0 +1,312 @@
+{
+  "generator": {
+    "tool": "tools/oracle",
+    "reference_implementation": "rpf-archive 0.7.1",
+    "extraction_semantics": "binary entries: inflated contents. resource entries: 16-byte RSC7 header followed by the still-deflated body, which is the file as it exists outside the archive. Nested archives are descended into, not emitted."
+  },
+  "source": {
+    "name": "dlc.rpf",
+    "path": "rmrp_volgas/dlc.rpf",
+    "len": 11080704,
+    "sha256": "e010d7df1e00ab6e22b024218443994faad1a3b56d6367e2952648330545ea49"
+  },
+  "archives": [
+    {
+      "path": "dlc.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 11,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 4,
+          "entries_index": 1
+        },
+        {
+          "name": "content.xml",
+          "kind": "binary",
+          "file_offset": 2,
+          "file_size": 472,
+          "is_encrypted": 0,
+          "uncompressed_size": 2044
+        },
+        {
+          "name": "data",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 5
+        },
+        {
+          "name": "setup2.xml",
+          "kind": "binary",
+          "file_offset": 9,
+          "file_size": 281,
+          "is_encrypted": 0,
+          "uncompressed_size": 514
+        },
+        {
+          "name": "x64",
+          "kind": "directory",
+          "entries_count": 2,
+          "entries_index": 8
+        },
+        {
+          "name": "carvariations.meta",
+          "kind": "binary",
+          "file_offset": 3,
+          "file_size": 387,
+          "is_encrypted": 0,
+          "uncompressed_size": 1463
+        },
+        {
+          "name": "dlctext.meta",
+          "kind": "binary",
+          "file_offset": 4,
+          "file_size": 130,
+          "is_encrypted": 0,
+          "uncompressed_size": 191
+        },
+        {
+          "name": "vehicles.meta",
+          "kind": "binary",
+          "file_offset": 5,
+          "file_size": 1745,
+          "is_encrypted": 0,
+          "uncompressed_size": 6014
+        },
+        {
+          "name": "vehiclemods",
+          "kind": "directory",
+          "entries_count": 1,
+          "entries_index": 10
+        },
+        {
+          "name": "vehicles.rpf",
+          "kind": "binary",
+          "file_offset": 3051,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 9518592
+        },
+        {
+          "name": "volga5_mods.rpf",
+          "kind": "binary",
+          "file_offset": 34,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 1544704
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/vehicles.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 4,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 1
+        },
+        {
+          "name": "volga5.yft",
+          "kind": "resource",
+          "file_offset": 12117,
+          "file_size": 3314556,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2720803364
+        },
+        {
+          "name": "volga5.ytd",
+          "kind": "resource",
+          "file_offset": 4644,
+          "file_size": 1450113,
+          "graphics_flags": 3491233798,
+          "is_encrypted": 0,
+          "system_flags": 131073
+        },
+        {
+          "name": "volga5_hi.yft",
+          "kind": "resource",
+          "file_offset": 7477,
+          "file_size": 2375415,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354645
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/volga5_mods.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 9,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 8,
+          "entries_index": 1
+        },
+        {
+          "name": "volga5_bonnet2_mod.yft",
+          "kind": "resource",
+          "file_offset": 1,
+          "file_size": 129503,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354625
+        },
+        {
+          "name": "volga5_bonnet_mod.yft",
+          "kind": "resource",
+          "file_offset": 254,
+          "file_size": 106373,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354657
+        },
+        {
+          "name": "volga5_exhaust_mod.yft",
+          "kind": "resource",
+          "file_offset": 462,
+          "file_size": 224326,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354626
+        },
+        {
+          "name": "volga5_skirt_f_mod.yft",
+          "kind": "resource",
+          "file_offset": 901,
+          "file_size": 630917,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354674
+        },
+        {
+          "name": "volga5_skirt_mod.yft",
+          "kind": "resource",
+          "file_offset": 2134,
+          "file_size": 57945,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354624
+        },
+        {
+          "name": "volga5_skirt_r_mod.yft",
+          "kind": "resource",
+          "file_offset": 2248,
+          "file_size": 263147,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354626
+        },
+        {
+          "name": "volga5_spolier2_mod.yft",
+          "kind": "resource",
+          "file_offset": 2762,
+          "file_size": 109334,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354625
+        },
+        {
+          "name": "volga5_spolier_mod.yft",
+          "kind": "resource",
+          "file_offset": 2976,
+          "file_size": 20872,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354816
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "carvariations.meta",
+      "len": 1463,
+      "sha256": "533d552f8cd5b7e12fc37874305e24f65e107695f589fc00ef75c8385de2a908"
+    },
+    {
+      "path": "content.xml",
+      "len": 2044,
+      "sha256": "f83350eab6ae96656ebc188642021b2608fe42db7554828d6e143f8cdf818e36"
+    },
+    {
+      "path": "dlctext.meta",
+      "len": 191,
+      "sha256": "7f7680809cca8f91a22b9fff70b77f3e18e65aea168bb3a78b8ba944fd19d8a8"
+    },
+    {
+      "path": "setup2.xml",
+      "len": 514,
+      "sha256": "aebe053fb55f15ea8652de903a532ec615a1b3a1dea58a905031e6ffad93ebd1"
+    },
+    {
+      "path": "vehicles.meta",
+      "len": 6014,
+      "sha256": "7c4c6ea945b0d0d3de003da4c25d6f3cdbb10bc327a604ecf93da252b56fbb14"
+    },
+    {
+      "path": "vehicles.rpf/volga5.yft",
+      "len": 3314556,
+      "sha256": "6712e5efdd44e39e865556dc3f5882c64e3c7595cc67cbb829690781423db5c9"
+    },
+    {
+      "path": "vehicles.rpf/volga5.ytd",
+      "len": 1450113,
+      "sha256": "82193fb10d8b46c5d832c0194721fa4db02d356eda72de3f1f7e9211ee3e3c25"
+    },
+    {
+      "path": "vehicles.rpf/volga5_hi.yft",
+      "len": 2375415,
+      "sha256": "6e87fe4e256af02b45935c774b76d290fd37f471722ab4a29c655743c35c4c17"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_bonnet2_mod.yft",
+      "len": 129503,
+      "sha256": "9b42c2b4a5262ccc0c02c92975b83ab2098ee33936719236ce650ee5f1914626"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_bonnet_mod.yft",
+      "len": 106373,
+      "sha256": "8301ed5be74b9c7aac79ff5159faca9260e8f8e2eee37f203e62a357a5689e0b"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_exhaust_mod.yft",
+      "len": 224326,
+      "sha256": "f61391a3372e2f16ca64ca6f289678047aa01315f152571587592e69f2f93eac"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_skirt_f_mod.yft",
+      "len": 630917,
+      "sha256": "34b494dd793e96d621420629b0a1f9da1c048760c799c8188511efc27da78b57"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_skirt_mod.yft",
+      "len": 57945,
+      "sha256": "e973008714e86915a06a398310ad307010dd322c024c059d4d3da1d581a0925f"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_skirt_r_mod.yft",
+      "len": 263147,
+      "sha256": "5abb2431ec7d74bfa3d16d3b0695fbbc2e9548089dc2bf4113ebe5dcd963c451"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_spolier2_mod.yft",
+      "len": 109334,
+      "sha256": "51fbfd00b3313497326133de5013567c3b8896d059f974450ab930f9352d5df7"
+    },
+    {
+      "path": "volga5_mods.rpf/volga5_spolier_mod.yft",
+      "len": 20872,
+      "sha256": "31890362550ed210cbb9671384cc12796062180010302dd3a6875ad618885a71"
+    }
+  ]
+}

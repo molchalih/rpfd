@@ -922,40 +922,6 @@ fn cat_out_writes_the_payload_and_reports_it_instead_of_printing_it() {
 }
 
 #[test]
-fn a_failure_under_json_is_an_object_on_standard_error() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let archive = dir.path().join("failing.rpf");
-    make_archive(&archive);
-    let archive = archive.display().to_string();
-
-    let output = Command::new(RPF)
-        .args(["--json", "cat", &archive, "data/absent.txt"])
-        .output()
-        .expect("binary runs");
-    assert_eq!(output.status.code(), Some(3), "not found");
-    assert!(
-        output.stdout.is_empty(),
-        "standard output carried a failure"
-    );
-
-    let object: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("one JSON object on standard error");
-    assert_eq!(object["code"], serde_json::json!(3), "{object}");
-    assert_eq!(object["data"]["reason"], serde_json::json!("NotFound"));
-    assert!(
-        object["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("data/absent.txt"),
-        "the message says nothing about what failed: {object}"
-    );
-
-    let (code, message) = run_err(&["cat", &archive, "data/absent.txt"]);
-    assert_eq!(code, 3);
-    assert!(message.starts_with("rpf: "), "{message}");
-}
-
-#[test]
 fn extract_then_pack_preserves_a_resources_page_flags() {
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("test.rpf");
@@ -2991,18 +2957,11 @@ fn a_refused_extraction_writes_nothing_at_all() {
     ]);
     assert_eq!(code, 6);
 
-    let mut left: Vec<String> = fs::read_dir(&tree)
-        .expect("readable")
-        .map(|entry| {
-            entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    left.sort();
-    assert_eq!(left, vec!["mine.txt".to_owned()], "it wrote something");
+    assert_eq!(
+        listed(&tree),
+        vec!["mine.txt".to_owned()],
+        "it wrote something",
+    );
 }
 
 /// A rebuild replaces an archive this process still holds open, which Windows
@@ -3108,6 +3067,532 @@ fn a_donor_that_cannot_be_reopened_is_read_once_and_still_written() {
     let (code, bytes) = run(&["cat", &archive.display().to_string(), "data/greeting.txt"]);
     assert_eq!(code, 0);
     assert_eq!(bytes, b"through a pipe".to_vec());
+}
+
+// --- where an extraction lands, what a failure is called, and who is told ---
+
+/// Extraction into a relative path that does not exist yet: every component the
+/// caller named is created, under the directory they ran from and nowhere else,
+/// and the target the guards are asked about is the one that was named.
+#[test]
+fn an_extraction_into_a_relative_path_lands_under_every_component_named() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let here = fs::canonicalize(dir.path()).expect("canonical temp dir");
+    let archive = here.join("test.rpf");
+    make_archive(&archive);
+    let archive_str = archive.display().to_string();
+
+    // Two components, neither of them there yet.
+    let (code, message) = run_err_in(&here, &["extract", &archive_str, "out/sub"]);
+    assert_eq!(code, 0, "{message}");
+    assert!(
+        here.join("out/sub/data/greeting.txt").is_file(),
+        "the tree is not under both components: {:?}",
+        listed(&here),
+    );
+    assert!(
+        !here.join("sub").exists(),
+        "the leading component was dropped and the tree landed at {}",
+        here.join("sub").display(),
+    );
+
+    // One component, not there yet either.
+    let (code, message) = run_err_in(&here, &["extract", &archive_str, "beside"]);
+    assert_eq!(code, 0, "a bare relative name was refused: {message}");
+    assert!(
+        here.join("beside/data/greeting.txt").is_file(),
+        "the tree is not under the name given: {:?}",
+        listed(&here),
+    );
+
+    // The guard that refuses an extraction over the archive it is reading is
+    // asked about the resolved target, so a target resolved to the wrong
+    // directory refuses a request naming a different one. `shared` exists and
+    // holds an archive named after one of its own entries; `later` does not,
+    // so `later/shared` resolves through components that are not there yet.
+    let shared = here.join("shared");
+    fs::create_dir(&shared).expect("creatable");
+    let named_after_an_entry = shared.join("stored.bin");
+    make_archive(&named_after_an_entry);
+    let before = fs::read(&named_after_an_entry).expect("readable");
+
+    let (code, message) = run_err_in(&here, &["extract", "shared/stored.bin", "later/shared"]);
+    assert_eq!(
+        code, 0,
+        "an extraction into later/shared was answered for shared: {message}",
+    );
+    assert!(
+        here.join("later/shared/stored.bin").is_file(),
+        "the tree is not under both components: {:?}",
+        listed(&here),
+    );
+    assert_eq!(
+        fs::read(&named_after_an_entry).expect("readable"),
+        before,
+        "the archive being read was written over",
+    );
+}
+
+/// What a directory holds, for a failure message that has to say where the
+/// files went instead.
+fn listed(at: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(at)
+        .map(|held| {
+            held.filter_map(|entry| {
+                entry
+                    .ok()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The failure object the binary put on standard error, with its exit code.
+fn failure_json(args: &[&str]) -> (i32, serde_json::Value) {
+    let output = Command::new(RPF)
+        .args([&["--json"], args].concat())
+        .output()
+        .expect("binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let object = serde_json::from_str(&stderr)
+        .map_err(|error| format!("{error}; standard error carried {stderr:?}"))
+        .expect("one JSON object on standard error");
+    (output.status.code().unwrap_or(-1), object)
+}
+
+/// An archive whose manifest names `tag` as its encryption, packed from a tree
+/// this test extracted, so `pack` reaches the encryption refusals.
+fn tree_encrypted(dir: &Path, tag: u32) -> String {
+    let archive = dir.join("for-tree.rpf");
+    make_archive(&archive);
+    let tree = dir.join(format!("tree-{tag:#x}"));
+    assert_eq!(
+        run(&[
+            "extract",
+            &archive.display().to_string(),
+            &tree.display().to_string(),
+        ])
+        .0,
+        0,
+        "extract",
+    );
+    let at = tree.join(rpf_core::MANIFEST_NAME);
+    let mut manifest =
+        rpf_core::Manifest::from_json(&fs::read_to_string(&at).expect("manifest readable"))
+            .expect("manifest parses");
+    manifest.encryption = tag;
+    fs::write(&at, manifest.to_json().expect("renders")).expect("manifest writable");
+    tree.display().to_string()
+}
+
+/// Every failure the command line can produce, against the exit code and the
+/// symbol it is contracted to. Written out rather than derived from the enum,
+/// so a variant that changes its number fails here.
+///
+/// Two of `Failure`'s variants are not on this table because no command line
+/// can reach them: `PayloadTooLarge` and `NotText` are the MCP transport's
+/// ceilings, and are covered in `mcp.rs`. `UncertainInstall` is the one
+/// remaining variant, and needs a filesystem that declines a question, so it
+/// has a test of its own below. Of the categories `Container` classifies by,
+/// `Cancelled` has no command-line caller to cancel it and `Io` reaches the
+/// caller as `Failure::Io`; both are pinned by `exit.rs`'s own table.
+#[test]
+fn every_failure_the_command_line_reaches_carries_its_own_code_and_symbol() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = dir.path();
+
+    let archive = dir.join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let stub = dir.join("stub.rpf");
+    fs::write(&stub, b"7FPR").expect("writable");
+    let stub = stub.display().to_string();
+
+    let plain = dir.join("plain.txt");
+    fs::write(&plain, b"this is definitely not an archive at all").expect("writable");
+    let plain = plain.display().to_string();
+
+    let absent = dir.join("GTA5.exe").display().to_string();
+
+    let install = dir.join("Grand Theft Auto V");
+    fs::create_dir_all(&install).expect("creatable");
+    fs::write(install.join("GTA5.exe"), b"not really").expect("writable");
+    let inside_install = install.join("test.rpf");
+    make_archive(&inside_install);
+    let inside_install = inside_install.display().to_string();
+
+    let needs_key = tree_encrypted(dir, 0x0FFF_FFF9);
+    let no_inverse = tree_encrypted(dir, 0x0FEF_FFFF);
+    let packed = dir.join("packed.rpf").display().to_string();
+    let empty_cache = dir.join("keys").display().to_string();
+
+    for (variant, args, code, reason, says) in [
+        (
+            "Container, not found",
+            vec!["cat", &archive, "data/absent.txt"],
+            3,
+            "NotFound",
+            "data/absent.txt",
+        ),
+        (
+            "Container, corrupt",
+            vec!["info", &stub],
+            4,
+            "NotAnArchive",
+            "not an RPF7 archive",
+        ),
+        (
+            "Container, needs a key",
+            vec!["pack", &needs_key, &packed, "--cache-dir", &empty_cache],
+            5,
+            "NeedsKey",
+            "no key material available",
+        ),
+        (
+            "Container, refused",
+            vec!["info", &plain],
+            6,
+            "NotAnArchive",
+            "not an RPF7 archive",
+        ),
+        (
+            "Container, unsupported",
+            vec!["pack", &no_inverse, &packed, "--cache-dir", &empty_cache],
+            9,
+            "CannotWriteEncrypted",
+            "derives this archive's forward transform",
+        ),
+        (
+            "Refused",
+            vec!["serve"],
+            6,
+            "Refused",
+            "serve needs one of --stdio or --mcp",
+        ),
+        (
+            "GameInstall",
+            vec!["rm", &inside_install, "stored.bin"],
+            6,
+            "GameInstall",
+            "refusing to write into the game installation at",
+        ),
+        ("Io", vec!["keys", "extract", &absent], 7, "Io", "GTA5.exe"),
+    ] {
+        let (answered, object) = failure_json(&args);
+        assert_eq!(answered, code, "{variant}: {object}");
+        assert_eq!(object["code"], serde_json::json!(code), "{variant}");
+        assert_eq!(
+            object["data"]["reason"],
+            serde_json::json!(reason),
+            "{variant}",
+        );
+        let message = object["message"].as_str().unwrap_or_default();
+        assert!(message.contains(says), "{variant}: {message}");
+
+        // The same failure, rendered for a person: the sentence and nothing
+        // else on standard output.
+        let output = Command::new(RPF).args(&args).output().expect("binary runs");
+        assert_eq!(output.status.code(), Some(code), "{variant}");
+        assert!(output.stdout.is_empty(), "{variant}: answered on stdout");
+        let rendered = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(rendered.starts_with("rpf: "), "{variant}: {rendered}");
+        assert!(rendered.contains(says), "{variant}: {rendered}");
+    }
+}
+
+/// The half of the install guard that fires when a directory above the archive
+/// will not say whether it is an installation. A name the guard looks for,
+/// pointing at itself, is a question the filesystem answers with `ELOOP`
+/// rather than with "not there".
+#[cfg(unix)]
+#[test]
+fn a_directory_that_cannot_be_examined_is_the_uncertain_half_of_the_install_guard() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let work = dir.path().join("work");
+    fs::create_dir_all(&work).expect("creatable");
+    let archive = work.join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+    std::os::unix::fs::symlink("GTA5.exe", work.join("GTA5.exe")).expect("symlink");
+
+    let (code, object) = failure_json(&["rm", &archive, "stored.bin"]);
+    assert_eq!(code, 6, "{object}");
+    assert_eq!(
+        object["data"]["reason"],
+        serde_json::json!("UncertainInstall"),
+        "{object}",
+    );
+    assert!(
+        object["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be examined"),
+        "{object}",
+    );
+}
+
+// --- refusals that had never fired -----------------------------------------
+
+/// A view write against an entry the archive does not hold, and no `--create`:
+/// the entry that is not there is what failed, and the conversion never runs.
+#[test]
+fn a_view_write_to_an_entry_that_is_not_there_is_not_found_rather_than_converted() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let source = dir.path().join("new.xml");
+    fs::write(&source, b"<?xml version=\"1.0\"?>\n<root>\n</root>\n").expect("writable");
+    let source = source.display().to_string();
+
+    let (code, object) =
+        failure_json(&["put", &archive, "data/absent.xml", &source, "--as", "xml"]);
+    assert_eq!(code, 3, "{object}");
+    assert_eq!(
+        object["data"]["reason"],
+        serde_json::json!("NotFound"),
+        "an entry that is not there was converted against instead: {object}",
+    );
+    assert!(
+        object["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("data/absent.xml"),
+        "{object}",
+    );
+    assert!(
+        !listing(Path::new(&archive)).contains(&"data/absent.xml".to_owned()),
+        "it was created without being asked: {:?}",
+        listing(Path::new(&archive)),
+    );
+}
+
+/// A target directory that cannot be read is not the same as one that is not
+/// there: only the second is empty, and only the second may be extracted into.
+#[cfg(unix)]
+#[test]
+fn a_target_that_cannot_be_read_is_not_taken_for_an_empty_one() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let target = dir.path().join("closed");
+    fs::create_dir(&target).expect("creatable");
+    fs::write(target.join("mine.txt"), b"not the archive's").expect("writable");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o300)).expect("chmod");
+
+    if fs::read_dir(&target).is_ok() {
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("chmod");
+        eprintln!(
+            "SKIP a_target_that_cannot_be_read_is_not_taken_for_an_empty_one: \
+             this process reads a directory it has no read permission on"
+        );
+        return;
+    }
+
+    let at = target.display().to_string();
+    let (code, said) = run_err(&["--json", "extract", &archive, &at]);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    assert_eq!(
+        code, 7,
+        "a directory that would not answer was extracted into: {said:?}",
+    );
+    let object: serde_json::Value =
+        serde_json::from_str(&said).expect("one JSON object on standard error");
+    assert_eq!(
+        object["data"]["reason"],
+        serde_json::json!("Io"),
+        "{object}"
+    );
+    assert!(
+        object["message"].as_str().unwrap_or_default().contains(&at),
+        "{object}",
+    );
+    assert_eq!(
+        listed(&target),
+        vec!["mine.txt".to_owned()],
+        "it wrote into the directory it could not read",
+    );
+}
+
+/// A manifest that records a checksum for an entry the archive no longer holds
+/// is drift, and `verify` says so rather than counting it as checked.
+#[test]
+fn a_manifest_naming_an_entry_the_archive_no_longer_holds_says_so() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let tree = dir.path().join("tree");
+    extracted_to(&archive, &tree);
+
+    // The manifest still records both entries; the archive now holds one.
+    assert_eq!(
+        run(&["rm", &archive.display().to_string(), "stored.bin"]).0,
+        0,
+        "rm",
+    );
+
+    let (code, report) = verified_against(&archive, &tree);
+    assert_eq!(code, 0, "what is left reads back clean: {report}");
+    assert!(
+        report.contains("1 of 2 recorded checksums checked"),
+        "the report was: {report}",
+    );
+    assert!(
+        report.contains("1 recorded checksums name nothing this archive holds"),
+        "the drift was not reported: {report}",
+    );
+}
+
+// --- what the report says, and which stream it says it on -------------------
+
+/// `encryption` is a field of the published `--json` report, not a sentence:
+/// `clients/agent/README.md` documents an unencrypted archive as `"OPEN"`.
+#[test]
+fn info_reports_the_exact_encryption_name_the_wire_contract_publishes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("test.rpf");
+    make_archive(&archive);
+    let archive = archive.display().to_string();
+
+    let report = cli_json(&["info", &archive]);
+    assert_eq!(
+        report["encryption"],
+        serde_json::json!("OPEN"),
+        "the documented value for an unencrypted archive: {report}",
+    );
+
+    // The same value, in the line a person reads.
+    let (code, out) = run(&["info", &archive]);
+    assert_eq!(code, 0);
+    let said = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        said.lines().any(|line| line == "encryption   OPEN"),
+        "the header was: {said}",
+    );
+}
+
+/// `info` names a nested archive when it was given one, and says nothing about
+/// one when it was not.
+#[test]
+fn info_names_the_nested_archive_it_was_given_and_no_other() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (outer, _) = make_nested(dir.path());
+    let outer = outer.display().to_string();
+
+    let (code, out) = run(&["info", &outer, "x64/inner.rpf"]);
+    assert_eq!(code, 0);
+    let said = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        said.lines()
+            .any(|line| line == "inside       x64/inner.rpf"),
+        "the nested archive is not named: {said}",
+    );
+
+    let (code, out) = run(&["info", &outer]);
+    assert_eq!(code, 0);
+    let said = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        !said.contains("inside"),
+        "an archive that is not nested was given an empty `inside` line: {said}",
+    );
+}
+
+/// The advisory that a write is about to rebuild is for a person watching, and
+/// a `--json` caller was promised one object on standard output and nothing
+/// else anywhere.
+#[test]
+fn a_rebuild_advisory_reaches_a_person_and_never_a_json_caller() {
+    let dir = tempfile::tempdir().expect("temp dir");
+
+    // Bytes that do not compress, so no spare block will hold them: the write
+    // does not fit, and the archive has to be rebuilt to take it.
+    let big: Vec<u8> = (0..200_000_u32)
+        .map(|i| u8::try_from((i.wrapping_mul(2_654_435_761) >> 13) & 0xFF).unwrap_or_default())
+        .collect();
+    let edited = dir.path().join("big.bin");
+    fs::write(&edited, &big).expect("writable");
+    let edited = edited.display().to_string();
+
+    let mut made = 0_usize;
+    let mut fresh = || {
+        made = made.saturating_add(1);
+        let archive = dir.path().join(format!("case-{made}.rpf"));
+        make_archive(&archive);
+        archive.display().to_string()
+    };
+
+    for (what, says) in [
+        ("a payload that will not fit", "will not fit"),
+        ("a structural change", "; rebuilding"),
+    ] {
+        let plain = fresh();
+        let reported = fresh();
+        let (plain_args, json_args) = if what == "a payload that will not fit" {
+            (
+                vec!["put", &plain, "data/greeting.txt", &edited],
+                vec!["--json", "put", &reported, "data/greeting.txt", &edited],
+            )
+        } else {
+            (
+                vec!["rm", &plain, "stored.bin"],
+                vec!["--json", "rm", &reported, "stored.bin"],
+            )
+        };
+
+        let (code, said) = run_err(&plain_args);
+        assert_eq!(code, 0, "{what}: {said}");
+        assert!(
+            said.contains(says),
+            "{what}: a person was told nothing: {said:?}",
+        );
+
+        let output = Command::new(RPF)
+            .args(&json_args)
+            .output()
+            .expect("binary runs");
+        let said = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert_eq!(output.status.code(), Some(0), "{what} as --json: {said}");
+        assert!(
+            said.is_empty(),
+            "{what} as --json: prose beside the object: {said:?}",
+        );
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+        let report: serde_json::Value = serde_json::from_str(&printed).unwrap_or_else(|error| {
+            panic!("{what} as --json: standard output carried {printed:?}: {error}")
+        });
+        assert_eq!(
+            report["method"],
+            serde_json::json!("rebuild"),
+            "{what} as --json: the advisory's report never reached standard output: {report}",
+        );
+    }
+}
+
+/// `keys cache` names the directory it used in the line a person reads, not
+/// only in the JSON report.
+#[test]
+fn the_cache_line_a_person_reads_names_the_directory_it_used() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache = dir.path().join("cache");
+    let at = cache.display().to_string();
+
+    let (code, out) = run(&["keys", "cache", "--cache-dir", &at]);
+    assert_eq!(code, 0);
+    let said = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        said.lines().any(|line| line == format!("cache   {at}")),
+        "the report was: {said}",
+    );
 }
 
 /// The AES-encrypted archive in the corpus, by its relative path.

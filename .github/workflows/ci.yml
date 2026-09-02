@@ -92,12 +92,12 @@ jobs:
       # gating one that should have run, fails here rather than going unnoticed.
       #
       # **One number for all three platforms, and that is not an oversight.**
-      # The tests that vary by platform are gated by `#[cfg]` — `unix`, and
-      # `any(unix, windows)` for the two that carry DR-009's file identity — so
-      # where they do not apply they are not compiled at all rather than
-      # reported as ignored: they change the total the suite runs and not the
-      # count of corpus skips. Every corpus-gated test is unconditional. If that
-      # ever stops being true this step is what says so.
+      # The tests that vary by platform are gated by `#[cfg]` — `unix`,
+      # `windows`, and `any(unix, windows)` for the two that carry DR-009's
+      # file identity — so where they do not apply they are not compiled at
+      # all rather than reported as ignored: they change the total the suite
+      # runs and not the count of corpus skips. Every corpus-gated test is
+      # unconditional. If that ever stops being true this step is what says so.
       #
       # `shell: bash` because the default on the Windows runner is PowerShell,
       # where none of this is even syntax. `pipefail` because bash's own default
@@ -110,8 +110,38 @@ jobs:
           cargo test --all 2>&1 | tee suite.log
           skipped=$(grep -c 'ignored, no RPF_CORPUS' suite.log || true)
           grep 'ignored, no RPF_CORPUS' suite.log || true
-          test "$skipped" -eq 13 \
-            || { echo "expected 13 corpus tests to report themselves skipped, got $skipped"; exit 1; }
+          test "$skipped" -eq 14 \
+            || { echo "expected 14 corpus tests to report themselves skipped, got $skipped"; exit 1; }
+
+  # R0.3: what is checked here is the oracle's **output**, and the generator is
+  # never built. `tools/oracle` links the reference implementation — 114
+  # transitive crates, DR-007 — and is excluded from the workspace, so the lock
+  # is what says it is not in a build here; the test re-emits every committed
+  # fixture from its own content and compares bytes. The corpus-gated half,
+  # which rebuilds each fixture from the archive it names, cannot run here:
+  # no game data is tracked (DR-006), and the suite job above is what counts
+  # those two skips.
+  #
+  # Asked once rather than per platform, for the same reason `deny` and `docs`
+  # are: a committed fixture is bytes in the repository and does not vary by
+  # runner. The matrix runs the same test as part of `cargo test --all`.
+  fixtures:
+    name: oracle fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: fixtures
+      - name: the generator is not in this workspace
+        run: |
+          if grep -q '^name = "rpf-archive"' Cargo.lock; then
+            echo "the reference implementation is in the workspace lock; DR-007"
+            exit 1
+          fi
+      - name: every committed fixture is the document its generator emits
+        run: cargo test -p rpf-core --test oracle -- --nocapture
 
   # `missing_docs` is on, so every public item has a doc comment, and a doc
   # comment is where a reader looks for a contract. A broken link in one is

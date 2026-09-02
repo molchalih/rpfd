@@ -1,0 +1,334 @@
+{
+  "generator": {
+    "tool": "tools/oracle",
+    "reference_implementation": "rpf-archive 0.7.1",
+    "extraction_semantics": "binary entries: inflated contents. resource entries: 16-byte RSC7 header followed by the still-deflated body, which is the file as it exists outside the archive. Nested archives are descended into, not emitted."
+  },
+  "source": {
+    "name": "dlc.rpf",
+    "path": "rmrp_vestacross/dlc.rpf",
+    "len": 47092736,
+    "sha256": "25f02211852469aae00b05c9596a8eb53efd20a99a5125d77315b2cac9b406f0"
+  },
+  "archives": [
+    {
+      "path": "dlc.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 10,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 4,
+          "entries_index": 1
+        },
+        {
+          "name": "content.xml",
+          "kind": "binary",
+          "file_offset": 1,
+          "file_size": 493,
+          "is_encrypted": 0,
+          "uncompressed_size": 1974
+        },
+        {
+          "name": "data",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 5
+        },
+        {
+          "name": "setup2.xml",
+          "kind": "binary",
+          "file_offset": 11,
+          "file_size": 274,
+          "is_encrypted": 0,
+          "uncompressed_size": 499
+        },
+        {
+          "name": "x64",
+          "kind": "directory",
+          "entries_count": 2,
+          "entries_index": 8
+        },
+        {
+          "name": "carvariations.meta",
+          "kind": "binary",
+          "file_offset": 3,
+          "file_size": 388,
+          "is_encrypted": 0,
+          "uncompressed_size": 1471
+        },
+        {
+          "name": "dlctext.meta",
+          "kind": "binary",
+          "file_offset": 4,
+          "file_size": 130,
+          "is_encrypted": 0,
+          "uncompressed_size": 191
+        },
+        {
+          "name": "vehicles.meta",
+          "kind": "binary",
+          "file_offset": 7,
+          "file_size": 1717,
+          "is_encrypted": 0,
+          "uncompressed_size": 5715
+        },
+        {
+          "name": "vestacross.rpf",
+          "kind": "binary",
+          "file_offset": 12,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 13263872
+        },
+        {
+          "name": "vestacross_mods.rpf",
+          "kind": "binary",
+          "file_offset": 54704,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 19084288
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/vestacross.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 4,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 1
+        },
+        {
+          "name": "vestacross.yft",
+          "kind": "resource",
+          "file_offset": 17473,
+          "file_size": 4317473,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2687781300
+        },
+        {
+          "name": "vestacross.ytd",
+          "kind": "resource",
+          "file_offset": 7399,
+          "file_size": 2188861,
+          "graphics_flags": 3557163016,
+          "is_encrypted": 0,
+          "system_flags": 131073
+        },
+        {
+          "name": "vestacross_hi.yft",
+          "kind": "resource",
+          "file_offset": 11675,
+          "file_size": 2968329,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684356965
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/vestacross_mods.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 11,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 10,
+          "entries_index": 1
+        },
+        {
+          "name": "vestacross_bonnet_1.yft",
+          "kind": "resource",
+          "file_offset": 1,
+          "file_size": 97656,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2701524995
+        },
+        {
+          "name": "vestacross_bonnet_2.yft",
+          "kind": "resource",
+          "file_offset": 192,
+          "file_size": 96012,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2869297155
+        },
+        {
+          "name": "vestacross_bonnet_3.yft",
+          "kind": "resource",
+          "file_offset": 380,
+          "file_size": 100898,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684878851
+        },
+        {
+          "name": "vestacross_bonnet_4.yft",
+          "kind": "resource",
+          "file_offset": 578,
+          "file_size": 112597,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2751987715
+        },
+        {
+          "name": "vestacross_chassis_1.yft",
+          "kind": "resource",
+          "file_offset": 798,
+          "file_size": 4834242,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354583
+        },
+        {
+          "name": "vestacross_chassis_2.yft",
+          "kind": "resource",
+          "file_offset": 10240,
+          "file_size": 4204129,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354583
+        },
+        {
+          "name": "vestacross_chassis_3.yft",
+          "kind": "resource",
+          "file_offset": 18452,
+          "file_size": 4354705,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684354583
+        },
+        {
+          "name": "vestacross_chassis_4.yft",
+          "kind": "resource",
+          "file_offset": 26958,
+          "file_size": 4289382,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684837892
+        },
+        {
+          "name": "vestacross_roof_1.yft",
+          "kind": "resource",
+          "file_offset": 35336,
+          "file_size": 67452,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2785280003
+        },
+        {
+          "name": "vestacross_roof_2.yft",
+          "kind": "resource",
+          "file_offset": 35468,
+          "file_size": 924202,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2802192579
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "carvariations.meta",
+      "len": 1471,
+      "sha256": "1fd56aab9afcce89a630f06724152e47c2a82f915502e38928fa8e656eb14c2c"
+    },
+    {
+      "path": "content.xml",
+      "len": 1974,
+      "sha256": "3811d696f6c476b8d62583f04c00da0f6cb5dade599511e99141b96a4c628d28"
+    },
+    {
+      "path": "dlctext.meta",
+      "len": 191,
+      "sha256": "7f7680809cca8f91a22b9fff70b77f3e18e65aea168bb3a78b8ba944fd19d8a8"
+    },
+    {
+      "path": "setup2.xml",
+      "len": 499,
+      "sha256": "e6230b8d02d567bf84de563f7b601147d44445d69e55617f555e7ad7f82042dd"
+    },
+    {
+      "path": "vehicles.meta",
+      "len": 5715,
+      "sha256": "d97e4cedba91cd1365cc7fdc32acb10c23212678abaa00546f179dde3c2e93d4"
+    },
+    {
+      "path": "vestacross.rpf/vestacross.yft",
+      "len": 4317473,
+      "sha256": "56864260127f9309e92bca1dc523e890f36d1f8c65ed2b3bd61d34bc699be490"
+    },
+    {
+      "path": "vestacross.rpf/vestacross.ytd",
+      "len": 2188861,
+      "sha256": "b1c38c937a8b39a7cc37ac89c512a7eead80812cd32185b7a94948b1823a288b"
+    },
+    {
+      "path": "vestacross.rpf/vestacross_hi.yft",
+      "len": 2968329,
+      "sha256": "96b13186fa45bc63c27dcdbfc8dee5c57b2a4b187bb0724993ec69530c25602e"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_bonnet_1.yft",
+      "len": 97656,
+      "sha256": "c3a61aba050a91cb2f994e1c0087106bca8eab47cab970d24aa9538b78b7bc4d"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_bonnet_2.yft",
+      "len": 96012,
+      "sha256": "7fd1d04d3ff5dc925bad54a720c913b743a37f6059c6a2ea341f13389ab8a6ff"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_bonnet_3.yft",
+      "len": 100898,
+      "sha256": "16bad53c4a173fef524716309648c4f7d7f9c8812d5f11922eb1b1226f6c0ddc"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_bonnet_4.yft",
+      "len": 112597,
+      "sha256": "84e5d352d3ff95f31dbff605d4eccf8683c689f82784469173dffa5eae3dab28"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_chassis_1.yft",
+      "len": 4834242,
+      "sha256": "d018220bacd7b64b621bc598e32f6e018daf0e842c43d10540c45054fcfe923c"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_chassis_2.yft",
+      "len": 4204129,
+      "sha256": "493cb70be04003a61b39f06f4303afe7b7e04dba808837f0e2f39c95e16f2fbd"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_chassis_3.yft",
+      "len": 4354705,
+      "sha256": "346dcc52eb427586ac1a225dc3279d26bcc086403d34fae6d8f444168965724e"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_chassis_4.yft",
+      "len": 4289382,
+      "sha256": "37a5b73dea2fbcd49417937d6988f3ce58937f9bb7a9e7b4c119a0814aaa6eb5"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_roof_1.yft",
+      "len": 67452,
+      "sha256": "bdb10df657e2723d26ce9bc3a677088f0bf45a3273c1ba1d4256a00b0240658c"
+    },
+    {
+      "path": "vestacross_mods.rpf/vestacross_roof_2.yft",
+      "len": 924202,
+      "sha256": "0dc5a92190e9b23dd67ab218c0ab786349ca94dbbc7c28b5cb7ce1a5b6111b25"
+    }
+  ]
+}

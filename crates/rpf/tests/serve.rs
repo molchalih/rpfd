@@ -11,7 +11,7 @@
 
 use std::{
     fs,
-    io::{BufRead as _, Cursor, Write as _},
+    io::{BufRead as _, Cursor, Read as _, Write as _},
     path::Path,
     process::{Command, Stdio},
 };
@@ -22,65 +22,21 @@ use serde_json::{Value, json};
 
 mod common;
 
+use crate::common::deadline::{Deadline, PATIENCE};
+
 const RPF: &str = env!("CARGO_BIN_EXE_rpf");
 
-/// How long anything here waits on the daemon before the wait is a failure.
-const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// A bound on one wait, naming what the wait is for. [`Deadline::check`] fails
-/// a loop that returns; the watchdog ends a process blocked inside a read.
-struct Deadline {
-    what: &'static str,
-    started: std::time::Instant,
-    met: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Deadline {
-    /// A deadline of [`PATIENCE`] on waiting for `what`.
-    fn on(what: &'static str) -> Self {
-        let met = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watching = std::sync::Arc::clone(&met);
-        std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            while started.elapsed() < PATIENCE {
-                if watching.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            if watching.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            // Straight at the descriptor: the harness captures what the print macros
-            // write and drops it when the process ends this way.
-            let said = format!("waited {PATIENCE:?} for {what}, and it never arrived\n");
-            let mut stderr = std::io::stderr();
-            let _ = stderr.write_all(said.as_bytes());
-            let _ = stderr.flush();
-            std::process::abort();
-        });
-        Self {
-            what,
-            started: std::time::Instant::now(),
-            met,
-        }
-    }
-
-    /// Fails, naming what was being waited for, once the patience is spent.
-    #[track_caller]
-    fn check(&self) {
-        assert!(
-            self.started.elapsed() < PATIENCE,
-            "waited {PATIENCE:?} for {}, and it never arrived",
-            self.what
-        );
-    }
-}
-
-impl Drop for Deadline {
-    fn drop(&mut self) {
-        self.met.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+/// A budget for a wait on a scan of `file`, end to end: [`PATIENCE`], and a
+/// second for every 4 MiB of it. A `keys.extract` over a 10,263,234,184-byte
+/// image took ~1,050 s on the reference box with four of them at once — 9.32
+/// MiB/s across the two passes it makes over the image, the digest and the
+/// scan — against the 2,507 s this budgets, which is 2.39x.
+fn scanning(file: &Path) -> std::time::Duration {
+    let bytes = fs::metadata(file).map_or(0, |it| it.len());
+    let scan = std::time::Duration::from_secs(bytes)
+        .checked_div(4 * 1024 * 1024)
+        .unwrap_or_default();
+    PATIENCE.saturating_add(scan)
 }
 
 /// An archive with one deflated file and one resource.
@@ -248,22 +204,61 @@ fn daemon() -> Command {
     daemon
 }
 
-/// Feeds every request in and sorts what came back: responses first.
-fn drive(mut daemon: Command, requests: &[Value]) -> (Vec<Value>, Vec<Value>) {
-    let _deadline = Deadline::on("the daemon to answer every request and exit");
+/// `daemon` started under `deadline`, its two pipes handed back so a test can
+/// state when each is read and closed. The pipes come off the child and the
+/// child goes to the deadline before a byte is written, because the write is
+/// itself a wait: a daemon that stops reading fills the pipe, and only a
+/// deadline holding the child can end it.
+fn started(
+    deadline: &Deadline,
+    mut daemon: Command,
+) -> (std::process::ChildStdin, std::process::ChildStdout) {
     let mut child = daemon
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .expect("daemon starts");
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        for request in requests {
-            writeln!(stdin, "{request}").expect("writable");
-        }
+    let requesting = child.stdin.take().expect("stdin");
+    let answers = child.stdout.take().expect("stdout");
+    deadline.watching(child);
+    (requesting, answers)
+}
+
+/// As [`started`], with `requests` written to it and standard input still open.
+fn asking(
+    deadline: &Deadline,
+    daemon: Command,
+    requests: &[Value],
+) -> (std::process::ChildStdin, std::process::ChildStdout) {
+    let (mut requesting, answers) = started(deadline, daemon);
+    for request in requests {
+        writeln!(requesting, "{request}").expect("writable");
     }
-    let output = child.wait_with_output().expect("daemon exits");
-    String::from_utf8_lossy(&output.stdout)
+    (requesting, answers)
+}
+
+/// Feeds every request in and sorts what came back: responses first.
+fn drive(daemon: Command, requests: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    drive_within(daemon, requests, PATIENCE)
+}
+
+/// As [`drive`], with `patience` on the answer rather than [`PATIENCE`].
+fn drive_within(
+    daemon: Command,
+    requests: &[Value],
+    patience: std::time::Duration,
+) -> (Vec<Value>, Vec<Value>) {
+    let deadline = Deadline::within("the daemon to answer every request and exit", patience);
+    let (requesting, mut answers) = asking(&deadline, daemon, requests);
+    // The daemon reads to the end of its input, so the write end goes before
+    // anything waits on the answers.
+    drop(requesting);
+    let mut out = Vec::new();
+    let read = answers.read_to_end(&mut out);
+    let _ = deadline.reap();
+    deadline.check();
+    read.expect("the daemon's output is readable");
+    String::from_utf8_lossy(&out)
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str::<Value>(l).expect("a JSON object per line"))
@@ -486,6 +481,60 @@ fn a_line_that_is_not_a_request_is_answered_with_a_null_id() {
     assert_eq!(responses[0]["error"]["code"], json!(-32600));
     assert_eq!(responses[1]["id"], json!(null));
     assert_eq!(responses[1]["error"]["code"], json!(-32600));
+}
+
+/// Feeds raw lines in, and returns the responses. [`talk`] can only send what
+/// is JSON, and a line that is not is exactly what this wire has to classify.
+fn talk_in_lines(lines: &[&str]) -> Vec<Value> {
+    let deadline = Deadline::on("the daemon to answer every line and exit");
+    let (mut requesting, mut answers) = started(&deadline, daemon());
+    for line in lines {
+        writeln!(requesting, "{line}").expect("writable");
+    }
+    drop(requesting);
+    let mut out = Vec::new();
+    let read = answers.read_to_end(&mut out);
+    let _ = deadline.reap();
+    deadline.check();
+    read.expect("the daemon's output is readable");
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("a JSON object per line"))
+        .collect()
+}
+
+/// The sign is the classification: negative is JSON-RPC's own protocol failure,
+/// positive is the exit code the same failure has on the command line (DR-010),
+/// and `data.reason` tells two protocol failures apart without the sentence.
+#[test]
+fn a_malformed_line_is_classified_by_which_protocol_rule_it_broke() {
+    let responses = talk_in_lines(&[
+        "not json at all",
+        r#"[{"jsonrpc":"2.0","id":1,"method":"info"},{"jsonrpc":"2.0","id":2,"method":"info"}]"#,
+        r#"{"jsonrpc":"2.0","id":1}"#,
+    ]);
+
+    assert_eq!(responses.len(), 3, "one answer per line: {responses:?}");
+    let expected = [
+        (-32700_i64, "ParseError"),
+        (-32600, "InvalidRequest"),
+        (-32600, "InvalidRequest"),
+    ];
+    for (answered, (code, reason)) in responses.iter().zip(expected) {
+        assert_eq!(answered["error"]["code"], json!(code), "{answered}");
+        assert_eq!(
+            answered["error"]["data"]["reason"],
+            json!(reason),
+            "{answered}"
+        );
+        assert!(
+            answered["error"]["code"]
+                .as_i64()
+                .is_some_and(|code| code < 0),
+            "a protocol refusal is negative, and a positive one reads as an exit code: {answered}"
+        );
+    }
 }
 
 /// Bytes that do not compress, so no edit of them fits a spare block.
@@ -817,14 +866,8 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
     drop(out);
     let before = fs::read(&archive).expect("readable");
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
+    let deadline = Deadline::on("the cancelled commit to answer");
+    let (mut stdin, stdout) = started(&deadline, daemon());
 
     // Read on another thread: progress fills the pipe, and a daemon blocked
     // writing it would never reach the cancel.
@@ -849,7 +892,6 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
     }
 
     // Short enough that the flag is set within one entry of the rebuild starting.
-    let deadline = Deadline::on("the cancelled commit to answer");
     let mut commit = None;
     while commit.is_none() {
         deadline.check();
@@ -868,7 +910,7 @@ fn a_rebuild_can_be_cancelled_while_it_is_running() {
     }
     drop(stdin);
     let commit = commit.expect("the commit answered");
-    let _ = child.wait();
+    let _ = deadline.reap();
     let _ = reader.join();
 
     assert_eq!(
@@ -1343,7 +1385,19 @@ fn a_claim_is_on_the_archive_and_not_on_the_spelling_of_its_path() {
             "{spelling} was not recognised as the archive already open: {refused}"
         );
         let message = refused["error"]["message"].as_str().unwrap_or_default();
-        assert!(message.contains("handle 1"), "{spelling}: {message}");
+        // Every spelling here resolves to the one path the session claimed, the
+        // symlink included, so the refusal names one name and not two.
+        assert!(
+            message.contains(&format!(
+                "{} is already open on handle 1",
+                root.join("test.rpf").display()
+            )),
+            "{spelling}: {message}"
+        );
+        assert!(
+            !message.contains("another name for"),
+            "one spelling was reported as two: {spelling}: {message}"
+        );
     }
 }
 
@@ -1389,14 +1443,8 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
     .expect("builds");
     drop(out);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
+    let deadline = Deadline::on("the commit to answer past the cancels aimed elsewhere");
+    let (mut stdin, stdout) = started(&deadline, daemon());
 
     let (lines, received) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -1418,7 +1466,6 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
         writeln!(stdin, "{request}").expect("writable");
     }
 
-    let deadline = Deadline::on("the commit to answer past the cancels aimed elsewhere");
     let mut commit = None;
     let mut answers = Vec::new();
     while commit.is_none() {
@@ -1448,7 +1495,7 @@ fn a_cancel_that_names_another_operation_does_not_stop_this_one() {
     }
     drop(stdin);
     let commit = commit.expect("the commit answered");
-    let _ = child.wait();
+    let _ = deadline.reap();
     let _ = reader.join();
 
     assert_eq!(
@@ -1477,28 +1524,22 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
     let archive = dir.path().join("test.rpf");
     make_archive(&archive);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout")).lines();
-
-    for request in [
-        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
-            "path": archive.display().to_string()}}),
-        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"replaced")}}),
-        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"rebuild":true}}),
-    ] {
-        writeln!(stdin, "{request}").expect("writable");
-    }
-
     // The cancel goes out only once the commit has answered, so it cannot race
     // the rebuild it would otherwise be naming.
     let deadline = Deadline::on("the rebuilding commit to answer");
+    let (mut stdin, answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(b"replaced")}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{
+                "handle":1,"rebuild":true}}),
+        ],
+    );
+    let mut lines = std::io::BufReader::new(answers).lines();
     let mut committed = None;
     while committed.is_none() {
         deadline.check();
@@ -1535,29 +1576,30 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
         json!({ "cancelling": false, "running": Value::Null }),
         "a finished commit was still registered as the thing to cancel: {answered}"
     );
-    let _ = child.wait();
+    let _ = deadline.reap();
 }
 
 #[test]
 fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
-    let _deadline = Deadline::on("the daemon to exit after its notifications");
+    let deadline = Deadline::on("the daemon to exit after its notifications");
     // Progress is dropped rather than queued without bound, so `skipped` counts
     // what was dropped since the last notification that got through.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     make_bulk_archive(&archive, 3000, 1024);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let stdout = child.stdout.take().expect("stdout");
-    let reading =
-        std::thread::spawn(move || read_slowly(stdout, 512, std::time::Duration::from_millis(4)));
-    {
-        let mut stdin = child.stdin.take().expect("stdin");
+    let (mut stdin, mut stdout) = started(&deadline, daemon());
+    // The reader starts before the first request, so nothing the daemon writes
+    // waits on a pipe nobody is draining yet.
+    let read = std::thread::scope(|scope| {
+        let reading = scope.spawn(|| {
+            read_slowly(
+                &mut stdout,
+                512,
+                std::time::Duration::from_millis(4),
+                &deadline,
+            )
+        });
         for request in [
             json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
                 "path": archive.display().to_string()}}),
@@ -1567,9 +1609,10 @@ fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
         ] {
             writeln!(stdin, "{request}").expect("writable");
         }
-    }
-    let status = child.wait().expect("the daemon exits");
-    let read = reading.join().expect("the reading thread finished");
+        drop(stdin);
+        reading.join().expect("the reading thread finished")
+    });
+    let status = deadline.reap().expect("the daemon exits");
     assert!(status.success(), "the daemon exited with {status}");
 
     let text = String::from_utf8_lossy(&read).into_owned();
@@ -1609,17 +1652,21 @@ fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
 
 #[test]
 fn a_broken_standard_output_is_reported_rather_than_swallowed() {
-    let _deadline = Deadline::on("the daemon to exit on its broken standard output");
+    let deadline = Deadline::on("the daemon to exit on its broken standard output");
     // Enough cancels that the answers cannot all have been written into a pipe
     // nobody is reading, so the reading end closes on a write still in flight.
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
+    // Hand-rolled rather than `started`, because the complaint is a third pipe
+    // and the reading end of the second is closed part way through.
+    let mut child = daemon()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("daemon starts");
     let mut stdin = child.stdin.take().expect("stdin");
+    let answers = child.stdout.take().expect("stdout");
+    let mut complained = child.stderr.take().expect("stderr");
+    deadline.watching(child);
     let feeding = std::thread::spawn(move || {
         let cancel = json!({"jsonrpc":"2.0","id":1,"method":"cancel","params":{}});
         for _ in 0..4000 {
@@ -1629,14 +1676,12 @@ fn a_broken_standard_output_is_reported_rather_than_swallowed() {
         }
     });
     std::thread::sleep(std::time::Duration::from_millis(300));
-    drop(child.stdout.take());
+    drop(answers);
 
-    let status = child.wait().expect("the daemon exits");
+    let status = deadline.reap().expect("the daemon exits");
     let _ = feeding.join();
     let mut complaint = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = std::io::Read::read_to_string(&mut stderr, &mut complaint);
-    }
+    let _ = std::io::Read::read_to_string(&mut complained, &mut complaint);
 
     assert_eq!(
         status.code(),
@@ -1655,19 +1700,23 @@ fn a_broken_standard_output_is_reported_rather_than_swallowed() {
 
 #[test]
 fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
-    let _deadline = Deadline::on("the rebuild to give up on its broken output");
+    let deadline = Deadline::on("the rebuild to give up on its broken output");
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
     make_bulk_archive(&archive, 4000, 1024);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
+    // Hand-rolled rather than `started`, for the same two reasons as the test
+    // above: a third pipe, and a second one closed part way through.
+    let mut child = daemon()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("daemon starts");
     let mut stdin = child.stdin.take().expect("stdin");
+    let answers = child.stdout.take().expect("stdout");
+    let mut complained = child.stderr.take().expect("stderr");
+    deadline.watching(child);
     for request in [
         json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
             "path": archive.display().to_string()}}),
@@ -1680,16 +1729,14 @@ fn a_rebuild_whose_output_breaks_is_an_io_failure_and_not_a_cancellation() {
     // The pipe holds the first notifications; closing the reading end turns the
     // next write into a broken pipe, which is the moment the rebuild gives up.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    drop(child.stdout.take());
+    drop(answers);
     // And standard input ends, because nothing more is coming: what is under
     // test is what the daemon exits with, not when.
     drop(stdin);
 
-    let status = child.wait().expect("the daemon exits");
+    let status = deadline.reap().expect("the daemon exits");
     let mut complaint = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = std::io::Read::read_to_string(&mut stderr, &mut complaint);
-    }
+    let _ = std::io::Read::read_to_string(&mut complained, &mut complaint);
 
     assert_eq!(
         status.code(),
@@ -1817,14 +1864,8 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
     .expect("builds");
     drop(out);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
+    let deadline = Deadline::on("the commit to answer past the ill-typed cancels");
+    let (mut stdin, stdout) = started(&deadline, daemon());
 
     let (lines, received) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -1846,7 +1887,6 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
         writeln!(stdin, "{request}").expect("writable");
     }
 
-    let deadline = Deadline::on("the commit to answer past the ill-typed cancels");
     let mut commit = None;
     let mut answers = Vec::new();
     while commit.is_none() {
@@ -1879,7 +1919,7 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
     }
     drop(stdin);
     let commit = commit.expect("the commit answered");
-    let _ = child.wait();
+    let _ = deadline.reap();
     let _ = reader.join();
 
     assert_eq!(
@@ -1900,12 +1940,12 @@ fn an_ill_typed_cancel_does_not_stop_the_rebuild_it_failed_to_name() {
 /// Reads everything on `stdout`, taking `piece` bytes and then pausing — an
 /// ordinary client, reading at an ordinary rate.
 fn read_slowly(
-    mut stdout: std::process::ChildStdout,
+    stdout: &mut std::process::ChildStdout,
     piece: usize,
     pause: std::time::Duration,
+    deadline: &Deadline,
 ) -> Vec<u8> {
     use std::io::Read as _;
-    let deadline = Deadline::on("the daemon to finish writing its answer");
     let mut all = Vec::new();
     let mut buffer = vec![0_u8; piece];
     loop {
@@ -1920,33 +1960,31 @@ fn read_slowly(
 
 #[test]
 fn an_answer_bigger_than_the_grace_survives_standard_input_ending() {
-    let _deadline = Deadline::on("the answer that outlasts standard input ending");
+    let deadline = Deadline::on("the answer that outlasts standard input ending");
     // Standard input ends long before the answer to the last request is written.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("one.rpf");
     make_bulk_archive(&archive, 1, 512 * 1024);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    {
-        let mut stdin = child.stdin.take().expect("stdin");
-        for request in [
+    let (requesting, mut answers) = asking(
+        &deadline,
+        daemon(),
+        &[
             json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
                 "path": archive.display().to_string()}}),
             json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
                 "handle":1,"path":"bulk/0000.bin"}}),
-        ] {
-            writeln!(stdin, "{request}").expect("writable");
-        }
-        // And standard input ends here, with the answer not yet written.
-    }
-    let stdout = child.stdout.take().expect("stdout");
-    let taken = read_slowly(stdout, 8 * 1024, std::time::Duration::from_millis(40));
-    let status = child.wait().expect("the daemon exits");
+        ],
+    );
+    // And standard input ends here, with the answer not yet written.
+    drop(requesting);
+    let taken = read_slowly(
+        &mut answers,
+        8 * 1024,
+        std::time::Duration::from_millis(40),
+        &deadline,
+    );
+    let status = deadline.reap().expect("the daemon exits");
 
     assert!(
         status.success(),
@@ -1991,7 +2029,7 @@ fn resident_kilobytes(pid: u32) -> u64 {
 
 #[test]
 fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
-    let _deadline = Deadline::on("the daemon to exit once its answers are drained");
+    let deadline = Deadline::on("the daemon to exit once its answers are drained");
     // A queued response the worker never waits on grows without bound while the
     // client is behind. Zero-byte payloads, so each answer is still megabytes.
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1999,14 +2037,7 @@ fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
     let entry = 2 * 1024 * 1024;
     make_bulk_archive(&archive, 64, entry);
 
-    let mut child = Command::new(RPF)
-        .args(["serve", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
+    let (mut stdin, stdout) = started(&deadline, daemon());
 
     writeln!(
         stdin,
@@ -2025,7 +2056,7 @@ fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
     std::thread::sleep(std::time::Duration::from_secs(3));
     #[cfg(unix)]
     {
-        let resident = resident_kilobytes(child.id());
+        let resident = resident_kilobytes(deadline.pid().expect("the daemon is running"));
         assert!(
             resident < 96 * 1024,
             "the daemon is holding {resident} KB of answers for a client that is not reading"
@@ -2045,7 +2076,7 @@ fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
         objects
     });
     drop(stdin);
-    let status = child.wait().expect("the daemon exits");
+    let status = deadline.reap().expect("the daemon exits");
     let objects = drain.join().expect("the draining thread finished");
     assert!(status.success(), "the daemon exited with {status}");
 
@@ -2087,9 +2118,15 @@ fn a_second_name_for_one_file_is_the_same_archive() {
         "a second name for one file opened a second session: {refused}"
     );
     let message = refused["error"]["message"].as_str().unwrap_or_default();
+    // Two names for one file, and the refusal names both: the one asked for and
+    // the one the holder claimed.
     assert!(
-        message.contains("handle 1"),
-        "the refusal must name the handle holding it: {message}"
+        message.contains(&format!(
+            "{} is another name for {}, which is already open on handle 1",
+            alias.canonicalize().expect("canonical").display(),
+            archive.canonicalize().expect("canonical").display(),
+        )),
+        "the refusal must name both spellings and the handle holding it: {message}"
     );
     assert_eq!(answer(&responses, 3)["result"]["closed"], json!(true));
     assert_eq!(
@@ -2151,24 +2188,20 @@ fn a_session_still_holds_its_archive_after_its_own_rebuild() {
     let archive_str = archive.display().to_string();
     let big = incompressible(200_000);
 
-    let mut child = daemon()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    for request in [
-        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
-        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-            "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(&big)}}),
-        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
-    ] {
-        writeln!(stdin, "{request}").expect("writable");
-    }
+    let deadline = Deadline::on("the commit that precedes the second name to answer");
+    let (mut stdin, answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{"path": archive_str}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+                "handle":1,"path":"data/greeting.txt","bytes": BASE64.encode(&big)}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1}}),
+        ],
+    );
     // The commit is read before the second name is made, so the link is made
     // against the inode the rebuild left rather than the one it replaced.
-    let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout"));
-    let deadline = Deadline::on("the commit that precedes the second name to answer");
+    let mut lines = std::io::BufReader::new(answers);
     let committed = loop {
         deadline.check();
         let mut line = String::new();
@@ -2207,7 +2240,7 @@ fn a_session_still_holds_its_archive_after_its_own_rebuild() {
         }
         rest.push(serde_json::from_str::<Value>(&line).expect("a JSON object per line"));
     }
-    let _ = child.wait();
+    let _ = deadline.reap();
 
     let refused = answer(&rest, 4);
     assert_eq!(
@@ -2282,13 +2315,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
     .expect("builds");
     drop(out);
 
-    let mut child = daemon()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
+    let (mut stdin, stdout) = started(&deadline, daemon());
 
     let huge = "i".repeat(256 * 1024);
     for request in [
@@ -2322,7 +2349,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
     // Nothing has read a byte of standard output, so the answers to those two
     // thousand cancels are all still queued.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let resident = resident_kilobytes(child.id());
+    let resident = resident_kilobytes(deadline.pid().expect("the daemon is running"));
 
     let drain = std::thread::spawn(move || {
         let mut objects = Vec::new();
@@ -2336,7 +2363,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         objects
     });
     drop(stdin);
-    let status = child.wait().expect("the daemon exits");
+    let status = deadline.reap().expect("the daemon exits");
     let objects = drain.join().expect("the draining thread finished");
 
     assert!(
@@ -2369,15 +2396,15 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
 /// Reads everything on `stdout` at full speed, pausing once after `after`
 /// bytes — a client that hiccups for longer than the daemon's grace.
 fn read_with_one_pause(
-    mut stdout: std::process::ChildStdout,
+    stdout: &mut std::process::ChildStdout,
     after: usize,
     pause: std::time::Duration,
+    deadline: &Deadline,
 ) -> Vec<u8> {
     use std::io::Read as _;
     let mut all = Vec::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut paused = false;
-    let deadline = Deadline::on("the daemon to finish writing its answer past the pause");
     loop {
         deadline.check();
         match stdout.read(&mut buffer) {
@@ -2400,29 +2427,29 @@ fn a_client_that_pauses_once_still_gets_every_answer_whole() {
     let entry = 512 * 1024;
     make_bulk_archive(&archive, 1, entry);
 
-    let mut child = daemon()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("daemon starts");
-    {
-        let mut stdin = child.stdin.take().expect("stdin");
-        for request in [
+    let deadline = Deadline::on("the daemon to finish writing its answer past the pause");
+    let (requesting, mut answers) = asking(
+        &deadline,
+        daemon(),
+        &[
             json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
                 "path": archive.display().to_string()}}),
             json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
                 "handle":1,"path":"bulk/0000.bin"}}),
             json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
                 "handle":1,"path":"bulk/0000.bin"}}),
-        ] {
-            writeln!(stdin, "{request}").expect("writable");
-        }
-        // And standard input ends here, which is all
-        // `rpf serve --stdio < requests.jsonl` does.
-    }
-    let stdout = child.stdout.take().expect("stdout");
-    let taken = read_with_one_pause(stdout, 200 * 1024, std::time::Duration::from_secs(3));
-    let status = child.wait().expect("the daemon exits");
+        ],
+    );
+    // And standard input ends here, which is all
+    // `rpf serve --stdio < requests.jsonl` does.
+    drop(requesting);
+    let taken = read_with_one_pause(
+        &mut answers,
+        200 * 1024,
+        std::time::Duration::from_secs(3),
+        &deadline,
+    );
+    let status = deadline.reap().expect("the daemon exits");
 
     assert!(
         status.success(),
@@ -2502,6 +2529,343 @@ fn a_client_that_never_reads_does_not_hold_the_daemon_open_for_ever() {
         status.code(),
         Some(7),
         "giving up on a client that never read is an i/o failure, not a success"
+    );
+}
+
+/// An entry whose `read` answers one line longer than the published 8 MB
+/// backlog: 8,388,926 bytes of JSON for 6,291,600 bytes of payload.
+const OVER_THE_BACKLOG: usize = 6_291_600;
+
+/// An entry whose `read` answers 4,194,126 bytes, so that two of them are
+/// 8,388,252 — inside the published backlog, and only just.
+const HALF_THE_BACKLOG: usize = 3_145_500;
+
+/// Reads everything on `stdout`, taking exactly `piece` bytes every `every`, so
+/// that the rate a test states is the rate and not whatever the pipe hands over.
+fn read_at_a_rate(
+    stdout: &mut std::process::ChildStdout,
+    piece: usize,
+    every: std::time::Duration,
+    deadline: &Deadline,
+) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut buffer = vec![0_u8; piece];
+    loop {
+        deadline.check();
+        let mut got = 0_usize;
+        while got < piece {
+            match stdout.read(buffer.get_mut(got..).unwrap_or_default()) {
+                Ok(0) | Err(_) => {
+                    all.extend_from_slice(buffer.get(..got).unwrap_or_default());
+                    return all;
+                }
+                Ok(taken) => got = got.saturating_add(taken),
+            }
+        }
+        all.extend_from_slice(buffer.get(..got).unwrap_or_default());
+        std::thread::sleep(every);
+    }
+}
+
+/// The objects on `stdout`, and the length of the line each arrived on.
+fn objects_and_line_lengths(taken: &[u8]) -> Vec<(Value, usize)> {
+    String::from_utf8_lossy(taken)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            (
+                serde_json::from_str::<Value>(line).expect("a JSON object per line"),
+                line.len(),
+            )
+        })
+        .collect()
+}
+
+/// The far end is measured in bytes it takes in a five-second window, and 256
+/// KiB every 500 ms is two and a half megabytes of them — a client keeping up.
+/// Inverting the comparison declares it starved and cuts it off with 7.
+#[test]
+fn a_client_that_keeps_up_is_not_cut_off_part_way_through_an_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("one.rpf");
+    make_bulk_archive(&archive, 1, OVER_THE_BACKLOG);
+
+    let deadline = Deadline::on("the daemon to write a whole answer to a client that is reading");
+    let (requesting, mut answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"bulk/0000.bin"}}),
+            // Queued behind an answer already over the backlog, so the worker is
+            // waiting on room for the whole time the client is reading.
+            json!({"jsonrpc":"2.0","id":3,"method":"info","params":{"handle":1}}),
+        ],
+    );
+    drop(requesting);
+    let taken = read_at_a_rate(
+        &mut answers,
+        256 * 1024,
+        std::time::Duration::from_millis(500),
+        &deadline,
+    );
+    let status = deadline.reap().expect("the daemon exits");
+    deadline.check();
+
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a client reading 256 KiB every 500 ms was cut off as starved"
+    );
+    assert_eq!(
+        taken.last().copied(),
+        Some(b'\n'),
+        "the last line was cut off with no terminating newline: {} bytes",
+        taken.len()
+    );
+    let objects: Vec<Value> = objects_and_line_lengths(&taken)
+        .into_iter()
+        .map(|(object, _)| object)
+        .collect();
+    let answered = answer(&objects, 2);
+    assert_eq!(
+        answered["result"]["len"],
+        json!(OVER_THE_BACKLOG),
+        "the answer arrived, but not whole"
+    );
+    assert!(
+        answer(&objects, 3)["result"]["entries"].as_u64().is_some(),
+        "the answer queued behind it never arrived: {objects:?}"
+    );
+}
+
+/// The mirror, and the half the shutdown path does not cover: a client that
+/// takes nothing is given up on **while the request is still being answered**,
+/// so the worker cannot wait on room that will never come back.
+#[test]
+fn a_client_that_takes_nothing_is_given_up_on_mid_answer() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("one.rpf");
+    make_bulk_archive(&archive, 1, OVER_THE_BACKLOG);
+
+    let deadline = Deadline::within(
+        "the daemon to give up on a client taking nothing",
+        std::time::Duration::from_secs(40),
+    );
+    let (requesting, answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"bulk/0000.bin"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"info","params":{"handle":1}}),
+        ],
+    );
+    // Standard input ends, and standard output is held open and never read: the
+    // wait inside the request is the only thing that can end this.
+    drop(requesting);
+    let status = deadline.reap().expect("the daemon exits");
+    deadline.check();
+    drop(answers);
+
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "giving up on a client that takes nothing is an i/o failure, not a success"
+    );
+}
+
+/// The published floor is 20 KiB in a five-second window. A client taking about
+/// five, which is above every smaller figure the constant could be misread as,
+/// is below the floor and is given up on.
+#[test]
+fn a_client_below_the_published_floor_is_given_up_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("one.rpf");
+    make_bulk_archive(&archive, 1, 512 * 1024);
+
+    let deadline = Deadline::within(
+        "the daemon to give up on a client reading a kilobyte a second",
+        std::time::Duration::from_secs(45),
+    );
+    let (requesting, mut answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"read","params":{
+                "handle":1,"path":"bulk/0000.bin"}}),
+        ],
+    );
+    drop(requesting);
+    // 1,024 bytes a second is about 5,120 in a window: below 20,480 and well
+    // above any of the smaller numbers the floor could be mistaken for. It reads
+    // on its own thread, because how long the answer left in the pipe takes to
+    // drain at that rate is not what this test is waiting for.
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = std::sync::Arc::clone(&stopping);
+    let reading = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match answers.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+            }
+        }
+    });
+    let status = deadline.reap().expect("the daemon exits");
+    deadline.check();
+    stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+    reading.join().expect("the reading thread finished");
+
+    assert_eq!(
+        status.code(),
+        Some(7),
+        "a client below the published floor held the daemon open"
+    );
+}
+
+/// Whether `marker` turned up inside `patience`, asked without waiting on it.
+fn appeared(marker: &Path, patience: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < patience {
+        if marker.exists() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// The bound in bytes rather than in symbols: two answers that together come to
+/// 8,388,252 do not make the worker wait, so the queue takes at least that many.
+/// A later request's own side effect on disk is what says the worker ran on.
+#[test]
+fn two_answers_inside_the_published_backlog_do_not_stop_the_worker() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bulk = dir.path().join("bulk.rpf");
+    make_bulk_archive(&bulk, 2, HALF_THE_BACKLOG);
+    let side = dir.path().join("side.rpf");
+    make_archive(&side);
+    let marker = dir.path().join("marker");
+
+    let deadline = Deadline::on("the worker to run on past two answers inside the backlog");
+    let (requesting, mut answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": bulk.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"open","params":{
+                "path": side.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+                "handle":1,"path":"bulk/0000.bin"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"read","params":{
+                "handle":1,"path":"bulk/0001.bin"}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"extract","params":{
+                "handle":2,"into": marker.display().to_string(),"progress":false}}),
+        ],
+    );
+    // Nothing is read, and standard input stays open, so the only thing that can
+    // stop the worker reaching the extraction is the backlog.
+    let ran = appeared(&marker, std::time::Duration::from_secs(20));
+    drop(requesting);
+    let taken = read_at_a_rate(
+        &mut answers,
+        1024 * 1024,
+        std::time::Duration::ZERO,
+        &deadline,
+    );
+    let status = deadline.reap().expect("the daemon exits");
+    deadline.check();
+
+    assert!(
+        ran,
+        "two answers inside the published backlog stopped the worker"
+    );
+    assert_eq!(status.code(), Some(0), "the daemon exited with {status}");
+    let objects = objects_and_line_lengths(&taken);
+    let queued: usize = objects
+        .iter()
+        .filter(|(object, _)| object["id"] == json!(3) || object["id"] == json!(4))
+        .map(|&(_, len)| len)
+        .sum();
+    assert_eq!(
+        queued, 8_388_252,
+        "the fixture no longer sizes the queue it means"
+    );
+    assert!(
+        queued <= 8_388_608,
+        "the two answers this test queues are over the published bound: {queued}"
+    );
+}
+
+/// The other side of the same number, and the rule the constant's own comment
+/// makes: one answer goes through however big it is, and the next one waits.
+#[test]
+fn one_answer_over_the_backlog_goes_through_and_the_next_one_waits() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bulk = dir.path().join("bulk.rpf");
+    make_bulk_archive(&bulk, 1, OVER_THE_BACKLOG);
+    let side = dir.path().join("side.rpf");
+    make_archive(&side);
+    let marker = dir.path().join("marker");
+
+    let deadline = Deadline::on("the worker to wait behind an answer over the backlog");
+    let (requesting, mut answers) = asking(
+        &deadline,
+        daemon(),
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": bulk.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"open","params":{
+                "path": side.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"read","params":{
+                "handle":1,"path":"bulk/0000.bin"}}),
+            json!({"jsonrpc":"2.0","id":4,"method":"info","params":{"handle":1}}),
+            json!({"jsonrpc":"2.0","id":5,"method":"extract","params":{
+                "handle":2,"into": marker.display().to_string(),"progress":false}}),
+        ],
+    );
+    let ran = appeared(&marker, std::time::Duration::from_secs(10));
+    drop(requesting);
+    let taken = read_at_a_rate(
+        &mut answers,
+        1024 * 1024,
+        std::time::Duration::ZERO,
+        &deadline,
+    );
+    let status = deadline.reap().expect("the daemon exits");
+    deadline.check();
+
+    assert!(
+        !ran,
+        "an answer already over the backlog did not make the next request wait"
+    );
+    assert_eq!(status.code(), Some(0), "the daemon exited with {status}");
+    let objects = objects_and_line_lengths(&taken);
+    let over = objects
+        .iter()
+        .find(|(object, _)| object["id"] == json!(3))
+        .map_or(0, |&(_, len)| len);
+    assert_eq!(
+        over, 8_388_926,
+        "the fixture no longer sizes the answer it means"
+    );
+    assert!(
+        over > 8_388_608,
+        "the one answer this test queues is inside the published bound: {over}"
+    );
+    // And the room came back: the extraction the client's reading released ran.
+    let objects: Vec<Value> = objects.into_iter().map(|(object, _)| object).collect();
+    assert!(
+        answer(&objects, 5)["result"]["files"].as_u64().is_some(),
+        "the request behind the backlog never ran once there was room: {objects:?}"
     );
 }
 
@@ -2876,6 +3240,79 @@ fn the_daemon_extracts_and_packs_as_the_command_line_does() {
     );
 }
 
+/// A `pack` destination that is not there yet is resolved through its parent,
+/// and a bare name has none: the working directory stands in for it. Reading
+/// that filter the other way round leaves the empty parent to resolve, which
+/// nothing can, and an ordinary `pack` into the working directory fails.
+#[test]
+fn pack_resolves_a_destination_that_is_not_there_yet_from_a_bare_name() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical temp dir");
+    let archive = root.join("test.rpf");
+    make_archive(&archive);
+    let tree = root.join("tree");
+
+    let responses = talk_in(
+        &root,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+                "handle":1,"into": tree.display().to_string(),"progress":false}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+                "from": tree.display().to_string(),"archive":"new.rpf","progress":false}}),
+        ],
+    );
+
+    let packed = answer(&responses, 3);
+    assert!(
+        packed["result"]["entries"].as_u64().is_some(),
+        "a bare destination name was not resolved: {packed}"
+    );
+    assert!(
+        root.join("new.rpf").is_file(),
+        "the archive was reported packed and is not in the working directory: {packed}"
+    );
+}
+
+/// The other half of the same resolution: a named parent is the one the archive
+/// lands in, and not the working directory.
+#[test]
+fn pack_writes_the_archive_where_it_was_asked_and_not_beside_the_daemon() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical temp dir");
+    let archive = root.join("test.rpf");
+    make_archive(&archive);
+    let tree = root.join("tree");
+    fs::create_dir(root.join("out")).expect("the destination's parent");
+
+    let responses = talk_in(
+        &root,
+        &[
+            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+                "path": archive.display().to_string()}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+                "handle":1,"into": tree.display().to_string(),"progress":false}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+                "from": tree.display().to_string(),"archive":"out/new.rpf","progress":false}}),
+        ],
+    );
+
+    let packed = answer(&responses, 3);
+    assert!(
+        packed["result"]["entries"].as_u64().is_some(),
+        "the pack did not run: {packed}"
+    );
+    assert!(
+        root.join("out").join("new.rpf").is_file(),
+        "the archive was reported packed and is not where it was asked for: {packed}"
+    );
+    assert!(
+        !root.join("new.rpf").exists(),
+        "the archive landed beside the working directory instead of in out/"
+    );
+}
+
 #[test]
 fn packing_over_an_archive_a_session_holds_is_refused() {
     // `pack` is the one method that names its output by path, and writing over an
@@ -3058,6 +3495,83 @@ fn extracting_over_an_archive_an_open_session_holds_is_refused() {
         fs::read(&held).expect("readable"),
         before,
         "an archive an open session holds was written over"
+    );
+}
+
+#[test]
+#[cfg(any(unix, windows))]
+fn neither_pack_nor_extract_may_write_over_a_second_name_for_a_held_archive() {
+    // DR-009: the claim is on the file, not on the spelling. A hard link is the
+    // spelling a path comparison cannot see through — both names canonicalise to
+    // themselves — so it is the only one that tells the identity check from a
+    // path check. A symlink would not: `open` and `pack` both canonicalise, and
+    // the two spellings arrive as one path.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let held = dir.path().join("held.rpf");
+    make_archive(&held);
+    let alias = dir.path().join("alias.rpf");
+    fs::hard_link(&held, &alias).expect("hard link");
+    let before = fs::read(&held).expect("readable");
+
+    // An archive whose one entry is named after the second name for the held one.
+    let source = dir.path().join("source.rpf");
+    let files = [FileSpec {
+        path: "alias.rpf".to_owned(),
+        kind: FileKind::Binary {
+            storage: Storage::Stored,
+            encryption: 0,
+        },
+    }];
+    let mut out = fs::File::create(&source).expect("creatable");
+    rpf_core::build(
+        &mut out,
+        rpf_core::Version::Rpf7,
+        &files,
+        &[],
+        |_: &str| Ok(Cursor::new(b"not an archive".to_vec())),
+        &mut Unwatched,
+    )
+    .expect("builds");
+    drop(out);
+
+    let tree = dir.path().join("tree").display().to_string();
+    let responses = talk(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": held.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"extract","params":{
+            "handle":1,"into": tree,"progress":false}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"pack","params":{
+            "from": tree,"archive": alias.display().to_string(),"progress":false}}),
+        json!({"jsonrpc":"2.0","id":4,"method":"open","params":{
+            "path": source.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":5,"method":"extract","params":{
+            "handle":2,"into": dir.path().display().to_string(),"overwrite":true}}),
+    ]);
+
+    for id in [3, 5] {
+        let refused = answer(&responses, id);
+        assert_eq!(
+            refused["error"]["code"],
+            json!(6),
+            "a second name for the held archive was written over: {refused}"
+        );
+        assert_eq!(
+            refused["error"]["data"]["reason"],
+            json!("Refused"),
+            "{refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("handle 1")),
+            "the refusal must name the handle holding it: {refused}"
+        );
+    }
+    assert_eq!(
+        fs::read(&held).expect("readable"),
+        before,
+        "every offset handle 1 holds moved: the archive it parsed was written over \
+         under its other name"
     );
 }
 
@@ -3435,7 +3949,15 @@ fn a_created_entry_is_buffered_and_committed() {
         json!({"jsonrpc":"2.0","id":7,"method":"verify","params":{"handle":1,"progress":false}}),
     ]);
 
-    assert!(answer(&responses, 2)["error"].is_object(), "{responses:?}");
+    // Not merely an error: the path the archive does not hold is code 3 on the
+    // command line and `NotFound` here, which is what `create: false` promises.
+    let missing = answer(&responses, 2);
+    assert_eq!(missing["error"]["code"], json!(3), "{missing}");
+    assert_eq!(
+        missing["error"]["data"]["reason"],
+        json!("NotFound"),
+        "{missing}"
+    );
     assert_eq!(answer(&responses, 3)["result"]["pending"], json!(1));
     assert_eq!(answer(&responses, 4)["result"]["pending"], json!(true));
 
@@ -3848,12 +4370,17 @@ fn corpus(test: &str, relative: &str) -> Option<std::path::PathBuf> {
 /// As [`talk`], with a configuration directory of the test's own, so the key
 /// cache the daemon reads is one this test put there.
 fn talk_homed(home: &Path, requests: &[Value]) -> Vec<Value> {
+    talk_homed_within(home, requests, PATIENCE)
+}
+
+/// As [`talk_homed`], with `patience` on the answer rather than [`PATIENCE`].
+fn talk_homed_within(home: &Path, requests: &[Value], patience: std::time::Duration) -> Vec<Value> {
     let mut daemon = daemon();
     daemon
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("APPDATA", home.join("appdata"));
-    drive(daemon, requests).0
+    drive_within(daemon, requests, patience).0
 }
 
 #[test]
@@ -3880,12 +4407,15 @@ fn the_wire_writes_into_an_ng_archive_and_it_opens_again() {
     fs::copy(&archive, &copy).expect("copyable");
     let at = copy.display().to_string();
 
-    let extracted = talk_homed(
+    // The one wait here whose honest length is the image's size rather than the
+    // daemon's speed: a full scan of it, and the image is not this test's to bound.
+    let extracted = talk_homed_within(
         &home,
         &[
             json!({"jsonrpc":"2.0","id":1,"method":"keys.extract","params":{
             "executable": source.display().to_string()}}),
         ],
+        scanning(&source),
     );
     assert!(answer(&extracted, 1)["result"].is_object(), "{extracted:?}");
 

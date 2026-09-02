@@ -2,7 +2,8 @@
 //! writes down what it saw, so our own reader can be checked against something
 //! that is not us. Deliberately outside the workspace; its output is committed.
 //!
-//! Usage: `cargo run --release -- <archive.rpf> > ../../fixtures/<name>.json`
+//! Usage: `cargo run --release -- <corpus-root> <archive.rpf under it>
+//! > ../../fixtures/<name>.json`
 
 use std::{collections::BTreeMap, env, fs, path::Path};
 
@@ -40,6 +41,9 @@ struct Generator {
 #[derive(Serialize)]
 struct Source {
     name: String,
+    /// Where the archive sits under the corpus root, `/`-separated. A fixture
+    /// that cannot say which archive it describes cannot be checked against it.
+    path: String,
     len: u64,
     sha256: String,
 }
@@ -128,10 +132,15 @@ fn dump_archives(
 }
 
 fn main() -> Result<()> {
-    let Some(arg) = env::args().nth(1) else {
-        bail!("usage: oracle <archive.rpf>");
+    let mut args = env::args().skip(1);
+    let (Some(root), Some(relative)) = (args.next(), args.next()) else {
+        bail!("usage: oracle <corpus-root> <archive.rpf under it>");
     };
-    let path = Path::new(&arg);
+    if Path::new(&relative).is_absolute() || relative.contains('\\') {
+        bail!("the second argument is a `/`-separated path relative to the corpus root");
+    }
+    let path = Path::new(&root).join(&relative);
+    let path = path.as_path();
 
     let raw = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     let name = path
@@ -162,7 +171,7 @@ fn main() -> Result<()> {
                 which is the file as it exists outside the archive. \
                 Nested archives are descended into, not emitted.",
         },
-        source: Source { name, len: raw.len() as u64, sha256: sha256(&raw) },
+        source: Source { name, path: relative, len: raw.len() as u64, sha256: sha256(&raw) },
         archives,
         files,
     };

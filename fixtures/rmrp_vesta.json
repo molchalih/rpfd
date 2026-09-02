@@ -1,0 +1,264 @@
+{
+  "generator": {
+    "tool": "tools/oracle",
+    "reference_implementation": "rpf-archive 0.7.1",
+    "extraction_semantics": "binary entries: inflated contents. resource entries: 16-byte RSC7 header followed by the still-deflated body, which is the file as it exists outside the archive. Nested archives are descended into, not emitted."
+  },
+  "source": {
+    "name": "dlc.rpf",
+    "path": "rmrp_vesta/dlc.rpf",
+    "len": 26837504,
+    "sha256": "02bd4c0e5bd152e0cf51aa1b3a68407dc64bfc1ee77ca131bb1c3b07441c488d"
+  },
+  "archives": [
+    {
+      "path": "dlc.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 10,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 4,
+          "entries_index": 1
+        },
+        {
+          "name": "content.xml",
+          "kind": "binary",
+          "file_offset": 2,
+          "file_size": 453,
+          "is_encrypted": 0,
+          "uncompressed_size": 2000
+        },
+        {
+          "name": "data",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 5
+        },
+        {
+          "name": "setup2.xml",
+          "kind": "binary",
+          "file_offset": 9,
+          "file_size": 280,
+          "is_encrypted": 0,
+          "uncompressed_size": 512
+        },
+        {
+          "name": "x64",
+          "kind": "directory",
+          "entries_count": 2,
+          "entries_index": 8
+        },
+        {
+          "name": "carvariations.meta",
+          "kind": "binary",
+          "file_offset": 3,
+          "file_size": 506,
+          "is_encrypted": 0,
+          "uncompressed_size": 17343
+        },
+        {
+          "name": "dlctext.meta",
+          "kind": "binary",
+          "file_offset": 4,
+          "file_size": 130,
+          "is_encrypted": 0,
+          "uncompressed_size": 189
+        },
+        {
+          "name": "vehicles.meta",
+          "kind": "binary",
+          "file_offset": 5,
+          "file_size": 1741,
+          "is_encrypted": 0,
+          "uncompressed_size": 6025
+        },
+        {
+          "name": "vehiclemods.rpf",
+          "kind": "binary",
+          "file_offset": 34,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 13239296
+        },
+        {
+          "name": "vehicles.rpf",
+          "kind": "binary",
+          "file_offset": 25892,
+          "file_size": 0,
+          "is_encrypted": 0,
+          "uncompressed_size": 13580800
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/vehiclemods.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 6,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 5,
+          "entries_index": 1
+        },
+        {
+          "name": "vesta_chassis_1.yft",
+          "kind": "resource",
+          "file_offset": 1,
+          "file_size": 3989243,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2687379828
+        },
+        {
+          "name": "vesta_chassis_2.yft",
+          "kind": "resource",
+          "file_offset": 7793,
+          "file_size": 4170121,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2687121780
+        },
+        {
+          "name": "vesta_chassis_3.yft",
+          "kind": "resource",
+          "file_offset": 15938,
+          "file_size": 4061590,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2687510900
+        },
+        {
+          "name": "vesta_roof_1.yft",
+          "kind": "resource",
+          "file_offset": 23871,
+          "file_size": 66763,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684881056
+        },
+        {
+          "name": "vesta_roof_2.yft",
+          "kind": "resource",
+          "file_offset": 24002,
+          "file_size": 949995,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2685014659
+        }
+      ]
+    },
+    {
+      "path": "dlc.rpf/vehicles.rpf",
+      "version": "V7",
+      "encryption": "Open",
+      "entry_count": 4,
+      "entries": [
+        {
+          "name": "",
+          "kind": "directory",
+          "entries_count": 3,
+          "entries_index": 1
+        },
+        {
+          "name": "vesta.yft",
+          "kind": "resource",
+          "file_offset": 18392,
+          "file_size": 4163989,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2771403188
+        },
+        {
+          "name": "vesta.ytd",
+          "kind": "resource",
+          "file_offset": 6155,
+          "file_size": 3113938,
+          "graphics_flags": 3490185226,
+          "is_encrypted": 0,
+          "system_flags": 131073
+        },
+        {
+          "name": "vesta_hi.yft",
+          "kind": "resource",
+          "file_offset": 12237,
+          "file_size": 3150895,
+          "graphics_flags": 536870912,
+          "is_encrypted": 0,
+          "system_flags": 2684365125
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "carvariations.meta",
+      "len": 17343,
+      "sha256": "228a20f471f44349eab12ca745cc8b610b6e242a97ce773e92496fe1febca7f2"
+    },
+    {
+      "path": "content.xml",
+      "len": 2000,
+      "sha256": "52b740ce9e0c82bc1f5c1d145486d9d2f09221f737775e1150e1779faa800912"
+    },
+    {
+      "path": "dlctext.meta",
+      "len": 189,
+      "sha256": "c0c3a4e6a56d1f6d8fa5f8e5076592f67df7f40bc6a49ec9773740e7e389d0f2"
+    },
+    {
+      "path": "setup2.xml",
+      "len": 512,
+      "sha256": "98d365e1e4710f9d1b97e35e2607ebf68c863a91b75b9954e05a74f6ca54a0eb"
+    },
+    {
+      "path": "vehiclemods.rpf/vesta_chassis_1.yft",
+      "len": 3989243,
+      "sha256": "744d38ea2bf6efd07969bf80710a8ea617b803fbe3d7403f8a0390beb07d29c3"
+    },
+    {
+      "path": "vehiclemods.rpf/vesta_chassis_2.yft",
+      "len": 4170121,
+      "sha256": "a4cda2f301eca542a9de861e423f54a37c45e8feba81ab23879b66c1f660fc08"
+    },
+    {
+      "path": "vehiclemods.rpf/vesta_chassis_3.yft",
+      "len": 4061590,
+      "sha256": "67dbc80e292a3faed1cd3870fb87f152ca8cfe283da9ed1a48c67c5f042e0d6d"
+    },
+    {
+      "path": "vehiclemods.rpf/vesta_roof_1.yft",
+      "len": 66763,
+      "sha256": "b38874adae63a6d6563bfbc3a5267945f2f0d204ead6e4950dc0a57b34635d58"
+    },
+    {
+      "path": "vehiclemods.rpf/vesta_roof_2.yft",
+      "len": 949995,
+      "sha256": "b8aef81b75654d286dd2b2023e9cc824442cd5d6ad03bcadd1b8aad31c424781"
+    },
+    {
+      "path": "vehicles.meta",
+      "len": 6025,
+      "sha256": "3e4f40aa1d0a430c7ff20883d8b97cd79d86f42105670fd71be73ce0ce673418"
+    },
+    {
+      "path": "vehicles.rpf/vesta.yft",
+      "len": 4163989,
+      "sha256": "8d20c2a9d5649764815740cbbba91c7ffca36ac731031e30feddce0bf5278ae2"
+    },
+    {
+      "path": "vehicles.rpf/vesta.ytd",
+      "len": 3113938,
+      "sha256": "1a8f055b1e0aec18b777ef1dfff5cd8be868a61dc2042cdeeb8bc78c6f0e1bae"
+    },
+    {
+      "path": "vehicles.rpf/vesta_hi.yft",
+      "len": 3150895,
+      "sha256": "bf04e3cfd4c28301f65247c04a580699a6b267b8d8f6cc89e156f2c28a37a5ea"
+    }
+  ]
+}

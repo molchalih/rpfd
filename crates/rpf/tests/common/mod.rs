@@ -1,4 +1,5 @@
-//! Real `RBF`, `PSO` and `Meta` payloads, and the documents they convert to.
+//! Real `RBF`, `PSO` and `Meta` payloads, the documents they convert to, and
+//! the deadline a wait on a served process is under.
 //! Shared by both frontends' tests; each payload is built here, from no game data.
 #![allow(
     dead_code,
@@ -18,6 +19,8 @@
               the fixture that must fail the test loudly. docs/conventions.md \
               §15"
 )]
+
+pub mod deadline;
 
 use std::path::Path;
 

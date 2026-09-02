@@ -9,6 +9,6 @@
 # file). R10.8.
 #
 # Everything tracked here is text: source, manifests, documents, workflows,
-# licences and one JSON fixture. `text=auto` still lets git decline to touch
+# licences and the JSON fixtures. `text=auto` still lets git decline to touch
 # anything it detects as binary, so a future binary fixture is safe by default.
 * text=auto eol=lf
