@@ -479,8 +479,8 @@ fn to_stdout(inside: &str, bytes: &[u8]) -> Result<()> {
     if !goes_to(bytes, holds_payloads()) {
         return Err(Failure::Refused {
             reason: format!(
-                "{inside} is not text and standard output is a terminal or a \
-                 pipe; pass --out FILE, or redirect standard output to a file"
+                "{inside} is not text and standard output is not a file; pass \
+                 --out FILE, or redirect standard output to a file"
             ),
         });
     }

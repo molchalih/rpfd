@@ -824,6 +824,52 @@ fn a_binary_payload_into_a_pipe_is_refused_and_names_the_way_through() {
     );
 }
 
+// The rule is on what the destination can hold, not on whether a person is
+// watching: a character device holds nothing a caller can read back.
+#[cfg(unix)]
+#[test]
+fn a_binary_payload_into_a_device_that_is_not_a_file_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("device.rpf");
+    make_rockstar_archive(&archive);
+
+    let output = Command::new(RPF)
+        .args(["cat", &archive.display().to_string(), "art.ydr"])
+        .stdout(fs::File::create("/dev/null").expect("the null device opens"))
+        .output()
+        .expect("binary runs");
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "a device that is not a file took bytes that are not text"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("--out"), "no way through: {message}");
+}
+
+// The same rule against the other implementation of it: a handle's type, not
+// its metadata, is what tells a device from a file here.
+#[cfg(windows)]
+#[test]
+fn a_binary_payload_into_a_device_that_is_not_a_file_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = dir.path().join("device.rpf");
+    make_rockstar_archive(&archive);
+
+    let output = Command::new(RPF)
+        .args(["cat", &archive.display().to_string(), "art.ydr"])
+        .stdout(fs::File::create("NUL").expect("the null device opens"))
+        .output()
+        .expect("binary runs");
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "a device that is not a file took bytes that are not text"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("--out"), "no way through: {message}");
+}
+
 #[test]
 fn a_binary_payload_still_goes_to_a_redirected_file() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -3112,6 +3158,18 @@ fn run_err_homed(home: &Path, args: &[&str]) -> (i32, String) {
     )
 }
 
+/// One entry's raw payload from a run homed at `home`, through `cat --out`
+/// into `dir`: standard output takes text only, and a captured one is a pipe.
+fn payload_homed(home: &Path, dir: &Path, archive: &str, inside: &str) -> Vec<u8> {
+    let destination = dir.join("cat.out");
+    let at = destination.display().to_string();
+    // The name is shared across call sites, so a stale read would look correct.
+    let _ = fs::remove_file(&destination);
+    let (code, message) = run_err_homed(home, &["cat", "--out", &at, archive, inside]);
+    assert_eq!(code, 0, "cat --out {inside}: {message}");
+    fs::read(&destination).expect("the payload was written")
+}
+
 #[test]
 #[cfg_attr(
     any(no_corpus, no_game_image),
@@ -3162,16 +3220,8 @@ fn an_ng_archive_is_written_back_through_the_command_line_and_opens_again() {
             "{what}: the written NG archive does not verify: {message}"
         );
 
-        let output = Command::new(RPF)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("APPDATA", home.join("appdata"))
-            .args(["cat", &at, "content.xml"])
-            .output()
-            .expect("binary runs");
-        assert_eq!(output.status.code(), Some(0), "{what}");
         assert_eq!(
-            output.stdout,
+            payload_homed(&home, &at_dir, &at, "content.xml"),
             fs::read(&donor).expect("donor"),
             "{what}: the entry did not come back out"
         );
@@ -3266,16 +3316,8 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
             "{what}: the written archive does not list: {message}"
         );
 
-        let output = Command::new(RPF)
-            .env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("APPDATA", home.join("appdata"))
-            .args(["cat", &at, "_manifest.ymf"])
-            .output()
-            .expect("binary runs");
-        assert_eq!(output.status.code(), Some(0), "{what}");
         assert_eq!(
-            output.stdout,
+            payload_homed(&home, dir.path(), &at, "_manifest.ymf"),
             fs::read(&donor).expect("donor"),
             "{what}: the entry did not come back out"
         );
@@ -3299,16 +3341,8 @@ fn an_aes_archive_is_written_back_through_the_command_line_and_opens_again() {
     assert_eq!(code, 0, "{message}");
     let (code, message) = run_err_homed(&home, &["ls", &at]);
     assert_eq!(code, 0, "the packed archive does not list: {message}");
-    let output = Command::new(RPF)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", home.join("config"))
-        .env("APPDATA", home.join("appdata"))
-        .args(["cat", &at, "_manifest.ymf"])
-        .output()
-        .expect("binary runs");
-    assert_eq!(output.status.code(), Some(0));
     assert_eq!(
-        output.stdout,
+        payload_homed(&home, dir.path(), &at, "_manifest.ymf"),
         fs::read(tree.join("_manifest.ymf")).expect("the extracted file"),
         "the entry did not survive extract and pack"
     );

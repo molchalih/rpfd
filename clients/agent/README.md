@@ -187,8 +187,8 @@ nowhere to put it, so both are refused; a redirect to a file is not:
 ```
 $ rpf cat dlc.rpf x64/…/meringls63amg24_brabus_diffuser_1.yft | wc -c ; echo ${PIPESTATUS[0]}
 rpf: refusing: x64/…/meringls63amg24_brabus_diffuser_1.yft is not text and
-standard output is a terminal or a pipe; pass --out FILE, or redirect standard
-output to a file
+standard output is not a file; pass --out FILE, or redirect standard output to
+a file
        0
 6
 
