@@ -22,7 +22,7 @@ use rpf_core::{
 };
 use serde_json::{Value, json};
 
-use crate::{commands, exit::Failure, install};
+use crate::{commands, exit::Failure};
 
 /// JSON-RPC's own error codes, for a request that did not follow the protocol.
 const INVALID_REQUEST: i64 = -32600;
@@ -227,7 +227,7 @@ struct Job {
 }
 
 /// Whether a running operation can be stopped, and what to say when it cannot.
-enum Stoppable {
+pub enum Stoppable {
     /// It can be, and the watcher sees the mark between entries.
     Yes,
     /// It cannot, and this is why.
@@ -235,17 +235,17 @@ enum Stoppable {
 }
 
 /// The commit is still choosing between patching in place and rebuilding.
-const DECIDING: &str = "the commit is still working out whether every edit fits where it is, which reads and \
+pub const DECIDING: &str = "the commit is still working out whether every edit fits where it is, which reads and \
      compresses them and stops at nothing";
 
 /// A patch in place is under way.
-const PATCHING: &str =
+pub const PATCHING: &str =
     "a patch in place writes the bytes of one edit; there is no part-way to stop at";
 
 /// What a `cancel` acts on: at most one operation, and only the one it names.
 /// One lock, so reading what runs and marking it cancelled cannot be separated.
 #[derive(Default)]
-struct Cancellation {
+pub struct Cancellation {
     job: Mutex<Option<Job>>,
 }
 
@@ -257,7 +257,7 @@ impl Cancellation {
     }
 
     /// Registers the operation a `cancel` may now name.
-    fn begin(
+    pub fn begin(
         &self,
         request: &Value,
         handle: Option<u64>,
@@ -275,18 +275,18 @@ impl Cancellation {
     }
 
     /// Whether the running operation has been asked to stop.
-    fn stopped(&self) -> bool {
+    pub fn stopped(&self) -> bool {
         self.job().as_ref().is_some_and(|job| job.cancelled)
     }
 
     /// Forgets it, so a later cancel finds nothing rather than being stored
     /// against whatever runs next.
-    fn finish(&self) {
+    pub fn finish(&self) {
         *self.job() = None;
     }
 
     /// Answers a `cancel`, and acts on it when it names what is running.
-    fn ask(&self, request: Option<&Value>, handle: Option<u64>) -> Value {
+    pub fn ask(&self, request: Option<&Value>, handle: Option<u64>) -> Value {
         let mut running = self.job();
         let Some(job) = running.as_mut() else {
             return json!({ "cancelling": false, "running": Value::Null });
@@ -364,16 +364,17 @@ enum Outgoing {
 
 /// What the reading thread and the worker share. Nothing here blocks on the far
 /// end of standard output: emitting queues a line and returns.
-struct Wire {
+pub struct Wire {
     lines: mpsc::Sender<Outgoing>,
     backlog: Arc<Backlog>,
-    cancel: Cancellation,
+    /// What a cancel is registered against, and what a watcher asks.
+    pub cancel: Cancellation,
 }
 
 impl Wire {
     /// Queues one response, waiting first while the client is too far behind.
     /// Only the worker calls this, and it is the only thread that may wait here.
-    fn answer(&self, value: &Value) {
+    pub fn answer(&self, value: &Value) {
         let text = render(value);
         let len = text.len();
         self.make_room(len);
@@ -440,7 +441,7 @@ impl Wire {
     }
 
     /// Whether standard output has stopped accepting what is written to it.
-    fn gone(&self) -> bool {
+    pub fn gone(&self) -> bool {
         self.backlog.broken.load(Ordering::SeqCst)
     }
 }
@@ -501,7 +502,7 @@ fn write_line(out: &mut impl Write, text: &str, backlog: &Backlog) -> bool {
 
 /// Reports progress as notifications, and stops on a cancel or on nobody being
 /// left to report to.
-struct Notifying<'a> {
+pub struct Notifying<'a> {
     wire: &'a Wire,
     /// The session being reported on, or `None` for a `pack`, which has none.
     handle: Option<u64>,
@@ -517,7 +518,7 @@ struct Notifying<'a> {
 
 /// Why a watched write stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stopped {
+pub enum Stopped {
     /// A cancel named it. The caller's doing.
     Cancelled,
     /// Standard output stopped accepting what was written to it. Ours.
@@ -560,9 +561,23 @@ impl Watch for Notifying<'_> {
     }
 }
 
-impl Notifying<'_> {
+impl<'a> Notifying<'a> {
+    /// A watcher that reports nothing and only watches for a stop: the MCP
+    /// front sends no progress and still has to tell a cancel from a broken
+    /// standard output.
+    pub fn silent(wire: &'a Wire, name: &'a Value) -> Self {
+        Self {
+            wire,
+            handle: None,
+            name,
+            wanted: false,
+            skipped: 0,
+            stopped: None,
+        }
+    }
+
     /// Why the write stopped, in the terms the contract uses.
-    fn explain(&self, failure: Failure) -> Failure {
+    pub fn explain(&self, failure: Failure) -> Failure {
         stopped_as(self.stopped, failure)
     }
 }
@@ -570,7 +585,7 @@ impl Notifying<'_> {
 /// Translates a stopped write into the failure that actually happened: the
 /// library has one variant for "the watcher said stop" and this daemon stops
 /// for two unrelated reasons.
-fn stopped_as(stopped: Option<Stopped>, failure: Failure) -> Failure {
+pub fn stopped_as(stopped: Option<Stopped>, failure: Failure) -> Failure {
     if matches!(stopped, Some(Stopped::OutputGone))
         && matches!(
             failure,
@@ -598,11 +613,11 @@ enum Incoming {
 }
 
 /// What the reading thread made of a line.
-enum Seen {
+pub enum Seen {
     /// A `cancel`, acted on or refused, with the object to write back.
     Cancel(Value),
-    /// A `cancel` sent as a notification, which must not be answered.
-    CancelNotification,
+    /// A notification, which must not be answered.
+    Notification,
     /// Anything else. It goes to the worker, in order.
     Request,
 }
@@ -613,6 +628,24 @@ enum Seen {
 ///
 /// [`Failure::Io`] if standard input or output failed part-way.
 pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
+    let mut state = State {
+        cache: named_cache.map(Path::to_path_buf),
+        ..State::default()
+    };
+    pump(answer_cancel, |line, wire| respond(&mut state, line, wire))
+}
+
+/// The transport both `serve --stdio` and `serve --mcp` are: three threads, one
+/// object per line, and a reader that never waits. `ahead` is what the reading
+/// thread answers where it stands; `respond` is the worker's, in order.
+///
+/// # Errors
+///
+/// [`Failure::Io`] if standard input or output failed part-way.
+pub fn pump(
+    ahead: fn(&str, &Cancellation) -> Seen,
+    mut respond: impl FnMut(&str, &Wire) -> Option<Value>,
+) -> crate::exit::Result<()> {
     let backlog = Arc::new(Backlog::default());
     let (lines, queued) = mpsc::channel::<Outgoing>();
     let (finished, drained) = mpsc::channel::<()>();
@@ -631,20 +664,16 @@ pub fn run(named_cache: Option<&Path>) -> crate::exit::Result<()> {
 
     let reading_wire = Arc::clone(&wire);
     let reader = thread::spawn(move || {
-        reading(io::stdin().lock(), &reading_wire, &queue);
+        reading(io::stdin().lock(), &reading_wire, &queue, ahead);
         reading_wire.backlog.ending.store(true, Ordering::SeqCst);
         reading_wire.backlog.room.notify_all();
     });
 
-    let mut state = State {
-        cache: named_cache.map(Path::to_path_buf),
-        ..State::default()
-    };
     let mut fault = None;
     for message in requests {
         match message {
             Incoming::Request(line) => {
-                if let Some(response) = respond(&mut state, &line, &wire) {
+                if let Some(response) = respond(&line, &wire) {
                     wire.answer(&response);
                 }
             }
@@ -708,7 +737,12 @@ fn drain(drained: &mpsc::Receiver<()>, backlog: &Backlog) -> bool {
 
 /// The reading thread: one line at a time, cancels answered where they stand.
 /// `input` is a parameter so a test can drive it. [`Opening`].
-fn reading(input: impl BufRead, wire: &Wire, queue: &mpsc::Sender<Incoming>) {
+fn reading(
+    input: impl BufRead,
+    wire: &Wire,
+    queue: &mpsc::Sender<Incoming>,
+    ahead: fn(&str, &Cancellation) -> Seen,
+) {
     for line in input.lines() {
         let line = match line {
             Ok(line) => line,
@@ -725,12 +759,12 @@ fn reading(input: impl BufRead, wire: &Wire, queue: &mpsc::Sender<Incoming>) {
         }
         // Ahead of the queue: a cancel that waits its turn arrives after the
         // thing it would have cancelled finished.
-        match answer_cancel(&line, &wire.cancel) {
+        match ahead(&line, &wire.cancel) {
             Seen::Cancel(answer) => {
                 wire.answer_now(&answer);
                 continue;
             }
-            Seen::CancelNotification => continue,
+            Seen::Notification => continue,
             Seen::Request => {}
         }
         if wire.gone() {
@@ -805,7 +839,7 @@ fn answer_cancel(line: &str, cancel: &Cancellation) -> Seen {
     let outcome =
         aim(request.get("params")).map(|aimed| cancel.ask(aimed.request.as_ref(), aimed.handle));
     match (request.get("id"), outcome) {
-        (None, _) => Seen::CancelNotification,
+        (None, _) => Seen::Notification,
         (Some(id), Ok(result)) => {
             Seen::Cancel(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
         }
@@ -1146,9 +1180,13 @@ fn inside_of(params: &Value) -> String {
 fn list(state: &mut State, params: &Value) -> Answered {
     let inside = inside_of(params);
     let recursive = flag(params, "recursive")?;
+    let pattern = optional_string(params, "pattern")?;
     let session = session(state, params)?;
 
-    let rows = rpf_core::Listed::at(&mut session.file, &session.archive, &inside, recursive)?;
+    let rows = commands::matching(
+        rpf_core::Listed::at(&mut session.file, &session.archive, &inside, recursive)?,
+        pattern.as_deref(),
+    );
     Ok(Value::Array(
         rows.iter().map(commands::listing_row).collect(),
     ))
@@ -1422,19 +1460,7 @@ fn info(state: &mut State, params: &Value) -> Answered {
     let inside = inside_of(params);
     let session = session(state, params)?;
     let summary = rpf_core::Summary::of(&mut session.file, &session.archive, &inside)?;
-    Ok(json!({
-        "path": session.path.display().to_string(),
-        "inside": inside,
-        "len": summary.len,
-        "encryption": commands::encryption_name(summary.encryption),
-        "entries": summary.entries,
-        "directories": summary.directories,
-        "binary_files": summary.binary_files,
-        "resource_files": summary.resource_files,
-        "nested_archives": summary.nested_archives,
-        "locked_archives": summary.locked_archives,
-        "unreferenced_bytes": summary.unreferenced_bytes,
-    }))
+    Ok(commands::info_report(&session.path, &inside, &summary))
 }
 
 /// `verify` — read every entry back and check it against what the archive says.
@@ -1476,7 +1502,12 @@ fn verify(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
         .iter()
         .map(commands::verify_problem)
         .collect();
-    Ok(commands::verify_report(&session.path, &checked, &problems))
+    Ok(commands::verify_report(
+        &session.path,
+        &checked,
+        &problems,
+        usize::MAX,
+    ))
 }
 
 /// `extract` — write every entry of an open archive to a tree.
@@ -1649,6 +1680,17 @@ fn packing_over_held(path: &Path, held: &Path, holder: u64) -> Failure {
              {holder} first, or pack somewhere else",
             names_held(path, held, holder),
         ),
+    }
+}
+
+/// An optional string parameter.
+fn optional_string(params: &Value, name: &str) -> Answer<Option<String>> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|text| Some(text.to_owned()))
+            .ok_or_else(|| invalid_params(format!("{name:?} is a string"))),
     }
 }
 
@@ -1855,17 +1897,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     // reports the refusal rather than a rebuild that could not happen.
     session.archive.writable().map_err(Failure::Container)?;
     // Before the dry run: what the real call would do here is refuse.
-    if !force {
-        match install::detect(&session.path) {
-            Some(install::Detected::Installation(root)) => {
-                return Err(Failure::GameInstall { root }.into());
-            }
-            Some(install::Detected::Unexaminable(directory)) => {
-                return Err(Failure::UncertainInstall { directory }.into());
-            }
-            None => {}
-        }
-    }
+    commands::refuse_game_install(&session.path, force)?;
     if dry_run {
         return would_commit(session, asked_to_rebuild);
     }
@@ -1876,17 +1908,7 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
     wire.cancel.finish();
     let method = outcome?;
 
-    // Re-opened, so the warm state describes what is now on disk. The claim is
-    // re-taken with it: a rebuild renames, and a claim kept on the old inode
-    // would claim a file nobody has.
-    let path = session.path.clone();
-    let (file, archive) = commands::open(&path, cache.as_deref())?;
-    let entries = archive.entries().len();
-    let len = archive.len_bytes();
-    session.id = FileId::of(&file, &path)?;
-    session.file = file;
-    session.archive = archive;
-    session.pending.clear();
+    let (entries, len) = refreshed(state, asked.handle, cache.as_deref())?;
 
     Ok(json!({
         "committed": committed,
@@ -1894,6 +1916,55 @@ fn commit(state: &mut State, params: &Value, wire: &Wire, request: &Value) -> An
         "entries": entries,
         "len": len,
     }))
+}
+
+/// Re-opens the archive a commit has just written, so the warm state describes
+/// what is now on disk. The claim is re-taken with it: a rebuild renames, and a
+/// claim kept on the old inode would claim a file nobody has.
+///
+/// The set is cleared first and whatever happens next, because the write has
+/// already landed: a retry of a commit that succeeded would apply it twice. A
+/// re-open that fails takes the session with it: the handle would otherwise go
+/// on serving the old file, which the rebuild may have unlinked.
+fn refreshed(
+    state: &mut State,
+    handle: u64,
+    cache: Option<&Path>,
+) -> crate::exit::Result<(usize, u64)> {
+    let Some(session) = state.sessions.get_mut(&handle) else {
+        return Err(Failure::Refused {
+            reason: format!("no open archive with handle {handle}"),
+        });
+    };
+    session.pending.clear();
+    let path = session.path.clone();
+    match reopened(session, &path, cache) {
+        Ok(counts) => Ok(counts),
+        Err(failure) => {
+            state.sessions.remove(&handle);
+            Err(Failure::Io {
+                path: path.display().to_string(),
+                source: io::Error::other(format!(
+                    "the archive was written; the session could not be re-opened on it: \
+                     {failure}. Mount it again to go on editing"
+                )),
+            })
+        }
+    }
+}
+
+/// The re-open itself, so that a failure of either half invalidates the session.
+fn reopened(
+    session: &mut Session,
+    path: &Path,
+    cache: Option<&Path>,
+) -> crate::exit::Result<(usize, u64)> {
+    let (file, archive) = commands::open(path, cache)?;
+    let counts = (archive.entries().len(), archive.len_bytes());
+    session.id = FileId::of(&file, path)?;
+    session.file = file;
+    session.archive = archive;
+    Ok(counts)
 }
 
 /// Registers itself, decides, registers what it decided so a `cancel` can name
@@ -1939,17 +2010,7 @@ fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
 
     match rpf_core::plan(&mut session.file, &session.archive, &session.pending)? {
         rpf_core::Plan::Fits(patches) => {
-            let planned: Vec<Value> = patches
-                .planned()
-                .map(|entry| {
-                    json!({
-                        "path": entry.path,
-                        "at": entry.at,
-                        "len": entry.len,
-                        "allocation": entry.allocation,
-                    })
-                })
-                .collect();
+            let planned: Vec<Value> = patches.planned().map(commands::planned_row).collect();
             Ok(json!({
                 "committed": 0,
                 "dry_run": true,
@@ -1958,16 +2019,7 @@ fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
             }))
         }
         rpf_core::Plan::DoesNotFit(rejected) => {
-            let rejected: Vec<Value> = rejected
-                .iter()
-                .map(|entry| {
-                    json!({
-                        "path": entry.path,
-                        "needed": entry.needed,
-                        "allocation": entry.allocation,
-                    })
-                })
-                .collect();
+            let rejected: Vec<Value> = rejected.iter().map(commands::rejected_row).collect();
             Ok(json!({
                 "committed": 0,
                 "dry_run": true,
@@ -1978,10 +2030,7 @@ fn would_commit(session: &mut Session, asked_to_rebuild: bool) -> Answered {
         // Nothing in place can add, remove or rename an entry, so the commit
         // will rebuild whatever else is in the set.
         rpf_core::Plan::Structural(structural) => {
-            let structural: Vec<Value> = structural
-                .iter()
-                .map(|change| json!({ "path": change.path, "structural": change.what }))
-                .collect();
+            let structural: Vec<Value> = structural.iter().map(commands::structural_row).collect();
             Ok(json!({
                 "committed": 0,
                 "dry_run": true,
@@ -2067,12 +2116,9 @@ mod tests {
         ));
     }
 
-    /// [`Notifying::explain`] where the daemon actually calls it: the test above
-    /// passes with nothing calling it.
-    #[test]
-    fn a_rebuild_that_loses_its_output_says_so_rather_than_claiming_a_cancel() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("test.rpf");
+    /// A two-entry archive on disk, and a session on it holding one buffered
+    /// write against `a.txt`.
+    fn session_on(path: PathBuf) -> Session {
         let files: Vec<rpf_core::FileSpec> = ["a.txt", "b.txt"]
             .into_iter()
             .map(|name| rpf_core::FileSpec {
@@ -2097,7 +2143,7 @@ mod tests {
 
         let (file, archive) = commands::open(&path, None).expect("opens");
         let id = FileId::of(&file, &path).expect("named");
-        let mut session = Session {
+        Session {
             path,
             id,
             file,
@@ -2110,7 +2156,15 @@ mod tests {
                     allow_encoding_change: false,
                 },
             ),
-        };
+        }
+    }
+
+    /// [`Notifying::explain`] where the daemon actually calls it: the test above
+    /// passes with nothing calling it.
+    #[test]
+    fn a_rebuild_that_loses_its_output_says_so_rather_than_claiming_a_cancel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut session = session_on(dir.path().join("test.rpf"));
 
         // Standard output already stopped accepting anything, which is the one
         // condition that stops a rebuild without a cancel.
@@ -2140,6 +2194,30 @@ mod tests {
         assert!(
             failure.to_string().contains("<stdout>"),
             "the failure does not name the output that broke: {failure}"
+        );
+    }
+
+    #[test]
+    fn a_session_that_cannot_be_reopened_after_a_write_is_closed_rather_than_left_stale() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("test.rpf");
+        let mut state = State::default();
+        state.sessions.insert(1, session_on(path.clone()));
+        // The commit wrote; what it wrote is then not there to be opened.
+        fs::remove_file(&path).expect("removable");
+
+        let failure = refreshed(&mut state, 1, None).expect_err("nothing to re-open");
+        assert!(
+            matches!(failure.code(), Code::Io),
+            "the archive was written, and this was reported as {failure:?}"
+        );
+        assert!(
+            failure.to_string().contains("the archive was written"),
+            "the failure does not say the write landed: {failure}"
+        );
+        assert!(
+            state.sessions.is_empty(),
+            "the handle outlived the file it reads, and would serve stale bytes",
         );
     }
 
@@ -2574,7 +2652,7 @@ mod tests {
         let (queue, incoming) = mpsc::channel::<Incoming>();
         let reader = Arc::clone(&wire);
         let reading_thread = thread::spawn(move || {
-            reading(io::Cursor::new(requests), &reader, &queue);
+            reading(io::Cursor::new(requests), &reader, &queue, answer_cancel);
         });
 
         let accepted = incoming

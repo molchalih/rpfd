@@ -71,3 +71,7 @@ dist/
 # for the same reason `docs/` is, and untracked for the same reason — it is how
 # the work is thought through, not what the work ships.
 /AGENTS.md
+
+# A machine-specific helper: it hardcodes this Mac's VS Code path and duplicates
+# clients/vscode/test/editor/run.ts, which is the portable one.
+/clients/vscode/editor-run.cjs

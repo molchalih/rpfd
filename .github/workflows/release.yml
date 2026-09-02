@@ -155,14 +155,40 @@ jobs:
 
   # R8.3's other half. The binaries above are what `rpf` is; the extension is
   # how it is used from an editor, and a release that attached four binaries and
-  # no client would ship half the tool. One runner and no matrix: a `.vsix` is a
-  # zip of compiled JavaScript, and nothing in it varies by platform — the
-  # per-platform part is the binary, which is attached separately and found on
-  # PATH.
+  # no client would ship half the tool.
+  #
+  # A matrix, and the binary travels inside the package. This reverses the
+  # earlier "nothing in a .vsix varies by platform": true of the JavaScript,
+  # false of the product. An extension that finds no binary does nothing at all,
+  # and v0.1.0 shipped exactly that — `locate.ts` looks in
+  # `bin/<platform>-<arch>/` first and the package carried no `bin` at all, so a
+  # first install was inert until the user separately fetched `rpf` and put it
+  # on PATH. The packer already walks `bin/`; only this job never filled it.
+  #
+  # Each row declares its platform in the manifest, via `--target`, so the four
+  # packages are more than four filenames. The last row carries no binary and
+  # names no platform on purpose: a package with no target is the fallback for
+  # every platform that has none of its own, so a platform this project does not
+  # build for — linux-arm64 — still gets an extension that finds `rpf` on PATH,
+  # which is the behaviour it has today.
   extension:
-    needs: release
-    name: vsix
+    needs: [release, binaries]
+    name: vsix ${{ matrix.platform || 'any' }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            target: aarch64-apple-darwin
+          - platform: darwin-x64
+            target: x86_64-apple-darwin
+          - platform: linux-x64
+            target: x86_64-unknown-linux-musl
+          - platform: win32-x64
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+          - platform: ''
     steps:
       - uses: actions/checkout@v5
         with:
@@ -194,6 +220,30 @@ jobs:
       # extension, and the packer takes it as an argument so that packaging and
       # publishing stay two acts. The repository variable lets a fork build its
       # own package without editing this file.
+      # Taken from the release rather than passed between jobs: the assets are
+      # already there, `binaries` is already a dependency, and an artefact
+      # upload would be a second copy of the same bytes under a second name.
+      - name: the binary this package carries
+        if: matrix.platform != ''
+        working-directory: clients/vscode
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="rpf-${TAG}-${{ matrix.target }}"
+          into="bin/${{ matrix.platform }}"
+          mkdir -p "$into"
+          if [ -n "${{ matrix.exe }}" ]; then
+            gh release download "$TAG" --pattern "$name.zip" --dir .
+            unzip -q "$name.zip"
+          else
+            gh release download "$TAG" --pattern "$name.tar.gz" --dir .
+            tar -xzf "$name.tar.gz"
+          fi
+          mv "$name/rpf${{ matrix.exe }}" "$into/"
+          chmod +x "$into/rpf${{ matrix.exe }}"
+          rm -rf "$name" "$name.zip" "$name.tar.gz"
+
       - name: package
         working-directory: clients/vscode
         env:
@@ -201,11 +251,89 @@ jobs:
         run: |
           set -euo pipefail
           npm version --no-git-tag-version --allow-same-version "${TAG#v}"
-          out="$PWD/rpf-${TAG}.vsix"
-          npm run package -- --publisher "$PUBLISHER" --out "$out"
+          suffix="${{ matrix.platform && format('-{0}', matrix.platform) || '' }}"
+          out="$PWD/rpf-${TAG}${suffix}.vsix"
+          args=(--publisher "$PUBLISHER" --out "$out")
+          if [ -n "${{ matrix.platform }}" ]; then
+            args+=(--target "${{ matrix.platform }}")
+          fi
+          npm run package -- "${args[@]}"
           echo "ASSET=$out" >> "$GITHUB_ENV"
 
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" "$ASSET" --clobber
+
+  # R8.6, and the half of R8.7 that is not a credential. One `.mcpb` — a zip of
+  # the binaries beside a `manifest.json` — is both Claude Desktop's
+  # drag-and-drop installer and the artefact the MCP registry's
+  # `registryType: "mcpb"` points at, so it is built once and used twice.
+  #
+  # macOS, for `lipo`. The bundle format names a platform and not an
+  # architecture, so `darwin` gets exactly one binary and it has to be the
+  # universal one made from the two the matrix above already published: an
+  # Intel Mac cannot run an arm64 binary and Rosetta does not translate that
+  # way round.
+  #
+  # `server.json` is attached rather than published. Publishing it needs a
+  # GitHub device-code login, which is a credential only the maintainer can
+  # supply; clients/mcp/README.md names the two commands that finish the job.
+  bundle:
+    needs: [release, binaries]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag }}
+
+      # From the release assets, as the extension job does: `binaries` is
+      # already a dependency and the bytes are already there.
+      - name: the binaries this bundle carries
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage/server/darwin stage/server/linux stage/server/win32
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl; do
+            name="rpf-${TAG}-$target"
+            gh release download "$TAG" --pattern "$name.tar.gz" --dir .
+            tar -xzf "$name.tar.gz"
+          done
+          win="rpf-${TAG}-x86_64-pc-windows-msvc"
+          gh release download "$TAG" --pattern "$win.zip" --dir .
+          unzip -q "$win.zip"
+          lipo -create -output stage/server/darwin/rpf \
+            "rpf-${TAG}-aarch64-apple-darwin/rpf" "rpf-${TAG}-x86_64-apple-darwin/rpf"
+          mv "rpf-${TAG}-x86_64-unknown-linux-musl/rpf" stage/server/linux/rpf
+          mv "$win/rpf.exe" stage/server/win32/rpf.exe
+
+      - name: bundle
+        shell: bash
+        run: tools/mcpb/bundle.sh "${TAG#v}" stage "rpf-${TAG}.mcpb"
+
+      # The registry rejects a package whose URL is not a GitHub or GitLab
+      # release and whose URL does not contain "mcp" — the extension answers
+      # the second — and clients check `fileSha256` before they run what they
+      # downloaded, so it is computed here from the file that was just built
+      # rather than written by hand from a file that may not be the same one.
+      - name: the registry entry, filled in but not published
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="rpf-${TAG}.mcpb"
+          jq --arg v "${TAG#v}" \
+             --arg url "https://github.com/${{ github.repository }}/releases/download/${TAG}/$asset" \
+             --arg sha "$(shasum -a 256 "$asset" | cut -d' ' -f1)" '
+            .version = $v
+            | .packages[0].version = $v
+            | .packages[0].identifier = $url
+            | .packages[0].fileSha256 = $sha
+          ' tools/mcpb/server.json > server.json
+
+      - name: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "rpf-${TAG}.mcpb" server.json --clobber

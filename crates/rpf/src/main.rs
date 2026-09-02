@@ -4,6 +4,7 @@ mod advice;
 mod commands;
 mod exit;
 mod install;
+mod mcp;
 mod serve;
 
 use std::{path::PathBuf, process::ExitCode};
@@ -50,6 +51,11 @@ enum Command {
         /// Descend into directories and nested archives.
         #[arg(short = 'R', long)]
         recursive: bool,
+        /// Keep only rows whose whole in-archive path matches this glob. `*`
+        /// matches within one path segment, `**` across separators, `?` one
+        /// character. Case-sensitive, because entry names are.
+        #[arg(long, value_name = "GLOB")]
+        pattern: Option<String>,
     },
     /// Write one entry's contents to standard output.
     Cat {
@@ -137,11 +143,15 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Serve JSON-RPC over standard input and output, one object per line.
+    /// Serve over standard input and output, one JSON object per line.
     Serve {
-        /// Required, and the only transport there is.
+        /// This project's own JSON-RPC daemon: warm state, buffered edits.
         #[arg(long)]
         stdio: bool,
+        /// The Model Context Protocol, either era: six tools over the same
+        /// lines.
+        #[arg(long)]
+        mcp: bool,
     },
     /// Read every entry back and check it against what the archive says.
     Verify {
@@ -204,7 +214,15 @@ fn main() -> ExitCode {
             ref archive,
             ref path,
             recursive,
-        } => commands::ls(archive, path, recursive, cache, cli.json),
+            ref pattern,
+        } => commands::ls(
+            archive,
+            path,
+            recursive,
+            pattern.as_deref(),
+            cache,
+            cli.json,
+        ),
         Command::Cat {
             ref archive,
             ref path,
@@ -244,15 +262,13 @@ fn main() -> ExitCode {
             ref archive,
             force,
         } => commands::pack(from, archive, force, cache, cli.json),
-        Command::Serve { stdio } => {
-            if stdio {
-                serve::run(cache)
-            } else {
-                Err(exit::Failure::Refused {
-                    reason: "serve needs --stdio".to_owned(),
-                })
-            }
-        }
+        Command::Serve { stdio, mcp } => match (stdio, mcp) {
+            (true, false) => serve::run(cache),
+            (false, true) => mcp::run(cache),
+            _ => Err(exit::Failure::Refused {
+                reason: "serve needs one of --stdio or --mcp".to_owned(),
+            }),
+        },
         Command::Verify {
             ref archive,
             ref against,

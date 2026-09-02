@@ -13,7 +13,7 @@
 
 import type { Daemon } from './daemon.js';
 import { Refused } from './errors.js';
-import { type Change, type Offer, Pending, type Plan } from './pending.js';
+import { type Change, type Offer, Pending, type Plan, type Shown } from './pending.js';
 import type {
     Cancelled,
     Committed,
@@ -38,12 +38,14 @@ export type SaveState = 'clean' | 'dirty' | 'saving';
 export interface Saved {
     /** How the archive was written. */
     method: 'patch' | 'rebuild';
-    /** How many buffered changes went in. */
+    /** How many buffered changes went in. `0` is a save held back. */
     committed: number;
     /** The archive's entry count afterwards. */
     entries: number;
     /** The archive's length afterwards. */
     len: number;
+    /** Why the set would not patch, when that is what held the save back. */
+    why?: string;
 }
 
 /** What a save would do, without doing any of it. */
@@ -61,12 +63,28 @@ export interface Preview {
 export interface SaveOptions {
     /** Rebuild even when every edit would fit where it is. */
     rebuild?: boolean;
+    /** Write nothing unless the whole set patches in place. */
+    patchOnly?: boolean;
     /** Write into a detected game installation anyway. */
     force?: boolean;
     onProgress?: (progress: Progress) => void;
 }
 
-/** Raised when a session is asked to do two incompatible things at once. */
+/** One save on the lane, and the ticket a cancel names it by. */
+export interface Saving {
+    ticket: number;
+    result: Promise<Saved | undefined>;
+}
+
+/** What a session knows about a save it has not answered yet. */
+interface Ticket {
+    /** The commit request, once one has been sent. */
+    request: number | undefined;
+    /** Whether a cancel took the save before it had a request to name. */
+    abandoned: boolean;
+}
+
+/** Raised when a session is asked to stop work it is not doing. */
 export class SessionBusy extends Error {
     constructor(message: string) {
         super(message);
@@ -108,11 +126,22 @@ export class ArchiveSession {
     private listing: Tree;
     private readonly pending = new Pending();
     private saveState: SaveState = 'clean';
-    private saving: number | undefined;
+    /** Every save asked for and not yet answered, by the ticket that names it. */
+    private readonly saves = new Map<number, Ticket>();
+    private tickets = 0;
     private stamp = Date.now();
     private readonly listeners = new Set<(state: SaveState) => void>();
     private entryCount: number;
     private byteLength: number;
+    /**
+     * The lane every mutation runs in, one at a time.
+     *
+     * A write issued while a commit is running reaches the daemon only after
+     * that commit has cleared its set, which is what keeps the two sides
+     * describing the same archive. `cancelSave` stays out of it, having a
+     * running save to stop.
+     */
+    private lane: Promise<unknown> = Promise.resolve();
 
     private constructor(daemon: Daemon, opened: Opened, rows: readonly Listed[]) {
         this.daemon = daemon;
@@ -190,6 +219,11 @@ export class ArchiveSession {
         return this.pending.paths();
     }
 
+    /** Each buffered change, at the path the tree shows it at. */
+    dirtyChanges(): Shown[] {
+        return this.pending.shown();
+    }
+
     /** The length an entry will have once the changes are saved. */
     lengthOf(inside: string): number | undefined {
         return this.listing.at(normalise(inside))?.len;
@@ -243,44 +277,46 @@ export class ArchiveSession {
      * consequence: the length this session projects for an edited metadata
      * entry is the document's, because that is what this client holds.
      */
-    async write(inside: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
+    write(inside: string, bytes: Uint8Array, options: WriteOptions = {}): Promise<void> {
         const visible = normalise(inside);
-        const held = this.pending.address(visible);
-        const there = this.pending.at(held);
-        // A rename and a write are two changes at one path, and a set holds at
-        // most one — so buffering this would silently drop the rename.
-        if (there?.kind === 'rename') {
-            throw new Refused(
-                'refused',
-                visible,
-                `${visible} has a rename buffered against it, and one change set holds one change per entry. Save the archive, then edit it.`,
-            );
-        }
-        // A directory the archive holds is the daemon's own refusal and is left
-        // to it; a directory only this session made is one it cannot see.
-        if (there?.kind === 'mkdir') {
-            throw new Refused(
-                'is-a-directory',
-                visible,
-                `${visible} is a directory this change set makes`,
-            );
-        }
-        // A creation is applied after the renames, so it is addressed by the
-        // path it will have; a replacement, by the one the archive holds it at.
-        const known = this.onDisk.at(held) !== undefined;
-        const path = known ? held : visible;
-        const create = !known && options.create === true;
-        // Only a file can be replaced this way: one set cannot hold both the
-        // removal of a directory and a write at that path.
-        const gone = this.committed.at(path);
-        if (this.pending.at(path)?.kind === 'remove' && gone !== undefined && isDirectory(gone)) {
-            throw new Refused(
-                'is-a-directory',
-                visible,
-                `${visible} is a directory this change set removes; a file cannot take its place in one set. Save the archive, then write it.`,
-            );
-        }
-        await this.carry(this.pending.plan(path, visible, { kind: 'write', contents: bytes, create }));
+        return this.carry(() => {
+            const held = this.pending.address(visible);
+            const there = this.pending.at(held);
+            // A rename and a write are two changes at one path, and a set holds
+            // at most one — so buffering this would silently drop the rename.
+            if (there?.kind === 'rename') {
+                throw new Refused(
+                    'refused',
+                    visible,
+                    `${visible} has a rename buffered against it, and one change set holds one change per entry. Save the archive, then edit it.`,
+                );
+            }
+            // A directory the archive holds is the daemon's own refusal and is
+            // left to it; a directory only this session made is one it cannot see.
+            if (there?.kind === 'mkdir') {
+                throw new Refused(
+                    'is-a-directory',
+                    visible,
+                    `${visible} is a directory this change set makes`,
+                );
+            }
+            // A creation is applied after the renames, so it is addressed by the
+            // path it will have; a replacement, by the one the archive holds it at.
+            const known = this.onDisk.at(held) !== undefined;
+            const path = known ? held : visible;
+            const create = !known && options.create === true;
+            // Only a file can be replaced this way: one set cannot hold both
+            // the removal of a directory and a write at that path.
+            const gone = this.committed.at(path);
+            if (this.pending.at(path)?.kind === 'remove' && gone !== undefined && isDirectory(gone)) {
+                throw new Refused(
+                    'is-a-directory',
+                    visible,
+                    `${visible} is a directory this change set removes; a file cannot take its place in one set. Save the archive, then write it.`,
+                );
+            }
+            return this.pending.plan(path, visible, { kind: 'write', contents: bytes, create });
+        });
     }
 
     /**
@@ -289,24 +325,26 @@ export class ArchiveSession {
      * A removal of something only a buffered change put there withdraws that
      * change instead, as does a directory removed over the changes inside it.
      */
-    async remove(inside: string, options: RemoveOptions = {}): Promise<void> {
+    remove(inside: string, options: RemoveOptions = {}): Promise<void> {
         const visible = normalise(inside);
-        const node = this.listing.at(visible);
-        if (!node) {
-            throw new Refused('not-found', visible, `${visible} is not in the archive`);
-        }
-        const recursive = options.recursive === true;
-        // Asked of the view as well as the archive: a directory the archive
-        // holds empty may hold buffered creations the daemon cannot see.
-        if (!recursive && isDirectory(node) && node.children.size > 0) {
-            throw new Refused(
-                'refused',
-                visible,
-                `${visible} is a directory that is not empty; ask for it recursively`,
-            );
-        }
-        const held = this.pending.address(visible);
-        await this.carry(this.pending.plan(held, visible, { kind: 'remove', recursive }));
+        return this.carry(() => {
+            const node = this.listing.at(visible);
+            if (!node) {
+                throw new Refused('not-found', visible, `${visible} is not in the archive`);
+            }
+            const recursive = options.recursive === true;
+            // Asked of the view as well as the archive: a directory the archive
+            // holds empty may hold buffered creations the daemon cannot see.
+            if (!recursive && isDirectory(node) && node.children.size > 0) {
+                throw new Refused(
+                    'refused',
+                    visible,
+                    `${visible} is a directory that is not empty; ask for it recursively`,
+                );
+            }
+            const held = this.pending.address(visible);
+            return this.pending.plan(held, visible, { kind: 'remove', recursive });
+        });
     }
 
     /**
@@ -317,64 +355,74 @@ export class ArchiveSession {
      * where removals are applied before renames. The entry keeps its storage
      * class and its kind, because it is still a rename.
      */
-    async rename(from: string, to: string, options: RenameOptions = {}): Promise<void> {
+    rename(from: string, to: string, options: RenameOptions = {}): Promise<void> {
         const source = normalise(from);
         const target = normalise(to);
         if (source === target) {
-            return;
+            return Promise.resolve();
         }
-        if (!this.listing.at(source)) {
-            throw new Refused('not-found', source, `${source} is not in the archive`);
-        }
-        const occupied = this.listing.at(target);
-        if (occupied && options.overwrite !== true) {
-            throw new Refused('exists', target, `${target} is already in the archive`);
-        }
-        const held = this.pending.address(source);
-        const blocked = this.pending.blocksRename(held);
-        if (blocked !== undefined) {
-            throw new Refused(
-                'refused',
-                source,
-                `${blocked}. Save the archive, then rename this one.`,
-            );
-        }
-        const plans: Plan[] = [];
-        if (occupied) {
-            // Taking a non-empty directory recursively is a deletion the user
-            // did not ask for, so it is refused rather than assumed.
-            if (isDirectory(occupied) && occupied.children.size > 0) {
+        return this.carry(() => {
+            if (!this.listing.at(source)) {
+                throw new Refused('not-found', source, `${source} is not in the archive`);
+            }
+            const occupied = this.listing.at(target);
+            if (occupied && options.overwrite !== true) {
+                throw new Refused('exists', target, `${target} is already in the archive`);
+            }
+            const held = this.pending.address(source);
+            const blocked = this.pending.blocksRename(held);
+            if (blocked !== undefined) {
                 throw new Refused(
                     'refused',
-                    target,
-                    `${target} is a directory that is not empty. Delete it first, then rename over it.`,
+                    source,
+                    `${blocked}. Save the archive, then rename this one.`,
                 );
             }
-            plans.push(
-                this.pending.plan(this.pending.address(target), target, {
-                    kind: 'remove',
-                    recursive: false,
-                }),
-            );
-        }
-        plans.push(this.pending.plan(held, source, { kind: 'rename', to: target }));
-        await this.carry(Pending.merged(plans));
+            const plans: Plan[] = [];
+            if (occupied) {
+                // Taking a non-empty directory recursively is a deletion the
+                // user did not ask for, so it is refused rather than assumed.
+                if (isDirectory(occupied) && occupied.children.size > 0) {
+                    throw new Refused(
+                        'refused',
+                        target,
+                        `${target} is a directory that is not empty. Delete it first, then rename over it.`,
+                    );
+                }
+                plans.push(
+                    this.pending.plan(this.pending.address(target), target, {
+                        kind: 'remove',
+                        recursive: false,
+                    }),
+                );
+            }
+            plans.push(this.pending.plan(held, source, { kind: 'rename', to: target }));
+            return Pending.merged(plans);
+        });
     }
 
     /** Buffers a directory. Nothing on disk changes until {@link save}. */
-    async makeDirectory(inside: string): Promise<void> {
+    makeDirectory(inside: string): Promise<void> {
         const visible = normalise(inside);
-        if (this.listing.at(visible)) {
-            throw new Refused('exists', visible, `${visible} is already in the archive`);
-        }
-        await this.carry(this.pending.plan(visible, visible, { kind: 'mkdir' }));
+        return this.carry(() => {
+            if (this.listing.at(visible)) {
+                throw new Refused('exists', visible, `${visible} is already in the archive`);
+            }
+            return this.pending.plan(visible, visible, { kind: 'mkdir' });
+        });
     }
 
     /** Drops every buffered change, on both sides. */
-    async discard(): Promise<number> {
-        if (this.saveState === 'saving') {
-            throw new SessionBusy('the archive is being saved; cancel that first');
-        }
+    discard(): Promise<number> {
+        return this.serial(() => this.drop());
+    }
+
+    /** What a save would do, deciding it exactly as the save would. */
+    preview(rebuild = false): Promise<Preview> {
+        return this.serial(() => this.plan(rebuild));
+    }
+
+    private async drop(): Promise<number> {
         const answer = await this.daemon.request<Discarded>('discard', { handle: this.handle });
         this.pending.clear();
         this.reshape();
@@ -382,8 +430,7 @@ export class ArchiveSession {
         return answer.discarded;
     }
 
-    /** What a save would do, deciding it exactly as the save would. */
-    async preview(rebuild = false): Promise<Preview> {
+    private async plan(rebuild: boolean): Promise<Preview> {
         const answer = await this.daemon.request<Committed>('commit', {
             handle: this.handle,
             dry_run: true,
@@ -403,13 +450,52 @@ export class ArchiveSession {
      * `undefined` when there was nothing to commit. A failure — a refusal, or a
      * cancel — leaves the changes buffered on both sides, so the same save can
      * be asked for again once whatever refused it has been dealt with.
+     *
+     * With `patchOnly`, a set the daemon would rebuild is left buffered and
+     * answered with a {@link Saved} that committed nothing and says why.
      */
-    async save(options: SaveOptions = {}): Promise<Saved | undefined> {
-        if (this.saveState === 'saving') {
-            throw new SessionBusy('this archive is already being saved');
-        }
-        if (this.pending.size === 0) {
+    save(options: SaveOptions = {}): Promise<Saved | undefined> {
+        return this.begin(options).result;
+    }
+
+    /**
+     * The same save, with the ticket {@link cancelSave} names it by.
+     *
+     * A cancel that named nothing would stop whichever save was running, which
+     * is somebody else's as readily as the caller's own.
+     */
+    begin(options: SaveOptions = {}): Saving {
+        this.tickets += 1;
+        const named = this.tickets;
+        const ticket: Ticket = { request: undefined, abandoned: false };
+        this.saves.set(named, ticket);
+        const result = this.serial(() => this.commit(ticket, options)).finally(() => {
+            this.saves.delete(named);
+        });
+        return { ticket: named, result };
+    }
+
+    private async commit(ticket: Ticket, options: SaveOptions): Promise<Saved | undefined> {
+        if (ticket.abandoned || this.pending.size === 0) {
             return undefined;
+        }
+        if (options.patchOnly === true) {
+            // There is no request to name across the dry run, so a cancel
+            // arriving here takes the save back instead.
+            const planned = await this.plan(options.rebuild ?? false);
+            if (ticket.abandoned) {
+                return undefined;
+            }
+            if (planned.method !== 'patch') {
+                this.touch('dirty');
+                return {
+                    method: planned.method,
+                    committed: 0,
+                    entries: this.entryCount,
+                    len: this.byteLength,
+                    why: whyRebuilt(planned),
+                };
+            }
         }
         const params = {
             handle: this.handle,
@@ -418,22 +504,24 @@ export class ArchiveSession {
             progress: options.onProgress !== undefined,
         };
         const call = this.daemon.send<Committed>('commit', params, options.onProgress);
-        this.saving = call.id;
+        ticket.request = call.id;
         this.touch('saving');
         let answer: Committed;
         try {
             answer = await call.result;
         } catch (failure) {
-            this.saving = undefined;
+            ticket.request = undefined;
             this.touch(this.pending.size === 0 ? 'clean' : 'dirty');
             throw failure;
         }
-        this.saving = undefined;
+        ticket.request = undefined;
+        // A commit is only sent with a set to commit, so an unchanged answer is
+        // the two sides disagreeing; clearing here would drop the edits unseen.
         if (answer.unchanged) {
-            this.pending.clear();
-            this.reshape();
-            this.touch('clean');
-            return undefined;
+            this.touch('dirty');
+            throw new Error(
+                `${this.path} still holds ${this.pending.size} buffered edit(s) the daemon has no record of. Its session did not survive the last save: unmount the archive and mount it again.`,
+            );
         }
         this.pending.clear();
         this.entryCount = answer.entries ?? this.entryCount;
@@ -449,18 +537,25 @@ export class ArchiveSession {
     }
 
     /**
-     * Asks the daemon to stop the save this session started.
+     * Asks the daemon to stop the save a {@link begin} named, and no other.
      *
      * Named by the request and this handle: a cancel that names nothing means
      * "whatever is running", which is somebody else's work as readily. A patch
      * answers `cancelling: false`, having no part-way to stop at.
+     *
+     * A save that has not reached the daemon yet has no request to name, so it
+     * is taken back here instead and gives up before it begins.
      */
-    async cancelSave(): Promise<Cancelled> {
-        const running = this.saving;
-        if (running === undefined) {
-            throw new SessionBusy('this archive is not being saved');
+    async cancelSave(ticket: number): Promise<Cancelled> {
+        const named = this.saves.get(ticket);
+        if (named === undefined) {
+            throw new SessionBusy('that save has already finished');
         }
-        return this.daemon.cancel(running, this.handle);
+        if (named.request === undefined) {
+            named.abandoned = true;
+            return { cancelling: true, running: 'commit' };
+        }
+        return this.daemon.cancel(named.request, this.handle);
     }
 
     /** Reads every entry back and reports what did not check out. */
@@ -505,7 +600,11 @@ export class ArchiveSession {
     }
 
     /** Releases the claim on the archive. Buffered changes go with it. */
-    async close(): Promise<number> {
+    close(): Promise<number> {
+        return this.serial(() => this.release());
+    }
+
+    private async release(): Promise<number> {
         const answer = await this.daemon.request<{ discarded: number }>('close', {
             handle: this.handle,
         });
@@ -516,8 +615,12 @@ export class ArchiveSession {
     }
 
     /**
-     * Asks the daemon for a gesture's whole plan, and records it once the
-     * daemon has taken all of it.
+     * Decides a gesture's whole plan, asks the daemon for it, and records it
+     * once the daemon has taken all of it.
+     *
+     * The plan is decided **in the lane**, against a listing and a set no
+     * commit can clear underneath it; a plan decided at call time and queued
+     * would name paths a rebuild had since moved.
      *
      * Withdrawals go first, because the daemon refuses a second change at a
      * path its set already holds — `Error::Claimed`, exit 6.
@@ -526,7 +629,11 @@ export class ArchiveSession {
      * withdrawn, so a gesture the daemon declines costs the gesture and never
      * the buffer.
      */
-    private async carry(plan: Plan): Promise<void> {
+    private carry(decide: () => Plan): Promise<void> {
+        return this.serial(() => this.buffer(decide()));
+    }
+
+    private async buffer(plan: Plan): Promise<void> {
         const withdrawn: Offer[] = [];
         const offered: string[] = [];
         try {
@@ -602,6 +709,12 @@ export class ArchiveSession {
         }
     }
 
+    private serial<T>(work: () => Promise<T>): Promise<T> {
+        const next = this.lane.then(work, work);
+        this.lane = next.catch(() => undefined);
+        return next;
+    }
+
     /** Rebuilds the view: the listing with every buffered change applied. */
     private reshape(): void {
         this.listing = this.pending.size === 0 ? this.onDisk : Tree.of(this.pending.rowsOver(this.rows));
@@ -609,12 +722,18 @@ export class ArchiveSession {
 
     private touch(state: SaveState): void {
         this.stamp = Date.now();
-        if (this.saveState === state) {
-            return;
-        }
         this.saveState = state;
         for (const listener of this.listeners) {
             listener(state);
         }
     }
+}
+
+/** Why a set will not patch, in the terms the daemon decided it in. */
+function whyRebuilt(planned: Preview): string {
+    // A structural change is a rebuild whatever else is in the set, so it is
+    // what the sentence names first.
+    return planned.structural.length > 0
+        ? `${planned.structural.length} change(s) alter what the archive holds`
+        : `${planned.rejected.length} edit(s) do not fit where they are`;
 }

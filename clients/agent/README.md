@@ -40,7 +40,7 @@ standard output, pretty-printed.
 | any of those under `--dry-run` | `method: "rebuild"`, `path`, `structural`, `dry_run` |
 | `extract` | `archive`, `into`, `files`, `directories`, `manifest` |
 | `pack` | `archive`, `entries`, `len` |
-| `verify` | `path`, `against`, `entries_checked`, `contents_checked`, `contents_recorded`, `problems` |
+| `verify` | `path`, `against`, `entries_checked`, `contents_checked`, `contents_recorded`, `problems`, `problems_total` |
 | `keys extract`, `keys cache`, `keys invalidate` | offsets, lengths, digests, counts and cache paths — never a key |
 
 ```
@@ -77,9 +77,31 @@ $ rpf --json ls dlc.rpf data
 ]
 ```
 
-`ls -R` descends into directories and nested archives and has no filter: on this
-archive it is 30 rows, and on a large one it is one row per entry. Ask for the
-directory you want rather than the root where you can.
+`ls -R` descends into directories and nested archives: on this archive it is 30
+rows, and on a large one it is one row per entry. Ask for the directory you want
+rather than the root where you can, and use `--pattern` when you know part of
+the name.
+
+```
+$ rpf --json ls -R --pattern '**/*.meta' dlc.rpf
+[
+  {
+    "encoding": "xml",
+    "kind": "binary",
+    "len": 1445,
+    "path": "data/carvariations.meta"
+  },
+  ...
+]
+```
+
+`--pattern` keeps the rows whose **whole** in-archive path matches the glob.
+`*` matches within one path segment, `**` matches across separators, `?`
+matches one character; a leading `**/` matches at the root as well as at depth,
+so `**/*.meta` finds a `.meta` wherever it sits. Matching is case-sensitive,
+because entry names are. The
+same filter is the daemon's `pattern` parameter and `rpf_list`'s `pattern`
+argument — one function, three frontends.
 
 ## Exit codes
 
@@ -87,7 +109,7 @@ directory you want rather than the root where you can.
 |---|---|---|
 | 0 | | It worked. The report on standard output is the answer |
 | 1 | internal | A failure with no better classification. Report it |
-| 2 | usage | The arguments were wrong. Fix the call. This one comes from the argument parser and is **not** JSON, whatever `--json` says |
+| 2 | usage | The arguments were wrong. Fix the call. This one comes from the argument parser and is **not** JSON, whatever `--json` says. `serve --mcp` is the exception: it owns argument validation, so it reports the same class as an object with `reason: "InvalidArguments"` |
 | 3 | not found | Nothing at that path. Check the spelling with `ls`; `\` is not a separator |
 | 4 | corrupt | The archive contradicts itself or does not decompress as it promises. Nothing to retry |
 | 5 | needs key | The archive is encrypted and no key material is available. `keys extract` against a game source, then retry |
@@ -129,8 +151,12 @@ else, as their `reason` and `message` came back:
 
 Match on `code` first and on `reason` only where two failures under one code
 need different answers. The `message` is for a person to read; it is not a
-contract. This is the same object the JSON-RPC daemon puts in its `error`
-member, built by the same code, so the two cannot come to disagree.
+contract. This is the same object every frontend answers
+with, built by the same code, so they cannot come to disagree: the command line
+writes it to standard error, `serve --stdio` puts it in its JSON-RPC `error`
+member, and `serve --mcp` puts it in a tool result's `structuredContent` beside
+`isError: true` — where the protocol requires a failure a model can act on to
+be.
 
 Without `--json` a failure is the same sentence, prefixed `rpf: `, on standard
 error.
@@ -261,7 +287,8 @@ $ rpf --json verify dlc.rpf
   "contents_recorded": 0,
   "entries_checked": 27,
   "path": "dlc.rpf",
-  "problems": []
+  "problems": [],
+  "problems_total": 0
 }
 ```
 
@@ -283,7 +310,9 @@ $ rpf --json put dlc.rpf data/added.meta vehicles.xml --create --dry-run
 
 `verify` reads every entry back against what the archive says about it, and
 reports what it found in `problems` rather than as a failure — the call did what
-it was asked. `problems` is an array of `{path, reason}`. Checking an entry's
+it was asked. `problems` is an array of `{path, reason}`, and `problems_total` is how many
+there were — the command line and `serve --stdio` report every one, and
+`serve --mcp` carries the first hundred. Checking an entry's
 *contents* needs a record of what they should be, which only an extracted tree
 carries: `verify` alone checked 27 entries and 0 contents above.
 
@@ -313,7 +342,8 @@ $ rpf --json verify rebuilt.rpf --against tree
   "contents_recorded": 7,
   "entries_checked": 27,
   "path": "rebuilt.rpf",
-  "problems": []
+  "problems": [],
+  "problems_total": 0
 }
 ```
 

@@ -1,0 +1,8 @@
+# One root per line, a directory to walk or a single archive. Blank lines and #
+# comments are ignored, a leading ~ is expanded, and a relative path resolves
+# against the repository root. These are read, never written.
+#
+# $RPF_CORPUS is walked as well when it is set.
+~/rpf-demo
+~/Downloads
+assets

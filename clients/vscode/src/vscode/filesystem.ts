@@ -6,7 +6,9 @@
  * rendered by `core/errors.ts`. What is here is the editor's own vocabulary.
  *
  * **A change buffers.** `writeFile`, `delete`, `rename` and `createDirectory`
- * do not write the archive; the explicit `RPF: Save Archive` command does.
+ * do not write the archive: the set is committed a moment later, and only when
+ * the daemon would patch it in place. A set it would rebuild waits for the
+ * explicit `RPF: Rebuild Archive` command.
  *
  * **The explorer is shown the session's view, not the daemon's listing**, which
  * answers the archive on disk and would show a created entry as absent until

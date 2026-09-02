@@ -30,6 +30,15 @@ export type Change =
 /** One change, at the path the archive holds it at. */
 export type Offer = readonly [path: string, change: Change];
 
+/** One change, at both the path it is keyed by and the path the user sees. */
+export interface Shown {
+    /** Where the change appears in the tree the client shows. */
+    readonly path: string;
+    /** The key: the path the archive holds it at, which a rename moves it from. */
+    readonly held: string;
+    readonly change: Change;
+}
+
 /**
  * What the daemon's buffer has to be told for its set to become this one.
  *
@@ -127,6 +136,22 @@ export class Pending {
             }
         }
         return visible;
+    }
+
+    /**
+     * Every change, at the path it is visible at as well as the path it is
+     * keyed by, which is what a decoration on the tree needs.
+     *
+     * The inverse of {@link Pending.address}: a buffered rename moves what the
+     * archive still holds where it was.
+     */
+    shown(): Shown[] {
+        return this.paths().map((held) => ({
+            path: this.visible(held),
+            held,
+            // `paths` came from this map, so the change is there.
+            change: this.changes.get(held) as Change,
+        }));
     }
 
     /**
@@ -325,6 +350,20 @@ export class Pending {
             offer.push([held, { kind: 'rename', to }]);
         }
         return { forget, offer: inCommitOrder(offer) };
+    }
+
+    /** Where a held path appears once the set's renames are applied. */
+    private visible(held: string): string {
+        const there = this.changes.get(held);
+        if (there?.kind === 'rename') {
+            return there.to;
+        }
+        for (const [from, change] of this.changes) {
+            if (change.kind === 'rename' && from !== held && atOrUnder(held, from)) {
+                return moved(held, from, change.to);
+            }
+        }
+        return held;
     }
 
     /** Refuses a change the set cannot hold beside the one already at its path. */

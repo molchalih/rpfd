@@ -1,0 +1,46 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-latest.schema.json",
+  "manifest_version": "0.3",
+  "name": "rpf",
+  "display_name": "rpf",
+  "version": "0.0.0",
+  "description": "Read and write RAGE Package Format archives",
+  "long_description": "Six read-mostly tools over RPF2 through RPF7 archives: summarise one, list a path, read an entry as bytes or as its XML view, plan a change set, apply it, and verify every entry against what the archive says. Entry bytes never travel on the wire in either direction — a read writes the file you name, and a write reads the file you name.",
+  "author": {
+    "name": "molchalih",
+    "url": "https://github.com/molchalih"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/molchalih/rpf"
+  },
+  "homepage": "https://github.com/molchalih/rpf",
+  "documentation": "https://github.com/molchalih/rpf/blob/main/clients/mcp/README.md",
+  "support": "https://github.com/molchalih/rpf/issues",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["rpf", "rage", "archive", "gta", "modding"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/darwin/rpf",
+    "mcp_config": {
+      "command": "${__dirname}/server/darwin/rpf",
+      "args": ["serve", "--mcp"],
+      "env": {},
+      "platform_overrides": {
+        "linux": { "command": "${__dirname}/server/linux/rpf" },
+        "win32": { "command": "${__dirname}/server/win32/rpf.exe" }
+      }
+    }
+  },
+  "tools": [
+    { "name": "rpf_info", "description": "Summarise an archive, or one nested inside it" },
+    { "name": "rpf_list", "description": "List what is at a path, filtered and paged" },
+    { "name": "rpf_read", "description": "Read one entry, as its bytes or as its XML view" },
+    { "name": "rpf_plan", "description": "Report what a change set would do, and write nothing" },
+    { "name": "rpf_apply", "description": "Apply a change set: writes, removals, renames, directories" },
+    { "name": "rpf_verify", "description": "Read every entry back and check it against what the archive says" }
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"]
+  }
+}

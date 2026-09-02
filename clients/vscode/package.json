@@ -5,7 +5,7 @@
   "version": "0.0.0",
   "license": "MIT OR Apache-2.0",
   "engines": {
-    "vscode": "^1.90.0",
+    "vscode": "^1.101.0",
     "node": ">=20"
   },
   "categories": [
@@ -28,6 +28,12 @@
     }
   },
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "rpf.servers",
+        "label": "RPF Archives"
+      }
+    ],
     "commands": [
       {
         "command": "rpf.mountArchive",
@@ -41,12 +47,7 @@
       },
       {
         "command": "rpf.saveArchive",
-        "title": "Save Archive",
-        "category": "RPF"
-      },
-      {
-        "command": "rpf.previewSave",
-        "title": "Preview Archive Save",
+        "title": "Rebuild Archive",
         "category": "RPF"
       },
       {
@@ -68,6 +69,55 @@
         "command": "rpf.endHandOff",
         "title": "Stop Watching Handed-Off Files",
         "category": "RPF"
+      }
+    ],
+    "colors": [
+      {
+        "id": "rpf.modifiedResourceForeground",
+        "description": "Colour of an entry with a buffered edit waiting to be written to the archive.",
+        "defaults": {
+          "dark": "gitDecoration.modifiedResourceForeground",
+          "light": "gitDecoration.modifiedResourceForeground",
+          "highContrast": "gitDecoration.modifiedResourceForeground"
+        }
+      },
+      {
+        "id": "rpf.addedResourceForeground",
+        "description": "Colour of an entry this session created, waiting to be written to the archive.",
+        "defaults": {
+          "dark": "gitDecoration.addedResourceForeground",
+          "light": "gitDecoration.addedResourceForeground",
+          "highContrast": "gitDecoration.addedResourceForeground"
+        }
+      },
+      {
+        "id": "rpf.deletedResourceForeground",
+        "description": "Colour of an entry with a buffered deletion waiting to be written to the archive.",
+        "defaults": {
+          "dark": "gitDecoration.deletedResourceForeground",
+          "light": "gitDecoration.deletedResourceForeground",
+          "highContrast": "gitDecoration.deletedResourceForeground"
+        }
+      },
+      {
+        "id": "rpf.renamedResourceForeground",
+        "description": "Colour of an entry with a buffered rename waiting to be written to the archive.",
+        "defaults": {
+          "dark": "gitDecoration.renamedResourceForeground",
+          "light": "gitDecoration.renamedResourceForeground",
+          "highContrast": "gitDecoration.renamedResourceForeground"
+        }
+      }
+    ],
+    "resourceLabelFormatters": [
+      {
+        "scheme": "rpf",
+        "formatting": {
+          "label": "${path}",
+          "separator": "/",
+          "tildify": false,
+          "workspaceSuffix": "rpf"
+        }
       }
     ],
     "menus": {
@@ -130,7 +180,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "^1.101.0",
     "@vscode/test-electron": "^2.5.2",
     "typescript": "^5.9.0"
   }

@@ -2,7 +2,7 @@
 
 Edit files inside RAGE `.rpf` archives as ordinary files. The archive mounts as
 a folder in the explorer, entries open and save the way any other file does,
-and the archive itself is written by one explicit act.
+and the archive is written back for you whenever it can be patched in place.
 
 The extension holds no format knowledge of its own. Everything it does it asks
 the `rpf` binary for, over `rpf serve --stdio` — one long-lived process per
@@ -20,24 +20,37 @@ window, with the entry table parsed once and kept warm.
   given key material. No keys are bundled: `rpf keys extract` reads them from
   your own game installation and caches them, and the extension finds them
   there.
-- **Holds changes until you say so.** Saving a document buffers the edit;
-  `RPF: Save Archive` writes the archive. Creating, deleting and renaming
-  entries in the explorer buffer the same way.
-- **Says what a save would cost.** `RPF: Preview Archive Save` reports whether
-  it would patch the archive in place or rebuild it, and which edits do not fit
-  where they are.
-- **Can be stopped.** The save progress notification is cancellable. A
+- **Writes your edits for you, when it can do it in place.** Saving a document
+  buffers the edit, and a moment later the archive is patched with it.
+  Creating, deleting and renaming entries in the explorer buffer the same way.
+- **Shows what is waiting, where it is waiting.** An entry with a buffered
+  change is badged in the explorer with the letter git uses — `M` modified, `A`
+  added, `D` deleted, `R` renamed — and every folder above it carries the badge
+  too. The colours are the theme's: this extension contributes four colour ids
+  that default to git's own, so a theme that recolours git recolours these.
+- **Never rebuilds an archive behind your back.** An edit that does not fit
+  where its entry sits, and any change to what the archive holds, would have
+  the whole archive written out again. The edits stay buffered instead, the
+  status bar says so, and `RPF: Rebuild Archive` is what writes them.
+- **Can be stopped.** The rebuild progress notification is cancellable. A
   cancelled rebuild leaves the original archive untouched.
 - **Checks an archive.** `RPF: Verify Archive` reads every entry back and lists
   what did not come back as recorded.
 - **Hands an asset to another tool.** `RPF: Edit With Another Tool` writes a
   `.ytd`, `.yft` or the like to disk, watches it, and buffers whatever the
   other tool writes back.
+- **Gives the editor's agents an MCP server.** A mounted archive is a folder
+  only inside this editor, so nothing outside its file service — an agent
+  included — can read one. The extension registers `rpf serve --mcp` instead,
+  built from the same binary it found for itself, and there is nothing to
+  configure. `clients/mcp/README.md` describes the six tools it offers. With no
+  binary, no server is offered rather than one that cannot start.
 
 ## Requirements
 
-The `rpf` binary. The extension looks for it in this order, and proves each
-candidate by running `rpf --version`:
+VS Code 1.101 or later, for the MCP server registration, and the `rpf` binary.
+The extension looks for the binary in this order, and proves each candidate by
+running `rpf --version`:
 
 1. The `rpf.binaryPath` setting. It is machine-scoped, so a workspace cannot
    choose which executable the extension runs.
@@ -45,8 +58,9 @@ candidate by running `rpf --version`:
 3. The first `rpf` on `PATH`.
 
 With none of them, the first mount fails with a message naming every place it
-looked. `rpf` is one static binary with no runtime prerequisite: put it on
-`PATH`, or build it and point the setting at the result.
+looked, and no MCP server is offered. `rpf` is one static binary with no
+runtime prerequisite: put it on `PATH`, or build it and point the setting at
+the result.
 
 ## Settings
 
@@ -61,7 +75,22 @@ looked. `rpf` is one static binary with no runtime prerequisite: put it on
 A listing from the daemon is the archive as it is on disk: a created entry is
 not in it, a deleted one still is, and a renamed one is under its old name,
 until the save. So the extension keeps the buffered changes itself and shows
-you the archive a save would produce. Nothing on disk has moved until you save.
+you the archive a save would produce, badged with what is waiting against each
+entry. Nothing on disk has moved until the archive is written.
+
+## When you have to ask for the rebuild
+
+An archive is patched in place when every buffered edit fits in the room its
+entry already has. Anything else — an edit that grew, a created, deleted or
+renamed entry — means writing the whole archive out again, which is slow and
+replaces the file. That is not done for you: the edits stay buffered, the
+status bar turns amber with how many are waiting, and hovering it says why.
+Run `RPF: Rebuild Archive`, or press the status bar item, to write them. The
+archive on disk is untouched until you do.
+
+Writing into a detected game installation is refused as well. The rebuild
+command offers to do it anyway; nothing writes there without being told to
+twice.
 
 ## Limits
 

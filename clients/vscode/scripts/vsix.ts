@@ -38,7 +38,7 @@ interface Manifest {
 }
 
 /** Every file that goes into the package. */
-export function contents(root: string, publisher: string): Part[] {
+export function contents(root: string, publisher: string, target?: string): Part[] {
     const manifest = JSON.parse(
         fs.readFileSync(path.join(root, 'package.json'), 'utf8'),
     ) as Manifest;
@@ -86,7 +86,7 @@ export function contents(root: string, publisher: string): Part[] {
 
     parts.unshift(
         { name: '[Content_Types].xml', bytes: Buffer.from(contentTypes(parts), 'utf8') },
-        { name: 'extension.vsixmanifest', bytes: Buffer.from(vsixManifest(shipped, publisher, root), 'utf8') },
+        { name: 'extension.vsixmanifest', bytes: Buffer.from(vsixManifest(shipped, publisher, root, target), 'utf8') },
     );
     return parts;
 }
@@ -163,13 +163,14 @@ function contentTypes(parts: readonly Part[]): string {
 }
 
 /** The gallery manifest, which is what an installer reads first. */
-function vsixManifest(manifest: Manifest, publisher: string, root: string): string {
+function vsixManifest(manifest: Manifest, publisher: string, root: string, target?: string): string {
     const license = licenseOf(root)?.name;
+    const platform = target ? ` TargetPlatform="${escapeXml(target)}"` : '';
     return [
         '<?xml version="1.0" encoding="utf-8"?>',
         '<PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">',
         '  <Metadata>',
-        `    <Identity Language="en-US" Id="${escapeXml(manifest.name)}" Version="${escapeXml(manifest.version)}" Publisher="${escapeXml(publisher)}"/>`,
+        `    <Identity Language="en-US" Id="${escapeXml(manifest.name)}" Version="${escapeXml(manifest.version)}" Publisher="${escapeXml(publisher)}"${platform}/>`,
         `    <DisplayName>${escapeXml(manifest.displayName)}</DisplayName>`,
         `    <Description xml:space="preserve">${escapeXml(manifest.description)}</Description>`,
         `    <Tags>${escapeXml((manifest.keywords ?? []).join(','))}</Tags>`,
@@ -214,13 +215,18 @@ function escapeXml(text: string): string {
 }
 
 /** Builds the package and returns where it was written. */
-export function build(root: string, publisher: string, out?: string): string {
+export function build(root: string, publisher: string, out?: string, target?: string): string {
     const manifest = JSON.parse(
         fs.readFileSync(path.join(root, 'package.json'), 'utf8'),
     ) as Manifest;
     const at = out ?? path.join(root, `${manifest.name}-${manifest.version}.vsix`);
-    fs.writeFileSync(at, zip(contents(root, publisher)));
+    fs.writeFileSync(at, zip(contents(root, publisher, target)));
     return at;
+}
+
+/** What a part is extracted as. The bundled binary has to be executable. */
+function modeOf(name: string): number {
+    return name.startsWith('extension/bin/') ? 0o100755 : 0o100644;
 }
 
 /** One zip file holding every part, each deflated. */
@@ -247,9 +253,11 @@ function zip(parts: readonly Part[]): Buffer {
         local.writeUInt16LE(name.length, 26);
         locals.push(local, name, deflated);
 
+        // Made by Unix, so the mode below is read: an MS-DOS entry extracts
+        // as 0o644 and locate.ts skips a binary it cannot execute.
         const entry = Buffer.alloc(46);
         entry.writeUInt32LE(0x02014b50, 0);
-        entry.writeUInt16LE(20, 4); // version made by
+        entry.writeUInt16LE(0x0314, 4); // version made by
         entry.writeUInt16LE(20, 6); // version needed
         entry.writeUInt16LE(0x0800, 8);
         entry.writeUInt16LE(8, 10);
@@ -257,6 +265,7 @@ function zip(parts: readonly Part[]): Buffer {
         entry.writeUInt32LE(deflated.length, 20);
         entry.writeUInt32LE(part.bytes.length, 24);
         entry.writeUInt16LE(name.length, 28);
+        entry.writeUInt32LE(modeOf(part.name) * 0x10000, 38);
         entry.writeUInt32LE(at, 42);
         central.push(entry, name);
 
@@ -298,8 +307,12 @@ function main(argv: readonly string[]): number {
     }
     const outAt = argv.indexOf('--out');
     const out = outAt >= 0 ? argv[outAt + 1] : undefined;
-    const written = build(ROOT, publisher.trim(), out);
-    const parts = contents(ROOT, publisher.trim()).length;
+    // No --target is the package platforms without one of their own fall back
+    // to, so an absent target is a package rather than a mistake.
+    const targetAt = argv.indexOf('--target');
+    const target = targetAt >= 0 ? argv[targetAt + 1] : undefined;
+    const written = build(ROOT, publisher.trim(), out, target);
+    const parts = contents(ROOT, publisher.trim(), target).length;
     process.stdout.write(
         `${written}\n${parts} files, ${fs.statSync(written).size} bytes\n` +
             'Install it with: code --install-extension ' +

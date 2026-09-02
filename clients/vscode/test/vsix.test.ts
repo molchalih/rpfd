@@ -20,6 +20,16 @@ import { scratch } from './support.js';
 /** The extension's own directory, from the compiled test. */
 const ROOT = path.resolve(__dirname, '../..');
 
+/** Whether unzip is on hand to extract the package independently. */
+function unzip(): boolean {
+    try {
+        execFileSync('unzip', ['-v'], { stdio: 'ignore' });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 /** Whether a Python is on hand to read the zip back independently. */
 function python(): string | undefined {
     for (const candidate of ['python3', 'python']) {
@@ -104,6 +114,44 @@ describe('the vsix', () => {
             assert.ok(declared.has(extension), `${part.name} has no content type`);
         }
     });
+
+    it('declares the platform it was packaged for, and none when it was not', () => {
+        const of = (target?: string) =>
+            contents(ROOT, 'somebody', target)
+                .find((part) => part.name === 'extension.vsixmanifest')
+                ?.bytes.toString() ?? '';
+        assert.match(of('darwin-arm64'), /<Identity [^>]*TargetPlatform="darwin-arm64"/);
+        assert.ok(!of().includes('TargetPlatform'), 'the fallback package named a platform');
+    });
+
+    it(
+        'extracts the bundled binary executable',
+        {
+            skip:
+                process.platform === 'win32'
+                    ? 'no unix modes'
+                    : unzip()
+                      ? false
+                      : 'no unzip',
+        },
+        () => {
+            assert.ok(!fs.existsSync(path.join(ROOT, 'bin')), 'bin/ is in the way');
+            try {
+                fs.mkdirSync(path.join(ROOT, 'bin', 'darwin-arm64'), { recursive: true });
+                fs.writeFileSync(path.join(ROOT, 'bin', 'darwin-arm64', 'rpf'), '#!/bin/sh\n');
+                const at = build(ROOT, 'somebody', path.join(dir, 'rpf-exec.vsix'));
+                const into = path.join(dir, 'unpacked');
+                fs.rmSync(into, { recursive: true, force: true });
+                fs.mkdirSync(into, { recursive: true });
+                execFileSync('unzip', ['-q', at, '-d', into]);
+                // What locate.ts gates every candidate on; a zip entry made by
+                // MS-DOS extracts as 0o644 and is silently skipped.
+                fs.accessSync(path.join(into, 'extension/bin/darwin-arm64/rpf'), fs.constants.X_OK);
+            } finally {
+                fs.rmSync(path.join(ROOT, 'bin'), { recursive: true, force: true });
+            }
+        },
+    );
 
     it('writes a zip a second reader agrees is a zip', { skip: python() ? false : 'no python' } , () => {
         const at = build(ROOT, 'somebody', path.join(dir, 'rpf-test.vsix'));

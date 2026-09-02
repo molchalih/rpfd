@@ -1,0 +1,6 @@
+# One archive per line. Blank lines and # comments are ignored; a leading ~ is
+# expanded. These are read, never written: every measurement runs on a copy.
+~/rpf-demo/test/test.rpf
+~/Downloads/rage gta community assets/cars/rmrp_vesta/dlc.rpf
+~/rpf-demo/test2/test2.rpf
+~/Downloads/rage gta community assets/clothes/dlc.rpf

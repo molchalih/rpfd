@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.molchalih/rpf",
+  "title": "rpf",
+  "description": "Read and write RAGE Package Format archives",
+  "version": "0.0.0",
+  "websiteUrl": "https://github.com/molchalih/rpf",
+  "repository": {
+    "source": "github",
+    "url": "https://github.com/molchalih/rpf"
+  },
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "registryBaseUrl": "https://github.com",
+      "identifier": "https://github.com/molchalih/rpf/releases/download/v0.0.0/rpf-v0.0.0.mcpb",
+      "version": "0.0.0",
+      "fileSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

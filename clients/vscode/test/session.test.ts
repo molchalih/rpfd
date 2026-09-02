@@ -11,7 +11,7 @@ import { after, describe, it } from 'node:test';
 
 import { Daemon } from '../src/core/daemon.js';
 import { DaemonError, EXIT, advise } from '../src/core/errors.js';
-import { ArchiveSession, SessionBusy } from '../src/core/session.js';
+import { ArchiveSession } from '../src/core/session.js';
 import {
     SKIP,
     binary,
@@ -193,15 +193,15 @@ describe('an archive session', { skip: SKIP }, () => {
         await session.write('bulk/00.bin', Buffer.from('replaced'));
 
         let settled = false;
-        const stopping = session.save({
+        const stopping = session.begin({
             rebuild: true,
             onProgress: () => {
                 if (!settled) {
-                    void session.cancelSave().catch(() => undefined);
+                    void session.cancelSave(stopping.ticket).catch(() => undefined);
                 }
             },
         });
-        const failure = await stopping.then(
+        const failure = await stopping.result.then(
             () => undefined,
             (error: unknown) => error,
         );
@@ -217,13 +217,163 @@ describe('an archive session', { skip: SKIP }, () => {
         assert.equal(saved?.committed, 1, 'the same save could not be asked for again');
     });
 
-    it('refuses to start a second save while one is running', async () => {
+    it('queues a second save behind the one already running', async () => {
         const archive = await archiveOf('busy');
         const session = await ArchiveSession.open(start(), archive);
         await session.write('data/greeting.txt', Buffer.from('replaced'));
         const first = session.save();
-        await assert.rejects(() => session.save(), SessionBusy);
-        await first;
+        const second = session.save();
+        assert.equal((await first)?.committed, 1);
+        assert.equal(await second, undefined, 'one set of edits was committed twice');
+    });
+
+    it('sends a write issued during a save only once that save has cleared its set', async () => {
+        const archive = await archiveOf('during');
+        const session = await ArchiveSession.open(start(), archive);
+        await session.write('data/greeting.txt', Buffer.from('replaced'));
+        const saving = session.save();
+        const writing = session.write('data/handling.meta', Buffer.from('<handling x="2"/>'));
+        assert.equal((await saving)?.committed, 1);
+        await writing;
+        assert.deepEqual(session.dirtyPaths(), ['data/handling.meta']);
+        assert.equal(session.state, 'dirty');
+        assert.equal((await session.save())?.committed, 1);
+    });
+
+    it('addresses a write issued during a save against the archive the save leaves', async () => {
+        const archive = await archiveOf('renamed-under');
+        const session = await ArchiveSession.open(start(), archive);
+        await session.rename('data/greeting.txt', 'data/hello.txt');
+        const saving = session.save();
+        const writing = session.write('data/hello.txt', Buffer.from('written after'));
+        assert.equal((await saving)?.committed, 1);
+        await writing;
+        assert.deepEqual(session.dirtyPaths(), ['data/hello.txt']);
+        assert.equal((await session.save())?.committed, 1);
+        assert.equal(Buffer.from(await session.read('data/hello.txt')).toString(), 'written after');
+        assert.equal(session.tree.at('data/greeting.txt'), undefined);
+    });
+
+    it('gives up a save that was cancelled before it began', async () => {
+        const archive = await archiveOf('cancel-queued');
+        const before = fs.readFileSync(archive);
+        const session = await ArchiveSession.open(start(), archive);
+        await session.write('data/greeting.txt', Buffer.from('replaced'));
+        const saving = session.begin();
+        assert.equal((await session.cancelSave(saving.ticket)).cancelling, true);
+        assert.equal(await saving.result, undefined, 'a cancelled save was written anyway');
+        assert.deepEqual(fs.readFileSync(archive), before);
+        assert.equal(session.state, 'dirty');
+        assert.equal((await session.save())?.committed, 1, 'the edit went with the cancel');
+    });
+
+    it('abandons the save a cancel named and leaves the one asked for after it', async () => {
+        const archive = await archiveOf('cancel-then-save');
+        const session = await ArchiveSession.open(start(), archive);
+        await session.write('data/greeting.txt', Buffer.from('replaced'));
+
+        const cancelled = session.begin();
+        const stopping = session.cancelSave(cancelled.ticket);
+        const asked = session.save();
+
+        assert.equal((await stopping).cancelling, true);
+        assert.equal(await cancelled.result, undefined, 'a cancelled save was written anyway');
+        assert.equal((await asked)?.committed, 1, 'the save asked for after the cancel did nothing');
+        assert.equal(session.state, 'clean');
+        assert.equal(Buffer.from(await session.read('data/greeting.txt')).toString(), 'replaced');
+    });
+
+    it('takes back the queued save a cancel named and no other', async () => {
+        const archive = await archiveOf('cancel-one-of-two');
+        const session = await ArchiveSession.open(start(), archive);
+        await session.write('data/greeting.txt', Buffer.from('replaced'));
+
+        const first = session.begin();
+        const second = session.begin();
+        assert.equal((await session.cancelSave(second.ticket)).cancelling, true);
+
+        assert.equal((await first.result)?.committed, 1, 'a cancel took a save it was not given');
+        assert.equal(await second.result, undefined, 'a cancelled save was written anyway');
+        assert.equal(session.state, 'clean');
+    });
+
+    it('leaves a running save alone when the cancel named a queued one', async () => {
+        const archive = path.join(dir, 'cancel-queued-not-running.rpf');
+        await packArchive(archive, {
+            entries: Array.from({ length: 16 }, (_, at) => ({
+                path: `bulk/${String(at).padStart(2, '0')}.bin`,
+                bytes: incompressible(512 * 1024),
+            })),
+        });
+        const session = await ArchiveSession.open(start(), archive);
+        await session.write('bulk/00.bin', Buffer.from('replaced'));
+
+        let running = (): void => undefined;
+        const begun = new Promise<void>((resolve) => {
+            running = resolve;
+        });
+        const rebuilding = session.begin({ rebuild: true, onProgress: () => running() });
+        await begun;
+        const queued = session.begin();
+        assert.equal((await session.cancelSave(queued.ticket)).cancelling, true);
+
+        assert.equal(
+            (await rebuilding.result)?.committed,
+            1,
+            'the cancel of a queued save stopped the one already running',
+        );
+        assert.equal(await queued.result, undefined);
+        assert.equal(session.state, 'clean');
+    });
+
+    it('leaves no cancel behind when a dry run is refused', async () => {
+        // Inside a game installation every dry run is refused, which is the one
+        // way out of a save that never sent a request a cancel could name.
+        const install = path.join(dir, 'install');
+        fs.mkdirSync(install, { recursive: true });
+        fs.writeFileSync(path.join(install, 'GTA5.exe'), '');
+        const packed = await archiveOf('guarded');
+        const archive = path.join(install, 'guarded.rpf');
+        fs.copyFileSync(packed, archive);
+
+        const session = await ArchiveSession.open(start(), archive);
+        await session.write('data/greeting.txt', Buffer.from('replaced'));
+
+        const refused = session.begin({ patchOnly: true });
+        await new Promise((resolve) => setImmediate(resolve));
+        const rebuilding = session.begin({ rebuild: true });
+        assert.equal((await session.cancelSave(rebuilding.ticket)).cancelling, true);
+
+        const failure = await refused.result.then(
+            () => undefined,
+            (error: unknown) => error,
+        );
+        assert.ok(failure instanceof DaemonError, String(failure));
+        assert.equal(failure.failure, 'GameInstall');
+        assert.equal(await rebuilding.result, undefined);
+
+        const saved = await session.save({ force: true });
+        assert.equal(saved?.committed, 1, 'a cancel outlived the save it was given');
+    });
+
+    it('holds a save back rather than rebuilding when only a patch was asked for', async () => {
+        const archive = await archiveOf('patch-only');
+        const before = fs.readFileSync(archive);
+        const session = await ArchiveSession.open(start(), archive);
+
+        await session.write('data/greeting.txt', Buffer.from('tiny'));
+        assert.equal((await session.save({ patchOnly: true }))?.committed, 1);
+
+        await session.write('data/handling.meta', incompressible(64 * 1024));
+        const held = await session.save({ patchOnly: true });
+        assert.equal(held?.committed, 0, 'a set that would rebuild was written anyway');
+        assert.equal(held?.method, 'rebuild');
+        assert.match(String(held?.why), /do not fit/);
+        assert.equal(session.state, 'dirty');
+        assert.deepEqual(session.dirtyPaths(), ['data/handling.meta']);
+        assert.notDeepEqual(fs.readFileSync(archive), before, 'the first patch did not land');
+
+        assert.equal((await session.save())?.method, 'rebuild');
     });
 
     it('refuses a second session on one archive, naming the handle that holds it', async () => {

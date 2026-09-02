@@ -8,40 +8,65 @@
 
 import * as vscode from 'vscode';
 
-import { advise, render } from './core/errors.js';
+import { DaemonError, advise, render } from './core/errors.js';
 import type { Progress } from './core/protocol.js';
+import type { ArchiveSession, SaveOptions, Saved } from './core/session.js';
 import { SCHEME, rootOf } from './core/uri.js';
 import { Archives, type Mounted } from './vscode/archives.js';
+import { AutoSave } from './vscode/autosave.js';
+import { Decorations } from './vscode/decorations.js';
 import { RpfFileSystem } from './vscode/filesystem.js';
+import { serveMcp } from './vscode/mcp.js';
 import { log, note, report } from './vscode/messages.js';
 
+/** What the extension hands back, which only its own editor suite asks for. */
+export interface Api {
+    decorations: Decorations;
+}
+
 /** Starts the extension. */
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): Api {
     const archives = new Archives(context);
     const files = new RpfFileSystem(archives);
     const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     status.command = 'rpf.saveArchive';
+    // Before the listener below, so that an archive is out of the held set by
+    // the time the status bar is asked what to show.
+    const autosave = new AutoSave(archives, files);
+    const decorations = new Decorations(archives);
 
     context.subscriptions.push(
         vscode.workspace.registerFileSystemProvider(SCHEME, files, { isCaseSensitive: true }),
+        vscode.window.registerFileDecorationProvider(decorations),
         status,
+        autosave,
+        decorations,
         { dispose: () => void archives.dispose() },
-        archives.onDidChange(() => showState(archives, status)),
+        archives.onDidChange(() => showState(autosave, status)),
+        autosave.onDidHold((held) => {
+            showState(autosave, status);
+            void vscode.window
+                .showWarningMessage(
+                    `${basename(held.path)}: ${held.edits} edit(s) could not be written for you. ${held.why}`,
+                    'Rebuild Now',
+                )
+                .then((chosen) => {
+                    if (chosen === 'Rebuild Now') {
+                        void vscode.commands.executeCommand('rpf.saveArchive', held.path);
+                    }
+                });
+        }),
         archives.onImported((event) => {
             if ('failure' in event) {
                 void report(event.failure, `re-importing ${event.inside}`);
-                return;
             }
-            void vscode.window.showInformationMessage(
-                `${event.inside}: ${event.len} bytes read back and buffered. Run "RPF: Save Archive" to write them.`,
-            );
         }),
+        ...serveMcp(context),
     );
 
     register(context, 'rpf.mountArchive', (uri?: vscode.Uri) => mount(archives, files, uri));
     register(context, 'rpf.unmountArchive', () => unmount(archives));
-    register(context, 'rpf.saveArchive', () => save(archives, files));
-    register(context, 'rpf.previewSave', () => preview(archives));
+    register(context, 'rpf.saveArchive', (path?: string) => save(archives, files, autosave, path));
     register(context, 'rpf.discardEdits', () => discard(archives, files));
     register(context, 'rpf.verifyArchive', () => verify(archives));
     register(context, 'rpf.handOff', (uri?: vscode.Uri) => handOff(archives, uri));
@@ -50,7 +75,8 @@ export function activate(context: vscode.ExtensionContext): void {
     // A window reopened on a saved workspace already has the folders; the
     // archives behind them have to be opened again before anything can be read.
     void remount(archives);
-    showState(archives, status);
+    showState(autosave, status);
+    return { decorations };
 }
 
 /** Stops it. The daemon goes with the subscriptions. */
@@ -126,7 +152,9 @@ async function mount(
         await vscode.commands.executeCommand('revealInExplorer', root);
         return;
     }
-    const name = `${basename(mounted.session.path)} (rpf)`;
+    // The `(rpf)` suffix is the resource label formatter's, contributed in
+    // `package.json`, which puts it on breadcrumbs and tabs as well.
+    const name = basename(mounted.session.path);
     const added = vscode.workspace.updateWorkspaceFolders(
         vscode.workspace.workspaceFolders?.length ?? 0,
         0,
@@ -176,9 +204,22 @@ async function unmount(archives: Archives): Promise<void> {
     }
 }
 
-/** The one act that writes the archive. */
-async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
-    const mount = await choose(archives, 'Save which archive?');
+/**
+ * The one act that writes the archive.
+ *
+ * With `path`, the archive it names and no other: a caller that has already
+ * said which archive it means must not be answered with a picker.
+ */
+async function save(
+    archives: Archives,
+    files: RpfFileSystem,
+    autosave: AutoSave,
+    path?: string,
+): Promise<void> {
+    const mount =
+        path === undefined
+            ? await choose(archives, 'Save which archive?')
+            : archives.all().find((open) => open.session.path === path);
     if (!mount) {
         return;
     }
@@ -193,23 +234,7 @@ async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
     // in the session in the first place.
     await vscode.workspace.saveAll(false);
 
-    const saved = await vscode.window.withProgress(
-        {
-            location: vscode.ProgressLocation.Notification,
-            title: `Saving ${basename(session.path)}`,
-            cancellable: true,
-        },
-        async (progress, token) => {
-            token.onCancellationRequested(() => {
-                void session.cancelSave().then((answer) => {
-                    if (!answer.cancelling) {
-                        progress.report({ message: answer.reason ?? 'this cannot be stopped' });
-                    }
-                });
-            });
-            return session.save({ onProgress: (step) => progress.report(reported(step)) });
-        },
-    );
+    const saved = await autosave.asked(session, () => commit(session, {}));
     files.changed(session.path);
     if (!saved) {
         return;
@@ -220,38 +245,66 @@ async function save(archives: Archives, files: RpfFileSystem): Promise<void> {
     );
 }
 
-/** What a save would do, without doing any of it. */
-async function preview(archives: Archives): Promise<void> {
-    const mount = await choose(archives, 'Preview a save of which archive?');
-    if (!mount) {
-        return;
+/**
+ * The save itself, with the install guard answered by whoever asked for it.
+ *
+ * The daemon refuses a write inside a game installation, and only a person can
+ * say that they meant it; nothing else here retries a refusal.
+ */
+async function commit(
+    session: ArchiveSession,
+    options: SaveOptions,
+): Promise<Saved | undefined> {
+    try {
+        return await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: `Saving ${basename(session.path)}`,
+                cancellable: true,
+            },
+            async (progress, token) => {
+                const saving = session.begin({
+                    ...options,
+                    onProgress: (step) => progress.report(reported(step)),
+                });
+                token.onCancellationRequested(() => {
+                    void session.cancelSave(saving.ticket).then(
+                        (answer) => {
+                            if (!answer.cancelling) {
+                                progress.report({
+                                    message: answer.reason ?? 'this cannot be stopped',
+                                });
+                            }
+                        },
+                        // A save that finished between the click and this call
+                        // is nothing to tell the user about.
+                        (failure: unknown) => note(`cancelling ${session.path}: ${String(failure)}`),
+                    );
+                });
+                return saving.result;
+            },
+        );
+    } catch (failure) {
+        if (options.force === true || !guarded(failure)) {
+            throw failure;
+        }
+        const chosen = await vscode.window.showWarningMessage(
+            `${basename(session.path)} is inside a game installation.`,
+            { modal: true, detail: advise(failure).reason },
+            'Write into the game installation anyway',
+        );
+        if (chosen === undefined) {
+            return undefined;
+        }
+        return commit(session, { ...options, force: true });
     }
-    if (mount.session.state === 'clean') {
-        void vscode.window.showInformationMessage('There are no buffered edits to preview.');
-        return;
-    }
-    const planned = await mount.session.preview();
-    log().appendLine(`--- ${mount.session.path}: a save would ${planned.method} ---`);
-    for (const entry of planned.planned) {
-        log().appendLine(`  patch ${entry.path} at ${entry.at}: ${entry.len} of ${entry.allocation}`);
-    }
-    for (const entry of planned.rejected) {
-        log().appendLine(`  will not fit: ${entry.path} needs ${entry.needed}, has ${entry.allocation}`);
-    }
-    for (const entry of planned.structural) {
-        log().appendLine(`  ${entry.path} ${entry.structural}, which no patch can express`);
-    }
-    log().show(true);
-    // A structural change is a rebuild whatever else is in the set, so it is
-    // what the report names first.
-    const why =
-        planned.structural.length > 0
-            ? `${planned.structural.length} change(s) alter what the archive holds`
-            : `${planned.rejected.length} edit(s) do not fit where they are`;
-    void vscode.window.showInformationMessage(
-        planned.method === 'patch'
-            ? 'A save would patch every edit in place.'
-            : `A save would rebuild the archive: ${why}.`,
+}
+
+/** Whether the daemon refused this only because of where the archive sits. */
+function guarded(failure: unknown): boolean {
+    return (
+        failure instanceof DaemonError &&
+        (failure.failure === 'GameInstall' || failure.failure === 'UncertainInstall')
     );
 }
 
@@ -377,21 +430,22 @@ function reported(step: Progress): { message: string; increment?: number } {
     };
 }
 
-/** The dirty state of every mounted archive, in the status bar. */
-function showState(archives: Archives, status: vscode.StatusBarItem): void {
-    const open = archives.all();
-    if (open.length === 0) {
+/**
+ * The archives an autosave held back, in the status bar.
+ *
+ * Only those: an edit that is about to be written for the user is not something
+ * to keep an eye on, and a badge that is always there says nothing.
+ */
+function showState(autosave: AutoSave, status: vscode.StatusBarItem): void {
+    const held = autosave.stuck();
+    if (held.length === 0) {
         status.hide();
         return;
     }
-    const dirty = open.filter((mount) => mount.session.state !== 'clean');
-    status.text = dirty.length === 0 ? '$(archive) rpf' : `$(archive) rpf: ${dirty.length} unsaved`;
-    status.tooltip = open
-        .map(
-            (mount) =>
-                `${mount.session.path} — ${mount.session.state} (${mount.session.dirtyPaths().length} buffered)`,
-        )
-        .join('\n');
+    const edits = held.reduce((count, one) => count + one.edits, 0);
+    status.text = `$(warning) rpf: ${edits} edit(s) need a rebuild`;
+    status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+    status.tooltip = held.map((one) => `${one.path} — ${one.why}`).join('\n');
     status.show();
 }
 

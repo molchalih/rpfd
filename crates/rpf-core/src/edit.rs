@@ -123,7 +123,9 @@ fn restructuring(change: &Change) -> bool {
     !matches!(*change, Change::Write { create: false, .. })
 }
 
-fn does(change: &Change) -> &'static str {
+/// What a change does, in the words a refusal names it by.
+#[must_use]
+pub fn does(change: &Change) -> &'static str {
     match *change {
         Change::Write { .. } => "a write",
         Change::Remove { .. } => "a removal",

@@ -40,6 +40,11 @@ export const RPF: string | undefined = findBinary();
  * the kind. Loud is the whole point — the suite must not be able to pass, or
  * fail, against a binary that is not this tree.
  *
+ * A source is a file under a crate's `src/`, plus `Cargo.toml` and
+ * `Cargo.lock`. A crate's `tests/` is not one: cargo does not relink for a
+ * change to a test, so a guard watching those refused the whole suite over a
+ * binary that was current.
+ *
  * Only for a binary this file resolved itself. `RPF_BIN` is a deliberate
  * choice, and second-guessing it would break testing a released binary.
  */
@@ -51,28 +56,32 @@ function refuseStale(binaryPath: string): void {
     const built = fs.statSync(binaryPath).mtimeMs;
     let newest = 0;
     let newestPath = '';
+    const consider = (full: string): void => {
+        const seen = fs.statSync(full).mtimeMs;
+        if (seen > newest) {
+            newest = seen;
+            newestPath = full;
+        }
+    };
     const walk = (at: string): void => {
         for (const found of fs.readdirSync(at, { withFileTypes: true })) {
             const full = path.join(at, found.name);
             if (found.isDirectory()) {
                 walk(full);
             } else if (found.isFile()) {
-                const seen = fs.statSync(full).mtimeMs;
-                if (seen > newest) {
-                    newest = seen;
-                    newestPath = full;
-                }
+                consider(full);
             }
         }
     };
-    walk(path.join(root, 'crates'));
-    for (const also of ['Cargo.toml', 'Cargo.lock']) {
-        const full = path.join(root, also);
-        const seen = fs.statSync(full).mtimeMs;
-        if (seen > newest) {
-            newest = seen;
-            newestPath = full;
+    const crates = path.join(root, 'crates');
+    for (const crate of fs.readdirSync(crates, { withFileTypes: true })) {
+        const sources = path.join(crates, crate.name, 'src');
+        if (crate.isDirectory() && fs.existsSync(sources)) {
+            walk(sources);
         }
+    }
+    for (const also of ['Cargo.toml', 'Cargo.lock']) {
+        consider(path.join(root, also));
     }
     if (newest > built) {
         throw new Error(

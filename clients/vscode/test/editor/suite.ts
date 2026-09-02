@@ -1,5 +1,5 @@
 /**
- * The editor layer, exercised in a running editor. R7.1, R7.2, R7.3, R7.5.
+ * The editor layer, exercised in a running editor. R7.1, R7.2, R7.3, R7.5, R7.7.
  *
  * This is the half of the client `npm test` cannot reach: the filesystem
  * provider as the editor asks it questions, the commands as a person runs them,
@@ -27,6 +27,7 @@ import { promisify } from 'node:util';
 import * as vscode from 'vscode';
 
 import { SCHEME, rootOf, uriOf } from '../../src/core/uri.js';
+import type { Api } from '../../src/extension.js';
 import { binary, packArchive, scratch } from '../support.js';
 
 const tool = promisify(execFile);
@@ -134,6 +135,12 @@ function entryUri(archive: string, inside: string): vscode.Uri {
     return vscode.Uri.from(uriOf({ archive, inside }));
 }
 
+/** The badge the explorer carries for one entry, if the extension shows one. */
+function badge(archive: string, inside: string): string | undefined {
+    const api = extension().exports as Api;
+    return api.decorations.provideFileDecoration(entryUri(archive, inside))?.badge;
+}
+
 /** What the archive holds on disk, whatever the editor is showing. */
 async function listed(archive: string, inside = ''): Promise<string[]> {
     const { stdout } = await tool(binary(), ['--json', 'ls', '--recursive', archive, inside], {
@@ -215,9 +222,12 @@ function mountedPaths(): string[] {
         .map((one) => one.uri.query);
 }
 
-async function until(holds: () => boolean, complaint: () => string): Promise<void> {
+async function until(
+    holds: () => boolean | Promise<boolean>,
+    complaint: () => string,
+): Promise<void> {
     for (let attempt = 0; attempt < 200; attempt += 1) {
-        if (holds()) {
+        if (await holds()) {
             return;
         }
         await new Promise((wake) => setTimeout(wake, 50));
@@ -308,8 +318,9 @@ function workflow(): void {
         assert.deepEqual(await children(entryUri(at, 'x64/vehicles.rpf/data')), ['vehicles.meta']);
     });
 
-    it('an edit inside the nested archive buffers, and one save writes it', async () => {
-        const uri = entryUri(at, 'x64/vehicles.rpf/data/vehicles.meta');
+    it('an edit inside the nested archive is written without a save command', async () => {
+        const inside = 'x64/vehicles.rpf/data/vehicles.meta';
+        const uri = entryUri(at, inside);
         const document = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(document);
         assert.ok(document.getText().includes('VC_SUPER'));
@@ -323,23 +334,22 @@ function workflow(): void {
         );
         assert.ok(await vscode.workspace.applyEdit(edit), 'the edit was not applied');
         assert.ok(await document.save(), 'saving the document did not buffer the edit');
-
-        assert.ok(
-            text(await contents(at, 'x64/vehicles.rpf/data/vehicles.meta')).includes('VC_SUPER'),
-            'a buffered edit reached the archive before the save',
-        );
         assert.equal(
             text(await vscode.workspace.fs.readFile(uri)).includes('VC_SEDAN'),
             true,
             'the buffered edit is not what the editor reads back',
         );
 
-        await vscode.commands.executeCommand('rpf.previewSave');
-        await vscode.commands.executeCommand('rpf.saveArchive');
-
-        const written = text(await contents(at, 'x64/vehicles.rpf/data/vehicles.meta'));
-        assert.ok(written.includes('VC_SEDAN'), 'the save did not reach the archive');
-        assert.ok(!written.includes('VC_SUPER'), 'the old bytes are still there');
+        // No command is run: an edit that patches is what the autosave writes
+        // on its own, and only a set that would rebuild waits for a person.
+        await until(
+            async () => text(await contents(at, inside)).includes('VC_SEDAN'),
+            () => 'an edit that patches was never written without a save command',
+        );
+        assert.ok(
+            !text(await contents(at, inside)).includes('VC_SUPER'),
+            'the old bytes are still there',
+        );
         assert.deepEqual((await verified(at)).problems, [], 'the archive does not verify');
     });
 
@@ -354,9 +364,16 @@ function workflow(): void {
             !(await listed(at)).includes('data/added/notes.txt'),
             'a created entry reached the archive before the save',
         );
+        assert.equal(badge(at, 'data/added/notes.txt'), 'A', 'the creation carries no badge');
+        assert.equal(badge(at, 'data/added'), 'A');
         await vscode.commands.executeCommand('rpf.saveArchive');
         assert.ok((await listed(at)).includes('data/added/notes.txt'));
         assert.equal(text(await contents(at, 'data/added/notes.txt')), 'added by the editor\n');
+        assert.equal(
+            badge(at, 'data/added/notes.txt'),
+            undefined,
+            'the badge outlived the save that wrote it',
+        );
     });
 
     it('a rename is shown before the save, and is in the archive after it', async () => {
@@ -366,6 +383,7 @@ function workflow(): void {
             { overwrite: false },
         );
         assert.deepEqual(await children(entryUri(at, 'data/added')), ['renamed.txt']);
+        assert.equal(badge(at, 'data/added/renamed.txt'), 'R', 'the rename is badged where it is');
         assert.ok(
             (await listed(at)).includes('data/added/notes.txt'),
             'a rename reached the archive before the save',
@@ -382,6 +400,7 @@ function workflow(): void {
             useTrash: false,
         });
         assert.deepEqual(await children(entryUri(at, 'data/added')), []);
+        assert.equal(badge(at, 'data/added/renamed.txt'), 'D');
         assert.ok(
             (await listed(at)).includes('data/added/renamed.txt'),
             'a delete reached the archive before the save',

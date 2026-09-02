@@ -155,19 +155,7 @@ pub fn info(path: &Path, inside: &str, named_cache: Option<&Path>, json_out: boo
     let summary = rpf_core::Summary::of(&mut file, &archive, inside)?;
 
     if json_out {
-        emit(&json!({
-            "path": path.display().to_string(),
-            "inside": inside,
-            "len": summary.len,
-            "encryption": encryption_name(summary.encryption),
-            "entries": summary.entries,
-            "directories": summary.directories,
-            "binary_files": summary.binary_files,
-            "resource_files": summary.resource_files,
-            "nested_archives": summary.nested_archives,
-            "locked_archives": summary.locked_archives,
-            "unreferenced_bytes": summary.unreferenced_bytes,
-        }));
+        emit(&info_report(path, inside, &summary));
     } else {
         println!("path         {}", path.display());
         if !inside.is_empty() {
@@ -186,16 +174,38 @@ pub fn info(path: &Path, inside: &str, named_cache: Option<&Path>, json_out: boo
     Ok(())
 }
 
+/// An `info` report as JSON, shared by all three frontends.
+#[must_use]
+pub fn info_report(path: &Path, inside: &str, summary: &rpf_core::Summary) -> Value {
+    json!({
+        "path": path.display().to_string(),
+        "inside": inside,
+        "len": summary.len,
+        "encryption": encryption_name(summary.encryption),
+        "entries": summary.entries,
+        "directories": summary.directories,
+        "binary_files": summary.binary_files,
+        "resource_files": summary.resource_files,
+        "nested_archives": summary.nested_archives,
+        "locked_archives": summary.locked_archives,
+        "unreferenced_bytes": summary.unreferenced_bytes,
+    })
+}
+
 /// `ls` — what is at a path.
 pub fn ls(
     path: &Path,
     inside: &str,
     recursive: bool,
+    pattern: Option<&str>,
     named_cache: Option<&Path>,
     json_out: bool,
 ) -> Result<()> {
     let (mut file, archive) = open(path, named_cache)?;
-    let rows = rpf_core::Listed::at(&mut file, &archive, inside, recursive)?;
+    let rows = matching(
+        rpf_core::Listed::at(&mut file, &archive, inside, recursive)?,
+        pattern,
+    );
 
     if json_out {
         emit(&Value::Array(rows.iter().map(listing_row).collect()));
@@ -207,6 +217,98 @@ pub fn ls(
         }
     }
     Ok(())
+}
+
+/// Keeps the rows whose whole in-archive path matches `pattern`, and all of
+/// them when there is none. `*` matches within one path segment, `**` across
+/// separators, `?` one character; a leading `**/` matches at the root as well
+/// as at depth, the way a shell and a gitignore both read it. Matching is
+/// case-sensitive, because entry names are.
+///
+/// Shared by `ls --pattern`, the daemon's `list` and `rpf_list`: it is a glob
+/// over strings and knows nothing about archives, so it lives here rather than
+/// in `rpf-core`.
+#[must_use]
+pub fn matching(rows: Vec<rpf_core::Listed>, pattern: Option<&str>) -> Vec<rpf_core::Listed> {
+    let Some(pattern) = pattern else {
+        return rows;
+    };
+    let glob = globbed(pattern);
+    rows.into_iter()
+        .filter(|row| matches_glob(&row.path.chars().collect::<Vec<char>>(), &glob))
+        .collect()
+}
+
+/// One piece of a glob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Glob {
+    /// This character, and nothing else.
+    Just(char),
+    /// Any one character other than the separator.
+    One,
+    /// Any run of characters within one segment.
+    Run,
+    /// Any run of characters, separators included.
+    Reach,
+}
+
+/// Reads a pattern into its pieces. Two adjacent `*` are one `**`.
+fn globbed(pattern: &str) -> Vec<Glob> {
+    let mut pieces = Vec::new();
+    let mut characters = pattern.chars().peekable();
+    while let Some(character) = characters.next() {
+        pieces.push(match character {
+            '?' => Glob::One,
+            '*' => {
+                if characters.peek() == Some(&'*') {
+                    characters.next();
+                    Glob::Reach
+                } else {
+                    Glob::Run
+                }
+            }
+            other => Glob::Just(other),
+        });
+    }
+    pieces
+}
+
+/// Whether the whole path matches the whole pattern. Filled backwards, one row
+/// per piece, so a pattern of many runs costs the product of the two lengths
+/// rather than growing exponentially in the runs.
+fn matches_glob(path: &[char], glob: &[Glob]) -> bool {
+    let at = |row: &[bool], index: usize| row.get(index).copied().unwrap_or(false);
+    let mut next: Vec<bool> = (0..=path.len()).map(|index| index == path.len()).collect();
+    let mut beyond: Vec<bool> = vec![false; next.len()];
+    // A leading `**/` may stand for no directory at all, so the row past the
+    // separator is carried: `**/x` is "x anywhere", the root included.
+    let rootless =
+        matches!(glob.first(), Some(&Glob::Reach)) && matches!(glob.get(1), Some(&Glob::Just('/')));
+    for (position, piece) in glob.iter().enumerate().rev() {
+        let mut here = vec![false; next.len()];
+        for index in (0..=path.len()).rev() {
+            let character = path.get(index).copied();
+            let after = index.saturating_add(1);
+            let matched = match (*piece, character) {
+                (Glob::Just(wanted), Some(found)) => found == wanted && at(&next, after),
+                (Glob::One, Some(found)) => found != '/' && at(&next, after),
+                (Glob::Run, _) => {
+                    at(&next, index) || (character.is_some_and(|it| it != '/') && at(&here, after))
+                }
+                (Glob::Reach, _) => {
+                    at(&next, index)
+                        || (character.is_some() && at(&here, after))
+                        || (rootless && position == 0 && index == 0 && at(&beyond, 0))
+                }
+                (Glob::Just(_) | Glob::One, None) => false,
+            };
+            if let Some(cell) = here.get_mut(index) {
+                *cell = matched;
+            }
+        }
+        beyond = std::mem::replace(&mut next, here);
+    }
+    at(&next, 0)
 }
 
 /// One `ls` row as JSON, shared by `--json ls` and the daemon's `list`.
@@ -237,7 +339,7 @@ fn encoding_named(listed: &rpf_core::Listed) -> Option<&'static str> {
 
 /// A view, with the empty dictionary: an unnamed hash renders as
 /// `hash_XXXXXXXX` and reads back as the same hash.
-const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
+pub const fn wanted(view: View) -> rpf_core::view::Wanted<'static> {
     rpf_core::view::Wanted {
         view,
         names: Dictionary::EMPTY,
@@ -524,7 +626,7 @@ impl rpf_core::Contents for Donor {
 
 /// The payload a document at `from` becomes, against the entry it is going
 /// into. The archive is opened for reading only, so `--dry-run` reaches it.
-fn convert(
+pub fn convert(
     path: &Path,
     inside: &str,
     from: &Path,
@@ -772,8 +874,36 @@ fn in_place(
 
 /// Whether these bytes may go to standard output: a file takes anything, a
 /// terminal and a pipe take text.
-fn goes_to(bytes: &[u8], file: bool) -> bool {
+pub fn goes_to(bytes: &[u8], file: bool) -> bool {
     file || std::str::from_utf8(bytes).is_ok()
+}
+
+/// One planned in-place patch as JSON, shared by every frontend that reports a
+/// plan.
+#[must_use]
+pub fn planned_row(entry: &rpf_core::Planned) -> Value {
+    json!({
+        "path": entry.path,
+        "at": entry.at,
+        "len": entry.len,
+        "allocation": entry.allocation,
+    })
+}
+
+/// One edit that will not fit where its entry sits, as JSON.
+#[must_use]
+pub fn rejected_row(entry: &rpf_core::TooLarge) -> Value {
+    json!({
+        "path": entry.path,
+        "needed": entry.needed,
+        "allocation": entry.allocation,
+    })
+}
+
+/// One change no patch can express, as JSON.
+#[must_use]
+pub fn structural_row(change: &rpf_core::Structural) -> Value {
+    json!({ "path": change.path, "structural": change.what })
 }
 
 /// Reports one patch, made or merely planned.
@@ -1127,7 +1257,7 @@ fn create_dir(path: &Path) -> Result<()> {
 }
 
 /// Writes a file, reporting the path rather than the syscall.
-fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes).map_err(|source| Failure::Io {
         path: path.display().to_string(),
         source,
@@ -1136,7 +1266,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Streams contents into a file, answering how many bytes moved. A failed read
 /// stays the container's and names the entry; a failed write names the file.
-fn stream_file<S: std::io::Read>(path: &Path, contents: &mut S) -> Result<u64> {
+pub fn stream_file<S: std::io::Read>(path: &Path, contents: &mut S) -> Result<u64> {
     let named = || path.display().to_string();
     let file = fs::File::create(path).map_err(|source| Failure::Io {
         path: named(),
@@ -1164,7 +1294,7 @@ fn stream_file<S: std::io::Read>(path: &Path, contents: &mut S) -> Result<u64> {
 
 /// Refuses to write into a detected game installation, or below a directory
 /// that would not say whether it is one.
-fn refuse_game_install(path: &Path, force: bool) -> Result<()> {
+pub fn refuse_game_install(path: &Path, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
@@ -1317,15 +1447,18 @@ pub fn verify_problem(problem: &rpf_core::Problem) -> Value {
     json!({ "path": problem.path, "reason": problem.error.to_string() })
 }
 
-/// A `verify` report as JSON, shared by both frontends.
-pub fn verify_report(path: &Path, checked: &Checked, problems: &[Value]) -> Value {
+/// A `verify` report as JSON, shared by all three frontends. `most` bounds how
+/// many problems the report carries, for a frontend whose answer has a size
+/// limit; `problems_total` is how many there were.
+pub fn verify_report(path: &Path, checked: &Checked, problems: &[Value], most: usize) -> Value {
     json!({
         "path": path.display().to_string(),
         "entries_checked": checked.verified.checked,
         "contents_checked": checked.verified.contents_checked,
         "contents_recorded": checked.recorded,
         "against": checked.against.as_ref().map(|tree| tree.display().to_string()),
-        "problems": problems,
+        "problems": problems.get(..problems.len().min(most)).unwrap_or(problems),
+        "problems_total": problems.len(),
     })
 }
 
@@ -1390,7 +1523,7 @@ pub fn verify(
 
     if json_out {
         let rendered: Vec<Value> = problems.iter().map(verify_problem).collect();
-        emit(&verify_report(path, &checked, &rendered));
+        emit(&verify_report(path, &checked, &rendered, usize::MAX));
     } else {
         for problem in problems {
             println!("{}: {}", problem.path, problem.error);
@@ -1761,9 +1894,99 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        FROM_CACHE, FROM_EXECUTABLE, KeysFound, NG_ABSENT, NG_DECRYPT_TABLE_COUNT,
-        NG_EXPANDED_KEY_COUNT, NgFound, OnStderr, Step, Watch as _, goes_to, keys_report, padding,
+        FROM_CACHE, FROM_EXECUTABLE, Glob, KeysFound, NG_ABSENT, NG_DECRYPT_TABLE_COUNT,
+        NG_EXPANDED_KEY_COUNT, NgFound, OnStderr, Step, Watch as _, globbed, goes_to, keys_report,
+        matches_glob, padding,
     };
+
+    fn glob_matches(pattern: &str, path: &str) -> bool {
+        matches_glob(&path.chars().collect::<Vec<char>>(), &globbed(pattern))
+    }
+
+    #[test]
+    fn a_leading_double_star_finds_a_name_at_the_root_as_well_as_at_depth() {
+        assert!(glob_matches("**/vehicles.meta", "vehicles.meta"));
+        assert!(glob_matches("**/vehicles.meta", "data/vehicles.meta"));
+        assert!(glob_matches(
+            "**/vehicles.meta",
+            "x64/dlc.rpf/data/vehicles.meta"
+        ));
+        assert!(!glob_matches("**/vehicles.meta", "data/handling.meta"));
+        assert!(glob_matches("**/*.meta", "handling.meta"));
+        assert!(
+            !glob_matches("data/**/x", "x"),
+            "only a leading reach is rootless"
+        );
+        assert!(glob_matches("data/*.meta", "data/handling.meta"));
+        assert!(!glob_matches("data/*.meta", "data/inner/handling.meta"));
+    }
+
+    #[test]
+    fn a_leading_double_star_still_anchors_the_rest_of_the_pattern() {
+        assert!(!glob_matches("**/vehicles.meta", "data/notvehicles.meta"));
+        assert!(!glob_matches("**/a", "ba"));
+        assert!(!glob_matches("**/name", "xname"));
+        assert!(!glob_matches("**/name", "dir/xname"));
+        assert!(!glob_matches("**/", "data/vehicles.meta"), "a bare reach");
+        assert!(glob_matches("**/", "data/"), "which wants the separator");
+    }
+
+    /// The rule spelled out by recursion, to differ against the row-filled one.
+    fn reference(path: &[char], glob: &[Glob]) -> bool {
+        fn plain(path: &[char], glob: &[Glob]) -> bool {
+            let Some((piece, rest)) = glob.split_first() else {
+                return path.is_empty();
+            };
+            match *piece {
+                Glob::Reach => (0..=path.len()).any(|taken| plain(&path[taken..], rest)),
+                Glob::Run => (0..=path.len())
+                    .take_while(|&taken| !path[..taken].contains(&'/'))
+                    .any(|taken| plain(&path[taken..], rest)),
+                Glob::One => {
+                    matches!(path.first(), Some(&found) if found != '/') && plain(&path[1..], rest)
+                }
+                Glob::Just(wanted) => {
+                    matches!(path.first(), Some(&found) if found == wanted)
+                        && plain(&path[1..], rest)
+                }
+            }
+        }
+        let rootless = matches!(glob.first(), Some(&Glob::Reach))
+            && matches!(glob.get(1), Some(&Glob::Just('/')));
+        plain(path, glob) || (rootless && plain(path, &glob[2..]))
+    }
+
+    fn strings(alphabet: &[char], longest: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut edge = vec![String::new()];
+        for _ in 0..longest {
+            edge = edge
+                .iter()
+                .flat_map(|prefix| alphabet.iter().map(move |it| format!("{prefix}{it}")))
+                .collect();
+            all.extend(edge.iter().cloned());
+        }
+        all
+    }
+
+    #[test]
+    fn every_short_pattern_answers_what_the_rule_answers() {
+        let paths: Vec<Vec<char>> = strings(&['a', 'b', '/'], 4)
+            .iter()
+            .map(|path| path.chars().collect())
+            .collect();
+        for pattern in strings(&['a', 'b', '/', '*', '?'], 4) {
+            let glob = globbed(&pattern);
+            for path in &paths {
+                assert_eq!(
+                    matches_glob(path, &glob),
+                    reference(path, &glob),
+                    "{pattern:?} against {:?}",
+                    path.iter().collect::<String>()
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_shorter_progress_line_covers_the_one_before_it() {

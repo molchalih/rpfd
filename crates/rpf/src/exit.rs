@@ -43,6 +43,33 @@ pub enum Failure {
         root: PathBuf,
     },
 
+    /// An entry's contents are longer than the caller's transport will carry
+    /// inline. Truncating a document a caller may hand back is silent data
+    /// loss, so the length is reported and nothing is sent.
+    #[error(
+        "{path} is {len} bytes and only {limit} can be sent inline; \
+         name a file in \"out\" and it will be written there instead"
+    )]
+    PayloadTooLarge {
+        /// The entry inside the archive.
+        path: String,
+        /// What its contents measure.
+        len: usize,
+        /// What the transport will carry.
+        limit: usize,
+    },
+
+    /// An entry's contents are not text, and the caller's transport carries
+    /// nothing else.
+    #[error(
+        "{path} is not text and only text can be sent inline; \
+         name a file in \"out\" and it will be written there instead"
+    )]
+    NotText {
+        /// The entry inside the archive.
+        path: String,
+    },
+
     /// A directory above the archive could not be examined, so the install
     /// guard has no answer rather than a negative one.
     #[error(
@@ -99,9 +126,11 @@ impl Failure {
                 Category::Io => Code::Io,
             },
             Self::Io { .. } => Code::Io,
-            Self::Refused { .. } | Self::GameInstall { .. } | Self::UncertainInstall { .. } => {
-                Code::Refused
-            }
+            Self::Refused { .. }
+            | Self::GameInstall { .. }
+            | Self::UncertainInstall { .. }
+            | Self::PayloadTooLarge { .. }
+            | Self::NotText { .. } => Code::Refused,
         }
     }
 }
@@ -117,6 +146,8 @@ impl Failure {
             Self::Refused { .. } => "Refused",
             Self::GameInstall { .. } => "GameInstall",
             Self::UncertainInstall { .. } => "UncertainInstall",
+            Self::PayloadTooLarge { .. } => "PayloadTooLarge",
+            Self::NotText { .. } => "NotText",
         }
     }
 }
@@ -179,13 +210,21 @@ mod tests {
 
     #[test]
     fn what_the_binary_refuses_for_itself_lands_on_the_same_number() {
-        assert_eq!(
+        for failure in [
             Failure::Refused {
                 reason: "no".to_owned(),
-            }
-            .code() as i32,
-            Code::Refused as i32,
-        );
+            },
+            Failure::PayloadTooLarge {
+                path: "art.yft".to_owned(),
+                len: 4096,
+                limit: 16,
+            },
+            Failure::NotText {
+                path: "art.yft".to_owned(),
+            },
+        ] {
+            assert_eq!(failure.code() as i32, Code::Refused as i32, "{failure}");
+        }
     }
 
     #[test]

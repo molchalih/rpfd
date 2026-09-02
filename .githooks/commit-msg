@@ -1,6 +1,8 @@
 #!/bin/sh
 # Enforces this repository's commit rule: one line, no body,
 # `type(scope): what changed`, lower case, no trailing full stop, 72 at most.
+# The scope is not optional: a log is scanned down its left edge, and a bare
+# `fix:` beside a `fix(core):` makes that edge unreadable.
 #
 # A rule that is only written down is a rule that is only sometimes followed.
 # Enable it once per clone:  git config core.hooksPath .githooks
@@ -16,7 +18,8 @@ die() {
     echo "  the rule: type(scope): what changed — one line, lower case," >&2
     echo "            no trailing full stop, 72 characters at most" >&2
     echo "  types:   feat fix docs style refactor perf test build ci chore" >&2
-    echo "  scopes:  core cli serve client, or none" >&2
+    echo "  scopes:  core cli serve client tools release repo — required" >&2
+    echo "           the narrowest that covers it; repo only when it spans" >&2
     echo "  why:     reasoning belongs in docs/, which can be corrected;" >&2
     echo "           a commit message cannot" >&2
     exit 1
@@ -27,7 +30,7 @@ die() {
 case "$subject" in
     *.) die "the subject ends in a full stop" ;;
 esac
-echo "$subject" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\((core|cli|serve|client)\))?: [a-z0-9]' \
+echo "$subject" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)\((core|cli|serve|client|tools|release|repo)\): [a-z0-9]' \
     || die "the subject does not read as type(scope): what changed, lower case"
 
 exit 0
