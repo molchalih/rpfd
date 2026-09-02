@@ -102,6 +102,9 @@ mod tests {
             "00001_system_a.ymt",
             "00001_sys_a.ymt",
             "00001_sys12a_a.ymt",
+            // `u64::from_str` takes a leading sign where `is_ascii_digit` does not,
+            // so this is the one name the digit guard has to refuse by itself.
+            "00001_sys+12_a.ymt",
             "sys12_00001_a.ymt",
             "_sys12_a.ymt",
             "",
