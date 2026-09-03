@@ -42,6 +42,11 @@ pub(super) fn chain(payload: &[u8]) -> Result<Vec<Section<'_>>, (u64, Malformed)
             .checked_add(usize::try_from(length).unwrap_or(usize::MAX))
             .ok_or((at64, Malformed::Section))?;
         let bytes = payload.get(at..end).ok_or((at64, Malformed::Section))?;
+        // `at` moves only here, so a turn that leaves it where it was pushes a
+        // `Section` for ever. Unreachable while the length guard above holds.
+        if end <= at {
+            return Err((at64, Malformed::Section));
+        }
         sections.push(Section { tag, at, bytes });
         at = end;
     }
@@ -120,6 +125,185 @@ pub(super) fn f16(bytes: &[u8], at: usize) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `HEADER_LEN` as an offset, for a test that builds payloads by hand.
+    fn header() -> usize {
+        usize::try_from(HEADER_LEN).expect("a header length fits an offset")
+    }
+
+    /// A payload whose sections declare `parts` in order — each header written
+    /// at the offset the lengths before it name — cut or zero-padded to `len`.
+    fn payload_of(parts: &[([u8; 4], u32)], len: usize) -> Vec<u8> {
+        let mut payload = vec![0_u8; len];
+        let mut at = 0_usize;
+        for (tag, declared) in parts {
+            let header = tag.iter().copied().chain(declared.to_be_bytes());
+            for (offset, byte) in header.enumerate() {
+                if let Some(slot) = payload.get_mut(at.saturating_add(offset)) {
+                    *slot = byte;
+                }
+            }
+            at = at.saturating_add(usize::try_from(*declared).unwrap_or(usize::MAX));
+        }
+        payload
+    }
+
+    /// The same chain walked the other way round: a remainder that every turn
+    /// takes a prefix off, rather than a cursor that every turn adds to. It
+    /// cannot fail to advance — `rest` is strictly shorter each time — which is
+    /// what makes it a reference for a walk that can.
+    fn tiling_of(payload: &[u8]) -> Result<Vec<(usize, usize)>, Malformed> {
+        let mut rest = payload;
+        let mut at = 0_usize;
+        let mut taken: Vec<(usize, usize)> = Vec::new();
+        while !rest.is_empty() {
+            if rest.len() < header() {
+                return Err(Malformed::Section);
+            }
+            let tag = [rest[0], rest[1], rest[2], rest[3]];
+            if taken.is_empty() && tag != PSIN {
+                return Err(Malformed::NotPso);
+            }
+            let declared = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]);
+            let length = usize::try_from(declared).unwrap_or(usize::MAX);
+            if length < header() || length > rest.len() {
+                return Err(Malformed::Section);
+            }
+            taken.push((at, length));
+            at = at.saturating_add(length);
+            rest = &rest[length..];
+        }
+        if taken.is_empty() {
+            return Err(Malformed::NotPso);
+        }
+        Ok(taken)
+    }
+
+    /// What `chain` makes of `payload`, as `(at, length)` pairs — checked
+    /// against the reference walk, and against the law the bound states: every
+    /// section takes a non-empty bite, and the chain tiles the payload with no
+    /// gap, no overlap and nothing left over.
+    fn agreed(payload: &[u8]) -> Result<Vec<(usize, usize)>, Malformed> {
+        let walked = chain(payload).map(|sections| {
+            sections
+                .iter()
+                .map(|section| (section.at, section.bytes.len()))
+                .collect::<Vec<_>>()
+        });
+        let reference = tiling_of(payload);
+        assert_eq!(
+            walked.as_ref().map_err(|(_, cause)| cause),
+            reference.as_ref(),
+            "{payload:02x?}: the two walks disagree"
+        );
+        if let Ok(taken) = &walked {
+            assert!(!taken.is_empty(), "{payload:02x?}: an empty chain");
+            let mut at = 0_usize;
+            for (start, length) in taken {
+                assert_eq!(*start, at, "{payload:02x?}: a gap or an overlap");
+                assert!(*length > 0, "{payload:02x?}: a turn that stood still");
+                assert!(
+                    *length >= header(),
+                    "{payload:02x?}: a section without a header"
+                );
+                at = at.saturating_add(*length);
+            }
+            assert_eq!(
+                at,
+                payload.len(),
+                "{payload:02x?}: the chain missed the end"
+            );
+        }
+        walked.map_err(|(_, cause)| cause)
+    }
+
+    #[test]
+    fn a_section_that_is_exactly_its_own_header_is_a_section() {
+        // The boundary the length guard draws, from both sides. A section may
+        // be all header and no body; one byte less is not a section at all,
+        // because the walk would then step by less than it just read.
+        let empty = payload_of(&[(PSIN, HEADER_LEN)], header());
+        assert_eq!(agreed(&empty), Ok(vec![(0, header())]));
+
+        let short = payload_of(&[(PSIN, HEADER_LEN - 1)], header());
+        assert_eq!(agreed(&short), Err(Malformed::Section));
+
+        // And a chain of them: three header-only sections tile twenty-four bytes.
+        let three = payload_of(
+            &[(PSIN, HEADER_LEN), (PMAP, HEADER_LEN), (PSCH, HEADER_LEN)],
+            header().saturating_mul(3),
+        );
+        assert_eq!(
+            agreed(&three),
+            Ok(vec![
+                (0, header()),
+                (header(), header()),
+                (header().saturating_mul(2), header())
+            ])
+        );
+    }
+
+    #[test]
+    fn every_declared_length_is_refused_or_moves_the_walk() {
+        // Exhaustive over the declared `u32`, covered the way `leading_bit`'s
+        // test covers a word: each sixteen-bit half in turn, both halves at
+        // once, and the complement. 262,144 draws, every one of them either
+        // refused or walked in a chain whose every turn moved.
+        for half in 0..=u32::from(u16::MAX) {
+            for declared in [half, half << 16, (half << 16) | 0xFFFF, !half] {
+                let payload = payload_of(&[(PSIN, declared)], header());
+                let want = if declared == HEADER_LEN {
+                    Ok(vec![(0, header())])
+                } else {
+                    Err(Malformed::Section)
+                };
+                assert_eq!(agreed(&payload), want, "{declared:#010x}");
+            }
+        }
+
+        // The same lengths again where the payload is exactly as long as the
+        // section says, so the accepting branch is the one under test.
+        for declared in HEADER_LEN..=4096 {
+            let len = usize::try_from(declared).unwrap_or(usize::MAX);
+            let payload = payload_of(&[(PSIN, declared)], len);
+            assert_eq!(agreed(&payload), Ok(vec![(0, len)]), "{declared}");
+        }
+    }
+
+    #[test]
+    fn the_walk_tiles_the_payload_over_every_short_shape() {
+        // Exhaustive over every declared length and every payload length up to
+        // eight headers' worth — 4,225 payloads, each checked both ways.
+        let ceiling = header().saturating_mul(8);
+        for declared in 0..=u32::try_from(ceiling).unwrap_or(u32::MAX) {
+            for len in 0..=ceiling {
+                let payload = payload_of(&[(PSIN, declared)], len);
+                let _ = agreed(&payload);
+            }
+        }
+
+        // And every two-section shape in the same range, so the second turn of
+        // the walk is exercised at each of its own boundaries too.
+        for first in 0..=u32::try_from(ceiling).unwrap_or(u32::MAX) {
+            for second in 0..=u32::try_from(ceiling).unwrap_or(u32::MAX) {
+                let len = usize::try_from(first.saturating_add(second)).unwrap_or(usize::MAX);
+                let payload = payload_of(&[(PSIN, first), (PMAP, second)], len);
+                let walked = agreed(&payload);
+                // Below the guard the two headers overlap and the shape stops
+                // meaning anything; `agreed` still holds the walk to its law
+                // there. The exact answer is stated where the shape is one.
+                if first >= HEADER_LEN && second >= HEADER_LEN {
+                    let head = usize::try_from(first).unwrap_or(usize::MAX);
+                    let tail = usize::try_from(second).unwrap_or(usize::MAX);
+                    assert_eq!(
+                        walked,
+                        Ok(vec![(0, head), (head, tail)]),
+                        "{first}/{second}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_section_chain_must_land_exactly_on_the_end() {

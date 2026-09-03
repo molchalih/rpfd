@@ -3,7 +3,8 @@
 //! Bare bytes, so the corpus can be seeded with shipped `PSO` files that fit
 //! [`MAX_INPUT`](rpf_fuzz::MAX_INPUT): a `PSO` is a chain of big-endian
 //! sections that must land exactly on the payload's last byte, so from nothing
-//! a mutator only ever fails `Malformed::Trailing` and never sees `PSCH`.
+//! a mutator only ever fails `Malformed::Section` at the next header and never
+//! sees `PSCH`. It never fails `Malformed::Trailing`, which no payload reaches.
 //!
 //! The dictionary is cosmetic and cannot decide whether a payload converts, so
 //! the default one is a complete answer here. `PSO` has no reader on this side,
