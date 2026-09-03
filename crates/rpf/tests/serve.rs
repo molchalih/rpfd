@@ -39,6 +39,12 @@ fn scanning(file: &Path) -> std::time::Duration {
     PATIENCE.saturating_add(scan)
 }
 
+/// A budget for a wait on a daemon repeating work a fixture already did:
+/// [`PATIENCE`], or eight times what building the fixture cost where longer.
+fn repeating(building: std::time::Duration) -> std::time::Duration {
+    PATIENCE.max(building.saturating_mul(8))
+}
+
 /// An archive with one deflated file and one resource.
 fn make_archive(at: &Path) -> Vec<u8> {
     // An RSC7 header whose flags describe one 512-byte system page and no
@@ -1579,39 +1585,82 @@ fn a_cancel_after_a_commit_has_answered_finds_nothing_running() {
     let _ = deadline.reap();
 }
 
+/// How many entries the rebuild in the drop test walks. The gate is half the
+/// archive's bytes, which is past what any of the three platforms' pipes hold.
+const BULK_ENTRIES: u32 = 3000;
+
+/// What an atomic replacement changes about the file it replaces: another file
+/// of the same length still carries the moment it was written.
+fn stamp(file: &Path) -> (u64, Option<std::time::SystemTime>) {
+    fs::metadata(file).map_or((0, None), |it| (it.len(), it.modified().ok()))
+}
+
+/// Waits until the rebuild writing beside `archive` has put `bytes` into its
+/// scratch file — entries go in order — or until it has finished, which is the
+/// stronger of the two: nothing was read while all of it was written.
+fn written_past(directory: &Path, archive: &Path, bytes: u64, deadline: &Deadline) {
+    let before = stamp(archive);
+    let mut seen = false;
+    loop {
+        deadline.check();
+        // Asked of the path, not of the directory entry: Windows answers the
+        // entry from a size it does not update while the writer holds the file.
+        let scratch = fs::read_dir(directory)
+            .expect("the directory is readable")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.as_path() != archive)
+            .map(|path| fs::metadata(path).map_or(0, |it| it.len()))
+            .max()
+            .unwrap_or_default();
+        if scratch >= bytes {
+            return;
+        }
+        // The rebuild is over: either it landed, or its scratch went away
+        // unwritten. The first is a stronger pass than the wait asked for, the
+        // second is a failure the daemon's own answer will name.
+        if stamp(archive) != before || (seen && scratch == 0) {
+            return;
+        }
+        seen |= scratch > 0;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
-    let deadline = Deadline::on("the daemon to exit after its notifications");
     // Progress is dropped rather than queued without bound, so `skipped` counts
     // what was dropped since the last notification that got through.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("many.rpf");
-    make_bulk_archive(&archive, 3000, 1024);
+    let building = std::time::Instant::now();
+    make_bulk_archive(&archive, BULK_ENTRIES, 1024);
+    let len = fs::metadata(&archive).expect("readable").len();
 
+    // Started once the archive is, and paced by it: the rebuild walks the same
+    // entries again, so building them measured this box's rate for the work.
+    let deadline = Deadline::within(
+        "the daemon to exit after its notifications",
+        repeating(building.elapsed()),
+    );
     let (mut stdin, mut stdout) = started(&deadline, daemon());
-    // The reader starts before the first request, so nothing the daemon writes
-    // waits on a pipe nobody is draining yet.
-    let read = std::thread::scope(|scope| {
-        let reading = scope.spawn(|| {
-            read_slowly(
-                &mut stdout,
-                512,
-                std::time::Duration::from_millis(4),
-                &deadline,
-            )
-        });
-        for request in [
-            json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
-                "path": archive.display().to_string()}}),
-            json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
-                "handle":1,"path":"bulk/0000.bin","bytes": BASE64.encode(b"replaced")}}),
-            json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"rebuild":true}}),
-        ] {
-            writeln!(stdin, "{request}").expect("writable");
-        }
-        drop(stdin);
-        reading.join().expect("the reading thread finished")
-    });
+    for request in [
+        json!({"jsonrpc":"2.0","id":1,"method":"open","params":{
+            "path": archive.display().to_string()}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"write","params":{
+            "handle":1,"path":"bulk/0000.bin","bytes": BASE64.encode(b"replaced")}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"commit","params":{"handle":1,"rebuild":true}}),
+    ] {
+        writeln!(stdin, "{request}").expect("writable");
+    }
+    drop(stdin);
+
+    // Nothing is read until the rebuild is half written, so the drop is this
+    // test's doing rather than a race a loaded machine decides.
+    written_past(dir.path(), &archive, len / 2, &deadline);
+    let mut read = Vec::new();
+    stdout.read_to_end(&mut read).expect("readable");
+
     let status = deadline.reap().expect("the daemon exits");
     assert!(status.success(), "the daemon exited with {status}");
 
@@ -1631,21 +1680,20 @@ fn a_client_that_is_behind_is_told_how_many_notifications_it_missed() {
         .collect();
 
     let mut previous = 0_u64;
-    let mut gaps = 0_u32;
+    let mut dropped = 0_u64;
     for (done, skipped) in &steps {
         assert_eq!(
             *skipped,
             done.saturating_sub(previous).saturating_sub(1),
             "step {done} followed step {previous} but claims {skipped} dropped: {steps:?}",
         );
-        if *skipped > 0 {
-            gaps = gaps.saturating_add(1);
-        }
+        dropped = dropped.saturating_add(*skipped);
         previous = *done;
     }
     assert!(
-        gaps > 0,
-        "nothing was dropped, so this says nothing about the counter: {} of 3000 arrived",
+        dropped > 0,
+        "the rebuild was half written into a pipe nobody had read, and nothing \
+         was dropped: {} of {BULK_ENTRIES} arrived",
         steps.len(),
     );
 }
@@ -2029,14 +2077,20 @@ fn resident_kilobytes(pid: u32) -> u64 {
 
 #[test]
 fn answers_do_not_pile_up_for_a_client_that_is_not_reading() {
-    let deadline = Deadline::on("the daemon to exit once its answers are drained");
     // A queued response the worker never waits on grows without bound while the
     // client is behind. Zero-byte payloads, so each answer is still megabytes.
     let dir = tempfile::tempdir().expect("temp dir");
     let archive = dir.path().join("bulk.rpf");
     let entry = 2 * 1024 * 1024;
+    let building = std::time::Instant::now();
     make_bulk_archive(&archive, 64, entry);
 
+    // Started once the archive is, and paced by it: answering these reads is
+    // those same bytes again, so building them measured this box's rate.
+    let deadline = Deadline::within(
+        "the daemon to exit once its answers are drained",
+        repeating(building.elapsed()),
+    );
     let (mut stdin, stdout) = started(&deadline, daemon());
 
     writeln!(
@@ -2286,7 +2340,6 @@ fn close_on_a_handle_that_was_never_open_is_refused() {
 #[test]
 #[cfg(unix)]
 fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
-    let deadline = Deadline::on("the rebuild to start and the daemon to exit after it");
     // A cancel answer echoing the running job's `request` — an arbitrary value the
     // client wrote once — into an unbounded queue grows the daemon without bound.
     let dir = tempfile::tempdir().expect("temp dir");
@@ -2303,6 +2356,7 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
         })
         .collect();
     let bulk = incompressible(512 * 1024);
+    let building = std::time::Instant::now();
     let mut out = fs::File::create(&archive).expect("creatable");
     rpf_core::build(
         &mut out,
@@ -2315,6 +2369,12 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
     .expect("builds");
     drop(out);
 
+    // Started once the archive is, and paced by it: the rebuild deflates these
+    // same bytes, so building them measured this box's rate for the work.
+    let deadline = Deadline::within(
+        "the rebuild to start and the daemon to exit after it",
+        repeating(building.elapsed()),
+    );
     let (mut stdin, stdout) = started(&deadline, daemon());
 
     let huge = "i".repeat(256 * 1024);
@@ -2346,8 +2406,8 @@ fn a_cancel_answer_does_not_amplify_what_the_client_wrote() {
     for _ in 0..2000 {
         writeln!(stdin, "{cancel}").expect("writable");
     }
-    // Nothing has read a byte of standard output, so the answers to those two
-    // thousand cancels are all still queued.
+    // Nothing has read a byte of standard output, and standard input holds 64 KiB
+    // against 2000 lines of some 70, so most were answered before the last write.
     std::thread::sleep(std::time::Duration::from_millis(500));
     let resident = resident_kilobytes(deadline.pid().expect("the daemon is running"));
 
