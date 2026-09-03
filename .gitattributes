@@ -8,7 +8,14 @@
 # the one that was committed (§12: a file with the right name is not the same
 # file). R10.8.
 #
-# Everything tracked here is text: source, manifests, documents, workflows,
-# licences and the JSON fixtures. `text=auto` still lets git decline to touch
-# anything it detects as binary, so a future binary fixture is safe by default.
+# Nearly everything tracked here is text: source, manifests, documents,
+# workflows, licences and the JSON fixtures. `text=auto` still lets git decline
+# to touch anything it detects as binary, so a binary fixture is safe by
+# default.
 * text=auto eol=lf
+
+# The brand icons — `.github/icon-512.png` and `clients/vscode/icon.png` — are
+# the tracked bytes that are not text. Detection already covers them; this
+# states it, so a `.vsix` that has to carry the icon byte for byte does not
+# rest on a heuristic.
+*.png binary

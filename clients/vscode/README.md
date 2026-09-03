@@ -1,12 +1,23 @@
 # RPF Archives
 
-Edit files inside RAGE `.rpf` archives as ordinary files. The archive mounts as
-a folder in the explorer, entries open and save the way any other file does,
-and the archive is written back for you whenever it can be patched in place.
+Open a RAGE `.rpf` archive as a folder in the editor. Entries are files: they
+open in a tab, edit, and save the way any other file does, and the archive on
+disk is patched in place whenever the edit still fits where its entry sits,
+while anything that would mean writing the whole archive out again waits for you
+to ask. A nested archive is a folder inside a folder, and `.meta`, `.ymt` and
+their kind open as XML and are written back in the entry's own binary encoding.
 
-The extension holds no format knowledge of its own. Everything it does it asks
-the `rpf` binary for, over `rpf serve --stdio` — one long-lived process per
-window, with the entry table parsed once and kept warm.
+**It needs the `rpf` binary, and the package you install probably carries one.**
+Each per-platform release package — `rpf-vX.Y.Z-darwin-arm64.vsix` and its three
+siblings — ships the static binary for that platform inside it, so a first
+install has everything it needs and there is nothing to put on `PATH`. The
+suffix-less `rpf-vX.Y.Z.vsix` carries none, for a platform this project does not
+build for, and falls back to `rpf` on `PATH`. `INSTALL.md` at the repository
+root is how to install either, and the server without the editor.
+
+The extension holds no format knowledge of its own and parses nothing. Every
+answer it gives comes from the binary, over `rpf serve --stdio` — one long-lived
+process per window, with the entry table parsed once and kept warm.
 
 ## What it does
 
@@ -58,9 +69,10 @@ running `rpf --version`:
 3. The first `rpf` on `PATH`.
 
 With none of them, the first mount fails with a message naming every place it
-looked, and no MCP server is offered. `rpf` is one static binary with no
-runtime prerequisite: put it on `PATH`, or build it and point the setting at
-the result.
+looked, and no MCP server is offered. `rpf` is one static binary with no runtime
+prerequisite: install a per-platform package and row 2 answers, or put one on
+`PATH`, or build it and point the setting at the result. `INSTALL.md` covers the
+first two.
 
 ## Settings
 

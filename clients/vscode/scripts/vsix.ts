@@ -31,6 +31,8 @@ interface Manifest {
     description: string;
     version: string;
     license?: string;
+    icon?: string;
+    galleryBanner?: { color?: string; theme?: string };
     keywords?: string[];
     categories?: string[];
     engines: { vscode: string };
@@ -61,6 +63,16 @@ export function contents(root: string, publisher: string, target?: string): Part
     const license = licenseOf(root);
     if (license) {
         parts.push({ name: `extension/${license.name}`, bytes: fs.readFileSync(license.at) });
+    }
+
+    // The icon the manifest names, or a package whose `icon` points at nothing:
+    // a marketplace reads the asset, not the field, so a missing file has to
+    // fail here rather than produce a package with a broken icon.
+    if (manifest.icon) {
+        parts.push({
+            name: `extension/${manifest.icon}`,
+            bytes: fs.readFileSync(path.join(root, manifest.icon)),
+        });
     }
 
     // The compiled extension, and nothing else out of dist: the tests and the
@@ -135,6 +147,7 @@ function contentTypes(parts: readonly Part[]): string {
         js: 'application/javascript',
         md: 'text/markdown',
         txt: 'text/plain',
+        png: 'image/png',
     };
     const defaults = new Map<string, string>([['vsixmanifest', known.vsixmanifest ?? 'text/xml']]);
     const overrides: string[] = [];
@@ -181,8 +194,19 @@ function vsixManifest(manifest: Manifest, publisher: string, root: string, targe
         '      <Property Id="Microsoft.VisualStudio.Code.ExtensionDependencies" Value=""/>',
         '      <Property Id="Microsoft.VisualStudio.Code.ExtensionPack" Value=""/>',
         '      <Property Id="Microsoft.VisualStudio.Code.ExtensionKind" Value="workspace"/>',
+        ...(manifest.galleryBanner?.color
+            ? [
+                  `      <Property Id="Microsoft.VisualStudio.Services.Branding.Color" Value="${escapeXml(manifest.galleryBanner.color)}"/>`,
+              ]
+            : []),
+        ...(manifest.galleryBanner?.theme
+            ? [
+                  `      <Property Id="Microsoft.VisualStudio.Services.Branding.Theme" Value="${escapeXml(manifest.galleryBanner.theme)}"/>`,
+              ]
+            : []),
         '    </Properties>',
         ...(license ? [`    <License>extension/${license}</License>`] : []),
+        ...(manifest.icon ? [`    <Icon>extension/${escapeXml(manifest.icon)}</Icon>`] : []),
         '  </Metadata>',
         '  <Installation>',
         '    <InstallationTarget Id="Microsoft.VisualStudio.Code"/>',
@@ -198,6 +222,11 @@ function vsixManifest(manifest: Manifest, publisher: string, root: string, targe
         ...(license
             ? [
                   `    <Asset Type="Microsoft.VisualStudio.Services.Content.License" Path="extension/${license}" Addressable="true"/>`,
+              ]
+            : []),
+        ...(manifest.icon
+            ? [
+                  `    <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/${escapeXml(manifest.icon)}" Addressable="true"/>`,
               ]
             : []),
         '  </Assets>',

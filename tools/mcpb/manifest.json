@@ -18,6 +18,7 @@
   "documentation": "https://github.com/molchalih/rpfd/blob/main/clients/mcp/README.md",
   "support": "https://github.com/molchalih/rpfd/issues",
   "license": "MIT OR Apache-2.0",
+  "icon": "icon.png",
   "keywords": ["rpf", "rage", "archive", "gta", "modding"],
   "server": {
     "type": "binary",

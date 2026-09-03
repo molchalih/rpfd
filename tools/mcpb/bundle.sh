@@ -47,6 +47,10 @@ jq --arg v "$version" --argjson p "$platforms" '
 ' "$here/manifest.json" > "$stage/manifest.json"
 
 cp "$root/README.md" "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$stage/"
+# The manifest's `icon` names a path inside the bundle, so the icon travels in
+# the zip under the name the manifest uses rather than the one it has in the
+# repository.
+cp "$root/.github/icon-512.png" "$stage/icon.png"
 
 rm -f "$out"
-(cd "$stage" && zip -qrX "$out" manifest.json server README.md LICENSE-MIT LICENSE-APACHE)
+(cd "$stage" && zip -qrX "$out" manifest.json icon.png server README.md LICENSE-MIT LICENSE-APACHE)

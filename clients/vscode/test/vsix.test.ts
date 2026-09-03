@@ -65,6 +65,7 @@ describe('the vsix', () => {
         assert.ok(names.includes('extension/dist/src/extension.js'));
         assert.ok(names.some((name) => name.startsWith('extension/LICENSE')));
         assert.ok(names.includes('extension/README.md'));
+        assert.ok(names.includes('extension/icon.png'));
 
         for (const name of names) {
             assert.ok(!name.includes('node_modules'), name);
@@ -113,6 +114,28 @@ describe('the vsix', () => {
             const extension = part.name.slice(part.name.lastIndexOf('.') + 1).toLowerCase();
             assert.ok(declared.has(extension), `${part.name} has no content type`);
         }
+    });
+
+    it('points a marketplace at the icon it carries', () => {
+        // The field alone is not the icon: an installer reads the asset, so
+        // both the element and the asset row have to be there.
+        const manifest = contents(ROOT, 'somebody')
+            .find((part) => part.name === 'extension.vsixmanifest')
+            ?.bytes.toString();
+        assert.ok(manifest);
+        const icon = (
+            JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
+                icon?: string;
+            }
+        ).icon;
+        assert.ok(icon, 'the manifest names no icon');
+        assert.ok(manifest.includes(`<Icon>extension/${icon}</Icon>`));
+        assert.match(
+            manifest,
+            new RegExp(
+                `<Asset Type="Microsoft\\.VisualStudio\\.Services\\.Icons\\.Default" Path="extension/${icon.replace(/[.]/g, '\\.')}"`,
+            ),
+        );
     });
 
     it('declares the platform it was packaged for, and none when it was not', () => {

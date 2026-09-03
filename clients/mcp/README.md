@@ -59,25 +59,13 @@ the same either way. Only the envelope differs.
 
 ## Which file to download
 
-Nothing checks this for you. A `.vsix` or a binary fetched by hand installs
-whatever it is, on whatever it is; only the marketplace and the `.mcpb`
-installer read the platform out of the package, so a hand-download is the one
-case where the reader has to do the matching.
+`INSTALL.md` names the asset each platform takes, for every artefact this
+project ships. It owns that table; repeating it here is how the two drift when
+`release.yml` gains a target.
 
-| You are on | Take |
-|---|---|
-| macOS, Apple silicon | `rpf-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
-| macOS, Intel | `rpf-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
-| Linux, x86-64 | `rpf-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
-| Windows, x86-64 | `rpf-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
-
-`rpf-vX.Y.Z.mcpb` is the exception and carries all three: macOS as a universal
-binary, Linux x86-64, Windows x86-64. Claude Desktop picks the right one.
-
-The editor extension follows the same rule — `rpf-vX.Y.Z-darwin-arm64.vsix`,
-`-darwin-x64`, `-linux-x64`, `-win32-x64` — and `rpf-vX.Y.Z.vsix` with no
-suffix is the one that carries no binary at all, for a platform this project
-does not build for. It falls back to `rpf` on `PATH`.
+`rpf-vX.Y.Z.mcpb` is the one that needs no matching: it carries macOS as a
+universal binary, Linux x86-64 and Windows x86-64, and Claude Desktop picks the
+right one.
 
 Linux arm64 and Windows arm64 are not built. Build from source.
 

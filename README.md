@@ -1,14 +1,16 @@
+<div align="center">
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/banner-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset=".github/banner-light.svg">
   <img src=".github/banner-light.svg" alt="rpfd" width="800">
 </picture>
 
-[![ci](https://img.shields.io/github/actions/workflow/status/molchalih/rpfd/ci.yml?branch=main&style=for-the-badge&label=ci&logo=githubactions&logoColor=white)](https://github.com/molchalih/rpfd/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/molchalih/rpfd?style=for-the-badge&logo=github&logoColor=white)](https://github.com/molchalih/rpfd/releases/latest)
 [![rust 1.98+](https://img.shields.io/badge/rust-1.98%2B-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=for-the-badge)](https://github.com/molchalih/rpfd/releases/latest)
-[![licence MIT OR Apache-2.0](https://img.shields.io/badge/licence-MIT%20OR%20Apache--2.0-blue?style=for-the-badge)](#licence)
+
+</div>
 
 A dependency-light Rust toolchain for reading, editing and rebuilding RPF7
 archives — the `dlc.rpf` files RAGE Multiplayer and FiveM servers hand to their
@@ -41,8 +43,12 @@ under the transform.
 
 ## Installing
 
-Prebuilt binaries for macOS, Windows and Linux are attached to each release. To
-build from source — the toolchain is pinned in `rust-toolchain.toml`:
+`INSTALL.md` is the page for this, and it answers three separate questions: how
+to install the editor extension from a `.vsix`, how to register the MCP server
+with an editor or an agent, and where to put the binary if that is all you want.
+Prebuilt binaries for macOS, Windows and Linux are attached to each release.
+
+To build from source instead — the toolchain is pinned in `rust-toolchain.toml`:
 
 ```
 git clone <this repository> && cd rpf

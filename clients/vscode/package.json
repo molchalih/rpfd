@@ -1,9 +1,14 @@
 {
   "name": "rpf",
   "displayName": "RPF Archives",
-  "description": "Edit files inside RAGE .rpf archives as ordinary files, backed by the rpf daemon",
+  "description": "Open a RAGE .rpf archive as a folder in the editor: entries edit and save as ordinary files, patched in place, rebuilt when you ask.",
   "version": "0.0.0",
   "license": "MIT OR Apache-2.0",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#F4F1EC",
+    "theme": "light"
+  },
   "engines": {
     "vscode": "^1.101.0",
     "node": ">=20"
@@ -14,7 +19,11 @@
   "keywords": [
     "rpf",
     "rage",
-    "archive"
+    "gta",
+    "fivem",
+    "ragemp",
+    "archive",
+    "modding"
   ],
   "main": "./dist/src/extension.js",
   "activationEvents": [

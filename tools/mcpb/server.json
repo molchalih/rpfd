@@ -9,6 +9,13 @@
     "source": "github",
     "url": "https://github.com/molchalih/rpfd"
   },
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/molchalih/rpfd/main/.github/icon-512.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    }
+  ],
   "packages": [
     {
       "registryType": "mcpb",
