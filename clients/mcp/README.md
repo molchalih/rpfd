@@ -176,7 +176,11 @@ mcp-publisher login github
 mcp-publisher publish server.json
 ```
 
-Registry versions are immutable and there is no unpublish.
+Registry versions are immutable and there is no unpublish. So a published
+entry pins the release it names: `0.2.1` gives
+`releases/download/v0.2.1/rpf-v0.2.1.mcpb` as the file to fetch, and that
+tag, that release and that asset can never be deleted, whatever supersedes
+them. Every publish spends one release the same way.
 
 An `mcpb` package carries its full download URL in `identifier` and must not
 carry `registryBaseUrl`. The published schema permits the field, so nothing in
