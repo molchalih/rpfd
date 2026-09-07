@@ -517,9 +517,20 @@ fn every_oracle_fixture_rebuilds_from_the_archive_it_describes() {
     println!("{TEST}: {rebuilt} fixture(s) rebuilt and compared");
 }
 
+/// Archives this repository writes for its own measurements, by exact path.
+/// A fixture pins its subject's `sha256`, and these are the output of our own
+/// packer at whatever build ran the script — so a fixture would fail on a
+/// packer change, and would make a subject that is rebuilt on demand a corpus
+/// member every gated run needs present.
+const BUILT_HERE: [(&str, &str); 1] = [(
+    "cost_deflate/deflate.rpf",
+    "written by tools/cost/make-deflate-subject.sh from generated content; \
+     it is this packer's own output and is rebuilt rather than kept",
+)];
+
 /// The refusal, stated rather than implied: an archive the oracle cannot cover
-/// is one no key material can be committed for (DR-006), and every other one
-/// has a fixture.
+/// is one no key material can be committed for (DR-006) or one this repository
+/// built itself, and every other one has a fixture.
 #[test]
 #[cfg_attr(
     no_corpus,
@@ -536,17 +547,29 @@ fn every_unencrypted_corpus_archive_has_an_oracle_fixture() {
         .map(|(_, _, fixture)| fixture.source.path)
         .collect();
 
-    let (mut examined, mut refused) = (0_u32, 0_u32);
+    let (mut examined, mut refused, mut built) = (0_u32, 0_u32, 0_u32);
     for relative in archives_under(&root) {
         examined += 1;
         let path = root.join(&relative);
         let mut file = fs::File::open(&path).expect("archive opens");
         let has_fixture = described.contains(&relative);
+        let built_here = BUILT_HERE.iter().find(|(name, _)| *name == relative);
         match Archive::open(&mut file, &Unlock::unkeyed()) {
-            Ok(_) => assert!(
-                has_fixture,
-                "{relative} is unencrypted and has no oracle fixture",
-            ),
+            Ok(_) => {
+                if let Some((_, why)) = built_here {
+                    assert!(
+                        !has_fixture,
+                        "{relative} is built here and must not have a fixture: {why}",
+                    );
+                    println!("NO ORACLE {relative}: {why}");
+                    built += 1;
+                } else {
+                    assert!(
+                        has_fixture,
+                        "{relative} is unencrypted and has no oracle fixture",
+                    );
+                }
+            }
             Err(rpf_core::Error::NeedsKey { tag }) => {
                 assert!(
                     !has_fixture,
@@ -568,6 +591,7 @@ fn every_unencrypted_corpus_archive_has_an_oracle_fixture() {
     );
     println!(
         "{TEST}: {examined} archive(s) examined, \
-         {refused} of them encrypted and deliberately without a fixture",
+         {refused} of them encrypted and {built} built here, \
+         deliberately without a fixture",
     );
 }
