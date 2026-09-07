@@ -46,7 +46,8 @@ jobs:
   # macOS, Linux and Windows are one target (docs/approach.md), and until this
   # matrix existed only one of them had ever been built. DR-012: a behaviour
   # that differs by platform and has no test is a defect waiting for its first
-  # user, and the matrix is the mechanism rather than the intention. R10.1.
+  # user, and the matrix is the mechanism rather than the intention. R10.1,
+  # spent and resolved by "Spent ids" in docs/backlog.md.
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -70,7 +71,8 @@ jobs:
 
       # rustfmt.toml pins `newline_style = "Unix"`, so this also fails on a
       # clone whose line endings were rewritten — which is what .gitattributes
-      # exists to prevent and this is what notices when it has not. R10.8.
+      # exists to prevent and this is what notices when it has not. R10.8,
+      # spent and resolved by "Spent ids" in docs/backlog.md.
       - run: cargo fmt --all -- --check
 
       # Per platform rather than once: the findings differ. `serve.rs`'s
@@ -82,7 +84,8 @@ jobs:
 
       # No corpus is present here, and none ever will be: DR-006 keeps game
       # data out of tracked content. The suite must pass anyway, skipping what
-      # it cannot reach and saying what it skipped. docs/backlog.md R8.4.
+      # it cannot reach and saying what it skipped. R8.4, spent and resolved by
+      # "Spent ids" in docs/backlog.md.
       #
       # And that claim is checked rather than asserted. `cargo test` prints `ok`
       # for a passing test and swallows its output, so a corpus test that
@@ -114,14 +117,14 @@ jobs:
           test "$skipped" -eq 14 \
             || { echo "expected 14 corpus tests to report themselves skipped, got $skipped"; exit 1; }
 
-  # R0.3: what is checked here is the oracle's **output**, and the generator is
-  # never built. `tools/oracle` links the reference implementation — 114
-  # transitive crates, DR-007 — and is excluded from the workspace, so the lock
-  # is what says it is not in a build here; the test re-emits every committed
-  # fixture from its own content and compares bytes. The corpus-gated half,
-  # which rebuilds each fixture from the archive it names, cannot run here:
-  # no game data is tracked (DR-006), and the suite job above is what counts
-  # those two skips.
+  # R0.3, spent and resolved by "Spent ids" in docs/backlog.md: what is checked
+  # here is the oracle's **output**, and the generator is never built.
+  # `tools/oracle` links the reference implementation — 61 transitive crates,
+  # DR-007 — and is excluded from the workspace, so the lock is what says it is
+  # not in a build here; the test re-emits every committed fixture from its own
+  # content and compares bytes. The corpus-gated half, which rebuilds each
+  # fixture from the archive it names, cannot run here: no game data is tracked
+  # (DR-006), and the suite job above is what counts those two skips.
   #
   # Asked once rather than per platform, for the same reason `deny` and `docs`
   # are: a committed fixture is bytes in the repository and does not vary by
@@ -171,3 +174,37 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Nothing here looked at documentation until this job existed, and two reviews
+  # in two days found the same three shapes of rot by eye: a path that names
+  # nothing, a command line still cd-ing into a directory renamed three commits
+  # earlier, and a closing fence with a sentence after it that hid 86% of
+  # `fixtures/README.md` on GitHub — in a file read by eye more than once, from
+  # the commit that created it.
+  #
+  # **It covers the distributed surface and only that.** `actions/checkout` sees
+  # the tracked Markdown: `README.md`, `INSTALL.md`, and the README under each
+  # client, each tool and `fixtures/`. All of `docs/`, and `AGENTS.md`, are
+  # untracked by design — working notes are not distributed — so they are not
+  # here to check, and reaching for them would gate what no cloner receives
+  # while leaving what every cloner reads ungated. A reference from a tracked
+  # page into one of them is withdrawn by `git check-ignore` and printed rather
+  # than reported as rot, up to a capped share above which the excuse is
+  # refused outright; `.gitignore` is where that decision is written down. The
+  # citation check goes the same way for the same reason: with no decision
+  # record and no index tracked, a `DR-NNN` can resolve to nothing here, so the
+  # check reports `n/a` and counts neither for nor against.
+  #
+  # Asked once rather than per platform, for the same reason `deny`, `docs` and
+  # `fixtures` are: Markdown is bytes in the repository and does not vary by
+  # runner. `fetch-depth` is left at the default — the gate reads the tree at
+  # this commit and no history.
+  documentation:
+    name: documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # git, awk and sh, and deliberately nothing else. DR-001's static binary
+      # with no runtime prerequisite is this project's whole argument, and a
+      # gate on it that needed a package manager would be arguing the other way.
+      - run: ./tools/docgate/docgate.sh
