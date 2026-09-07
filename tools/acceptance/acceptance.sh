@@ -256,8 +256,8 @@ cache_report() {
 
 # ------------------------------------------------------------------ watching
 
-# The vocabulary is docs/acceptance.md §5 and §13's, and nothing here invents a
-# class of its own.
+# The vocabulary is docs/acceptance.md §5's and docs/acceptance-runs.md §13's,
+# and nothing here invents a class of its own.
 classify() {
     local log_file=$1 expect=$2
     local line

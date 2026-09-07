@@ -1,5 +1,6 @@
 # cargo-mutants: how a mutation sweep of this workspace is run, and what a
-# survivor from it is allowed to mean. `docs/mutants.md` reports the sweeps.
+# survivor from it is allowed to mean. `docs/mutants.md` reports the current
+# state and `docs/mutant-runs.md` the sweeps behind it.
 #
 # The tool is here because reading has twice missed what it found. Three bounds
 # checks were disabled and all 58 tests stayed green; a 16-bit name-offset check

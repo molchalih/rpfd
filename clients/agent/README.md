@@ -1,3 +1,9 @@
+---
+foreign-paths:
+  - "x64/*"      # a member inside a game archive, not a file in this tree
+  - "**/*.meta"  # a --pattern glob over in-archive paths, not a path
+---
+
 # Driving rpf from a program
 
 The agent client. There is nothing here to install — the client is the `rpf`

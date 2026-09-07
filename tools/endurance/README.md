@@ -1,9 +1,22 @@
+---
+foreign-paths:
+  - "rmrp_*/dlc.rpf"  # an archive under RPF_CORPUS, not in this tree
+---
+
 # endurance
 
 Drives one `rpf serve --stdio` through many open/read/edit/commit/close cycles
 and samples that process's resident set size throughout, to answer whether a
-long-lived daemon holds steady or grows. The findings are in
-`docs/endurance.md`.
+long-lived daemon holds steady or grows.
+
+**It holds.** Resident set size rises over the first few hundred cycles and then
+plateaus — 29 MB at 200 cycles, 34 MB at 2,000, 41 to 42 MB at 10,000 — and the
+plateau is the allocator rather than the daemon: taking `vmmap`'s empty regions
+off the physical footprint leaves 2.9 to 4.1 MB reachable at the end of every
+run, including a run that ended at 374 MB resident. The full account, per
+allocator and with the glibc measurements beside the macOS ones, is
+`docs/endurance.md` — working material a clone does not carry, as `README.md`
+explains.
 
 ## Running it
 

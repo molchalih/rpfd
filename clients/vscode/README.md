@@ -24,6 +24,10 @@ process per window, with the entry table parsed once and kept warm.
 - **Mounts an archive as a workspace folder.** Run `RPF: Mount Archive as
   Folder`, or use the same item on a `.rpf` in the explorer. An archive nested
   inside another is a folder inside a folder.
+- **Unmounts one again.** `RPF: Unmount Archive` closes the session, stops the
+  daemon's work on that archive and takes its workspace folder away. Edits
+  still waiting are lost with it, so an archive with any asks first, modally,
+  naming how many.
 - **Presents metadata as XML.** An entry holding `RBF`, `PSO` or a
   resource-embedded `Meta` opens as an XML document and is converted back on
   save. Everything else opens as its own bytes.
@@ -45,17 +49,35 @@ process per window, with the entry table parsed once and kept warm.
   status bar says so, and `RPF: Rebuild Archive` is what writes them.
 - **Can be stopped.** The rebuild progress notification is cancellable. A
   cancelled rebuild leaves the original archive untouched.
+- **Throws the buffered edits away.** `RPF: Discard Buffered Edits` drops every
+  change waiting against an archive and writes nothing. It asks first, modally,
+  naming how many, and then says how many it dropped. Nothing on disk changes,
+  because nothing had been written.
 - **Checks an archive.** `RPF: Verify Archive` reads every entry back and lists
   what did not come back as recorded.
 - **Hands an asset to another tool.** `RPF: Edit With Another Tool` writes a
   `.ytd`, `.yft` or the like to disk, watches it, and buffers whatever the
-  other tool writes back.
+  other tool writes back, offering to reveal the file it wrote. Run it from the
+  context menu on an entry inside a mounted archive, or from the palette, which
+  acts on the entry in the active editor.
+- **Stops watching what it handed off.** `RPF: Stop Watching Handed-Off Files`
+  ends every hand-off for an archive and says how many files it was watching.
+  The files stay where they were written; what the other tool saves into them
+  after that is no longer buffered, and edits already buffered stay buffered.
 - **Gives the editor's agents an MCP server.** A mounted archive is a folder
   only inside this editor, so nothing outside its file service — an agent
   included — can read one. The extension registers `rpf serve --mcp` instead,
   built from the same binary it found for itself, and there is nothing to
   configure. `clients/mcp/README.md` describes the six tools it offers. With no
   binary, no server is offered rather than one that cannot start.
+
+Seven of the bullets above name an `RPF:` command, and all seven are in the
+Command Palette. Two are also on the explorer's context menu — `Mount Archive as
+Folder` on a `.rpf` file, `Edit With Another Tool` on an entry inside a mounted
+archive. The five that act on a whole archive — unmount, rebuild, discard,
+verify, stop watching — are given no argument from the palette: with one
+archive mounted they act on it, with several they ask which and show what is
+buffered against each, and with none they say so and stop.
 
 ## Requirements
 

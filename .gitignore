@@ -1,12 +1,17 @@
 # Third-party game archives and extracted assets. Never tracked: redistribution
-# is not ours to grant, and 195 MB of binaries poisons clone time for a repo
+# is not ours to grant, and 807 MB of binaries poisons clone time for a repo
 # whose tracked content is text.
 /assets
 fixtures/corpus/
 
 # Design notes, decision records and the backlog. Present in the working tree
-# and deliberately untracked: they are how the work is thought through, not what
-# the work ships.
+# and deliberately untracked, all of it: they are how the work is thought
+# through, not what the work ships. The whole design record is working-tree
+# material — the decision records included, and with them the index of them, so
+# a `DR-NNN` cited from tracked code, scripts or workflows names a local
+# document a cloner does not have. Requirement ids (`R<N>.<M>`) resolve the same
+# way, in the untracked backlog, and `README.md` says so on the distributed
+# surface.
 /docs
 
 # Game executables, kept locally so key extraction has something to read.
@@ -80,3 +85,11 @@ dist/
 # A machine-specific helper: it hardcodes this Mac's VS Code path and duplicates
 # clients/vscode/test/editor/run.ts, which is the portable one.
 /clients/vscode/editor-run.cjs
+
+# MCP server registrations a reader writes at their own repository root or in
+# their editor. `INSTALL.md` and `clients/mcp/README.md` tell a reader to write
+# these; none is a file this repository carries, and naming them here is what
+# says so. An instruction target is not a dead reference.
+.vscode/mcp.json
+.cursor/mcp.json
+.mcp.json

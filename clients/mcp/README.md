@@ -1,3 +1,9 @@
+---
+foreign-paths:
+  - "server/discover"           # a JSON-RPC method name, not a path
+  - "io.github.molchalih/rpfd"  # the MCP registry identifier, not a path
+---
+
 # Driving rpf from an MCP client
 
 The Model Context Protocol client. There is nothing here to install — the server
@@ -178,9 +184,10 @@ mcp-publisher publish server.json
 
 Registry versions are immutable and there is no unpublish. So a published
 entry pins the release it names: `0.2.1` gives
-`releases/download/v0.2.1/rpf-v0.2.1.mcpb` as the file to fetch, and that
-tag, that release and that asset can never be deleted, whatever supersedes
-them. Every publish spends one release the same way.
+`https://github.com/molchalih/rpfd/releases/download/v0.2.1/rpf-v0.2.1.mcpb`
+as the file to fetch, and that tag, that release and that asset can never be
+deleted, whatever supersedes them. Every publish spends one release the same
+way.
 
 An `mcpb` package carries its full download URL in `identifier` and must not
 carry `registryBaseUrl`. The published schema permits the field, so nothing in

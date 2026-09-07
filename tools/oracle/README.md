@@ -1,3 +1,8 @@
+---
+foreign-paths:
+  - "data/*.meta"  # a path inside a game archive, not in this tree
+---
+
 # oracle
 
 Runs the reference implementation over an archive and writes down what it saw,
@@ -15,9 +20,36 @@ names and compares byte for byte. Once a fixture exists the crate is not needed
 again until the corpus changes.
 
 It is worth knowing what linking it costs, since that cost is the argument:
-`rpf-archive` pulls in 114 transitive crates, among them `image`, `gltf`,
-`texture2ddecoder` and `wasm-bindgen`. That is the typed-asset surface DR-003
-excludes, and it is why this stays in `tools/`.
+`rpf-archive` pulls in **61 transitive crates**, among them `image v0.25.10`,
+`gltf v1.4.1`, `texture2ddecoder v0.1.2` and `wasm-bindgen v0.2.127`. That is
+the typed-asset surface DR-003 excludes, and it is why this stays in `tools/`.
+
+Verified 2026-09-07 against `Cargo.lock` beside this file, unchanged since it
+was generated:
+
+```
+$ cargo tree --offline --target all --edges normal,build -p rpf-archive \
+    --prefix none | sed '/^$/d; s/ (\*)$//' | sort -u | wc -l
+      62
+```
+
+62 distinct `name version` lines, less `rpf-archive` itself, is 61. The 114
+this corrects was two counting errors at once: a tree rooted at the whole crate
+rather than at `rpf-archive`, counted by occurrence rather than by distinct
+crate, since `cargo tree` prints a crate once under every parent that depends
+on it.
+
+```
+$ cargo tree --offline --target all --edges normal,build --prefix none \
+    | sed '/^$/d' | wc -l
+     114
+```
+
+Rooted at `rpf-archive` — the same command with `-p rpf-archive` — that
+occurrence count is 98, so neither error alone reaches 114. DR-007's amendment
+of 2026-09-07 carries the correction. The whole lockfile is 71 `[[package]]`
+entries: those 62, plus `oracle` and the eight crates `anyhow`, `serde`,
+`serde_json`, `sha2` and `hex` bring that `rpf-archive` does not.
 
 ## Running it
 
@@ -35,7 +67,8 @@ cargo run --release -- /path/to/corpus <dir>/<archive>.rpf > ../../fixtures/<nam
 - `source.path` — where the archive sits under `RPF_CORPUS`. What
   `crates/rpf-core/tests/oracle.rs` locates the archive by.
 - `archives[]` — the entry table of the archive and of every archive nested
-  inside it, with each entry's raw fields. This is what R3.1–R3.5 check against.
+  inside it, with each entry's raw fields. This is what the corpus-gated leg of
+  `crates/rpf-core/tests/oracle.rs` checks our reader against.
 - `files[]` — every leaf file with a checksum of its extracted bytes.
   `generator.extraction_semantics` states exactly what those bytes are, because
   the rule is not the same for both entry kinds and our reader has to match it.
@@ -43,12 +76,13 @@ cargo run --release -- /path/to/corpus <dir>/<archive>.rpf > ../../fixtures/<nam
 **`files[].path` omits directories.** The reference implementation walks entries
 linearly and skips directory entries rather than descending them, so
 `data/carvariations.meta` is emitted as `carvariations.meta`. Path construction
-(R3.2) is therefore checked against `archives[].entries`, which does carry the
+is therefore checked against `archives[].entries`, which does carry the
 directory records, and not against these paths.
 
 ## Limits
 
 No key material, so unencrypted archives only. `GtaKeys::load` wants a
-pre-dumped blob, which is the artifact DR-006 declines to hold. Encrypted
-archives get an oracle once R2 can supply material extracted from the user's own
-install, and not before.
+pre-dumped blob, which is the artifact DR-006 declines to hold. That `rpf`
+itself takes its keys from the user's own install at run time does not settle
+it: nothing routes that material into this crate, so an encrypted archive has no
+oracle and gets one only when something does.
