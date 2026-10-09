@@ -265,6 +265,37 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" "$ASSET" --clobber
 
+  # The five packages above, listed on Open VSX: the registry Cursor, VSCodium
+  # and Windsurf install from, and what lets an installed copy update itself.
+  # Taken from the release, as the bundle job takes the binaries. The
+  # Marketplace is still a hand upload; automating it is backlog R8.9.
+  openvsx:
+    needs: [release, extension]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: the packages this release carries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*.vsix' --dir vsix
+          count=$(find vsix -name '*.vsix' | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 packages on $TAG, found $count" >&2
+            exit 1
+          fi
+
+      # --skip-duplicate so a re-run after a partial failure publishes what is
+      # missing rather than failing on what is already there.
+      - name: publish
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx --yes ovsx@1.2.0 publish --skip-duplicate --packagePath vsix/*.vsix
+
   # R8.6, and the half of R8.7 that is not a credential. One `.mcpb` — a zip of
   # the binaries beside a `manifest.json` — is both Claude Desktop's
   # drag-and-drop installer and the artefact the MCP registry's
