@@ -15,6 +15,13 @@ Visual C++ redistributable.
 
 ## The editor extension
 
+**In Cursor, VSCodium and Windsurf, install it from the editor.** It is listed
+on [Open VSX](https://open-vsx.org/extension/molchalih/rpf), the registry those
+editors install from, as `molchalih.rpf`: search the Extensions view for it, and
+the editor takes the package for its platform and updates it with each release.
+Listed from `v0.3.0`, published by `release.yml`. VS Code installs from the
+Marketplace instead, where it is not listed yet, so in VS Code it is the file.
+
 **There is no one-click install for a `.vsix`.** A `vscode://` link that
 installs an extension resolves against the Marketplace, where this extension is
 not listed, so the file is what you have. Three ways to install it, all
@@ -44,8 +51,9 @@ arm64, Windows arm64 — and it expects `rpf` on `PATH`, which the last section 
 this page is about.
 
 **An extension installed from a file does not update itself.** Updates come from
-the Marketplace, and a `.vsix` is outside it: to move to a new release, download
-the next one and install it over this one.
+the registry an extension was installed from, and a `.vsix` is outside every
+one: to move to a new release, download the next one and install it over this
+one.
 
 `clients/vscode/README.md` is the extension's own page — what it does in the
 editor, what it refuses to do behind your back, and how it finds the binary.
