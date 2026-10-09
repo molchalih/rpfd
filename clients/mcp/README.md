@@ -78,7 +78,7 @@ Linux arm64 and Windows arm64 are not built. Build from source.
 ## Per client
 
 The transport and the argument list are the same everywhere; what differs is
-the file, and in one case the key inside it.
+the file, the key inside it, and for Codex the format.
 
 <details>
 <summary><b>Claude Code</b></summary>
@@ -102,6 +102,35 @@ untouched, which is why the two `rpf` arguments need no escaping:
 ```sh
 claude mcp add --scope project rpf -- /path/to/rpf serve --mcp
 ```
+
+`--scope user` registers it for every project on the machine instead, which is
+what `INSTALL.md`'s procedure for an agent does.
+
+</details>
+
+<details>
+<summary><b>Codex</b></summary>
+
+`~/.codex/config.toml`, or the same file under `CODEX_HOME` where that is set —
+TOML rather than JSON, under `mcp_servers`:
+
+```toml
+[mcp_servers.rpf]
+command = "/path/to/rpf"
+args = ["serve", "--mcp"]
+```
+
+Or let the CLI write it; as with Claude Code, everything after `--` goes to the
+server untouched:
+
+```sh
+codex mcp add rpf -- /path/to/rpf serve --mcp
+```
+
+The file above is what that command wrote, byte for byte, with Codex 0.160.0
+and a scratch `CODEX_HOME`. `codex mcp list` shows the entry without starting
+the server, and `codex mcp remove rpf` takes it out. A second `add` under the
+same name replaces the entry without asking.
 
 </details>
 
@@ -161,6 +190,11 @@ archive outside the workspace stops being reachable, which is most of them.
   }
 }
 ```
+
+`~/.cursor/mcp.json` takes the same object for every project on the machine,
+and Cursor's terminal agent reads it too: given only that file, in a scratch
+`HOME`, `cursor-agent mcp list-tools rpf` started the server and listed the six
+tools.
 
 </details>
 

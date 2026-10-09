@@ -10,8 +10,8 @@ import * as vscode from 'vscode';
 import { Daemon } from '../core/daemon.js';
 import { TransportError } from '../core/errors.js';
 import { HandOff, type Imported, PASSTHROUGH } from '../core/handoff.js';
-import { locate } from '../core/locate.js';
 import { ArchiveSession } from '../core/session.js';
+import { located } from './binary.js';
 import { note } from './messages.js';
 
 /** One mounted archive. */
@@ -24,6 +24,7 @@ export interface Mounted {
 export class Archives {
     private readonly context: vscode.ExtensionContext;
     private readonly mounted = new Map<string, Mounted>();
+    private readonly opening = new Map<string, Promise<Mounted>>();
     private readonly changed = new vscode.EventEmitter<void>();
     private daemon: Daemon | undefined;
     private starting: Promise<Daemon> | undefined;
@@ -56,17 +57,32 @@ export class Archives {
         return this.mounted.get(archive);
     }
 
+    /** The session for an archive once an open of it under way has finished. */
+    async settled(archive: string): Promise<Mounted | undefined> {
+        await this.opening.get(archive)?.catch(() => undefined);
+        return this.mounted.get(archive);
+    }
+
     /**
      * Mounts an archive, or gives back the session already holding it.
      *
      * Keyed on the path the daemon resolved, so two spellings of one archive
      * are one mount.
      */
-    async mount(archive: string): Promise<Mounted> {
+    mount(archive: string): Promise<Mounted> {
         const existing = this.mounted.get(archive);
         if (existing) {
-            return existing;
+            return Promise.resolve(existing);
         }
+        let opening = this.opening.get(archive);
+        if (!opening) {
+            opening = this.open(archive).finally(() => this.opening.delete(archive));
+            this.opening.set(archive, opening);
+        }
+        return opening;
+    }
+
+    private async open(archive: string): Promise<Mounted> {
         const daemon = await this.running();
         const session = await ArchiveSession.open(daemon, archive);
         const already = this.mounted.get(session.path);
@@ -125,12 +141,7 @@ export class Archives {
     }
 
     private async startDaemon(): Promise<Daemon> {
-        const settings = vscode.workspace.getConfiguration('rpf');
-        const found = await locate({
-            setting: settings.get<string>('binaryPath'),
-            extensionRoot: this.context.extensionPath,
-            pathVariable: process.env.PATH,
-        });
+        const found = await located(this.context);
         if (!found.found) {
             note(found.instructions);
             throw new TransportError(found.instructions);
@@ -174,13 +185,14 @@ export class Archives {
             return;
         }
         note(`the daemon went; re-opening ${archives.length} archive(s)`);
-        for (const archive of archives) {
-            try {
-                await this.mount(archive);
-            } catch (failure) {
-                note(`${archive} could not be re-opened: ${String(failure)}`);
-            }
-        }
+        // All at once, so an unmount arriving meanwhile finds each one in flight.
+        await Promise.all(
+            archives.map((archive) =>
+                this.mount(archive).catch((failure: unknown) => {
+                    note(`${archive} could not be re-opened: ${String(failure)}`);
+                }),
+            ),
+        );
         const edits = lost === 0 ? '' : ` ${lost} buffered edit(s) were lost.`;
         void vscode.window.showWarningMessage(
             `The rpf daemon stopped and was restarted.${edits}`,

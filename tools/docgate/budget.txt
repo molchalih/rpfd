@@ -29,33 +29,45 @@
 #           command lines name is added here in the change that adds it.
 #
 # Measured on the settled tree with `./tools/docgate/docgate.sh measure`:
-#   claims 113  bytes 98702  citations 106 (n/a)  excused 25 (22.1%)
+#   claims 118  bytes 114385  citations 106 (n/a)  excused 24 (20.3%)
 #
-# The `bytes` line moves down from 105132, and the 6430 bytes it gives back are
-# a decision reversed rather than prose trimmed. `docs/decisions/INDEX.md` was
-# tracked for one round — 7585 bytes — so that the `DR-NNN` citations in tracked
-# code, scripts and workflows resolved for a cloner. It is untracked again: the
-# whole design record is working-tree material, with no exception, and the pages
-# that described the index as shipping have lost the paragraphs and table rows
-# that said so. `README.md` gains the plainer statement in their place — that a
-# `DR-NNN` in a clone names a local document the reader does not have — which is
-# why the fall is smaller than the page that left.
+# The `bytes` line moves up 15247 from 99138. `INSTALL.md` gains 12490: the
+# procedure an agent follows when asked to install this repository, in place of
+# the table it replaces, and Codex beside Claude Code. Most of it is the three
+# scripts — the binary with its digest checked, the profile line written in the
+# extension's words so neither tool adds a second, and the Windows `Path`
+# edited through the registry so `%USERPROFILE%`-style entries keep expanding —
+# and the rest is each client's detection, command, confirmation and undo, and
+# what was executed rather than only read. `clients/mcp/README.md` gains 1080
+# for Codex's `config.toml` form, as `codex mcp add` wrote it, and the
+# user-level registrations for Claude Code and Cursor. `README.md` gains 279: 285 for
+# the line that sends an agent there, less 6 for a home directory in the
+# `rpf keys cache` example that named a real user. `clients/vscode/README.md` gains 1398 for
+# the bundled binary on `PATH` in the editor's terminals, and for Install 'rpf'
+# Command in PATH, which writes the same paths the procedure does.
+#
+# 99138 was itself a rise of 436 from 98702, because `clients/vscode/README.md`
+# gained what the extension now does: it names an archive `dlc.rpf — mpheist`,
+# so two archives with one file name are two names, and it offers Unmount on a
+# mounted archive's folder in the explorer. 98702 was a fall of 6430 from
+# 105132, when `docs/decisions/INDEX.md` was untracked again: the whole design
+# record is working-tree material, with no exception.
 #
 # The citation check finds 106 identifiers and can resolve none of them, so it
 # reports `n/a — no yield` and counts in neither direction. A permanent red on a
 # decision the repository made deliberately would be noise, and a green would
 # claim the citations had been followed when none was.
 #
-# `docs` came off the `roots` line in the same change: nothing under it is
-# tracked any more, and a declared root naming no tracked directory is a failure
-# by design. No fenced command line in any tracked page was rooted there, so
-# nothing stopped being read as a claim.
+# `docs` came off the `roots` line when the index was untracked: nothing under
+# it is tracked any more, and a declared root naming no tracked directory is a
+# failure by design. No fenced command line in any tracked page was rooted
+# there, so nothing stopped being read as a claim.
 #
-# `claims` stays at 75 and is not moved: the extractor yields 113 against it, so
+# `claims` stays at 75 and is not moved: the extractor yields 118 against it, so
 # the floor is doing what it is for — a tripwire under the extractor, tripped
 # when shape_ok() or the fence split stops matching. Raising it to sit just under
 # today's yield would convert it into a second byte budget on a number that moves
 # for reasons nobody reviews, and it is the low side of it that carries meaning.
 claims 75
-bytes 98702
+bytes 114385
 roots .cargo .githooks .github clients crates fixtures fuzz tools

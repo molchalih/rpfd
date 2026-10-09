@@ -24,8 +24,13 @@ process per window, with the entry table parsed once and kept warm.
 - **Mounts an archive as a workspace folder.** Run `RPF: Mount Archive as
   Folder`, or use the same item on a `.rpf` in the explorer. An archive nested
   inside another is a folder inside a folder.
+- **Names an archive by its folder too.** The workspace folder and every
+  message call it `dlc.rpf — mpheist`: file name, then the folder holding it,
+  so two DLC packs' `dlc.rpf` are two names. One at a drive's root is its file
+  name alone. A workspace saved earlier keeps its saved folder names.
 - **Unmounts one again.** `RPF: Unmount Archive` closes the session, stops the
-  daemon's work on that archive and takes its workspace folder away. Edits
+  daemon's work on that archive and takes its workspace folder away; run from
+  a mounted archive's folder in the explorer, it does not ask which. Edits
   still waiting are lost with it, so an archive with any asks first, modally,
   naming how many.
 - **Presents metadata as XML.** An entry holding `RBF`, `PSO` or a
@@ -70,14 +75,34 @@ process per window, with the entry table parsed once and kept warm.
   built from the same binary it found for itself, and there is nothing to
   configure. `clients/mcp/README.md` describes the six tools it offers. With no
   binary, no server is offered rather than one that cannot start.
+- **Puts its bundled `rpf` on `PATH` in VS Code's terminals.** When the
+  binary in use is the one bundled with the extension and no `rpf` is on
+  `PATH` already, the integrated terminals get its folder, which holds nothing
+  else, prepended to `PATH`. A binary set in `rpf.binaryPath` or found on
+  `PATH` is not added, since its folder may hold other tools.
+- **Installs the command machine-wide, only when asked.** `RPF: Install 'rpf'
+  Command in PATH` copies the bundled or configured binary to
+  `~/.local/bin/rpf`, or `%LOCALAPPDATA%\Programs\rpf\rpf.exe`, recording its
+  SHA-256 and the extension version beside it; one found on `PATH` is already
+  a command and is not copied. It never overwrites a binary it did not
+  install: it refuses, naming the path and what answers there. If the folder
+  is not on `PATH`, it offers to add one marked line to your shell's startup
+  file (`.zshrc`, `.bashrc` and the like) or the folder to your Windows user
+  `PATH`, and does so only if you press the button. On startup, a newer
+  version of the extension replaces a copy it installed, only while that copy
+  is byte-for-byte what was installed, and never with an older one. `RPF:
+  Uninstall 'rpf' Command from PATH`, and uninstalling the extension, remove
+  the copy under the same rule. Neither takes the line or the `PATH` entry
+  back out, since the folder may hold other commands; the command says so.
 
-Seven of the bullets above name an `RPF:` command, and all seven are in the
-Command Palette. Two are also on the explorer's context menu — `Mount Archive as
-Folder` on a `.rpf` file, `Edit With Another Tool` on an entry inside a mounted
-archive. The five that act on a whole archive — unmount, rebuild, discard,
-verify, stop watching — are given no argument from the palette: with one
-archive mounted they act on it, with several they ask which and show what is
-buffered against each, and with none they say so and stop.
+Eight of the bullets above name nine `RPF:` commands, all in the
+Command Palette. Three are also on the explorer's context menu — `Mount Archive
+as Folder` on a `.rpf` file, `Unmount Archive` on the folder of a mounted
+archive, `Edit With Another Tool` on an entry inside a mounted archive. The
+five that act on a whole archive — unmount, rebuild, discard, verify, stop
+watching — are given no argument from the palette: with one archive mounted
+they act on it, with several they ask which and show what is buffered against
+each, and with none they say so and stop.
 
 ## Requirements
 

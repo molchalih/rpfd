@@ -4,8 +4,8 @@
 
 import * as vscode from 'vscode';
 
-import { locate } from '../core/locate.js';
 import { serversFor } from '../core/mcp.js';
+import { located } from './binary.js';
 import { note } from './messages.js';
 
 /** The id the `contributes.mcpServerDefinitionProviders` entry declares. */
@@ -17,11 +17,7 @@ export function serveMcp(context: vscode.ExtensionContext): vscode.Disposable[] 
     const provider: vscode.McpServerDefinitionProvider<vscode.McpStdioServerDefinition> = {
         onDidChangeMcpServerDefinitions: changed.event,
         provideMcpServerDefinitions: async () => {
-            const found = await locate({
-                setting: vscode.workspace.getConfiguration('rpf').get<string>('binaryPath'),
-                extensionRoot: context.extensionPath,
-                pathVariable: process.env.PATH,
-            });
+            const found = await located(context);
             if (!found.found) {
                 note(`no MCP server is offered: ${found.instructions}`);
             }

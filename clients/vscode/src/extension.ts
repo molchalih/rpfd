@@ -9,19 +9,25 @@
 import * as vscode from 'vscode';
 
 import { DaemonError, advise, render } from './core/errors.js';
+import { labelOf } from './core/label.js';
 import type { Progress } from './core/protocol.js';
 import type { ArchiveSession, SaveOptions, Saved } from './core/session.js';
-import { SCHEME, rootOf } from './core/uri.js';
+import { SCHEME, addressOf, rootOf } from './core/uri.js';
 import { Archives, type Mounted } from './vscode/archives.js';
 import { AutoSave } from './vscode/autosave.js';
+import { installCommand, pathInTerminals, uninstallCommand } from './vscode/command.js';
 import { Decorations } from './vscode/decorations.js';
 import { RpfFileSystem } from './vscode/filesystem.js';
 import { serveMcp } from './vscode/mcp.js';
 import { log, note, report } from './vscode/messages.js';
 
+/** How long a change to the workspace folders is waited for. */
+const FOLDER_CHANGE_LIMIT_MS = 5_000;
+
 /** What the extension hands back, which only its own editor suite asks for. */
 export interface Api {
     decorations: Decorations;
+    terminal: vscode.EnvironmentVariableCollection;
 }
 
 /** Starts the extension. */
@@ -47,7 +53,7 @@ export function activate(context: vscode.ExtensionContext): Api {
             showState(autosave, status);
             void vscode.window
                 .showWarningMessage(
-                    `${basename(held.path)}: ${held.edits} edit(s) could not be written for you. ${held.why}`,
+                    `${labelOf(held.path)}: ${held.edits} edit(s) could not be written for you. ${held.why}`,
                     'Rebuild Now',
                 )
                 .then((chosen) => {
@@ -62,21 +68,24 @@ export function activate(context: vscode.ExtensionContext): Api {
             }
         }),
         ...serveMcp(context),
+        ...pathInTerminals(context),
     );
 
     register(context, 'rpf.mountArchive', (uri?: vscode.Uri) => mount(archives, files, uri));
-    register(context, 'rpf.unmountArchive', () => unmount(archives));
+    register(context, 'rpf.unmountArchive', (uri?: vscode.Uri) => unmount(archives, uri));
     register(context, 'rpf.saveArchive', (path?: string) => save(archives, files, autosave, path));
     register(context, 'rpf.discardEdits', () => discard(archives, files));
     register(context, 'rpf.verifyArchive', () => verify(archives));
     register(context, 'rpf.handOff', (uri?: vscode.Uri) => handOff(archives, uri));
     register(context, 'rpf.endHandOff', () => endHandOff(archives));
+    register(context, 'rpf.installCommand', () => installCommand(context));
+    register(context, 'rpf.uninstallCommand', () => uninstallCommand());
 
     // A window reopened on a saved workspace already has the folders; the
     // archives behind them have to be opened again before anything can be read.
     void remount(archives);
     showState(autosave, status);
-    return { decorations };
+    return { decorations, terminal: context.environmentVariableCollection };
 }
 
 /** Stops it. The daemon goes with the subscriptions. */
@@ -106,18 +115,20 @@ function register(
     );
 }
 
-/** Opens every `rpf:` folder the window already holds. */
+/**
+ * Opens every `rpf:` folder the window already holds, all at once, so an
+ * unmount arriving meanwhile finds each one in flight.
+ */
 async function remount(archives: Archives): Promise<void> {
-    for (const folder of vscode.workspace.workspaceFolders ?? []) {
-        if (folder.uri.scheme !== SCHEME || folder.uri.query.length === 0) {
-            continue;
-        }
-        try {
-            await archives.mount(folder.uri.query);
-        } catch (failure) {
-            note(`${folder.uri.query}: ${render(advise(failure))}`);
-        }
-    }
+    await Promise.all(
+        (vscode.workspace.workspaceFolders ?? [])
+            .filter((folder) => folder.uri.scheme === SCHEME && folder.uri.query.length > 0)
+            .map((folder) =>
+                archives.mount(folder.uri.query).catch((failure: unknown) => {
+                    note(`${folder.uri.query}: ${render(advise(failure))}`);
+                }),
+            ),
+    );
 }
 
 /**
@@ -144,23 +155,20 @@ async function mount(
     }
     const mounted = await archives.mount(chosen.fsPath);
     const root = vscode.Uri.from(rootOf(mounted.session.path));
-    const existing = (vscode.workspace.workspaceFolders ?? []).findIndex(
-        (folder) => folder.uri.toString() === root.toString(),
-    );
-    if (existing >= 0) {
+    if (folderOf(mounted.session.path) >= 0) {
         files.changed(mounted.session.path);
         await vscode.commands.executeCommand('revealInExplorer', root);
         return;
     }
     // The `(rpf)` suffix is the resource label formatter's, contributed in
     // `package.json`, which puts it on breadcrumbs and tabs as well.
-    const name = basename(mounted.session.path);
-    const added = vscode.workspace.updateWorkspaceFolders(
+    const name = labelOf(mounted.session.path);
+    const added = await changeFolders(() => [
         vscode.workspace.workspaceFolders?.length ?? 0,
         0,
         { uri: root, name },
-    );
-    if (!added) {
+    ]);
+    if (added === false) {
         void vscode.window.showErrorMessage(
             `${name} could not be added to the workspace. Opening the folder directly instead.`,
         );
@@ -178,15 +186,25 @@ async function ask(): Promise<vscode.Uri | undefined> {
     return picked?.[0];
 }
 
-/** Closes an archive, which is what releases the daemon's claim on it. */
-async function unmount(archives: Archives): Promise<void> {
-    const mount = await choose(archives, 'Unmount which archive?');
-    if (!mount) {
+/**
+ * Closes an archive, which is what releases the daemon's claim on it.
+ *
+ * The archive is the one the command was given — the explorer context menu
+ * passes the folder that was right-clicked. Only an invocation with nothing to
+ * go on asks which.
+ */
+async function unmount(archives: Archives, given?: vscode.Uri): Promise<void> {
+    const archive =
+        given === undefined
+            ? (await choose(archives, 'Unmount which archive?'))?.session.path
+            : addressOf(given).archive;
+    if (archive === undefined) {
         return;
     }
-    if (mount.session.state === 'dirty') {
+    const mount = await archives.settled(archive);
+    if (mount?.session.state === 'dirty') {
         const chosen = await vscode.window.showWarningMessage(
-            `${basename(mount.session.path)} has ${mount.session.dirtyPaths().length} unsaved edit(s). Unmounting discards them.`,
+            `${labelOf(archive)} has ${mount.session.dirtyPaths().length} unsaved edit(s). Unmounting discards them.`,
             { modal: true },
             'Discard and Unmount',
         );
@@ -194,14 +212,61 @@ async function unmount(archives: Archives): Promise<void> {
             return;
         }
     }
-    const root = vscode.Uri.from(rootOf(mount.session.path)).toString();
-    const at = (vscode.workspace.workspaceFolders ?? []).findIndex(
+    await archives.unmount(archive);
+    const removed = await changeFolders(() => {
+        const at = folderOf(archive);
+        return at < 0 ? undefined : [at, 1];
+    });
+    if (removed === false) {
+        void vscode.window.showErrorMessage(
+            `${labelOf(archive)} is unmounted, but its folder could not be taken out of the workspace.`,
+        );
+    }
+}
+
+type FolderChange = [start: number, deleteCount: number, ...add: { uri: vscode.Uri; name?: string }[]];
+
+let folderChanges: Promise<unknown> = Promise.resolve();
+
+/**
+ * One change to the workspace folders, after any still pending: the editor
+ * refuses a change while another is in flight. `plan` is read when its turn comes.
+ *
+ * @returns whether the editor took the change; `undefined` when `plan` had none.
+ */
+function changeFolders(plan: () => FolderChange | undefined): Promise<boolean | undefined> {
+    const turn = folderChanges.then(async () => {
+        const change = plan();
+        if (change === undefined) {
+            return undefined;
+        }
+        let settle = (): void => undefined;
+        const settled = new Promise<void>((resolve) => {
+            settle = resolve;
+        });
+        const listening = vscode.workspace.onDidChangeWorkspaceFolders(() => settle());
+        const bound = setTimeout(() => settle(), FOLDER_CHANGE_LIMIT_MS);
+        try {
+            if (!vscode.workspace.updateWorkspaceFolders(...change)) {
+                return false;
+            }
+            await settled;
+            return true;
+        } finally {
+            clearTimeout(bound);
+            listening.dispose();
+        }
+    });
+    folderChanges = turn.catch(() => undefined);
+    return turn;
+}
+
+/** Where an archive's folder sits in the workspace, or -1 when it is not there. */
+function folderOf(archive: string): number {
+    const root = vscode.Uri.from(rootOf(archive)).toString();
+    return (vscode.workspace.workspaceFolders ?? []).findIndex(
         (folder) => folder.uri.toString() === root,
     );
-    await archives.unmount(mount.session.path);
-    if (at >= 0) {
-        vscode.workspace.updateWorkspaceFolders(at, 1);
-    }
 }
 
 /**
@@ -226,7 +291,7 @@ async function save(
     const { session } = mount;
     if (session.state === 'clean') {
         void vscode.window.showInformationMessage(
-            `${basename(session.path)} has no buffered edits.`,
+            `${labelOf(session.path)} has no buffered edits.`,
         );
         return;
     }
@@ -241,7 +306,7 @@ async function save(
     }
     const how = saved.method === 'patch' ? 'patched in place' : 'rebuilt';
     void vscode.window.showInformationMessage(
-        `${basename(session.path)}: ${saved.committed} edit(s) ${how}; ${saved.entries} entries, ${saved.len} bytes.`,
+        `${labelOf(session.path)}: ${saved.committed} edit(s) ${how}; ${saved.entries} entries, ${saved.len} bytes.`,
     );
 }
 
@@ -259,7 +324,7 @@ async function commit(
         return await vscode.window.withProgress(
             {
                 location: vscode.ProgressLocation.Notification,
-                title: `Saving ${basename(session.path)}`,
+                title: `Saving ${labelOf(session.path)}`,
                 cancellable: true,
             },
             async (progress, token) => {
@@ -289,7 +354,7 @@ async function commit(
             throw failure;
         }
         const chosen = await vscode.window.showWarningMessage(
-            `${basename(session.path)} is inside a game installation.`,
+            `${labelOf(session.path)} is inside a game installation.`,
             { modal: true, detail: advise(failure).reason },
             'Write into the game installation anyway',
         );
@@ -315,7 +380,7 @@ async function discard(archives: Archives, files: RpfFileSystem): Promise<void> 
         return;
     }
     const chosen = await vscode.window.showWarningMessage(
-        `Discard ${mount.session.dirtyPaths().length} buffered edit(s) to ${basename(mount.session.path)}?`,
+        `Discard ${mount.session.dirtyPaths().length} buffered edit(s) to ${labelOf(mount.session.path)}?`,
         { modal: true },
         'Discard',
     );
@@ -336,7 +401,7 @@ async function verify(archives: Archives): Promise<void> {
     const verified = await vscode.window.withProgress(
         {
             location: vscode.ProgressLocation.Notification,
-            title: `Verifying ${basename(mount.session.path)}`,
+            title: `Verifying ${labelOf(mount.session.path)}`,
             cancellable: false,
         },
         async (progress) =>
@@ -409,7 +474,7 @@ async function choose(archives: Archives, title: string): Promise<Mounted | unde
     }
     const picked = await vscode.window.showQuickPick(
         open.map((mount) => ({
-            label: basename(mount.session.path),
+            label: labelOf(mount.session.path),
             description: mount.session.path,
             detail:
                 mount.session.state === 'clean'
@@ -447,10 +512,4 @@ function showState(autosave: AutoSave, status: vscode.StatusBarItem): void {
     status.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
     status.tooltip = held.map((one) => `${one.path} — ${one.why}`).join('\n');
     status.show();
-}
-
-/** The last component of a path, whichever separator it uses. */
-function basename(at: string): string {
-    const cut = Math.max(at.lastIndexOf('/'), at.lastIndexOf('\\'));
-    return cut < 0 ? at : at.slice(cut + 1);
 }

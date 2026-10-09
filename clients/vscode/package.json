@@ -27,7 +27,8 @@
   ],
   "main": "./dist/src/extension.js",
   "activationEvents": [
-    "onFileSystem:rpf"
+    "onFileSystem:rpf",
+    "onStartupFinished"
   ],
   "capabilities": {
     "virtualWorkspaces": true,
@@ -77,6 +78,16 @@
       {
         "command": "rpf.endHandOff",
         "title": "Stop Watching Handed-Off Files",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.installCommand",
+        "title": "Install 'rpf' Command in PATH",
+        "category": "RPF"
+      },
+      {
+        "command": "rpf.uninstallCommand",
+        "title": "Uninstall 'rpf' Command from PATH",
         "category": "RPF"
       }
     ],
@@ -137,6 +148,11 @@
           "group": "navigation@50"
         },
         {
+          "command": "rpf.unmountArchive",
+          "when": "resourceScheme == rpf && explorerResourceIsRoot",
+          "group": "navigation@50"
+        },
+        {
           "command": "rpf.handOff",
           "when": "resourceScheme == rpf && !explorerResourceIsFolder",
           "group": "navigation@50"
@@ -185,7 +201,8 @@
     "check": "tsc -p . --noEmit",
     "test": "npm run build && node --test --test-timeout=60000 dist/test/*.test.js",
     "test:editor": "npm run build && node dist/test/editor/run.js",
-    "package": "npm run build && node dist/scripts/vsix.js"
+    "package": "npm run build && node dist/scripts/vsix.js",
+    "vscode:uninstall": "node ./dist/src/uninstall.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -67,14 +67,20 @@ export function candidates(search: Search): { source: Source; at: string }[] {
         found.push({ source: 'bundled', at: bundledAt(search.extensionRoot, platform, arch) });
     }
     const name = binaryName(platform);
-    const separator = platform === 'win32' ? ';' : ':';
-    for (const directory of (search.pathVariable ?? '').split(separator)) {
-        if (directory.trim().length === 0) {
-            continue;
-        }
+    for (const directory of pathEntries(search.pathVariable, platform)) {
         found.push({ source: 'path', at: path.join(directory, name) });
     }
     return found;
+}
+
+/** The directories of a `PATH` value, split the way the platform splits it. */
+export function pathEntries(
+    pathVariable: string | undefined,
+    platform: NodeJS.Platform = process.platform,
+): string[] {
+    return (pathVariable ?? '')
+        .split(platform === 'win32' ? ';' : ':')
+        .filter((directory) => directory.trim().length > 0);
 }
 
 /** Whether a path is there and can be executed. */

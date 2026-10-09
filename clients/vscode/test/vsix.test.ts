@@ -76,6 +76,16 @@ describe('the vsix', () => {
         }
     });
 
+    it('carries the script the editor runs when the extension is uninstalled', () => {
+        const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as {
+            scripts: Record<string, string>;
+        };
+        const script = /^node \.\/(\S+)$/.exec(manifest.scripts['vscode:uninstall'] ?? '')?.[1];
+        assert.equal(script, 'dist/src/uninstall.js');
+        const names = contents(ROOT, 'somebody').map((part) => part.name);
+        assert.ok(names.includes(`extension/${script}`), `${script} is not in the package`);
+    });
+
     it('injects the publisher rather than committing one', () => {
         const parts = contents(ROOT, 'somebody');
         const shipped = parts.find((part) => part.name === 'extension/package.json');

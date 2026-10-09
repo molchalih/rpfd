@@ -18,6 +18,11 @@ clients, and the archives Grand Theft Auto V ships. One command-line binary with
 no runtime prerequisite, and the same code behind a JSON-RPC daemon and a VS
 Code extension.
 
+**Asked to install this?** An agent follows
+[the procedure in `INSTALL.md`](INSTALL.md#installing-everything-as-an-agent):
+the binary on `PATH` first, then `rpf` registered with every client the machine
+has.
+
 ## Documentation
 
 This page, `INSTALL.md` and the `README.md` files under `clients/`, `tools/`
@@ -102,6 +107,7 @@ under the transform.
 `INSTALL.md` is the page for this, and it answers three separate questions: how
 to install the editor extension from a `.vsix`, how to register the MCP server
 with an editor or an agent, and where to put the binary if that is all you want.
+It ends with the procedure an agent follows to do all three on one machine.
 Prebuilt binaries for macOS, Windows and Linux are attached to each release.
 
 To build from source instead — the toolchain is pinned in `rust-toolchain.toml`.
@@ -130,7 +136,7 @@ landed and how much is in it:
 
 ```
 $ rpf keys cache
-cache   /Users/molchalin/Library/Application Support/rpf/keys
+cache   /Users/you/Library/Application Support/rpf/keys
 entries 2
 ```
 

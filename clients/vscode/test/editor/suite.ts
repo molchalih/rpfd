@@ -26,6 +26,7 @@ import { promisify } from 'node:util';
 
 import * as vscode from 'vscode';
 
+import { labelOf } from '../../src/core/label.js';
 import { SCHEME, rootOf, uriOf } from '../../src/core/uri.js';
 import type { Api } from '../../src/extension.js';
 import { binary, packArchive, scratch } from '../support.js';
@@ -425,6 +426,44 @@ function workflow(): void {
             async () => vscode.workspace.fs.readDirectory(entryUri(at, '')),
             'an unmounted archive is still readable',
         );
+    });
+
+    it('two archives with one name are two labels, and each unmounts from its own folder', async () => {
+        const mounted: string[] = [];
+        for (const folder of ['mpheist', 'mpbeach']) {
+            fs.mkdirSync(path.join(stage, folder));
+            const archive = await packArchive(path.join(stage, folder, 'dlc.rpf'), {
+                entries: [{ path: 'content.xml', bytes: Buffer.from('<content/>\n') }],
+            });
+            mounted.push(await mount(archive));
+        }
+        const named = (archive: string): string | undefined =>
+            (vscode.workspace.workspaceFolders ?? []).find((one) => one.uri.query === archive)?.name;
+        assert.deepEqual(mounted.map(named), ['dlc.rpf — mpheist', 'dlc.rpf — mpbeach']);
+        assert.deepEqual(mounted.map(named), mounted.map(labelOf));
+
+        // With two mounted, an invocation given no archive would ask which.
+        for (const archive of mounted) {
+            const folder = (vscode.workspace.workspaceFolders ?? []).find(
+                (one) => one.uri.query === archive,
+            );
+            assert.ok(folder, `${archive} has no workspace folder`);
+            await vscode.commands.executeCommand('rpf.unmountArchive', folder.uri);
+            await until(
+                () => named(archive) === undefined,
+                () => `${archive} outlived its unmount: the window holds ${folders()}`,
+            );
+            await assert.rejects(
+                async () => vscode.workspace.fs.readDirectory(entryUri(archive, '')),
+                `${archive} is still readable after its unmount`,
+            );
+        }
+    });
+
+    it('a configured binary is not put on the terminals\' PATH, since its folder may be shared', async () => {
+        const api = extension().exports as Api;
+        assert.equal(api.terminal.description, 'Puts the rpf binary bundled with this extension on PATH.');
+        assert.equal(api.terminal.get('PATH'), undefined, `${path.dirname(binary())} was put on PATH`);
     });
 }
 
