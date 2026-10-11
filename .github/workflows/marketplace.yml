@@ -1,0 +1,78 @@
+name: marketplace
+
+# Publishes a release's five packages to the VS Code Marketplace, and with no
+# tag only asks whether it could. No token: the Marketplace takes only a global
+# one, which Azure DevOps retires on 2026-12-01. It signs in as the Entra ID app
+# the `marketplace` environment's federated credential names, prints the Azure
+# DevOps profile id the publisher's Members tab adds as Contributor, and asks
+# vsce whether that identity may publish as `molchalih`.
+#
+# Called by release.yml, and run by hand to check access or to publish a tag
+# whose release already exists. Not by re-running the release: that rebuilds
+# the `.mcpb`, whose digest an immutable registry entry already names.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "an existing release to publish, e.g. v0.3.0; empty to only check access"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: marketplace
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      # 499b84ac-… is Azure DevOps' resource id, which the Marketplace sits behind.
+      # A service principal has no profile until Azure DevOps has met it, so the
+      # connection data's id is asked for as well; either is the Members-tab id.
+      - name: the id to add on the publisher's Members tab
+        run: |
+          set -uo pipefail
+          devops=499b84ac-1321-427f-aa17-267ca6975798
+          az rest -u https://app.vssps.visualstudio.com/_apis/profile/profiles/me \
+            --resource "$devops" --query id -o tsv || true
+          az rest -u https://app.vssps.visualstudio.com/_apis/connectionData \
+            --resource "$devops" --query authenticatedUser
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: may it publish as molchalih
+        run: npx --yes @vscode/vsce@4.0.0 verify-pat --azure-credential molchalih
+
+      - name: the packages this release carries
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern '*.vsix' --dir vsix
+          count=$(find vsix -name '*.vsix' | wc -l)
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 packages on $TAG, found $count" >&2
+            exit 1
+          fi
+
+      # --skip-duplicate so a re-run publishes what is missing.
+      - name: publish
+        if: env.TAG != ''
+        run: npx --yes @vscode/vsce@4.0.0 publish --azure-credential --skip-duplicate --packagePath vsix/*.vsix

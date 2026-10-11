@@ -268,7 +268,7 @@ jobs:
   # The five packages above, listed on Open VSX: the registry Cursor, VSCodium
   # and Windsurf install from, and what lets an installed copy update itself.
   # Taken from the release, as the bundle job takes the binaries. The
-  # Marketplace is still a hand upload; automating it is backlog R8.9.
+  # Marketplace is the job after this one.
   openvsx:
     needs: [release, extension]
     runs-on: ubuntu-latest
@@ -295,6 +295,16 @@ jobs:
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: npx --yes ovsx@1.2.0 publish --skip-duplicate --packagePath vsix/*.vsix
+
+  # The same five on the VS Code Marketplace; marketplace.yml says how it signs in.
+  marketplace:
+    needs: [release, extension]
+    uses: ./.github/workflows/marketplace.yml
+    with:
+      tag: ${{ inputs.tag }}
+    permissions:
+      contents: read
+      id-token: write
 
   # R8.6, and the half of R8.7 that is not a credential. One `.mcpb` — a zip of
   # the binaries beside a `manifest.json` — is both Claude Desktop's
