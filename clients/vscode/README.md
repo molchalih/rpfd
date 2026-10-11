@@ -1,3 +1,5 @@
+![rpfd](https://raw.githubusercontent.com/molchalih/rpfd/main/.github/banner.png)
+
 # RPF Archives
 
 Open a RAGE `.rpf` archive as a folder in the editor. Entries are files: they

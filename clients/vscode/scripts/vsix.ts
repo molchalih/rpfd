@@ -33,6 +33,9 @@ interface Manifest {
     license?: string;
     icon?: string;
     galleryBanner?: { color?: string; theme?: string };
+    repository?: { url: string };
+    bugs?: { url: string };
+    homepage?: string;
     keywords?: string[];
     categories?: string[];
     engines: { vscode: string };
@@ -175,6 +178,21 @@ function contentTypes(parts: readonly Part[]): string {
     ].join('\n');
 }
 
+/** The links a marketplace page shows beside the extension, under the ids vsce writes. */
+function links(manifest: Manifest): string[] {
+    const source = manifest.repository?.url;
+    const rows: [string, string | undefined][] = [
+        ['Source', source],
+        ['Getstarted', source],
+        ['GitHub', source?.startsWith('https://github.com/') ? source : undefined],
+        ['Support', manifest.bugs?.url],
+        ['Learn', manifest.homepage],
+    ];
+    return rows.flatMap(([id, url]) =>
+        url ? [`      <Property Id="Microsoft.VisualStudio.Services.Links.${id}" Value="${escapeXml(url)}"/>`] : [],
+    );
+}
+
 /** The gallery manifest, which is what an installer reads first. */
 function vsixManifest(manifest: Manifest, publisher: string, root: string, target?: string): string {
     const license = licenseOf(root)?.name;
@@ -204,6 +222,7 @@ function vsixManifest(manifest: Manifest, publisher: string, root: string, targe
                   `      <Property Id="Microsoft.VisualStudio.Services.Branding.Theme" Value="${escapeXml(manifest.galleryBanner.theme)}"/>`,
               ]
             : []),
+        ...links(manifest),
         '    </Properties>',
         ...(license ? [`    <License>extension/${license}</License>`] : []),
         ...(manifest.icon ? [`    <Icon>extension/${escapeXml(manifest.icon)}</Icon>`] : []),

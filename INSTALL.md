@@ -16,10 +16,10 @@ Visual C++ redistributable.
 ## The editor extension
 
 **In Cursor, VSCodium and Windsurf, install it from the editor.** It is listed
-on [Open VSX](https://open-vsx.org/extension/molchalih/rpf), the registry those
-editors install from, as `molchalih.rpf`: search the Extensions view for it, and
+on [Open VSX](https://open-vsx.org/extension/molchalih/rpfd), the registry those
+editors install from, as `molchalih.rpfd`: search the Extensions view for it, and
 the editor takes the package for its platform and updates it with each release.
-Listed from `v0.3.0`, published by `release.yml`. VS Code installs from the
+Listed from `v0.3.1`, published by `release.yml`. VS Code installs from the
 Marketplace instead, where it is not listed yet, so in VS Code it is the file.
 
 **There is no one-click install for a `.vsix`.** A `vscode://` link that
@@ -374,8 +374,8 @@ platform's `.vsix` from [the table](#the-editor-extension):
 code --install-extension rpf-vX.Y.Z-darwin-arm64.vsix
 ```
 
-`code --list-extensions` then lists `molchalih.rpf`, and
-`code --uninstall-extension molchalih.rpf` undoes it.
+`code --list-extensions` then lists `molchalih.rpfd`, and
+`code --uninstall-extension molchalih.rpfd` undoes it.
 
 **Cursor** — present if `~/.cursor/` exists or, on macOS,
 `/Applications/Cursor.app` does. A `cursor` on `PATH` is not proof: Cursor's

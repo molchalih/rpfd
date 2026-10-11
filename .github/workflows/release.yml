@@ -41,7 +41,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$TAG" \
-            || gh release create "$TAG" --title "$TAG" --generate-notes
+            || gh release create "$TAG" --title "$TAG" --generate-notes \
+                 --notes "![rpfd](https://raw.githubusercontent.com/molchalih/rpfd/main/.github/banner.png)"
 
   binaries:
     needs: release

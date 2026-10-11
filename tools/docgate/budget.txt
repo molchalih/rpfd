@@ -29,9 +29,13 @@
 #           command lines name is added here in the change that adds it.
 #
 # Measured on the settled tree with `./tools/docgate/docgate.sh measure`:
-#   claims 118  bytes 114897  citations 106 (n/a)  excused 24 (20.3%)
+#   claims 118  bytes 114984  citations 106 (n/a)  excused 24 (20.3%)
 #
-# The `bytes` line moves up 512 from 114385: `INSTALL.md` says where Cursor,
+# The `bytes` line moves up 87 from 114897: `clients/vscode/README.md` opens with
+# the rpfd banner, as a PNG because the Marketplace refuses an SVG on a listing,
+# and `INSTALL.md` names the extension `molchalih.rpfd`, its id from `v0.3.1`.
+#
+# 114897 was itself a rise of 512 from 114385: `INSTALL.md` says where Cursor,
 # VSCodium and Windsurf install the extension from, now that `v0.3.0` is listed
 # on Open VSX, and that the Marketplace is not yet.
 #
@@ -73,5 +77,5 @@
 # today's yield would convert it into a second byte budget on a number that moves
 # for reasons nobody reviews, and it is the low side of it that carries meaning.
 claims 75
-bytes 114897
+bytes 114984
 roots .cargo .githooks .github clients crates fixtures fuzz tools

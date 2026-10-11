@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/mcpb-manifest-latest.schema.json",
   "manifest_version": "0.3",
-  "name": "rpf",
-  "display_name": "rpf",
+  "name": "rpfd",
+  "display_name": "rpfd",
   "version": "0.0.0",
   "description": "Read and write RAGE Package Format archives",
   "long_description": "Six read-mostly tools over RPF2 through RPF7 archives: summarise one, list a path, read an entry as bytes or as its XML view, plan a change set, apply it, and verify every entry against what the archive says. Entry bytes never travel on the wire in either direction — a read writes the file you name, and a write reads the file you name.",

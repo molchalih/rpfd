@@ -125,7 +125,7 @@ function indent(text: string): string {
 /** The extension under development, as the editor holds it. */
 function extension(): vscode.Extension<unknown> {
     const found = vscode.extensions.all.find(
-        (candidate) => (candidate.packageJSON as { name?: string }).name === 'rpf',
+        (candidate) => (candidate.packageJSON as { name?: string }).name === 'rpfd',
     );
     assert.ok(found, 'the rpf extension is not loaded in this editor');
     return found;

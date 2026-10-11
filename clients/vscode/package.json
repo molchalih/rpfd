@@ -1,10 +1,18 @@
 {
-  "name": "rpf",
-  "displayName": "RPF Archives",
+  "name": "rpfd",
+  "displayName": "rpfd — RPF Archives",
   "description": "Open a RAGE .rpf archive as a folder in the editor: entries edit and save as ordinary files, patched in place, rebuilt when you ask.",
   "version": "0.0.0",
   "license": "MIT OR Apache-2.0",
   "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/molchalih/rpfd"
+  },
+  "bugs": {
+    "url": "https://github.com/molchalih/rpfd/issues"
+  },
+  "homepage": "https://github.com/molchalih/rpfd#readme",
   "galleryBanner": {
     "color": "#F4F1EC",
     "theme": "light"

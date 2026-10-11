@@ -148,6 +148,24 @@ describe('the vsix', () => {
         );
     });
 
+    it('links a marketplace page to the repository', () => {
+        const manifest = contents(ROOT, 'somebody')
+            .find((part) => part.name === 'extension.vsixmanifest')
+            ?.bytes.toString();
+        assert.ok(manifest);
+        for (const [id, url] of [
+            ['Source', 'https://github.com/molchalih/rpfd'],
+            ['GitHub', 'https://github.com/molchalih/rpfd'],
+            ['Support', 'https://github.com/molchalih/rpfd/issues'],
+            ['Learn', 'https://github.com/molchalih/rpfd#readme'],
+        ]) {
+            assert.ok(
+                manifest.includes(`<Property Id="Microsoft.VisualStudio.Services.Links.${id}" Value="${url}"/>`),
+                `no ${id} link`,
+            );
+        }
+    });
+
     it('declares the platform it was packaged for, and none when it was not', () => {
         const of = (target?: string) =>
             contents(ROOT, 'somebody', target)
