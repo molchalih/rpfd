@@ -109,12 +109,12 @@ script that writes it: 53 large entries of generated text that deflate about
 
 `docs/corpus.md` and `docs/metadata-encodings.md` are cited above as the
 independent readings these fixtures agree with. Both are working material a
-clone does not carry — `README.md` says why — and nothing here needs them read:
+clone does not carry, and nothing here needs them read:
 what they corroborate is stated in the table.
 
 Both manifests are located through **`RPF_METADATA`** rather than
 `RPF_CORPUS`, because they describe payloads that are already out of their
-archives; `README.md` says why that is a separate variable.
+archives.
 
 **`tools/metadata-dump` is what fills that directory**, and it is the step
 rather than a note about it: it walks a corpus for `*.rpf`, descends every

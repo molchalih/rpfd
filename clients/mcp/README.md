@@ -150,8 +150,10 @@ above.
 <details>
 <summary><b>VS Code</b></summary>
 
-Installing the extension is enough — it hands the editor the binary it ships
-with, and `clients/vscode/README.md` is that story.
+Installing the extension is enough — `molchalih.rpfd`, from the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=molchalih.rpfd).
+It hands the editor the binary it ships with, and `clients/vscode/README.md` is
+that story.
 
 To register the binary directly instead, `.vscode/mcp.json`. **The key is
 `servers`, not `mcpServers`**, and it is the one place in this page where that

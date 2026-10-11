@@ -29,9 +29,26 @@
 #           command lines name is added here in the change that adds it.
 #
 # Measured on the settled tree with `./tools/docgate/docgate.sh measure`:
-#   claims 118  bytes 114984  citations 106 (n/a)  excused 24 (20.3%)
+#   claims 95  bytes 113197  citations 105 (n/a)  excused 22 (23.2%)
 #
-# The `bytes` line moves up 87 from 114897: `clients/vscode/README.md` opens with
+# The `bytes` line moves down 5415 from 118612: `README.md` loses its
+# Documentation section, which described the untracked design record to a reader
+# who does not have it, and its build section is cut to the commands and the
+# corpus variables, and the platforms badge goes.
+#
+# 118612 was itself a rise of 3628 from 114984, because the store is now the way
+# to install the extension, since a file install never updates. `INSTALL.md`
+# gains 2380: its extension section leads with the Marketplace and Open VSX,
+# keeps the `.vsix` table as the fallback, and says to uninstall `molchalih.rpf`;
+# the agent procedure installs `molchalih.rpfd` from the store instead of a file,
+# in VS Code and in Cursor, with what those runs showed. `README.md` gains 777
+# for the store line and two badges carrying the listed version.
+# `clients/vscode/README.md` gains 353: it is the store page, its install
+# paragraph says the store picks the package carrying the binary, and its three
+# references to other pages are absolute links, since neither store resolves a
+# relative one. `clients/mcp/README.md` gains 118 for the Marketplace link.
+#
+# 114984 was itself a rise of 87 from 114897: `clients/vscode/README.md` opens with
 # the rpfd banner, as a PNG because the Marketplace refuses an SVG on a listing,
 # and `INSTALL.md` names the extension `molchalih.rpfd`, its id from `v0.3.1`.
 #
@@ -61,7 +78,7 @@
 # 105132, when `docs/decisions/INDEX.md` was untracked again: the whole design
 # record is working-tree material, with no exception.
 #
-# The citation check finds 106 identifiers and can resolve none of them, so it
+# The citation check finds 105 identifiers and can resolve none of them, so it
 # reports `n/a — no yield` and counts in neither direction. A permanent red on a
 # decision the repository made deliberately would be noise, and a green would
 # claim the citations had been followed when none was.
@@ -71,11 +88,11 @@
 # failure by design. No fenced command line in any tracked page was rooted
 # there, so nothing stopped being read as a claim.
 #
-# `claims` stays at 75 and is not moved: the extractor yields 118 against it, so
+# `claims` stays at 75 and is not moved: the extractor yields 95 against it, so
 # the floor is doing what it is for — a tripwire under the extractor, tripped
 # when shape_ok() or the fence split stops matching. Raising it to sit just under
 # today's yield would convert it into a second byte budget on a number that moves
 # for reasons nobody reviews, and it is the low side of it that carries meaning.
 claims 75
-bytes 114984
+bytes 113197
 roots .cargo .githooks .github clients crates fixtures fuzz tools

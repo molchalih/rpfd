@@ -9,13 +9,16 @@ while anything that would mean writing the whole archive out again waits for you
 to ask. A nested archive is a folder inside a folder, and `.meta`, `.ymt` and
 their kind open as XML and are written back in the entry's own binary encoding.
 
-**It needs the `rpf` binary, and the package you install probably carries one.**
-Each per-platform release package — `rpf-vX.Y.Z-darwin-arm64.vsix` and its three
-siblings — ships the static binary for that platform inside it, so a first
-install has everything it needs and there is nothing to put on `PATH`. The
-suffix-less `rpf-vX.Y.Z.vsix` carries none, for a platform this project does not
-build for, and falls back to `rpf` on `PATH`. `INSTALL.md` at the repository
-root is how to install either, and the server without the editor.
+**Install it from the store: that picks the package that carries the `rpf`
+binary, and keeps it updated.** `molchalih.rpfd` on the VS Code Marketplace or
+on Open VSX is published for macOS arm64 and x64, Linux x64 and Windows x64,
+each package holding the static binary for its platform, so the editor takes the
+one for the machine and there is nothing to put on `PATH`. Anywhere else —
+Linux arm64, Windows arm64 — the store serves the package with no binary, which
+falls back to `rpf` on `PATH`. A release's `.vsix` files are the fallback, for a
+machine that cannot reach the store, and a file install never updates itself.
+[`INSTALL.md`](https://github.com/molchalih/rpfd/blob/main/INSTALL.md) is how to
+install either, and the server without the editor.
 
 The extension holds no format knowledge of its own and parses nothing. Every
 answer it gives comes from the binary, over `rpf serve --stdio` — one long-lived
@@ -75,8 +78,10 @@ process per window, with the entry table parsed once and kept warm.
   only inside this editor, so nothing outside its file service — an agent
   included — can read one. The extension registers `rpf serve --mcp` instead,
   built from the same binary it found for itself, and there is nothing to
-  configure. `clients/mcp/README.md` describes the six tools it offers. With no
-  binary, no server is offered rather than one that cannot start.
+  configure.
+  [`clients/mcp/README.md`](https://github.com/molchalih/rpfd/blob/main/clients/mcp/README.md)
+  describes the six tools it offers. With no binary, no server is offered
+  rather than one that cannot start.
 - **Puts its bundled `rpf` on `PATH` in VS Code's terminals.** When the
   binary in use is the one bundled with the extension and no `rpf` is on
   `PATH` already, the integrated terminals get its folder, which holds nothing
@@ -120,8 +125,8 @@ running `rpf --version`:
 With none of them, the first mount fails with a message naming every place it
 looked, and no MCP server is offered. `rpf` is one static binary with no runtime
 prerequisite: install a per-platform package and row 2 answers, or put one on
-`PATH`, or build it and point the setting at the result. `INSTALL.md` covers the
-first two.
+`PATH`, or build it and point the setting at the result.
+[`INSTALL.md`](https://github.com/molchalih/rpfd/blob/main/INSTALL.md) covers the first two.
 
 ## Settings
 

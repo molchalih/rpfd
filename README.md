@@ -8,7 +8,8 @@
 
 [![release](https://img.shields.io/github/v/release/molchalih/rpfd?style=for-the-badge&logo=github&logoColor=white)](https://github.com/molchalih/rpfd/releases/latest)
 [![rust 1.98+](https://img.shields.io/badge/rust-1.98%2B-000000?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=for-the-badge)](https://github.com/molchalih/rpfd/releases/latest)
+[![VS Code](https://vsmarketplacebadges.dev/version-short/molchalih.rpfd.svg?style=for-the-badge&label=VS%20Code&color=0098FF)](https://marketplace.visualstudio.com/items?itemName=molchalih.rpfd)
+[![Open VSX](https://img.shields.io/open-vsx/v/molchalih/rpfd?style=for-the-badge&label=Open%20VSX&logo=eclipseide&logoColor=white)](https://open-vsx.org/extension/molchalih/rpfd)
 
 </div>
 
@@ -18,66 +19,16 @@ clients, and the archives Grand Theft Auto V ships. One command-line binary with
 no runtime prerequisite, and the same code behind a JSON-RPC daemon and a VS
 Code extension.
 
+**The editor extension installs from the store**, so updates arrive by
+themselves: `molchalih.rpfd` on the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=molchalih.rpfd)
+and on [Open VSX](https://open-vsx.org/extension/molchalih/rpfd), or
+`code --install-extension molchalih.rpfd`.
+
 **Asked to install this?** An agent follows
 [the procedure in `INSTALL.md`](INSTALL.md#installing-everything-as-an-agent):
 the binary on `PATH` first, then `rpf` registered with every client the machine
 has.
-
-## Documentation
-
-This page, `INSTALL.md` and the `README.md` files under `clients/`, `tools/`
-and `fixtures/` are the documentation this repository distributes — ten pages,
-and this is the list of them: `INSTALL.md` for each artefact and which release
-asset a platform takes, `clients/agent/README.md` for the JSON contract, the
-exit codes and the failure object, `clients/mcp/README.md` for the MCP server,
-`clients/vscode/README.md` for the extension, `fixtures/README.md` for what the
-committed fixtures prove, and one page per tool it is worth running yourself —
-`tools/acceptance/README.md` for showing a rebuilt archive to the game,
-`tools/endurance/README.md` for whether the daemon grows without bound,
-`tools/metadata-dump/README.md` for getting metadata payloads out of a corpus,
-and `tools/oracle/README.md` for how a committed fixture is generated and
-checked. The format and platform tables below and `rpf --help` are the rest of
-what a first reader needs. A release archive is narrower again: the binary,
-this page and both licence files.
-
-The design record is not distributed. The format notes, the conventions, the
-backlog and the numbered decision records live in the working tree under
-`docs/`, untracked by choice: they are working material, amended as the work
-moves, and a tag carrying them would publish a snapshot of reasoning as though
-it were a contract. What is tracked is what is held to the code.
-
-Every citation into it therefore resolves to nothing here. `DR-NNN` is cited
-throughout the tests, the build scripts and the workflows, and it names a
-decision record under `docs/decisions/` that your clone does not contain — not
-the reasoning, and not a row giving the title and the status either, because
-the index of them is working-tree material like the records it indexes. A bare
-`docs/...` path names a page no clone receives, for the same reason. So does a
-requirement id, `R<N>.<M>`, cited from `.github/workflows/ci.yml`,
-`rustfmt.toml`, `crates/rpf-core/Cargo.toml` and the extension's tests: it names
-a row in the untracked backlog. Nothing in a clone depends on any of them — it
-builds, tests and releases without them — and where such a citation points at
-something a reader actually needs, that thing is on one of the ten pages above.
-That is deliberate rather than a shortfall, but it is worth being plain about
-what it costs: an identifier you meet in the code is a reference to a document
-you do not have, and nothing you can run will produce it.
-
-**The distributed pages have no router, and that is permanent.** In the working
-tree `AGENTS.md` is the map: it says which document owns which class of fact,
-and it is where the contributor contract begins. It is untracked for the reason
-`docs/` is, so no clone receives it, and no arrangement of tracked pages can
-stand in — most of what it routes to is not here to route to. A documentation
-check that asks whether this corpus has a router therefore fails against it and
-always will. Recording that here as a known and argued failure is the point: a
-gap somebody chose is cheaper than one somebody has to rediscover.
-
-The cost is real. A reader landing on a tracked page has nothing telling them
-which of the ten owns the fact they are after, and finds it from the list above
-or by looking. The trade is taken because a public router would be worse: it
-either copies the ownership table, leaving two versions of one fact to keep in
-step, or it routes into documents a clone does not have, which is the failure
-it would exist to prevent. Ten pages is a surface a reader can hold without a
-map. What the contract enforces that this page can show is the gate list under
-Building and testing — a change passes those or it is not finished.
 
 ## Formats
 
@@ -105,8 +56,9 @@ under the transform.
 ## Installing
 
 `INSTALL.md` is the page for this, and it answers three separate questions: how
-to install the editor extension from a `.vsix`, how to register the MCP server
-with an editor or an agent, and where to put the binary if that is all you want.
+to install the editor extension — from the VS Code Marketplace or Open VSX, with
+a `.vsix` as the fallback — how to register the MCP server with an editor or an
+agent, and where to put the binary if that is all you want.
 It ends with the procedure an agent follows to do all three on one machine.
 Prebuilt binaries for macOS, Windows and Linux are attached to each release.
 
@@ -268,9 +220,8 @@ code tells a caller to do next.
 cargo build --release
 ```
 
-Continuous integration is six jobs — eight runs, because the job carrying the
-first three commands below is asked on macOS, Linux and Windows. Passing all of
-them locally is what makes a green run likely:
+Continuous integration runs these, on macOS, Linux and Windows for the first
+three; passing them locally is what makes a green run likely:
 
 ```
 cargo fmt --all -- --check
@@ -282,34 +233,13 @@ cargo deny check
 ./tools/docgate/docgate.sh
 ```
 
-Two of those are checked further than their exit code. The suite job counts the
-tests that reported themselves skipped for want of a corpus and fails unless
-there are exactly **14**, so a corpus test added without a gate — or gated when
-it should have run — is caught rather than passing quietly. The fixture job
-first refuses a `Cargo.lock` naming `rpf-archive`, because the oracle's
-generator links the reference implementation and is excluded from the workspace
-(DR-007).
+It also checks every commit message; `git config core.hooksPath .githooks`
+runs the same check locally.
 
-The last of the seven is the documentation gate, and it is the one command
-above that reads no Rust: `./tools/docgate/docgate.sh` walks the Markdown
-`git ls-files` reports — exactly the eleven a clone receives — and fails on a
-path claim that names nothing tracked, an unclosed fence, and a surface that
-has grown past the budget in `tools/docgate/budget.txt`. A reference into
-`docs/` or `AGENTS.md` is withdrawn by `git check-ignore` and printed rather
-than reported as rot.
-
-One job has no local command at all, and it is the first rather than the last:
-`.githooks/commit-msg` is run over every commit a push or pull request adds.
-Point git at it once — `git config core.hooksPath .githooks` — and a malformed
-subject is refused before the commit exists.
-
-The suite needs no game data and passes without it, skipping what it cannot
-reach. Four variables point it at real data: `RPF_CORPUS` at a directory of
-archives, `RPF_GAME_EXE` at game executables, `RPF_GAME_IMAGE` at one memory
-image of a running game, and `RPF_METADATA` at metadata payloads already out of
-their archives, as `tools/metadata-dump` writes them. Each has a companion —
-`RPF_REQUIRE_CORPUS` and its three siblings — turning its own skips into
-failures.
+The suite needs no game data: what needs it is skipped. `RPF_CORPUS`,
+`RPF_GAME_EXE`, `RPF_GAME_IMAGE` and `RPF_METADATA` point it at archives, game
+executables, a memory image of the running game, and extracted metadata
+payloads; the matching `RPF_REQUIRE_*` turns a skip into a failure.
 
 ## Licence
 

@@ -15,28 +15,50 @@ Visual C++ redistributable.
 
 ## The editor extension
 
-**In Cursor, VSCodium and Windsurf, install it from the editor.** It is listed
-on [Open VSX](https://open-vsx.org/extension/molchalih/rpfd), the registry those
-editors install from, as `molchalih.rpfd`: search the Extensions view for it, and
-the editor takes the package for its platform and updates it with each release.
-Listed from `v0.3.1`, published by `release.yml`. VS Code installs from the
-Marketplace instead, where it is not listed yet, so in VS Code it is the file.
-
-**There is no one-click install for a `.vsix`.** A `vscode://` link that
-installs an extension resolves against the Marketplace, where this extension is
-not listed, so the file is what you have. Three ways to install it, all
-equivalent:
+**Install it from the store, because that is how updates arrive.** It is
+`molchalih.rpfd`, listed as "rpfd — RPF Archives" on the
+[VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=molchalih.rpfd)
+and on [Open VSX](https://open-vsx.org/extension/molchalih/rpfd). `release.yml`
+publishes every release to both, all five packages each, from `v0.3.1`. In VS
+Code, search the Extensions view for `rpfd`, or:
 
 ```sh
-code --install-extension rpf-vX.Y.Z-darwin-arm64.vsix
+code --install-extension molchalih.rpfd
 ```
 
-- Run `Extensions: Install from VSIX…` from the command palette and pick the
-  file.
-- Drag the `.vsix` onto the Extensions panel.
+The store hands the editor the package for its platform, which carries the `rpf`
+binary, and an installed copy updates itself with each release. Run against a
+scratch profile on macOS arm64 on 2026-10-11, that command installed
+`molchalih.rpfd-0.3.1-darwin-arm64`, holding `bin/darwin-arm64/rpf`, which
+answered `rpf 0.3.1`. Two minutes earlier, before the Marketplace had validated
+the darwin-arm64 package, the same command installed the suffix-less
+`molchalih.rpfd-0.3.1`, which carries no binary — so a copy installed in the
+minutes after a release may need `rpf` on `PATH` until the next one. The folder
+name under the editor's `extensions` directory says which arrived.
 
-Take the package that matches the machine. Each carries the `rpf` binary for
-that platform inside it, so a first install has everything it needs:
+VSCodium and Windsurf install from Open VSX, and Cursor from a gallery of its
+own, so the same id and the same search work in all three. Cursor's gallery is
+the last to have a release: it answered `Extension 'molchalih.rpfd' not found.`
+at 03:12 UTC on 2026-10-11, and installed `v0.3.1` for darwin-arm64, binary
+included, three minutes later.
+
+**Uninstall `molchalih.rpf` if you have it.** That was the extension's id
+through `v0.3.0`, installed from a file or from Open VSX, and beside
+`molchalih.rpfd` the two would register the same `rpf:` scheme and the same
+commands:
+
+```sh
+code --uninstall-extension molchalih.rpf
+```
+
+### From a file, where the store is not an option
+
+A machine that cannot reach the store, or an editor whose gallery does not list
+the extension, installs the release's `.vsix` instead — with
+`code --install-extension rpf-vX.Y.Z-darwin-arm64.vsix`, with
+`Extensions: Install from VSIX…` from the command palette, or by dragging the
+file onto the Extensions panel. Take the package that matches the machine; each
+carries the `rpf` binary for that platform:
 
 | You are on | Take |
 |---|---|
@@ -47,13 +69,13 @@ that platform inside it, so a first install has everything it needs:
 
 `rpf-vX.Y.Z.vsix`, with no platform suffix, is the fifth package and carries no
 binary at all. It is for a platform this project does not build for — Linux
-arm64, Windows arm64 — and it expects `rpf` on `PATH`, which the last section of
-this page is about.
+arm64, Windows arm64 — and it expects `rpf` on `PATH`, which the binary's
+section below is about. The store serves it to such a platform by itself.
 
 **An extension installed from a file does not update itself.** Updates come from
 the registry an extension was installed from, and a `.vsix` is outside every
 one: to move to a new release, download the next one and install it over this
-one.
+one — or uninstall it and install from the store.
 
 `clients/vscode/README.md` is the extension's own page — what it does in the
 editor, what it refuses to do behind your back, and how it finds the binary.
@@ -356,8 +378,8 @@ or Finder starts with launchd's `/usr/bin:/bin:/usr/sbin:/sbin` and no shell
 profile. The editor extension and the Claude Desktop bundle each carry their
 own binary and need no path at all.
 
-The release assets below come down and are checked exactly as the archive was
-in step 1, with `--pattern` naming the asset.
+The Claude Desktop bundle below comes down and is checked exactly as the
+archive was in step 1, with `--pattern` naming the asset.
 
 **VS Code** — present if `code` is on `PATH` or, on macOS,
 `/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code` exists,
@@ -365,17 +387,21 @@ or the same under `~/Applications`, which is then the command line to use. Look
 first for a user-level registration an earlier `code --add-mcp` made: an `rpf`
 under `servers` in `~/Library/Application Support/Code/User/mcp.json` on macOS,
 `~/.config/Code/User/mcp.json` on Linux, `%APPDATA%\Code\User\mcp.json` on
-Windows. If there is one, ask the user to let it go, because
-the extension registers the server itself and the two would stand side by side.
-For the same reason, **never run `code --add-mcp` here**. Then install the
-platform's `.vsix` from [the table](#the-editor-extension):
+Windows. If there is one, ask the user to let it go, because the extension
+registers the server itself and the two would stand side by side. For the same
+reason, **never run `code --add-mcp` here**. Then take out the extension's old
+id, if it is there, and install the current one from the Marketplace:
 
 ```sh
-code --install-extension rpf-vX.Y.Z-darwin-arm64.vsix
+code --list-extensions | grep -qx molchalih.rpf && code --uninstall-extension molchalih.rpf
+code --install-extension molchalih.rpfd
 ```
 
-`code --list-extensions` then lists `molchalih.rpfd`, and
-`code --uninstall-extension molchalih.rpfd` undoes it.
+`code --list-extensions --show-versions` then lists `molchalih.rpfd@0.3.1` or
+whatever is current, and `code --uninstall-extension molchalih.rpfd` undoes it.
+Report the old id's removal as a change like any other; it has no undo worth
+offering, because it is superseded. The store keeps the copy up to date from
+here, which a `.vsix` would not.
 
 **Cursor** — present if `~/.cursor/` exists or, on macOS,
 `/Applications/Cursor.app` does. A `cursor` on `PATH` is not proof: Cursor's
@@ -400,11 +426,17 @@ terminal agent and not the editor: `cursor-agent mcp list-tools rpf` started the
 server and listed the six tools, while `cursor-agent mcp list` went on reporting
 `rpf: not loaded (needs approval)` — and `cursor-agent mcp enable rpf`, which
 adds a server to that agent's approved list, answered that it already was. What
-the editor asks the user before it starts the server was not checked. Nor is the
-`.vsix` installed into Cursor: the extension registers its server through VS
-Code's MCP provider API, and that Cursor honours it has not been checked.
-`cursor --add-mcp` exists and is not used, for the same reason — where it
-writes has not been checked either.
+the editor asks the user before it starts the server was not checked.
+`cursor --add-mcp` exists and is not used: where it writes has not been checked.
+
+Where the editor is installed, the extension goes in too, for mounting archives,
+through the editor's own command line — on macOS
+`/Applications/Cursor.app/Contents/Resources/app/bin/cursor`, not the shim —
+with the same two lines as VS Code, `code` replaced by it. Its MCP server is
+not relied on in Cursor: the extension registers it through VS Code's MCP
+provider API, and that Cursor honours it has not been checked. If it turns out
+to, the user sees `rpf` twice, and the `~/.cursor/mcp.json` entry is the one to
+remove.
 
 **Claude Code** — present if `claude` is on `PATH`. User scope, because this is
 a machine install; `--scope project` would write one repository's `.mcp.json`:
@@ -440,8 +472,15 @@ The Codex commands were run against a scratch `CODEX_HOME`, the Claude Code ones
 against a scratch `CLAUDE_CONFIG_DIR` and `HOME` — including a registration of a
 missing binary, to see `claude mcp get` exit 0 on it — and `code --add-mcp`
 against a scratch `--user-data-dir`, to see where it writes; all on 2026-10-09.
-`code --install-extension` and the Claude Desktop step were checked against
-`code --help` and the app's declared file types, not run.
+The VS Code lines ran on 2026-10-11 against a scratch `--user-data-dir` and
+`--extensions-dir`, with `molchalih.rpf@0.3.0` installed from its `.vsix`
+first: the first line removed the old id, and the second installed the
+darwin-arm64 package with its binary — after one `Server returned 503`, which a
+retry cleared, so a 503 is retried rather than reported. The same two lines ran
+against Cursor's editor command line with the same scratch flags, to the same
+result.
+The Claude Desktop step was checked against the app's declared file types, not
+run.
 
 ### 3. The report
 

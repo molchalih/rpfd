@@ -10,8 +10,7 @@ fixtures/corpus/
 # material — the decision records included, and with them the index of them, so
 # a `DR-NNN` cited from tracked code, scripts or workflows names a local
 # document a cloner does not have. Requirement ids (`R<N>.<M>`) resolve the same
-# way, in the untracked backlog, and `README.md` says so on the distributed
-# surface.
+# way, in the untracked backlog.
 /docs
 
 # Game executables, kept locally so key extraction has something to read.
